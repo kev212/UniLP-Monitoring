@@ -22,7 +22,7 @@ async function main(): Promise<void> {
   const notifier = new Notifier(config, chains);
   const discovery = new DiscoveryService(database, chains, config, notifier);
   const alchemyBootstrapper = new AlchemyBootstrapper(database, chains, discovery, config);
-  const pnl = new PnlService(database, reader, routes, config);
+  const pnl = new PnlService(database, reader, routes, config, tradingApi);
   const executor = new Executor(database, chains, reader, routes, notifier, config, tradingApi);
   const guardian = new Guardian(config, database, chains, alchemyBootstrapper, discovery, pnl, executor, notifier);
 

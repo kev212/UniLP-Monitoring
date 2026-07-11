@@ -2,9 +2,11 @@ import type { Address } from "viem";
 
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
+import { log } from "../log.js";
 import type { ExitTrigger, LiquidationQuote, PnlSnapshot, PositionRecord, TrailingStopState } from "../types.js";
 import type { PositionReader } from "./position-reader.js";
 import type { RoutePlanner } from "./route-planner.js";
+import type { UniswapTradingApi } from "./uniswap-trading-api.js";
 
 export interface ValuedPosition {
   snapshot: PnlSnapshot;
@@ -18,12 +20,19 @@ export type TrailingStopDecision =
   | { action: "activate" | "raise_peak"; state: TrailingStopState }
   | { action: "trigger"; state: TrailingStopState };
 
+interface ValuationRoute {
+  expectedOut: bigint;
+  minimumOut: bigint;
+  path: Address[];
+}
+
 export class PnlService {
   constructor(
     private readonly database: Database,
     private readonly reader: PositionReader,
     private readonly routes: RoutePlanner,
     private readonly config: RuntimeConfig,
+    private readonly tradingApi?: UniswapTradingApi,
   ) {}
 
   async value(position: PositionRecord, blockNumber: bigint): Promise<ValuedPosition> {
@@ -42,16 +51,18 @@ export class PnlService {
     const quoteIsToken0 = value.token0.token.toLowerCase() === position.quoteToken.toLowerCase();
     const quoteAmount = quoteIsToken0 ? value.token0.amount : value.token1.amount;
     const nonQuote = quoteIsToken0 ? value.token1 : value.token0;
-    const route = await this.routes.quoteDirect(position, nonQuote.token, nonQuote.amount, position.quoteToken);
+    const quoteSideFee = quoteIsToken0 ? value.unclaimedFees0 : value.unclaimedFees1;
+    const nonQuoteFee = quoteIsToken0 ? value.unclaimedFees1 : value.unclaimedFees0;
+    const [route, feeRoute] = await Promise.all([
+      this.quoteFresh(position, nonQuote.token, nonQuote.amount, position.quoteToken),
+      this.quoteFresh(position, nonQuote.token, nonQuoteFee, position.quoteToken),
+    ]);
     if (nonQuote.amount > 0n && !route) throw new Error("No safe direct Uniswap route from LP asset to quote token");
 
     const liquidationQuote = quoteAmount + (route?.minimumOut ?? 0n);
-    const quoteSideFee = quoteIsToken0 ? value.unclaimedFees0 : value.unclaimedFees1;
-    const nonQuoteFee = quoteIsToken0 ? value.unclaimedFees1 : value.unclaimedFees0;
     let feeQuote = quoteSideFee;
     let feeNonQuoteConverted = 0n;
     if (nonQuoteFee > 0n) {
-      const feeRoute = await this.routes.quoteDirect(position, nonQuote.token, nonQuoteFee, position.quoteToken);
       feeNonQuoteConverted = feeRoute?.minimumOut ?? 0n;
       feeQuote += feeNonQuoteConverted;
     }
@@ -63,7 +74,7 @@ export class PnlService {
     if (chainName) {
       const stable = this.config.quoteTokens[chainName]?.[0]?.address;
       if (stable && position.quoteToken.toLowerCase() !== stable.toLowerCase() && feeQuote > 0n) {
-        const stableRoute = await this.routes.quoteDirect(position, position.quoteToken, feeQuote, stable);
+        const stableRoute = await this.quoteFresh(position, position.quoteToken, feeQuote, stable);
         feeQuoteUsdg = stableRoute?.minimumOut ?? 0n;
       }
     }
@@ -91,7 +102,7 @@ export class PnlService {
         token1Amount: value.token1.amount,
         nonQuoteInput: nonQuote.amount > 0n ? nonQuote : null,
         quoteOutput: route?.expectedOut ?? 0n,
-        route: route ? [route.tokenIn, route.tokenOut] : [],
+        route: route?.path ?? [],
         blockNumber: value.observedBlock,
       },
       twapGuard,
@@ -124,6 +135,25 @@ export class PnlService {
     const drawdownBps = percentToBps(this.config.trailingStopDrawdownPercent);
     if (snapshot.pnlBps <= state.peakPnlBps - drawdownBps) return { action: "trigger", state };
     return { action: "none" };
+  }
+
+  private async quoteFresh(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address): Promise<ValuationRoute | null> {
+    if (amountIn === 0n || tokenIn.toLowerCase() === tokenOut.toLowerCase()) return null;
+    if (this.tradingApi) {
+      try {
+        const quote = await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut);
+        if (quote) {
+          return { expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, path: [tokenIn, tokenOut] };
+        }
+      } catch (error) {
+        log.warn({ err: error, positionId: position.id, tokenIn, tokenOut }, "Trading API valuation quote failed; using local quote");
+      }
+    }
+
+    const route = await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
+    return route
+      ? { expectedOut: route.expectedOut, minimumOut: route.minimumOut, path: route.path }
+      : null;
   }
 
   private async recordAndCheckPrice(position: PositionRecord, poolKey: string, marker: bigint, blockNumber: bigint): Promise<{ ready: boolean; deviationBps?: bigint }> {

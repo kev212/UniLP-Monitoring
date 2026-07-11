@@ -22,7 +22,7 @@ import {
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { PositionRecord, TransactionPlan } from "../types.js";
+import type { ExitTrigger, PositionRecord, TransactionPlan } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Notifier } from "./notifier.js";
 import type { PositionReader } from "./position-reader.js";
@@ -55,13 +55,14 @@ export class Executor {
     }
   }
 
-  async execute(position: PositionRecord): Promise<void> {
+  async execute(position: PositionRecord, trigger?: ExitTrigger): Promise<void> {
     if (!position.quoteToken) throw new Error("Cannot execute a position without quote token");
     if (position.status === "closing") return this.resume(position);
+    if (position.protocol === "v4" && !(await this.canCloseV4(position))) return;
 
     const value = await this.reader.read(position);
     const before = await this.tokenBalances(position.chainId, position.owner, position.token0, position.token1);
-    await this.database.setPositionStatus(position.id, "closing", { exitStartedAt: new Date().toISOString() });
+    await this.database.setPositionStatus(position.id, "closing", { exitStartedAt: new Date().toISOString(), exitRetry: null });
     let closeConfirmed = false;
 
     try {
@@ -95,9 +96,13 @@ export class Executor {
       await this.resume({ ...position, status: "closing", metadata: { ...position.metadata, pendingSwap: nonQuoteAmount > 0n ? { token: nonQuoteToken, amount: nonQuoteAmount.toString() } : null } });
     } catch (error) {
       if (!closeConfirmed) {
-        await this.database.recordExecution(position.id, "remove_liquidity", "failed", undefined, errorMessage(error));
-        await this.database.setPositionStatus(position.id, "armed", { lastExecutionError: errorMessage(error) });
-        await this.notifier.failure(position, errorMessage(error));
+        const message = errorMessage(error);
+        await this.database.recordExecution(position.id, "remove_liquidity", "failed", undefined, message);
+        await this.database.setPositionStatus(position.id, "armed", {
+          lastExecutionError: message,
+          exitRetry: nextExitRetry(position.metadata, trigger),
+        });
+        await this.notifier.failure(position, message);
       }
       throw error;
     }
@@ -175,6 +180,37 @@ export class Executor {
       await this.database.setPositionStatus(position.id, "closing", { lastExecutionError: errorMessage(error) });
       await this.notifier.failure(position, errorMessage(error));
       throw error;
+    }
+  }
+
+  private async canCloseV4(position: PositionRecord): Promise<boolean> {
+    const { client, registry } = this.chains.getById(position.chainId);
+    try {
+      const owner = await client.readContract({
+        address: registry.contracts.v4.positionManager,
+        abi: v4PositionManagerAbi,
+        functionName: "ownerOf",
+        args: [BigInt(position.positionKey)],
+      });
+      if (owner.toLowerCase() !== position.owner.toLowerCase()) {
+        throw new Error("V4 position owner no longer matches executor");
+      }
+      const liquidity = await client.readContract({
+        address: registry.contracts.v4.positionManager,
+        abi: v4PositionManagerAbi,
+        functionName: "getPositionLiquidity",
+        args: [BigInt(position.positionKey)],
+      });
+      if (liquidity > 0n) return true;
+      await this.database.setPositionStatus(position.id, "settled", { reason: "on_chain_liquidity_zero" });
+      log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 position has zero NFT liquidity — marking settled");
+      return false;
+    } catch (error) {
+      const message = errorMessage(error);
+      if (!message.includes("NOT_MINTED")) throw error;
+      await this.database.setPositionStatus(position.id, "settled", { reason: "nft_burned" });
+      log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 position NFT is burned — marking settled");
+      return false;
     }
   }
 
@@ -464,6 +500,22 @@ function positiveDelta(before: bigint, after: bigint): bigint {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function nextExitRetry(metadata: Record<string, unknown>, trigger?: ExitTrigger): Record<string, unknown> {
+  const existing = metadata.exitRetry;
+  const previousAttempts = existing && typeof existing === "object" && !Array.isArray(existing)
+    && typeof (existing as Record<string, unknown>).attempts === "number"
+    ? (existing as Record<string, unknown>).attempts as number
+    : 0;
+  const attempts = previousAttempts + 1;
+  const delaySeconds = Math.min(20, 5 * (2 ** Math.min(attempts - 1, 2)));
+  return {
+    reason: trigger ?? "manual",
+    attempts,
+    lastFailedAt: new Date().toISOString(),
+    nextAttemptAt: new Date(Date.now() + delaySeconds * 1_000).toISOString(),
+  };
 }
 
 function approvalSpender(approval: { to: Address; data: Hex }, token: Address, amount: bigint): Address {

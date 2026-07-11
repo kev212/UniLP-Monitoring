@@ -24,6 +24,9 @@ const envSchema = z.object({
   TAKE_PROFIT_PERCENT: z.coerce.number().positive(),
   TRAILING_STOP_ACTIVATION_PERCENT: z.coerce.number().positive().default(5),
   TRAILING_STOP_DRAWDOWN_PERCENT: z.coerce.number().positive().default(1.5),
+  POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).default(5_000),
+  DISCOVERY_INTERVAL_MS: z.coerce.number().int().min(5_000).max(300_000).default(30_000),
+  POSITION_MONITOR_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(2),
   MAX_SWAP_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(100),
   MAX_TWAP_DEVIATION_BPS: z.coerce.number().int().min(1).max(5_000).default(250),
   TWAP_WINDOW_SECONDS: z.coerce.number().int().min(10).max(3_600).default(300),
@@ -55,6 +58,9 @@ export interface RuntimeConfig {
   takeProfitPercent: number;
   trailingStopActivationPercent: number;
   trailingStopDrawdownPercent: number;
+  positionMonitorIntervalMs: number;
+  discoveryIntervalMs: number;
+  positionMonitorConcurrency: number;
   maxSwapSlippageBps: number;
   maxTwapDeviationBps: number;
   twapWindowSeconds: number;
@@ -154,6 +160,9 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     takeProfitPercent: env.TAKE_PROFIT_PERCENT,
     trailingStopActivationPercent: env.TRAILING_STOP_ACTIVATION_PERCENT,
     trailingStopDrawdownPercent: env.TRAILING_STOP_DRAWDOWN_PERCENT,
+    positionMonitorIntervalMs: env.POSITION_MONITOR_INTERVAL_MS,
+    discoveryIntervalMs: env.DISCOVERY_INTERVAL_MS,
+    positionMonitorConcurrency: env.POSITION_MONITOR_CONCURRENCY,
     maxSwapSlippageBps: env.MAX_SWAP_SLIPPAGE_BPS,
     maxTwapDeviationBps: env.MAX_TWAP_DEVIATION_BPS,
     twapWindowSeconds: env.TWAP_WINDOW_SECONDS,

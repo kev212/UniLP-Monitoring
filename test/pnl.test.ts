@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { Address } from "viem";
 
 import type { RuntimeConfig } from "../src/config.js";
 import { PnlService } from "../src/services/pnl.js";
@@ -16,6 +17,9 @@ const config: RuntimeConfig = {
   takeProfitPercent: 20,
   trailingStopActivationPercent: 5,
   trailingStopDrawdownPercent: 1.5,
+  positionMonitorIntervalMs: 5_000,
+  discoveryIntervalMs: 30_000,
+  positionMonitorConcurrency: 2,
   maxSwapSlippageBps: 100,
   maxTwapDeviationBps: 250,
   twapWindowSeconds: 300,
@@ -101,6 +105,61 @@ describe("trailing stop", () => {
     const metadata = { trailingStop: { peakPnlBps: "500", activatedAtBlock: "10" } };
 
     expect(pnl.evaluateTrailingStop(metadata, snapshot(-1n))).toEqual({ action: "reset" });
+  });
+});
+
+describe("fresh valuation quotes", () => {
+  it("uses a fresh Trading API quote before the local route planner", async () => {
+    const usdg = "0x0000000000000000000000000000000000000001" as Address;
+    const token = "0x0000000000000000000000000000000000000002" as Address;
+    const position = {
+      id: "position",
+      chainId: 8453,
+      protocol: "v4",
+      positionKey: "1",
+      owner: "0x0000000000000000000000000000000000000003" as Address,
+      poolAddress: null,
+      token0: usdg,
+      token1: token,
+      quoteToken: usdg,
+      status: "armed",
+      liquidity: 1n,
+      openedAtBlock: 1n,
+      metadata: {},
+    } as const;
+    const database = {
+      recordPositionObservation: vi.fn(),
+      getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 1_000_000n, realized: 0n }),
+      getPoolObservationAtOrBefore: vi.fn().mockResolvedValue(null),
+      recordPoolObservation: vi.fn(),
+    };
+    const reader = {
+      read: vi.fn().mockResolvedValue({
+        protocol: "v4",
+        poolKey: "pool",
+        sourcePool: null,
+        token0: { token: usdg, amount: 1_000_000n },
+        token1: { token, amount: 10n ** 18n },
+        liquidity: 1n,
+        priceMarker: 1n,
+        minAmount0: 0n,
+        minAmount1: 0n,
+        unclaimedFees0: 0n,
+        unclaimedFees1: 0n,
+        observedBlock: 1n,
+      }),
+    };
+    const routes = { quoteDirect: vi.fn() };
+    const tradingApi = {
+      quote: vi.fn().mockResolvedValue({ expectedOut: 100_000n, minimumOut: 99_000n }),
+    };
+    const pnl = new PnlService(database as never, reader as never, routes as never, config, tradingApi as never);
+
+    const valued = await pnl.value(position, 1n);
+
+    expect(tradingApi.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg);
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
+    expect(valued.snapshot.liquidationQuote).toBe(1_099_000n);
   });
 });
 
