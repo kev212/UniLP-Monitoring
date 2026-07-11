@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { hasMinimumScanVolume, MIN_VOLUME_1H_USD, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
+import { hasMinimumScanVolume, MIN_VOLUME_1H_USD, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
 
 describe("pool scoring formula", () => {
   const K = 1_000_000;
@@ -79,6 +79,11 @@ describe("scan pool eligibility", () => {
       .toBe("https://app.uniswap.org/explore/pools/robinhood/0xe39078fc024188927e10b26d91e4720a600fba85");
     expect(uniswapPoolUrl("0x4570413b567093841404954697bba9178a963f2810844321fcb777b27ac32267"))
       .toBe("https://app.uniswap.org/explore/pools/robinhood/0x4570413b567093841404954697bba9178a963f2810844321fcb777b27ac32267");
+  });
+
+  it("removes GeckoTerminal's fee suffix from pair symbols", () => {
+    expect(poolPair("USDG / seedcoin 2.499%", false)).toBe("seedcoin/USDG");
+    expect(poolPair("seedcoin / WETH 1%", true)).toBe("seedcoin/WETH");
   });
 
   it("returns at most three active pools and two zero-active pools in the watchlist", () => {

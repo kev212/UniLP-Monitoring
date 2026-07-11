@@ -152,16 +152,8 @@ export class PoolScanner {
     const score = (estimatedPoolFees1hUsd / tvlUsd) * safetyFactor;
 
     const baseId = raw.relationships.base_token.data.id;
-    const quoteId = raw.relationships.quote_token.data.id;
     const isTokenBase = baseId.toLowerCase().replace("robinhood_", "") === token;
-    const poolName = raw.attributes.pool_name ?? raw.attributes.name;
-    const tokenSymbol = isTokenBase
-      ? poolName.split(" / ")[0] ?? "?"
-      : poolName.split(" / ")[1] ?? "?";
-    const otherSymbol = isTokenBase
-      ? poolName.split(" / ")[1] ?? "?"
-      : poolName.split(" / ")[0] ?? "?";
-    const pair = `${tokenSymbol}/${otherSymbol}`;
+    const pair = poolPair(raw.attributes.pool_name ?? raw.attributes.name, isTokenBase);
 
     const warnings: string[] = [];
     if (stale) warnings.push("data mungkin stale");
@@ -308,6 +300,14 @@ export function hasMinimumScanVolume(volume1hUsd: number): boolean {
 
 export function uniswapPoolUrl(poolIdentifier: string): string {
   return `https://app.uniswap.org/explore/pools/robinhood/${poolIdentifier}`;
+}
+
+export function poolPair(poolName: string, tokenIsBase: boolean): string {
+  const [baseSymbol = "?", quoteSymbol = "?"] = poolName.split(" / ");
+  const clean = (symbol: string) => symbol.replace(/\s+\d+(?:\.\d+)?%$/, "");
+  return tokenIsBase
+    ? `${clean(baseSymbol)}/${clean(quoteSymbol)}`
+    : `${clean(quoteSymbol)}/${clean(baseSymbol)}`;
 }
 
 export function rankPools(pools: ScoredPool[]): PoolScan {
