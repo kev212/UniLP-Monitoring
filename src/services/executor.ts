@@ -62,7 +62,15 @@ export class Executor {
 
     const value = await this.reader.read(position);
     const before = await this.tokenBalances(position.chainId, position.owner, position.token0, position.token1);
-    await this.database.setPositionStatus(position.id, "closing", { exitStartedAt: new Date().toISOString(), exitRetry: null });
+    const quoteIsToken0 = value.token0.token.toLowerCase() === position.quoteToken.toLowerCase();
+    const quotePrincipal = quoteIsToken0 ? value.token0.amount : value.token1.amount;
+    const quoteFee = quoteIsToken0 ? value.unclaimedFees0 : value.unclaimedFees1;
+    const settlementQuoteFromClose = quotePrincipal + quoteFee;
+    await this.database.setPositionStatus(position.id, "closing", {
+      exitStartedAt: new Date().toISOString(),
+      exitRetry: null,
+      settlementQuoteFromClose: settlementQuoteFromClose.toString(),
+    });
     let closeConfirmed = false;
 
     try {
@@ -134,16 +142,17 @@ export class Executor {
     }
 
     try {
-      const apiPlan = await this.tradingApiSwapPlan(position, pending.token, actualBalance, quoteToken);
-      if (apiPlan === null) return;
-      if (apiPlan) {
-        const hash = await this.send(position, "swap_to_quote", apiPlan);
+      const apiResult = await this.tradingApiSwapPlan(position, pending.token, actualBalance, quoteToken);
+      if (apiResult === null) return;
+      if (apiResult) {
+        const { plan, expectedOut } = apiResult;
+        const hash = await this.send(position, "swap_to_quote", plan);
         if (!hash) {
           await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "swap_to_quote" });
           return;
         }
         await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash });
-        await this.saveSettlementBalance(position);
+        await this.saveSettlementBalance(position, expectedOut);
         await this.notifier.settled(position);
         return;
       }
@@ -176,7 +185,7 @@ export class Executor {
         return;
       }
       await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash });
-      await this.saveSettlementBalance(position);
+      await this.saveSettlementBalance(position, route.expectedOut);
       await this.notifier.settled(position);
     } catch (error) {
       await this.database.recordExecution(position.id, "swap_to_quote", "failed", undefined, errorMessage(error));
@@ -186,13 +195,15 @@ export class Executor {
     }
   }
 
-  private async saveSettlementBalance(position: PositionRecord): Promise<void> {
+  private async saveSettlementBalance(position: PositionRecord, swapExpectedOut = 0n): Promise<void> {
     if (!position.quoteToken) return;
     try {
-      const balance = await this.tokenBalance(position.chainId, position.quoteToken);
-      await this.database.setPositionStatus(position.id, "settled", { totalReceived: balance.toString() });
+      const meta = position.metadata as Record<string, unknown>;
+      const fromCloseStr = typeof meta.settlementQuoteFromClose === "string" ? meta.settlementQuoteFromClose : "0";
+      const totalReceived = BigInt(fromCloseStr) + swapExpectedOut;
+      await this.database.setPositionStatus(position.id, "settled", { totalReceived: totalReceived.toString() });
     } catch {
-      // Balance read is for notification only — do not block settlement.
+      // Balance calculation is for notification only — do not block settlement.
     }
   }
 
@@ -255,7 +266,7 @@ export class Executor {
     return { ...position, token0: currency0, token1: currency1, quoteToken };
   }
 
-  private async tradingApiSwapPlan(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address): Promise<TransactionPlan | undefined | null> {
+  private async tradingApiSwapPlan(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address): Promise<{ plan: TransactionPlan; expectedOut: bigint } | undefined | null> {
     if (!this.tradingApi) return undefined;
     let quote = await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut);
     if (!quote) return undefined;
@@ -276,7 +287,7 @@ export class Executor {
 
     const plan = await this.tradingApi.createSwap(position, quote);
     log.info({ positionKey: position.positionKey, routing: quote.routing, expectedOut: quote.expectedOut.toString(), minimumOut: quote.minimumOut.toString(), to: plan.to }, "Trading API swap selected");
-    return plan;
+    return { plan, expectedOut: quote.expectedOut };
   }
 
   private closePlan(position: PositionRecord, value: Awaited<ReturnType<PositionReader["read"]>>): TransactionPlan {

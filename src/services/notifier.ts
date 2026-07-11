@@ -146,7 +146,7 @@ export class Notifier {
     const lines = [`✅ LP settled`, `V4 #${position.positionKey} ${pair}`];
     if (total) {
       const qtDec = await this.decimals(position.quoteToken, position.chainId);
-      lines.push(`Total: ${formatToken(BigInt(total), qtDec, 2)} ${this.quoteSymbol(position.quoteToken)}`);
+      lines.push(`Total: ~${formatToken(BigInt(total), qtDec, 2)} ${this.quoteSymbol(position.quoteToken)}`);
     }
     await this.send(lines);
   }
