@@ -184,10 +184,9 @@ export class Guardian {
       }
 
       const trigger = staticTrigger ?? (trailing.action === "trigger" ? "trailing_take_profit" : null);
-      if (!trigger) {
-        if (retryAt(position.metadata) !== null) {
-          await this.database.setPositionStatus(position.id, "armed", { exitRetry: null });
-        }
+      const pendingRetry = !trigger ? parseExitRetry(position.metadata) : null;
+      const effectiveTrigger: ExitTrigger | null = trigger ?? pendingRetry?.reason ?? null;
+      if (!effectiveTrigger) {
         return true;
       }
       if (!valued.twapGuard.ready) {
@@ -196,16 +195,17 @@ export class Guardian {
       }
       const nextAttemptAt = retryAt(position.metadata);
       if (nextAttemptAt !== null && Date.now() < nextAttemptAt) {
-        log.info({ positionId: position.id, trigger, nextAttemptAt: new Date(nextAttemptAt).toISOString() }, "exit retry waiting for backoff");
+        log.info({ positionId: position.id, trigger: effectiveTrigger, nextAttemptAt: new Date(nextAttemptAt).toISOString() }, "exit retry waiting for backoff");
         return true;
       }
       if (this.queuedExitPositions.has(position.id)) return true;
-      void this.notifier.trigger(position, valued.snapshot, trigger);
+      void this.notifier.trigger(position, valued.snapshot, effectiveTrigger);
       try {
-        await this.executeExit(position, trigger);
+        await this.executeExit(position, effectiveTrigger);
+        await this.database.setPositionStatus(position.id, position.status, { exitRetry: null });
         return true;
       } catch (error) {
-        log.warn({ err: error, positionId: position.id, trigger }, "exit attempt failed; waiting for fresh PnL before retry");
+        log.warn({ err: error, positionId: position.id, trigger: effectiveTrigger }, "exit attempt failed; waiting for fresh PnL before retry");
         return false;
       }
     } catch (error) {
@@ -283,4 +283,15 @@ function retryAt(metadata: Record<string, unknown>): number | null {
   if (typeof nextAttemptAt !== "string") return null;
   const timestamp = Date.parse(nextAttemptAt);
   return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function parseExitRetry(metadata: Record<string, unknown>): { reason: ExitTrigger; nextAttemptAt: number } | null {
+  const raw = metadata.exitRetry;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.reason !== "string") return null;
+  if (typeof r.nextAttemptAt !== "string") return null;
+  const timestamp = Date.parse(r.nextAttemptAt);
+  if (!Number.isFinite(timestamp)) return null;
+  return { reason: r.reason as ExitTrigger, nextAttemptAt: timestamp };
 }
