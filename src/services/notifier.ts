@@ -233,7 +233,7 @@ export class Notifier {
     const reviewReason = position.status === "needs_review"
       ? ` | ${reviewReasonDisplay(position.metadata)}`
       : "";
-    const base = `${index}. ${statusLabel} ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${reviewReason}`;
+    const base = `${index}. ${statusLabel.split(" ")[0]} ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${reviewReason}`;
 
     if (!position.quoteToken || !blockNumber) return `${base}\n`;
     try {
@@ -250,7 +250,7 @@ export class Notifier {
       const feeDisplay = valued.snapshot.feeNonQuote
         ? `${feeStr} (≈ ${formatToken(valued.snapshot.feeQuoteUsdg, usdgDec, 4)} USDG)`
         : `${formatToken(valued.snapshot.feeQuoteUsdg, usdgDec, 4)} USDG`;
-      const pnlText = `${pnlEmoji(valued.snapshot.pnlBps)} ${formatBps(valued.snapshot.pnlBps)}%`;
+      const pnlText = `PnL ${formatBps(valued.snapshot.pnlBps)}%`;
       const trailingPeak = trailingPeakDisplay(position.metadata);
       return `${base} | 💰 ${cv} ${qtSymbol} | 🪙 ${feeDisplay} | 📊 ${pnlText}${trailingPeak}\n`;
     } catch {
