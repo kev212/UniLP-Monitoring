@@ -11,10 +11,12 @@ export interface ScoredPool {
   protocol: "v3" | "v4";
   pair: string;
   uniswapUrl: string;
+  activeLiquidity: boolean;
   feeTier: number;
   feeRate: number;
   tvlUsd: number;
   volume1hUsd: number;
+  estimatedPoolFees1hUsd: number;
   score: number;
   safetyFactor: number;
   dynamicFee: boolean;
@@ -23,12 +25,24 @@ export interface ScoredPool {
   warnings: string[];
 }
 
+export interface PoolScan {
+  active: ScoredPool[];
+  watchlist: ScoredPool[];
+}
+
+interface VerifiedPool {
+  feeTier?: number;
+  currentLpFee?: number;
+  activeLiquidity: boolean;
+}
+
 interface GeckoPool {
   id: string;
   type: string;
   attributes: {
     address: string;
     name: string;
+    pool_name?: string;
     reserve_in_usd: string;
     volume_usd: { h1: string; h24: string };
     base_token_price_usd?: string;
@@ -49,11 +63,11 @@ export class PoolScanner {
     private readonly chains: ChainClients,
   ) {}
 
-  async scan(tokenAddress: Address): Promise<ScoredPool[]> {
+  async scan(tokenAddress: Address): Promise<PoolScan> {
     const normalized = tokenAddress.toLowerCase();
 
     const pools = await this.fetchUniswapPools(normalized);
-    if (pools.length === 0) return [];
+    if (pools.length === 0) return { active: [], watchlist: [] };
 
     const scored: ScoredPool[] = [];
     for (const raw of pools) {
@@ -61,8 +75,7 @@ export class PoolScanner {
       if (pool) scored.push(pool);
     }
 
-    scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, 3);
+    return rankPools(scored);
   }
 
   private async fetchUniswapPools(token: string): Promise<GeckoPool[]> {
@@ -134,32 +147,37 @@ export class PoolScanner {
     }
 
     const feeRate = feeTier / 1_000_000;
+    const estimatedPoolFees1hUsd = volume1hUsd * feeRate;
     const safetyFactor = Math.sqrt(tvlUsd / (tvlUsd + K));
-    const score = volume1hUsd > 0 ? (volume1hUsd * feeRate / tvlUsd) * safetyFactor : 0;
+    const score = (estimatedPoolFees1hUsd / tvlUsd) * safetyFactor;
 
     const baseId = raw.relationships.base_token.data.id;
     const quoteId = raw.relationships.quote_token.data.id;
     const isTokenBase = baseId.toLowerCase().replace("robinhood_", "") === token;
+    const poolName = raw.attributes.pool_name ?? raw.attributes.name;
     const tokenSymbol = isTokenBase
-      ? raw.attributes.name.split(" / ")[0] ?? "?"
-      : raw.attributes.name.split(" / ")[1] ?? "?";
+      ? poolName.split(" / ")[0] ?? "?"
+      : poolName.split(" / ")[1] ?? "?";
     const otherSymbol = isTokenBase
-      ? raw.attributes.name.split(" / ")[1] ?? "?"
-      : raw.attributes.name.split(" / ")[0] ?? "?";
+      ? poolName.split(" / ")[1] ?? "?"
+      : poolName.split(" / ")[0] ?? "?";
     const pair = `${tokenSymbol}/${otherSymbol}`;
 
     const warnings: string[] = [];
     if (stale) warnings.push("data mungkin stale");
     if (dynamicFee) warnings.push("dynamic fee");
+    if (!verified.activeLiquidity) warnings.push("zero active liquidity");
 
     return {
       protocol,
       pair,
       uniswapUrl: uniswapPoolUrl(poolAddress),
+      activeLiquidity: verified.activeLiquidity,
       feeTier: verified.feeTier ?? 0,
       feeRate,
       tvlUsd,
       volume1hUsd,
+      estimatedPoolFees1hUsd,
       score,
       safetyFactor,
       dynamicFee,
@@ -173,12 +191,12 @@ export class PoolScanner {
     protocol: "v3" | "v4",
     poolAddress: Address,
     searchToken: string,
-  ): Promise<{ feeTier?: number; currentLpFee?: number } | null> {
+  ): Promise<VerifiedPool | null> {
     if (protocol === "v3") return this.verifyV3Pool(poolAddress, searchToken);
     return this.verifyV4Pool(poolAddress, searchToken);
   }
 
-  private async verifyV3Pool(pool: Address, searchToken: string): Promise<{ feeTier?: number } | null> {
+  private async verifyV3Pool(pool: Address, searchToken: string): Promise<VerifiedPool | null> {
     const { client, registry } = this.chains.get("robinhood");
     try {
       const [token0, token1, fee, liquidity] = await Promise.all([
@@ -203,7 +221,6 @@ export class PoolScanner {
       const t0 = (token0 as string).toLowerCase();
       const t1 = (token1 as string).toLowerCase();
       if (t0 !== searchToken && t1 !== searchToken) return null;
-      if (liquidity === 0n) return null;
 
       const factoryPool = await client.readContract({
         address: registry.contracts.v3.factory,
@@ -216,7 +233,7 @@ export class PoolScanner {
 
       if ((factoryPool as string).toLowerCase() !== pool.toLowerCase()) return null;
 
-      return { feeTier: Number(fee) };
+      return { feeTier: Number(fee), activeLiquidity: liquidity > 0n };
     } catch {
       return null;
     }
@@ -225,7 +242,7 @@ export class PoolScanner {
   private async verifyV4Pool(
     poolId: Address,
     searchToken: string,
-  ): Promise<{ feeTier?: number; currentLpFee?: number } | null> {
+  ): Promise<VerifiedPool | null> {
     if (!isHex(poolId) || poolId.length !== 66) return null;
 
     const { client, registry } = this.chains.get("robinhood");
@@ -248,8 +265,6 @@ export class PoolScanner {
           args: [poolId as Hex],
         }),
       ]);
-
-      if (liquidity === 0n) return null;
 
       const bytes25 = (poolId as Hex).slice(0, 2 + 25 * 2) as Hex;
       const poolKeyResult = await client.readContract({
@@ -276,7 +291,11 @@ export class PoolScanner {
       const c1 = String(poolKey.currency1).toLowerCase();
       if (c0 !== searchToken && c1 !== searchToken) return null;
 
-      return { feeTier: Number(poolKey.fee), currentLpFee: Number(slot0[3]) };
+      return {
+        feeTier: Number(poolKey.fee),
+        currentLpFee: Number(slot0[3]),
+        activeLiquidity: liquidity > 0n,
+      };
     } catch {
       return null;
     }
@@ -289,4 +308,12 @@ export function hasMinimumScanVolume(volume1hUsd: number): boolean {
 
 export function uniswapPoolUrl(poolIdentifier: string): string {
   return `https://app.uniswap.org/explore/pools/robinhood/${poolIdentifier}`;
+}
+
+export function rankPools(pools: ScoredPool[]): PoolScan {
+  const byScore = (a: ScoredPool, b: ScoredPool) => b.score - a.score;
+  return {
+    active: pools.filter((pool) => pool.activeLiquidity).sort(byScore).slice(0, 3),
+    watchlist: pools.filter((pool) => !pool.activeLiquidity).sort(byScore).slice(0, 2),
+  };
 }

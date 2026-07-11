@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { hasMinimumScanVolume, MIN_VOLUME_1H_USD, uniswapPoolUrl } from "../src/services/pool-scanner.js";
+import { hasMinimumScanVolume, MIN_VOLUME_1H_USD, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
 
 describe("pool scoring formula", () => {
   const K = 1_000_000;
@@ -79,5 +79,36 @@ describe("scan pool eligibility", () => {
       .toBe("https://app.uniswap.org/explore/pools/robinhood/0xe39078fc024188927e10b26d91e4720a600fba85");
     expect(uniswapPoolUrl("0x4570413b567093841404954697bba9178a963f2810844321fcb777b27ac32267"))
       .toBe("https://app.uniswap.org/explore/pools/robinhood/0x4570413b567093841404954697bba9178a963f2810844321fcb777b27ac32267");
+  });
+
+  it("returns at most three active pools and two zero-active pools in the watchlist", () => {
+    const pool = (pair: string, score: number, activeLiquidity: boolean): ScoredPool => ({
+      protocol: "v4",
+      pair,
+      uniswapUrl: uniswapPoolUrl(`0x${pair.padEnd(64, "0")}`),
+      activeLiquidity,
+      feeTier: 10_000,
+      feeRate: 0.01,
+      tvlUsd: 10_000,
+      volume1hUsd: 1_000,
+      estimatedPoolFees1hUsd: 10,
+      score,
+      safetyFactor: 0.1,
+      dynamicFee: false,
+      stale: false,
+      warnings: [],
+    });
+    const ranked = rankPools([
+      pool("A", 1, true),
+      pool("B", 4, true),
+      pool("C", 3, true),
+      pool("D", 2, true),
+      pool("W", 1, false),
+      pool("X", 4, false),
+      pool("Y", 3, false),
+    ]);
+
+    expect(ranked.active.map(({ pair }) => pair)).toEqual(["B", "C", "D"]);
+    expect(ranked.watchlist.map(({ pair }) => pair)).toEqual(["X", "Y"]);
   });
 });

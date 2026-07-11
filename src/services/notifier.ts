@@ -8,7 +8,7 @@ import type { ExitTrigger, PnlSnapshot, PositionRecord } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
-import type { PoolScanner } from "./pool-scanner.js";
+import type { PoolScanner, ScoredPool } from "./pool-scanner.js";
 
 type ChatContext = CommandContext<Context>;
 
@@ -283,36 +283,34 @@ export class Notifier {
 
     await ctx.reply(`🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(raw)} di Robinhood...`);
 
-    let pools;
+    let scan;
     try {
-      pools = await scanner.scan(raw as Address);
+      scan = await scanner.scan(raw as Address);
     } catch (error) {
       await ctx.reply(`Scan gagal: ${error instanceof Error ? error.message.slice(0, 500) : "unknown error"}`);
       return;
     }
 
-    if (pools.length === 0) {
+    if (scan.active.length === 0 && scan.watchlist.length === 0) {
       await ctx.reply(`Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 1h >= $100 untuk token ini.`);
       return;
     }
 
-    const lines: string[] = [`🔍 SCAN: ${shortAddress(raw)}`, `Chain: Robinhood (4663)`, `Pool ditemukan: ${pools.length}`, ""];
+    const lines: string[] = [
+      `🔍 SCAN: ${shortAddress(raw)}`,
+      "Chain: Robinhood (4663)",
+      `Top active: ${scan.active.length} | Watchlist: ${scan.watchlist.length}`,
+      "",
+    ];
     const medals = ["🥇", "🥈", "🥉"];
 
-    for (let i = 0; i < pools.length; i++) {
-      const p = pools[i]!;
-      const feePct = (p.feeTier / 10_000).toFixed(2);
-      const dynamicLabel = p.dynamicFee ? ` (dynamic, on-chain: ${((p.currentLpFee ?? p.feeTier) / 10_000).toFixed(2)}%)` : "";
-      const version = p.protocol.toUpperCase();
-      const star = scoreStars(p.score);
-
-      lines.push(
-        `${medals[i]} ${star} ${version} ${p.pair} | ${feePct}%${dynamicLabel}`,
-        `   TVL: $${fmtUsd(p.tvlUsd)} | Vol 1h: $${fmtUsd(p.volume1hUsd)} | Score: ${p.score.toFixed(6)}`,
-        `   Uniswap: ${p.uniswapUrl}`,
-      );
-      if (p.warnings.length > 0) {
-        lines.push(`   ⚠️ ${p.warnings.join(", ")}`);
+    for (let i = 0; i < scan.active.length; i++) {
+      lines.push(...formatScanPool(scan.active[i]!, medals[i]!));
+    }
+    if (scan.watchlist.length > 0) {
+      lines.push("", "⚠️ WATCHLIST: zero active liquidity");
+      for (const pool of scan.watchlist) {
+        lines.push(...formatScanPool(pool, "•"));
       }
     }
 
@@ -534,6 +532,19 @@ function scoreStars(score: number): string {
   if (score >= 0.0001) return "★★☆☆☆";
   if (score > 0) return "★☆☆☆☆";
   return "☆☆☆☆☆";
+}
+
+function formatScanPool(pool: ScoredPool, label: string): string[] {
+  const effectiveFee = pool.currentLpFee ?? pool.feeTier;
+  const feePct = (effectiveFee / 10_000).toFixed(2);
+  const dynamicLabel = pool.dynamicFee ? " (dynamic)" : "";
+  const lines = [
+    `${label} ${scoreStars(pool.score)} ${pool.protocol.toUpperCase()} ${pool.pair} | ${feePct}%${dynamicLabel}`,
+    `   TVL: $${fmtUsd(pool.tvlUsd)} | Vol 1h: $${fmtUsd(pool.volume1hUsd)} | Est. gross fees 1h: $${fmtUsd(pool.estimatedPoolFees1hUsd)}`,
+    `   Score: ${pool.score.toFixed(6)} | Uniswap: ${pool.uniswapUrl}`,
+  ];
+  if (pool.warnings.length > 0) lines.push(`   ⚠️ ${pool.warnings.join(", ")}`);
+  return lines;
 }
 
 function fmtUsd(value: number): string {
