@@ -292,7 +292,7 @@ export class Notifier {
     }
 
     if (scan.active.length === 0 && scan.watchlist.length === 0) {
-      await ctx.reply(`Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 1h >= $100 untuk token ini.`);
+      await ctx.reply(`Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 6h >= $100 untuk token ini.`);
       return;
     }
 
@@ -314,7 +314,7 @@ export class Notifier {
       }
     }
 
-    lines.push("", "Rumus: (vol1h × feeRate / TVL) × √(TVL / (TVL + $1M))");
+    lines.push("", "Rumus: (vol6h × feeRate / TVL) × √(TVL / (TVL + $1M))");
 
     await ctx.reply(lines.join("\n"));
   }
@@ -526,10 +526,10 @@ function reviewReasonDisplay(metadata: Record<string, unknown>): string {
 }
 
 function scoreStars(score: number): string {
-  if (score >= 0.01) return "★★★★★";
-  if (score >= 0.005) return "★★★★☆";
-  if (score >= 0.001) return "★★★☆☆";
-  if (score >= 0.0001) return "★★☆☆☆";
+  if (score >= 0.06) return "★★★★★";
+  if (score >= 0.03) return "★★★★☆";
+  if (score >= 0.006) return "★★★☆☆";
+  if (score >= 0.0006) return "★★☆☆☆";
   if (score > 0) return "★☆☆☆☆";
   return "☆☆☆☆☆";
 }
@@ -540,7 +540,7 @@ function formatScanPool(pool: ScoredPool, label: string): string[] {
   const dynamicLabel = pool.dynamicFee ? " (dynamic)" : "";
   const lines = [
     `${label} ${scoreStars(pool.score)} ${pool.protocol.toUpperCase()} ${pool.pair} | ${feePct}%${dynamicLabel}`,
-    `   TVL: $${fmtUsd(pool.tvlUsd)} | Vol 1h: $${fmtUsd(pool.volume1hUsd)} | Est. gross fees 1h: $${fmtUsd(pool.estimatedPoolFees1hUsd)}`,
+    `   TVL: $${fmtUsd(pool.tvlUsd)} | Vol 6h: $${fmtUsd(pool.volume6hUsd)} | Est. gross fees 6h: $${fmtUsd(pool.estimatedPoolFees6hUsd)}`,
     `   Score: ${pool.score.toFixed(6)} | Uniswap: ${pool.uniswapUrl}`,
   ];
   if (pool.warnings.length > 0) lines.push(`   ⚠️ ${pool.warnings.join(", ")}`);

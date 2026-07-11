@@ -1,18 +1,18 @@
 import { describe, expect, it } from "vitest";
 
-import { hasMinimumScanVolume, MIN_VOLUME_1H_USD, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
+import { hasMinimumScanVolume6h, MIN_VOLUME_6H_USD, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
 
 describe("pool scoring formula", () => {
   const K = 1_000_000;
 
-  function computeScore(volume1hUsd: number, feeTier: number, tvlUsd: number): { score: number; safetyFactor: number } {
+  function computeScore(volume6hUsd: number, feeTier: number, tvlUsd: number): { score: number; safetyFactor: number } {
     const feeRate = feeTier / 1_000_000;
     const safetyFactor = Math.sqrt(tvlUsd / (tvlUsd + K));
-    const score = volume1hUsd > 0 ? (volume1hUsd * feeRate / tvlUsd) * safetyFactor : 0;
+    const score = volume6hUsd > 0 ? (volume6hUsd * feeRate / tvlUsd) * safetyFactor : 0;
     return { score, safetyFactor };
   }
 
-  it("returns score 0 when volume 1h is 0", () => {
+  it("returns score 0 when volume 6h is 0", () => {
     const result = computeScore(0, 3000, 500_000);
     expect(result.score).toBe(0);
   });
@@ -68,10 +68,10 @@ describe("pool scoring formula", () => {
 });
 
 describe("scan pool eligibility", () => {
-  it("excludes pools with less than $100 of rolling 1h volume", () => {
-    expect(hasMinimumScanVolume(MIN_VOLUME_1H_USD - 0.01)).toBe(false);
-    expect(hasMinimumScanVolume(MIN_VOLUME_1H_USD)).toBe(true);
-    expect(hasMinimumScanVolume(Number.NaN)).toBe(false);
+  it("excludes pools with less than $100 of cumulative 6h volume", () => {
+    expect(hasMinimumScanVolume6h(MIN_VOLUME_6H_USD - 0.01)).toBe(false);
+    expect(hasMinimumScanVolume6h(MIN_VOLUME_6H_USD)).toBe(true);
+    expect(hasMinimumScanVolume6h(Number.NaN)).toBe(false);
   });
 
   it("builds an Uniswap explorer URL from either a pool address or V4 pool ID", () => {
@@ -95,8 +95,8 @@ describe("scan pool eligibility", () => {
       feeTier: 10_000,
       feeRate: 0.01,
       tvlUsd: 10_000,
-      volume1hUsd: 1_000,
-      estimatedPoolFees1hUsd: 10,
+      volume6hUsd: 1_000,
+      estimatedPoolFees6hUsd: 10,
       score,
       safetyFactor: 0.1,
       dynamicFee: false,

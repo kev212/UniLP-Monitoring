@@ -5,7 +5,7 @@ import type { ChainClients } from "./chain-client.js";
 
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
 const K = 1_000_000;
-export const MIN_VOLUME_1H_USD = 100;
+export const MIN_VOLUME_6H_USD = 100;
 
 export interface ScoredPool {
   protocol: "v3" | "v4";
@@ -15,8 +15,8 @@ export interface ScoredPool {
   feeTier: number;
   feeRate: number;
   tvlUsd: number;
-  volume1hUsd: number;
-  estimatedPoolFees1hUsd: number;
+  volume6hUsd: number;
+  estimatedPoolFees6hUsd: number;
   score: number;
   safetyFactor: number;
   dynamicFee: boolean;
@@ -44,7 +44,7 @@ interface GeckoPool {
     name: string;
     pool_name?: string;
     reserve_in_usd: string;
-    volume_usd: { h1: string; h24: string };
+    volume_usd: { h1: string; h6: string; h24: string };
     base_token_price_usd?: string;
   };
   relationships: {
@@ -125,10 +125,10 @@ export class PoolScanner {
     const tvlUsd = Number(raw.attributes.reserve_in_usd || "0");
     if (!Number.isFinite(tvlUsd) || tvlUsd <= 0) return null;
 
-    const volume1hUsd = Number(raw.attributes.volume_usd?.h1 || "0");
-    if (!hasMinimumScanVolume(volume1hUsd)) return null;
+    const volume6hUsd = Number(raw.attributes.volume_usd?.h6 || "0");
+    if (!hasMinimumScanVolume6h(volume6hUsd)) return null;
     const volume24hUsd = Number(raw.attributes.volume_usd?.h24 || "0");
-    const stale = volume24hUsd > 0 && volume1hUsd <= 0;
+    const stale = volume24hUsd > 0 && volume6hUsd <= 0;
 
     const verified = await this.verifyPool(protocol, poolAddress as Address, token);
     if (!verified) return null;
@@ -147,9 +147,9 @@ export class PoolScanner {
     }
 
     const feeRate = feeTier / 1_000_000;
-    const estimatedPoolFees1hUsd = volume1hUsd * feeRate;
+    const estimatedPoolFees6hUsd = volume6hUsd * feeRate;
     const safetyFactor = Math.sqrt(tvlUsd / (tvlUsd + K));
-    const score = (estimatedPoolFees1hUsd / tvlUsd) * safetyFactor;
+    const score = (estimatedPoolFees6hUsd / tvlUsd) * safetyFactor;
 
     const baseId = raw.relationships.base_token.data.id;
     const isTokenBase = baseId.toLowerCase().replace("robinhood_", "") === token;
@@ -168,8 +168,8 @@ export class PoolScanner {
       feeTier: verified.feeTier ?? 0,
       feeRate,
       tvlUsd,
-      volume1hUsd,
-      estimatedPoolFees1hUsd,
+      volume6hUsd,
+      estimatedPoolFees6hUsd,
       score,
       safetyFactor,
       dynamicFee,
@@ -294,8 +294,8 @@ export class PoolScanner {
   }
 }
 
-export function hasMinimumScanVolume(volume1hUsd: number): boolean {
-  return Number.isFinite(volume1hUsd) && volume1hUsd >= MIN_VOLUME_1H_USD;
+export function hasMinimumScanVolume6h(volume6hUsd: number): boolean {
+  return Number.isFinite(volume6hUsd) && volume6hUsd >= MIN_VOLUME_6H_USD;
 }
 
 export function uniswapPoolUrl(poolIdentifier: string): string {
