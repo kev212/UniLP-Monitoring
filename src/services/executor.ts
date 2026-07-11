@@ -112,6 +112,7 @@ export class Executor {
     const pending = parsePendingSwap(position.metadata.pendingSwap);
     if (!pending || pending.amount === 0n) {
       await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null });
+      await this.saveSettlementBalance(position);
       await this.notifier.settled(position);
       return;
     }
@@ -142,6 +143,7 @@ export class Executor {
           return;
         }
         await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash });
+        await this.saveSettlementBalance(position);
         await this.notifier.settled(position);
         return;
       }
@@ -174,12 +176,23 @@ export class Executor {
         return;
       }
       await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash });
+      await this.saveSettlementBalance(position);
       await this.notifier.settled(position);
     } catch (error) {
       await this.database.recordExecution(position.id, "swap_to_quote", "failed", undefined, errorMessage(error));
       await this.database.setPositionStatus(position.id, "closing", { lastExecutionError: errorMessage(error) });
       await this.notifier.failure(position, errorMessage(error));
       throw error;
+    }
+  }
+
+  private async saveSettlementBalance(position: PositionRecord): Promise<void> {
+    if (!position.quoteToken) return;
+    try {
+      const balance = await this.tokenBalance(position.chainId, position.quoteToken);
+      await this.database.setPositionStatus(position.id, "settled", { totalReceived: balance.toString() });
+    } catch {
+      // Balance read is for notification only — do not block settlement.
     }
   }
 
@@ -204,12 +217,14 @@ export class Executor {
       if (liquidity > 0n) return true;
       await this.database.setPositionStatus(position.id, "settled", { reason: "on_chain_liquidity_zero" });
       log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 position has zero NFT liquidity — marking settled");
+      void this.notifier.settled(position);
       return false;
     } catch (error) {
       const message = errorMessage(error);
       if (!message.includes("NOT_MINTED")) throw error;
       await this.database.setPositionStatus(position.id, "settled", { reason: "nft_burned" });
       log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 position NFT is burned — marking settled");
+      void this.notifier.settled(position);
       return false;
     }
   }

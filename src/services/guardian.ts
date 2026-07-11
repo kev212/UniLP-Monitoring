@@ -1,7 +1,7 @@
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, PositionRecord } from "../types.js";
+import type { ChainName, ExitTrigger, PositionRecord } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { AlchemyBootstrapper } from "./alchemy-bootstrap.js";
 import type { DiscoveryService } from "./discovery.js";
@@ -106,7 +106,7 @@ export class Guardian {
     const startedAt = Date.now();
     try {
       const valued = await this.pnl.value(position, blockNumber);
-      log.info({ positionId: position.id, positionKey: position.positionKey, valuationMs: Date.now() - startedAt }, "position valued");
+      log.debug({ positionId: position.id, positionKey: position.positionKey, valuationMs: Date.now() - startedAt }, "position valued");
       await this.database.addPnlSnapshot(valued.snapshot);
       await this.notifier.logPnL(position, valued.snapshot);
       const trailing = this.pnl.evaluateTrailingStop(position.metadata, valued.snapshot);
@@ -179,6 +179,7 @@ export class Guardian {
       if (message.includes("zero liquidity") || message.includes("NOT_MINTED") || message.includes("Invalid token ID")) {
         await this.database.setPositionStatus(position.id, "settled", { reason: "on_chain_liquidity_zero" });
         log.info({ positionId: position.id, reason: message }, "zero on-chain liquidity detected — marking settled");
+        void this.notifier.settled(position);
         return true;
       }
       if (message.includes("No safe direct Uniswap route") || message.includes("Native-currency")) {
@@ -205,7 +206,7 @@ export class Guardian {
     }
   }
 
-  private async executeExit(position: PositionRecord, trigger: "stop_loss" | "take_profit" | "trailing_take_profit"): Promise<void> {
+  private async executeExit(position: PositionRecord, trigger: ExitTrigger): Promise<void> {
     if (this.queuedExitPositions.has(position.id)) return;
     this.queuedExitPositions.add(position.id);
     const attempt = this.exitQueue.then(() => this.executor.execute(position, trigger));

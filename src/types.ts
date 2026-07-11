@@ -12,7 +12,7 @@ export type PositionStatus =
   | "failed"
   | "paused";
 
-export type ExitTrigger = "stop_loss" | "take_profit" | "trailing_take_profit";
+export type ExitTrigger = "stop_loss" | "take_profit" | "trailing_take_profit" | "manual";
 
 export interface TrailingStopState {
   peakPnlBps: bigint;

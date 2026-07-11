@@ -24,6 +24,10 @@ export class Notifier {
 
   registerCommands(database: Database, pnl: PnlService, executor: Executor): void {
     if (!this.bot) return;
+    void this.bot.api.setMyCommands([
+      { command: "status", description: "Tampilkan status semua posisi LP aktif" },
+      { command: "close", description: "Tutup posisi LP — /close <nomor> atau /close <key>" },
+    ]);
     this.bot.command("status", async (ctx: ChatContext) => {
       await this.handleStatus(ctx, database, pnl);
     });
@@ -111,26 +115,55 @@ export class Notifier {
       ? "stop loss"
       : reason === "take_profit"
         ? "take profit"
-        : "trailing take profit";
+      : reason === "trailing_take_profit"
+        ? "trailing take profit"
+        : "manual";
+    const pair = await this.pairLabel(position);
+    const qtSymbol = this.quoteSymbol(position.quoteToken);
+    const qtDec = await this.decimals(position.quoteToken, position.chainId);
     await this.send([
-      `LP ${label} triggered`,
-      `${position.protocol.toUpperCase()} | chain ${position.chainId}`,
-      `position: ${position.positionKey}`,
-      `PnL: ${formatBps(snapshot.pnlBps)}%`,
-      this.config.dryRun ? "DRY_RUN: transaction not broadcast" : "Auto-exit started",
+      `🔔 LP EXIT — ${label}`,
+      `V4 #${position.positionKey} ${pair}`,
+      `CV: ${formatToken(snapshot.liquidationQuote, qtDec, 2)} ${qtSymbol} | PnL: ${pnlEmoji(snapshot.pnlBps)} ${formatBps(snapshot.pnlBps)}% | Fees: ${formatToken(snapshot.feeQuoteUsdg, 6, 4)} USDG`,
+      this.config.dryRun ? "DRY_RUN: transaction not broadcast" : "Auto-exit started...",
     ]);
   }
 
   async transaction(position: PositionRecord, stage: string, hash: string): Promise<void> {
-    await this.send(["LP transaction confirmed", `position: ${position.positionKey}`, `stage: ${stage}`, `tx: ${hash}`]);
+    const pair = await this.pairLabel(position);
+    const label = stage === "remove_liquidity"
+      ? "🔓 Liquidity removed"
+      : stage === "swap_to_quote"
+        ? "💱 Swap completed"
+        : `✅ ${stage.replace(/_/g, " ")}`;
+    await this.send([label, `V4 #${position.positionKey} ${pair}`, `tx: ${hash}`]);
   }
 
   async settled(position: PositionRecord): Promise<void> {
-    await this.send(["LP settled to quote token", `${position.protocol.toUpperCase()} | chain ${position.chainId}`, `position: ${position.positionKey}`]);
+    const pair = await this.pairLabel(position);
+    const meta = position.metadata as Record<string, unknown>;
+    const total = typeof meta.totalReceived === "string" ? meta.totalReceived : undefined;
+    const lines = [`✅ LP settled`, `V4 #${position.positionKey} ${pair}`];
+    if (total) {
+      const qtDec = await this.decimals(position.quoteToken, position.chainId);
+      lines.push(`Total: ${formatToken(BigInt(total), qtDec, 2)} ${this.quoteSymbol(position.quoteToken)}`);
+    }
+    await this.send(lines);
   }
 
   async failure(position: PositionRecord, message: string): Promise<void> {
-    await this.send(["LP auto-exit requires retry", `position: ${position.positionKey}`, `error: ${message.slice(0, 700)}`]);
+    const pair = await this.pairLabel(position);
+    const meta = position.metadata as Record<string, unknown>;
+    const retry = meta.exitRetry;
+    const attempt = retry && typeof retry === "object" && !Array.isArray(retry)
+      ? (retry as Record<string, unknown>).attempts : undefined;
+    const reason = retry && typeof retry === "object" && !Array.isArray(retry)
+      ? (retry as Record<string, unknown>).reason : undefined;
+    const lines = ["❌ LP close failed", `V4 #${position.positionKey} ${pair}`];
+    if (reason) lines.push(`trigger: ${reason}`);
+    if (attempt !== undefined) lines.push(`retry #${attempt}`);
+    lines.push(`error: ${message.slice(0, 500)}`);
+    await this.send(lines);
   }
 
   async startBot(): Promise<void> {
@@ -258,7 +291,7 @@ export class Notifier {
 
     await ctx.reply(`Menutup ${found.protocol.toUpperCase()} #${found.positionKey}...`);
     try {
-      await executor.execute(found);
+      await executor.execute(found, "manual");
       await ctx.reply(`Posisi ${found.positionKey} — penutupan dimulai.`);
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
@@ -269,6 +302,12 @@ export class Notifier {
   private authorized(chatId: string): boolean {
     if (!this.config.telegram || chatId !== this.config.telegram.chatId) return false;
     return true;
+  }
+
+  private async pairLabel(position: PositionRecord): Promise<string> {
+    const t0 = await this.tokenLabel(position.token0, position.chainId);
+    const t1 = await this.tokenLabel(position.token1, position.chainId);
+    return position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
   }
 
   private async tokenLabel(address: Address | null, chainId?: number): Promise<string> {
