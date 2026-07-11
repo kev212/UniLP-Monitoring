@@ -11,6 +11,7 @@ import { PnlService } from "./services/pnl.js";
 import { PositionReader } from "./services/position-reader.js";
 import { RoutePlanner } from "./services/route-planner.js";
 import { UniswapTradingApi } from "./services/uniswap-trading-api.js";
+import { PoolScanner } from "./services/pool-scanner.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -25,8 +26,9 @@ async function main(): Promise<void> {
   const pnl = new PnlService(database, reader, routes, config, tradingApi);
   const executor = new Executor(database, chains, reader, routes, notifier, config, tradingApi);
   const guardian = new Guardian(config, database, chains, alchemyBootstrapper, discovery, pnl, executor, notifier);
+  const scanner = new PoolScanner(chains);
 
-  notifier.registerCommands(database, pnl, executor);
+  notifier.registerCommands(database, pnl, executor, scanner);
 
   await database.connect();
   await database.migrate();

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Address } from "viem";
+import { zeroAddress, type Address } from "viem";
 
 import type { RuntimeConfig } from "../src/config.js";
 import { Executor } from "../src/services/executor.js";
@@ -43,5 +43,19 @@ describe("Executor pending settlement recovery", () => {
     expect(recovered).toMatchObject({ token0: usdg, token1: token, quoteToken: usdg });
     expect(database.repairPositionAssets).toHaveBeenCalledWith("position", usdg, token, usdg);
     expect(database.setPositionStatus).not.toHaveBeenCalled();
+  });
+
+  it("reads native ETH with getBalance instead of ERC-20 balanceOf", async () => {
+    const client = { getBalance: vi.fn().mockResolvedValue(123n), readContract: vi.fn() };
+    const chains = { getById: vi.fn(() => ({ client })) };
+    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
+
+    const balance = await (executor as unknown as {
+      assetBalance(chainId: number, account: Address, tokenAddress: Address): Promise<bigint>;
+    }).assetBalance(4663, owner, zeroAddress);
+
+    expect(balance).toBe(123n);
+    expect(client.getBalance).toHaveBeenCalledWith({ address: owner });
+    expect(client.readContract).not.toHaveBeenCalled();
   });
 });

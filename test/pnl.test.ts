@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Address } from "viem";
+import { zeroAddress, type Address } from "viem";
 
 import type { RuntimeConfig } from "../src/config.js";
 import { PnlService } from "../src/services/pnl.js";
@@ -160,6 +160,47 @@ describe("fresh valuation quotes", () => {
     expect(tradingApi.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg);
     expect(routes.quoteDirect).not.toHaveBeenCalled();
     expect(valued.snapshot.liquidationQuote).toBe(1_099_000n);
+  });
+
+  it("uses native ETH as a quote token without an ERC-20 route", async () => {
+    const token = "0x0000000000000000000000000000000000000002" as Address;
+    const position = {
+      id: "position",
+      chainId: 4663,
+      protocol: "v4",
+      positionKey: "1",
+      owner: "0x0000000000000000000000000000000000000003" as Address,
+      poolAddress: null,
+      token0: zeroAddress,
+      token1: token,
+      quoteToken: zeroAddress,
+      status: "armed",
+      liquidity: 1n,
+      openedAtBlock: 1n,
+      metadata: {},
+    } as const;
+    const database = {
+      recordPositionObservation: vi.fn(),
+      getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 10n ** 18n, realized: 0n }),
+      getPoolObservationAtOrBefore: vi.fn().mockResolvedValue(null),
+      recordPoolObservation: vi.fn(),
+    };
+    const reader = {
+      read: vi.fn().mockResolvedValue({
+        protocol: "v4", poolKey: "pool", sourcePool: null,
+        token0: { token: zeroAddress, amount: 10n ** 18n },
+        token1: { token, amount: 10n ** 18n }, liquidity: 1n, priceMarker: 1n,
+        minAmount0: 0n, minAmount1: 0n, unclaimedFees0: 0n, unclaimedFees1: 0n, observedBlock: 1n,
+      }),
+    };
+    const routes = { quoteDirect: vi.fn() };
+    const tradingApi = { quote: vi.fn().mockResolvedValue({ expectedOut: 2n * 10n ** 18n, minimumOut: 0n }) };
+    const pnl = new PnlService(database as never, reader as never, routes as never, config, tradingApi as never);
+
+    await pnl.value(position, 1n);
+
+    expect(tradingApi.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, zeroAddress);
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
   });
 });
 

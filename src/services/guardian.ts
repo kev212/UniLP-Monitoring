@@ -1,5 +1,3 @@
-import { zeroAddress } from "viem";
-
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
@@ -108,10 +106,10 @@ export class Guardian {
           continue;
         }
       }
-      if (!candidate.quoteToken || isNativeCurrencyV4(candidate)) continue;
+      if (!candidate.quoteToken) continue;
 
       await this.database.setPositionStatus(candidate.id, "syncing", { needsReviewRetriedAt: new Date().toISOString(), reason: null });
-      await this.evaluatePosition({ ...candidate, status: "syncing" }, blockNumber);
+      await this.evaluatePosition(name, { ...candidate, status: "syncing" }, blockNumber);
     }
   }
 
@@ -129,13 +127,22 @@ export class Guardian {
     if (this.lastEvaluatedBlock.get(registry.chain.id) === blockNumber) return;
     const positions = (await this.database.listOpenPositions(registry.chain.id))
       .filter((position) => position.status !== "needs_review" && position.status !== "failed" && position.status !== "paused");
-    const results = await mapWithConcurrency(positions, this.config.positionMonitorConcurrency, (position) => this.evaluatePosition(position, blockNumber));
+    const results = await mapWithConcurrency(positions, this.config.positionMonitorConcurrency, (position) => this.evaluatePosition(name, position, blockNumber));
     if (results.every(Boolean)) this.lastEvaluatedBlock.set(registry.chain.id, blockNumber);
   }
 
-  private async evaluatePosition(position: PositionRecord, blockNumber: bigint): Promise<boolean> {
+  private async evaluatePosition(name: ChainName, position: PositionRecord, blockNumber: bigint): Promise<boolean> {
     const startedAt = Date.now();
     try {
+      if (position.protocol === "v4" && position.status === "syncing") {
+        try {
+          const totals = await this.database.getCashflowTotals(position.id);
+          const force = totals.deposits === 0n;
+          await this.discovery.retryHydrateV4OpeningCashflow(name, position, force);
+        } catch (error) {
+          log.warn({ err: error, positionId: position.id }, "V4 opening cashflow retry failed");
+        }
+      }
       const valued = await this.pnl.value(position, blockNumber);
       log.debug({ positionId: position.id, positionKey: position.positionKey, valuationMs: Date.now() - startedAt }, "position valued");
       await this.database.addPnlSnapshot(valued.snapshot);
@@ -276,8 +283,4 @@ function retryAt(metadata: Record<string, unknown>): number | null {
   if (typeof nextAttemptAt !== "string") return null;
   const timestamp = Date.parse(nextAttemptAt);
   return Number.isFinite(timestamp) ? timestamp : null;
-}
-
-function isNativeCurrencyV4(position: PositionRecord): boolean {
-  return position.protocol === "v4" && (position.token0 === zeroAddress || position.token1 === zeroAddress);
 }

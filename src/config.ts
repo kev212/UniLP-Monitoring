@@ -34,6 +34,7 @@ const envSchema = z.object({
   APPROVAL_MODE: z.literal("exact").default("exact"),
   DRY_RUN: z.string().default("true"),
   UNISWAP_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
+  THEGRAPH_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
   CONFIRMATIONS: z.coerce.number().int().min(1).max(32).default(2),
   SCAN_BLOCK_RANGE: z.coerce.number().int().min(100).max(100_000).default(2_000),
   MAX_LOG_BLOCK_RANGE: z.coerce.number().int().min(1).max(100_000).optional(),
@@ -67,6 +68,7 @@ export interface RuntimeConfig {
   pnlIncludeGas: boolean;
   dryRun: boolean;
   uniswapApiKey?: string;
+  thegraphApiKey?: string;
   confirmations: number;
   scanBlockRange: bigint;
   maxLogBlockRange: bigint;
@@ -169,6 +171,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     pnlIncludeGas: parseBoolean(env.PNL_INCLUDE_GAS, "PNL_INCLUDE_GAS"),
     dryRun: parseBoolean(env.DRY_RUN, "DRY_RUN"),
     uniswapApiKey: env.UNISWAP_API_KEY,
+    thegraphApiKey: env.THEGRAPH_API_KEY,
     confirmations: env.CONFIRMATIONS,
     scanBlockRange: BigInt(env.SCAN_BLOCK_RANGE),
     maxLogBlockRange: env.MAX_LOG_BLOCK_RANGE !== undefined

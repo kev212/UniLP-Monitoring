@@ -7,6 +7,7 @@ import {
   encodeFunctionData,
   http,
   isAddress,
+  zeroAddress,
   type Address,
   type Hex,
   type PublicClient,
@@ -274,7 +275,9 @@ export class Executor {
     let quote = await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut);
     if (!quote) return undefined;
 
-    const approval = await this.tradingApi.approval(position, tokenIn, amountIn);
+    const approval = tokenIn.toLowerCase() === zeroAddress
+      ? null
+      : await this.tradingApi.approval(position, tokenIn, amountIn);
     if (approval) {
       const spender = approvalSpender(approval, tokenIn, amountIn);
       const approvalChanged = await this.ensureExactApproval(position, tokenIn, spender, amountIn, "approve_swap");
@@ -435,6 +438,7 @@ export class Executor {
   }
 
   private async ensureExactApproval(position: PositionRecord, token: Address, spender: Address, amount: bigint, stage: string): Promise<boolean> {
+    if (token.toLowerCase() === zeroAddress) throw new Error("Native ETH does not require ERC-20 approval");
     const { client } = this.chains.getById(position.chainId);
     const allowance = await client.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [position.owner, spender] });
     if (allowance === amount) return false;
@@ -457,6 +461,7 @@ export class Executor {
   }
 
   private async ensurePermit2Approval(position: PositionRecord, token: Address, spender: Address, amount: bigint): Promise<boolean> {
+    if (token.toLowerCase() === zeroAddress) throw new Error("Native ETH does not require Permit2 approval");
     if (amount > (1n << 160n) - 1n) throw new Error("Permit2 approval amount overflows uint160");
     const { client, registry } = this.chains.getById(position.chainId);
     const allowance = await client.readContract({
@@ -521,17 +526,21 @@ export class Executor {
   }
 
   private async tokenBalances(chainId: number, owner: Address, token0: Address, token1: Address): Promise<{ token0: bigint; token1: bigint }> {
-    const { client } = this.chains.getById(chainId);
     const [balance0, balance1] = await Promise.all([
-      client.readContract({ address: token0, abi: erc20Abi, functionName: "balanceOf", args: [owner] }),
-      client.readContract({ address: token1, abi: erc20Abi, functionName: "balanceOf", args: [owner] }),
+      this.assetBalance(chainId, owner, token0),
+      this.assetBalance(chainId, owner, token1),
     ]);
     return { token0: balance0, token1: balance1 };
   }
 
   private async tokenBalance(chainId: number, token: Address): Promise<bigint> {
+    return this.assetBalance(chainId, this.config.executorAddress, token);
+  }
+
+  private async assetBalance(chainId: number, owner: Address, token: Address): Promise<bigint> {
     const { client } = this.chains.getById(chainId);
-    return client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [this.config.executorAddress] });
+    if (token.toLowerCase() === zeroAddress) return client.getBalance({ address: owner });
+    return client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
   }
 }
 

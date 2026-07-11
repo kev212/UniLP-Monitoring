@@ -142,9 +142,6 @@ export class PositionReader {
     if (!poolKey.currency0 || !poolKey.currency1 || tickLower === undefined || tickUpper === undefined) {
       throw new Error("V4 position metadata is incomplete — needs full re-discovery");
     }
-    if (poolKey.currency0 === zeroAddress || poolKey.currency1 === zeroAddress) {
-      throw new Error("Native-currency V4 positions are not eligible for automatic settlement");
-    }
     const poolId = keccak256(encodeAbiParameters(
       [
         { type: "address" },

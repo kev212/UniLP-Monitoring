@@ -1,4 +1,4 @@
-import { decodeEventLog, encodeAbiParameters, keccak256, zeroAddress, type Address, type Hex, type Log, type PublicClient } from "viem";
+import { decodeEventLog, encodeAbiParameters, keccak256, pad, toHex, zeroAddress, type Address, type Hex, type Log, type PublicClient } from "viem";
 
 import {
   erc20Abi,
@@ -24,6 +24,7 @@ import { log } from "../log.js";
 import type { ChainName, PositionRecord, PositionStatus, Protocol } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Notifier } from "./notifier.js";
+import { amountsForLiquidity } from "./uniswap-math.js";
 
 export interface WalletActivity {
   asset: Address;
@@ -382,6 +383,13 @@ export class DiscoveryService {
             ...(candidate.historyTrusted ? {} : { reason: "v4_position_transferred_or_history_unavailable" }),
           },
         });
+        try {
+          if ((position.metadata as Record<string, unknown>).openingCashflowHydrated !== true) {
+            await this.hydrateV4OpeningCashflow(name, position);
+          }
+        } catch (error) {
+          log.warn({ err: error, chain: name, tokenId: tokenId.toString() }, "V4 opening cashflow hydrate failed; will retry");
+        }
         positions.push(position);
         await this.notifier?.positionDiscovered(position);
       } catch (error) {
@@ -461,8 +469,7 @@ export class DiscoveryService {
     });
     const { tickLower, tickUpper } = unpackV4PositionInfo(packedPositionInfo);
     const quoteToken = this.findQuoteToken(name, poolKey.currency0, poolKey.currency1);
-    const nativeCurrency = poolKey.currency0 === zeroAddress || poolKey.currency1 === zeroAddress;
-    return this.database.upsertPosition({
+    const refreshed = await this.database.upsertPosition({
       chainId: registry.chain.id,
       protocol: "v4",
       positionKey: tokenId.toString(),
@@ -471,7 +478,7 @@ export class DiscoveryService {
       token0: poolKey.currency0,
       token1: poolKey.currency1,
       quoteToken,
-      status: nativeCurrency ? "needs_review" : (quoteToken && historyTrusted ? "syncing" : "needs_review"),
+      status: quoteToken && historyTrusted ? "syncing" : "needs_review",
       liquidity,
       openedAtBlock,
       metadata: {
@@ -483,11 +490,83 @@ export class DiscoveryService {
         hooks: poolKey.hooks,
         tickLower,
         tickUpper,
+        salt: pad(toHex(tokenId), { size: 32 }),
         positionManager: registry.contracts.v4.positionManager,
         historyTrusted,
-        ...(nativeCurrency ? { reason: "native_currency_v4_requires_manual_settlement" } : {}),
       },
     });
+    try {
+      if ((refreshed.metadata as Record<string, unknown>).openingCashflowHydrated !== true) {
+        await this.hydrateV4OpeningCashflow(name, refreshed);
+      }
+    } catch (error) {
+      log.warn({ err: error, chain: name, positionKey: tokenId.toString() }, "V4 opening cashflow hydrate failed in fallback path");
+    }
+    return refreshed;
+  }
+
+  async retryHydrateV4OpeningCashflow(name: ChainName, position: PositionRecord, force = false): Promise<void> {
+    if (!force && (position.metadata as Record<string, unknown>).openingCashflowHydrated === true) return;
+    await this.hydrateV4OpeningCashflow(name, position);
+  }
+
+  private async hydrateV4OpeningCashflow(name: ChainName, position: PositionRecord): Promise<void> {
+    if (!position.quoteToken || position.openedAtBlock === null) return;
+    const metadata = position.metadata as Record<string, unknown>;
+    const salt = metadata.salt as Hex | undefined;
+    const tickLower = metadata.tickLower as number | undefined;
+    const tickUpper = metadata.tickUpper as number | undefined;
+    const fee = metadata.fee as number | undefined;
+    const tickSpacing = metadata.tickSpacing as number | undefined;
+    const hooks = metadata.hooks as Address | undefined;
+    const currency0 = metadata.currency0 as Address | undefined;
+    const currency1 = metadata.currency1 as Address | undefined;
+    if (!salt || tickLower === undefined || tickUpper === undefined || fee === undefined || tickSpacing === undefined || !hooks || !currency0 || !currency1) return;
+
+    const { client, registry } = this.chains.get(name);
+    const events = await this.getLogsChunked(name, {
+      address: registry.contracts.v4.poolManager,
+      event: v4PoolManagerModifyLiquidityEvent,
+      args: { sender: registry.contracts.v4.positionManager },
+      fromBlock: position.openedAtBlock,
+      toBlock: position.openedAtBlock,
+    });
+    const event = events.find((entry) => {
+      const args = logArgs<{ salt?: Hex; liquidityDelta?: bigint }>(entry);
+      return args.salt?.toLowerCase() === salt.toLowerCase() && (args.liquidityDelta ?? 0n) > 0n;
+    });
+    if (!event?.transactionHash || !event.blockNumber) return;
+    const liquidityDelta = logArgs<{ liquidityDelta?: bigint }>(event).liquidityDelta;
+    if (!liquidityDelta || liquidityDelta <= 0n) return;
+    const poolId = v4PoolId(currency0, currency1, fee, tickSpacing, hooks);
+    const slot0 = await client.readContract({
+      address: registry.contracts.v4.stateView,
+      abi: v4StateViewAbi,
+      functionName: "getSlot0",
+      args: [poolId],
+      blockNumber: event.blockNumber,
+    });
+    const amounts = amountsForLiquidity(slot0[0], tickLower, tickUpper, liquidityDelta);
+    let quoteValue = await this.quoteV4AmountsAtBlock(position, amounts.amount0, amounts.amount1, event.blockNumber);
+    if (quoteValue === 0n) {
+      if (position.quoteToken.toLowerCase() === position.token0.toLowerCase() && amounts.amount0 > 0n) {
+        quoteValue = amounts.amount0;
+      } else if (position.quoteToken.toLowerCase() === position.token1.toLowerCase() && amounts.amount1 > 0n) {
+        quoteValue = amounts.amount1;
+      }
+      if (quoteValue > 0n) {
+        log.info({ positionId: position.id, quoteValue: quoteValue.toString(), amount0: amounts.amount0.toString(), amount1: amounts.amount1.toString() }, "V4 opening cashflow: quote underflow fallback used");
+      }
+    }
+    if (quoteValue > 0n) {
+      await this.database.addCashflow(position.id, event.blockNumber, event.transactionHash, "deposit", quoteValue, {
+        protocol: "v4",
+        token0Amount: amounts.amount0.toString(),
+        token1Amount: amounts.amount1.toString(),
+        source: "position_manager_fallback",
+      });
+    }
+    await this.database.setPositionStatus(position.id, position.status, { openingCashflowHydrated: true });
   }
 
   private decodeV4MintLog(logs: readonly { address: Address; data: Hex; topics: readonly Hex[] }[], poolManager: Address): { poolId: Hex; tickLower: number; tickUpper: number; liquidityDelta: bigint; salt: Hex } | null {

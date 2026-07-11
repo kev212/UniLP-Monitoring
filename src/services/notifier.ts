@@ -1,5 +1,5 @@
 import { Bot, Context, type CommandContext } from "grammy";
-import { zeroAddress, type Address } from "viem";
+import { isAddress, zeroAddress, type Address } from "viem";
 
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
@@ -8,6 +8,7 @@ import type { ExitTrigger, PnlSnapshot, PositionRecord } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
+import type { PoolScanner } from "./pool-scanner.js";
 
 type ChatContext = CommandContext<Context>;
 
@@ -22,17 +23,21 @@ export class Notifier {
     this.bot = config.telegram ? new Bot(config.telegram.token) : undefined;
   }
 
-  registerCommands(database: Database, pnl: PnlService, executor: Executor): void {
+  registerCommands(database: Database, pnl: PnlService, executor: Executor, scanner: PoolScanner): void {
     if (!this.bot) return;
     void this.bot.api.setMyCommands([
       { command: "status", description: "Tampilkan status semua posisi LP aktif" },
       { command: "close", description: "Tutup posisi LP — /close <nomor> atau /close <key>" },
+      { command: "scan", description: "Scan pool Uniswap V3/V4 untuk token — /scan <contract>" },
     ]);
     this.bot.command("status", async (ctx: ChatContext) => {
       await this.handleStatus(ctx, database, pnl);
     });
     this.bot.command("close", async (ctx: ChatContext) => {
       await this.handleClose(ctx, database, executor);
+    });
+    this.bot.command("scan", async (ctx: ChatContext) => {
+      await this.handleScan(ctx, scanner);
     });
   }
 
@@ -253,6 +258,68 @@ export class Notifier {
     }
   }
 
+  private lastScanAt = 0;
+
+  private async handleScan(ctx: ChatContext, scanner: PoolScanner): Promise<void> {
+    const chatId = ctx.chat.id.toString();
+    if (!this.authorized(chatId)) return;
+
+    const raw = ctx.match.trim();
+    if (!raw) {
+      await ctx.reply("Gunakan /scan <token-contract-address>");
+      return;
+    }
+    if (!isAddress(raw)) {
+      await ctx.reply("Address tidak valid.");
+      return;
+    }
+
+    const elapsed = Date.now() - this.lastScanAt;
+    if (elapsed < 15_000) {
+      await ctx.reply(`Tunggu ${Math.ceil((15_000 - elapsed) / 1_000)} detik sebelum scan berikutnya.`);
+      return;
+    }
+    this.lastScanAt = Date.now();
+
+    await ctx.reply(`🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(raw)} di Robinhood...`);
+
+    let pools;
+    try {
+      pools = await scanner.scan(raw as Address);
+    } catch (error) {
+      await ctx.reply(`Scan gagal: ${error instanceof Error ? error.message.slice(0, 500) : "unknown error"}`);
+      return;
+    }
+
+    if (pools.length === 0) {
+      await ctx.reply(`Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 untuk token ini.`);
+      return;
+    }
+
+    const lines: string[] = [`🔍 SCAN: ${shortAddress(raw)}`, `Chain: Robinhood (4663)`, `Pool ditemukan: ${pools.length}`, ""];
+    const medals = ["🥇", "🥈", "🥉"];
+
+    for (let i = 0; i < pools.length; i++) {
+      const p = pools[i]!;
+      const feePct = (p.feeTier / 10_000).toFixed(2);
+      const dynamicLabel = p.dynamicFee ? ` (dynamic, on-chain: ${((p.currentLpFee ?? p.feeTier) / 10_000).toFixed(2)}%)` : "";
+      const version = p.protocol.toUpperCase();
+      const star = scoreStars(p.score);
+
+      lines.push(
+        `${medals[i]} ${star} ${version} ${p.pair} | ${feePct}%${dynamicLabel}`,
+        `   TVL: $${fmtUsd(p.tvlUsd)} | Vol 1h: $${fmtUsd(p.volume1hUsd)} | Score: ${p.score.toFixed(6)}`,
+      );
+      if (p.warnings.length > 0) {
+        lines.push(`   ⚠️ ${p.warnings.join(", ")}`);
+      }
+    }
+
+    lines.push("", "Rumus: (vol1h × feeRate / TVL) × √(TVL / (TVL + $1M))");
+
+    await ctx.reply(lines.join("\n"));
+  }
+
   private async handleClose(ctx: ChatContext, database: Database, executor: Executor): Promise<void> {
     const chatId = ctx.chat.id.toString();
     if (!this.authorized(chatId)) return;
@@ -457,4 +524,21 @@ function reviewReasonDisplay(metadata: Record<string, unknown>): string {
   const reason = typeof metadata.reason === "string" ? metadata.reason : "requires manual review";
   if (reason === "native_currency_v4_requires_manual_settlement") return "native ETH requires manual settlement";
   return reason.length > 120 ? `${reason.slice(0, 117)}...` : reason;
+}
+
+function scoreStars(score: number): string {
+  if (score >= 0.01) return "★★★★★";
+  if (score >= 0.005) return "★★★★☆";
+  if (score >= 0.001) return "★★★☆☆";
+  if (score >= 0.0001) return "★★☆☆☆";
+  if (score > 0) return "★☆☆☆☆";
+  return "☆☆☆☆☆";
+}
+
+function fmtUsd(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(2)}K`;
+  if (value >= 1) return value.toFixed(2);
+  if (value >= 0.01) return value.toFixed(4);
+  return value.toExponential(2);
 }
