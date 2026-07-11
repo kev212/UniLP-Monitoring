@@ -1,3 +1,5 @@
+import { zeroAddress } from "viem";
+
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
@@ -58,6 +60,7 @@ export class Guardian {
         try {
           if (this.alchemyBootstrapper.isEnabled(name)) await this.alchemyBootstrapper.bootstrap(name);
           await this.discovery.syncChain(name);
+          await this.retryNeedsReview(name);
         } catch (error) {
           log.error({ err: error, chain: name }, "discovery cycle failed");
         }
@@ -81,6 +84,34 @@ export class Guardian {
       await this.resumeClosingPositions();
     } finally {
       this.monitorRunning = false;
+    }
+  }
+
+  private async retryNeedsReview(name: ChainName): Promise<void> {
+    const { client, registry } = this.chains.get(name);
+    const blockNumber = await client.getBlockNumber();
+    const positions = (await this.database.listOpenPositions(registry.chain.id))
+      .filter((position) => position.status === "needs_review");
+
+    for (const position of positions) {
+      let candidate = position;
+      if (candidate.protocol === "v4") {
+        try {
+          const refreshed = await this.discovery.refreshV4Position(name, candidate);
+          if (!refreshed || refreshed.status === "settled") continue;
+          candidate = refreshed;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (message.includes("NOT_MINTED")) {
+            await this.database.setPositionStatus(candidate.id, "settled", { reason: "nft_burned" });
+          }
+          continue;
+        }
+      }
+      if (!candidate.quoteToken || isNativeCurrencyV4(candidate)) continue;
+
+      await this.database.setPositionStatus(candidate.id, "syncing", { needsReviewRetriedAt: new Date().toISOString(), reason: null });
+      await this.evaluatePosition({ ...candidate, status: "syncing" }, blockNumber);
     }
   }
 
@@ -245,4 +276,8 @@ function retryAt(metadata: Record<string, unknown>): number | null {
   if (typeof nextAttemptAt !== "string") return null;
   const timestamp = Date.parse(nextAttemptAt);
   return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function isNativeCurrencyV4(position: PositionRecord): boolean {
+  return position.protocol === "v4" && (position.token0 === zeroAddress || position.token1 === zeroAddress);
 }

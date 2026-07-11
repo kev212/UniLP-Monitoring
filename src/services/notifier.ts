@@ -1,5 +1,5 @@
 import { Bot, Context, type CommandContext } from "grammy";
-import { type Address } from "viem";
+import { zeroAddress, type Address } from "viem";
 
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
@@ -190,7 +190,7 @@ export class Notifier {
       positions.push(...(await database.listActivePositions(registry.chain.id)));
     }
 
-    const active = positions.filter(p => p.status !== "paused" && p.status !== "needs_review");
+    const active = positions.filter((position) => position.status !== "paused");
 
     if (active.length === 0) {
       this.lastStatusCache.delete(chatId);
@@ -216,7 +216,7 @@ export class Notifier {
       message += line;
     }
 
-    message += `\n\nSL: ${sl}% | TP: +${tp}% | Trail: +${this.config.trailingStopActivationPercent}% / -${this.config.trailingStopDrawdownPercent}%\n— /close <nomor> atau /close <key>`;
+    message += `\n\nSL: ${sl}% | TP: +${tp}% | Trail: +${this.config.trailingStopActivationPercent}% / -${this.config.trailingStopDrawdownPercent}%\n⚠️ NEEDS REVIEW adalah manual-only\n— /close <nomor> atau /close <key>`;
     if (replied || message.length > 100) await ctx.reply(message);
   }
 
@@ -225,7 +225,10 @@ export class Notifier {
     const t1 = await this.tokenLabel(position.token1, position.chainId);
     const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
     const statusLabel = statusDisplay(position.status);
-    const base = `${index}. ${statusLabel} V4 #${position.positionKey} ${pair}`;
+    const reviewReason = position.status === "needs_review"
+      ? ` | ${reviewReasonDisplay(position.metadata)}`
+      : "";
+    const base = `${index}. ${statusLabel} ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${reviewReason}`;
 
     if (!position.quoteToken || !blockNumber) return `${base}\n`;
     try {
@@ -288,6 +291,10 @@ export class Notifier {
       await ctx.reply(`Posisi ${found.positionKey} sudah ${found.status === "closing" ? "sedang ditutup" : "settled"}.`);
       return;
     }
+    if (found.status === "needs_review") {
+      await ctx.reply(`Posisi ${found.positionKey} manual-only: ${reviewReasonDisplay(found.metadata)}.`);
+      return;
+    }
 
     await ctx.reply(`Menutup ${found.protocol.toUpperCase()} #${found.positionKey}...`);
     try {
@@ -312,6 +319,7 @@ export class Notifier {
 
   private async tokenLabel(address: Address | null, chainId?: number): Promise<string> {
     if (!address) return "0x0";
+    if (address.toLowerCase() === zeroAddress) return "ETH";
     const qt = this.config.quoteTokens.robinhood.concat(this.config.quoteTokens.base).find(q => q.address.toLowerCase() === address.toLowerCase());
     if (qt) return qt.symbol;
     const cached = this.chains.getCachedToken(address);
@@ -443,4 +451,10 @@ function trailingPeakDisplay(metadata: Record<string, unknown>): string {
   } catch {
     return "";
   }
+}
+
+function reviewReasonDisplay(metadata: Record<string, unknown>): string {
+  const reason = typeof metadata.reason === "string" ? metadata.reason : "requires manual review";
+  if (reason === "native_currency_v4_requires_manual_settlement") return "native ETH requires manual settlement";
+  return reason.length > 120 ? `${reason.slice(0, 117)}...` : reason;
 }

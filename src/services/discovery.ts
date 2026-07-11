@@ -344,14 +344,14 @@ export class DiscoveryService {
         const receipt = await client.getTransactionReceipt({ hash: candidate.transactionHash });
         const mintEvent = this.decodeV4MintLog(receipt.logs, registry.contracts.v4.poolManager);
         if (!mintEvent) {
-          log.warn({ chain: name, tokenId: tokenId.toString() }, "could not find PoolManager ModifyLiquidity log in V4 mint receipt");
-          await this.database.upsertPosition({
-            chainId: registry.chain.id, protocol: "v4", positionKey: tokenId.toString(),
-            owner: this.config.executorAddress, poolAddress: null, token0: "0x",
-            token1: "0x", quoteToken: null, status: "needs_review", liquidity: 0n,
-            openedAtBlock: candidate.blockNumber,
-            metadata: { positionManager: registry.contracts.v4.positionManager, source: "nft_transfer", reason: "mint_receipt_no_modify_liquidity_log", historyTrusted: candidate.historyTrusted },
+          const fallback = await this.upsertV4FromPositionManager(name, tokenId, candidate.blockNumber, candidate.historyTrusted, {
+            source: "position_manager_fallback",
+            reason: "mint_receipt_no_modify_liquidity_log",
           });
+          if (fallback) {
+            positions.push(fallback);
+            await this.notifier?.positionDiscovered(fallback);
+          }
           continue;
         }
         const bytes25 = mintEvent.poolId.slice(0, 2 + 25 * 2) as Hex;
@@ -418,6 +418,76 @@ export class DiscoveryService {
       }
     }
     return positions;
+  }
+
+  async refreshV4Position(name: ChainName, position: PositionRecord): Promise<PositionRecord | null> {
+    if (position.protocol !== "v4") return position;
+    const metadata = position.metadata as Record<string, unknown>;
+    return this.upsertV4FromPositionManager(
+      name,
+      BigInt(position.positionKey),
+      position.openedAtBlock ?? 0n,
+      Boolean(metadata.historyTrusted),
+      { ...metadata, source: "position_manager_fallback" },
+    );
+  }
+
+  private async upsertV4FromPositionManager(
+    name: ChainName,
+    tokenId: bigint,
+    openedAtBlock: bigint,
+    historyTrusted: boolean,
+    metadata: Record<string, unknown>,
+  ): Promise<PositionRecord | null> {
+    const { client, registry } = this.chains.get(name);
+    const owner = await client.readContract({
+      address: registry.contracts.v4.positionManager,
+      abi: v4PositionManagerAbi,
+      functionName: "ownerOf",
+      args: [tokenId],
+    });
+    if (owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) return null;
+    const [poolKey, packedPositionInfo] = await client.readContract({
+      address: registry.contracts.v4.positionManager,
+      abi: v4PositionManagerAbi,
+      functionName: "getPoolAndPositionInfo",
+      args: [tokenId],
+    });
+    const liquidity = await client.readContract({
+      address: registry.contracts.v4.positionManager,
+      abi: v4PositionManagerAbi,
+      functionName: "getPositionLiquidity",
+      args: [tokenId],
+    });
+    const { tickLower, tickUpper } = unpackV4PositionInfo(packedPositionInfo);
+    const quoteToken = this.findQuoteToken(name, poolKey.currency0, poolKey.currency1);
+    const nativeCurrency = poolKey.currency0 === zeroAddress || poolKey.currency1 === zeroAddress;
+    return this.database.upsertPosition({
+      chainId: registry.chain.id,
+      protocol: "v4",
+      positionKey: tokenId.toString(),
+      owner: this.config.executorAddress,
+      poolAddress: null,
+      token0: poolKey.currency0,
+      token1: poolKey.currency1,
+      quoteToken,
+      status: nativeCurrency ? "needs_review" : (quoteToken && historyTrusted ? "syncing" : "needs_review"),
+      liquidity,
+      openedAtBlock,
+      metadata: {
+        ...metadata,
+        currency0: poolKey.currency0,
+        currency1: poolKey.currency1,
+        fee: poolKey.fee,
+        tickSpacing: poolKey.tickSpacing,
+        hooks: poolKey.hooks,
+        tickLower,
+        tickUpper,
+        positionManager: registry.contracts.v4.positionManager,
+        historyTrusted,
+        ...(nativeCurrency ? { reason: "native_currency_v4_requires_manual_settlement" } : {}),
+      },
+    });
   }
 
   private decodeV4MintLog(logs: readonly { address: Address; data: Hex; topics: readonly Hex[] }[], poolManager: Address): { poolId: Hex; tickLower: number; tickUpper: number; liquidityDelta: bigint; salt: Hex } | null {
@@ -722,6 +792,17 @@ function quoteValueFromPairAmounts(position: PositionRecord, amount0: bigint, am
     return amount1 === 0n ? amount0 : amount0 + (amount1 * amount0) / amount1;
   }
   return amount0 === 0n ? amount1 : amount1 + (amount0 * amount1) / amount0;
+}
+
+function unpackV4PositionInfo(value: bigint): { tickLower: number; tickUpper: number } {
+  return {
+    tickLower: signed24((value >> 8n) & 0xffffffn),
+    tickUpper: signed24((value >> 32n) & 0xffffffn),
+  };
+}
+
+function signed24(value: bigint): number {
+  return Number(value >= 0x800000n ? value - 0x1000000n : value);
 }
 
 function tryDecode(event: typeof v2MintEvent | typeof v2BurnEvent, logEntry: { data: Hex; topics: readonly Hex[] }): ReturnType<typeof decodeEventLog> | null {
