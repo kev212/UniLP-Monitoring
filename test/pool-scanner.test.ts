@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { hasMinimumScanVolume6h, MIN_VOLUME_6H_USD, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
+import { estimatedHourlyYieldPercent, hasMinimumScanVolume6h, MIN_VOLUME_6H_USD, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
 
 describe("pool scoring formula", () => {
   const K = 1_000_000;
@@ -74,6 +74,11 @@ describe("scan pool eligibility", () => {
     expect(hasMinimumScanVolume6h(Number.NaN)).toBe(false);
   });
 
+  it("calculates gross pool yield per hour from six-hour fees and TVL", () => {
+    expect(estimatedHourlyYieldPercent(60, 1_000)).toBeCloseTo(1);
+    expect(estimatedHourlyYieldPercent(60, 0)).toBe(0);
+  });
+
   it("builds an Uniswap explorer URL from either a pool address or V4 pool ID", () => {
     expect(uniswapPoolUrl("0xe39078fc024188927e10b26d91e4720a600fba85"))
       .toBe("https://app.uniswap.org/explore/pools/robinhood/0xe39078fc024188927e10b26d91e4720a600fba85");
@@ -97,6 +102,7 @@ describe("scan pool eligibility", () => {
       tvlUsd: 10_000,
       volume6hUsd: 1_000,
       estimatedPoolFees6hUsd: 10,
+      estimatedPoolYieldHourlyPercent: 0.0167,
       score,
       safetyFactor: 0.1,
       dynamicFee: false,

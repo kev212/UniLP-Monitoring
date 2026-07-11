@@ -541,6 +541,7 @@ function formatScanPool(pool: ScoredPool, label: string): string[] {
   const lines = [
     `${label} ${scoreStars(pool.score)} ${pool.protocol.toUpperCase()} ${pool.pair} | ${feePct}%${dynamicLabel}`,
     `   TVL: $${fmtUsd(pool.tvlUsd)} | Vol 6h: $${fmtUsd(pool.volume6hUsd)} | Est. gross fees 6h: $${fmtUsd(pool.estimatedPoolFees6hUsd)}`,
+    `   Est. gross yield/h: ${fmtPercent(pool.estimatedPoolYieldHourlyPercent)}`,
     `   Score: ${pool.score.toFixed(6)} | Uniswap: ${pool.uniswapUrl}`,
   ];
   if (pool.warnings.length > 0) lines.push(`   ⚠️ ${pool.warnings.join(", ")}`);
@@ -553,4 +554,10 @@ function fmtUsd(value: number): string {
   if (value >= 1) return value.toFixed(2);
   if (value >= 0.01) return value.toFixed(4);
   return value.toExponential(2);
+}
+
+function fmtPercent(value: number): string {
+  if (value >= 1) return `${value.toFixed(2)}%`;
+  if (value >= 0.01) return `${value.toFixed(3)}%`;
+  return `${value.toFixed(4)}%`;
 }

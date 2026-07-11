@@ -17,6 +17,7 @@ export interface ScoredPool {
   tvlUsd: number;
   volume6hUsd: number;
   estimatedPoolFees6hUsd: number;
+  estimatedPoolYieldHourlyPercent: number;
   score: number;
   safetyFactor: number;
   dynamicFee: boolean;
@@ -148,6 +149,7 @@ export class PoolScanner {
 
     const feeRate = feeTier / 1_000_000;
     const estimatedPoolFees6hUsd = volume6hUsd * feeRate;
+    const estimatedPoolYieldHourlyPercent = estimatedHourlyYieldPercent(estimatedPoolFees6hUsd, tvlUsd);
     const safetyFactor = Math.sqrt(tvlUsd / (tvlUsd + K));
     const score = (estimatedPoolFees6hUsd / tvlUsd) * safetyFactor;
 
@@ -170,6 +172,7 @@ export class PoolScanner {
       tvlUsd,
       volume6hUsd,
       estimatedPoolFees6hUsd,
+      estimatedPoolYieldHourlyPercent,
       score,
       safetyFactor,
       dynamicFee,
@@ -296,6 +299,11 @@ export class PoolScanner {
 
 export function hasMinimumScanVolume6h(volume6hUsd: number): boolean {
   return Number.isFinite(volume6hUsd) && volume6hUsd >= MIN_VOLUME_6H_USD;
+}
+
+export function estimatedHourlyYieldPercent(estimatedPoolFees6hUsd: number, tvlUsd: number): number {
+  if (!Number.isFinite(estimatedPoolFees6hUsd) || !Number.isFinite(tvlUsd) || tvlUsd <= 0) return 0;
+  return (estimatedPoolFees6hUsd / tvlUsd / 6) * 100;
 }
 
 export function uniswapPoolUrl(poolIdentifier: string): string {
