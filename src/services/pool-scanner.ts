@@ -5,10 +5,12 @@ import type { ChainClients } from "./chain-client.js";
 
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
 const K = 1_000_000;
+export const MIN_VOLUME_1H_USD = 100;
 
 export interface ScoredPool {
   protocol: "v3" | "v4";
   pair: string;
+  uniswapUrl: string;
   feeTier: number;
   feeRate: number;
   tvlUsd: number;
@@ -108,9 +110,10 @@ export class PoolScanner {
     }
 
     const tvlUsd = Number(raw.attributes.reserve_in_usd || "0");
-    if (tvlUsd <= 0) return null;
+    if (!Number.isFinite(tvlUsd) || tvlUsd <= 0) return null;
 
     const volume1hUsd = Number(raw.attributes.volume_usd?.h1 || "0");
+    if (!hasMinimumScanVolume(volume1hUsd)) return null;
     const volume24hUsd = Number(raw.attributes.volume_usd?.h24 || "0");
     const stale = volume24hUsd > 0 && volume1hUsd <= 0;
 
@@ -152,6 +155,7 @@ export class PoolScanner {
     return {
       protocol,
       pair,
+      uniswapUrl: uniswapPoolUrl(poolAddress),
       feeTier: verified.feeTier ?? 0,
       feeRate,
       tvlUsd,
@@ -277,4 +281,12 @@ export class PoolScanner {
       return null;
     }
   }
+}
+
+export function hasMinimumScanVolume(volume1hUsd: number): boolean {
+  return Number.isFinite(volume1hUsd) && volume1hUsd >= MIN_VOLUME_1H_USD;
+}
+
+export function uniswapPoolUrl(poolIdentifier: string): string {
+  return `https://app.uniswap.org/explore/pools/robinhood/${poolIdentifier}`;
 }

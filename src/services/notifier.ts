@@ -292,7 +292,7 @@ export class Notifier {
     }
 
     if (pools.length === 0) {
-      await ctx.reply(`Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 untuk token ini.`);
+      await ctx.reply(`Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 1h >= $100 untuk token ini.`);
       return;
     }
 
@@ -309,6 +309,7 @@ export class Notifier {
       lines.push(
         `${medals[i]} ${star} ${version} ${p.pair} | ${feePct}%${dynamicLabel}`,
         `   TVL: $${fmtUsd(p.tvlUsd)} | Vol 1h: $${fmtUsd(p.volume1hUsd)} | Score: ${p.score.toFixed(6)}`,
+        `   Uniswap: ${p.uniswapUrl}`,
       );
       if (p.warnings.length > 0) {
         lines.push(`   ⚠️ ${p.warnings.join(", ")}`);

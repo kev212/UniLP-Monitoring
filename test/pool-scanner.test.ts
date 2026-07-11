@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import { hasMinimumScanVolume, MIN_VOLUME_1H_USD, uniswapPoolUrl } from "../src/services/pool-scanner.js";
+
 describe("pool scoring formula", () => {
   const K = 1_000_000;
 
@@ -62,5 +64,20 @@ describe("pool scoring formula", () => {
     pools.sort((a, b) => b.score - a.score);
     expect(pools[0]!.pair).toBe("B");
     expect(pools[2]!.pair).toBe("C");
+  });
+});
+
+describe("scan pool eligibility", () => {
+  it("excludes pools with less than $100 of rolling 1h volume", () => {
+    expect(hasMinimumScanVolume(MIN_VOLUME_1H_USD - 0.01)).toBe(false);
+    expect(hasMinimumScanVolume(MIN_VOLUME_1H_USD)).toBe(true);
+    expect(hasMinimumScanVolume(Number.NaN)).toBe(false);
+  });
+
+  it("builds an Uniswap explorer URL from either a pool address or V4 pool ID", () => {
+    expect(uniswapPoolUrl("0xe39078fc024188927e10b26d91e4720a600fba85"))
+      .toBe("https://app.uniswap.org/explore/pools/robinhood/0xe39078fc024188927e10b26d91e4720a600fba85");
+    expect(uniswapPoolUrl("0x4570413b567093841404954697bba9178a963f2810844321fcb777b27ac32267"))
+      .toBe("https://app.uniswap.org/explore/pools/robinhood/0x4570413b567093841404954697bba9178a963f2810844321fcb777b27ac32267");
   });
 });
