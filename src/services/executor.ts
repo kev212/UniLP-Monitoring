@@ -1,5 +1,6 @@
 import { privateKeyToAccount } from "viem/accounts";
 import {
+  createPublicClient,
   createWalletClient,
   decodeFunctionData,
   encodeAbiParameters,
@@ -8,6 +9,7 @@ import {
   isAddress,
   type Address,
   type Hex,
+  type PublicClient,
 } from "viem";
 
 import {
@@ -36,6 +38,7 @@ interface PendingSwap {
 
 export class Executor {
   private readonly account;
+  private readonly executorClientCache = new Map<string, PublicClient>();
 
   constructor(
     private readonly database: Database,
@@ -477,8 +480,27 @@ export class Executor {
     return true;
   }
 
+  private executorClient(chainId: number): PublicClient {
+    const { client, registry } = this.chains.getById(chainId);
+    const name = registry.name;
+    const existing = this.executorClientCache.get(name);
+    if (existing) return existing;
+    const alchemyUrl = this.config.alchemyHttp[name];
+    if (!alchemyUrl) {
+      this.executorClientCache.set(name, client);
+      return client;
+    }
+    const alchemyClient = createPublicClient({
+      chain: registry.chain,
+      transport: http(alchemyUrl, { retryCount: 3, timeout: 20_000 }),
+    });
+    this.executorClientCache.set(name, alchemyClient);
+    return alchemyClient;
+  }
+
   private async send(position: PositionRecord, stage: string, plan: TransactionPlan): Promise<Hex | null> {
-    const { client, registry } = this.chains.getById(plan.chainId);
+    const { registry } = this.chains.getById(plan.chainId);
+    const client = this.executorClient(plan.chainId);
     await client.call({ account: position.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n });
     await this.database.recordExecution(position.id, stage, "planned");
     if (this.config.dryRun) {
@@ -486,7 +508,9 @@ export class Executor {
       return null;
     }
     if (!this.account) throw new Error("No executor account is configured");
-    const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport: http(this.config.rpcHttp[registry.name]) });
+    const alchemyUrl = this.config.alchemyHttp[registry.name];
+    const transport = alchemyUrl ? http(alchemyUrl) : http(this.config.rpcHttp[registry.name]);
+    const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport });
     const hash = await wallet.sendTransaction({ to: plan.to, data: plan.data, value: plan.value ?? 0n });
     await this.database.recordExecution(position.id, stage, "submitted", hash);
     const receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
