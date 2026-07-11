@@ -1,0 +1,407 @@
+import { Bot, Context, type CommandContext } from "grammy";
+import { type Address } from "viem";
+
+import type { RuntimeConfig } from "../config.js";
+import type { Database } from "../db.js";
+import { log } from "../log.js";
+import type { ExitTrigger, PnlSnapshot, PositionRecord } from "../types.js";
+import type { ChainClients } from "./chain-client.js";
+import type { Executor } from "./executor.js";
+import type { PnlService } from "./pnl.js";
+
+type ChatContext = CommandContext<Context>;
+
+export class Notifier {
+  private readonly bot?: Bot;
+  private readonly lastStatusCache = new Map<string, PositionRecord[]>();
+
+  constructor(
+    private readonly config: RuntimeConfig,
+    private readonly chains: ChainClients,
+  ) {
+    this.bot = config.telegram ? new Bot(config.telegram.token) : undefined;
+  }
+
+  registerCommands(database: Database, pnl: PnlService, executor: Executor): void {
+    if (!this.bot) return;
+    this.bot.command("status", async (ctx: ChatContext) => {
+      await this.handleStatus(ctx, database, pnl);
+    });
+    this.bot.command("close", async (ctx: ChatContext) => {
+      await this.handleClose(ctx, database, executor);
+    });
+  }
+
+  async positionDiscovered(position: PositionRecord): Promise<void> {
+    if (!this.bot || !this.config.telegram) return;
+    const t0 = await this.tokenLabel(position.token0, position.chainId);
+    const t1 = await this.tokenLabel(position.token1, position.chainId);
+    const liq = position.liquidity === null ? "N/A" : await this.formatLiquidity(position, position.liquidity);
+    await this.send([
+      "🟢 LP DETECTED",
+      `${position.protocol.toUpperCase()} | chain ${position.chainId}`,
+      `position: ${position.positionKey}`,
+      `pair: ${t0} / ${t1}`,
+      `liquidity: ${liq}`,
+      `status: ${position.status}`,
+    ]);
+  }
+
+  async armed(position: PositionRecord, snapshot: PnlSnapshot): Promise<void> {
+    if (!this.bot || !this.config.telegram) return;
+    const t0 = await this.tokenLabel(position.token0, position.chainId);
+    const t1 = await this.tokenLabel(position.token1, position.chainId);
+    const qtSymbol = this.quoteSymbol(position.quoteToken);
+    const qtDec = await this.decimals(position.quoteToken, position.chainId);
+    const meta = position.metadata as Record<string, unknown>;
+    const tickLower = meta.tickLower as number | undefined;
+    const tickUpper = meta.tickUpper as number | undefined;
+    const sl = this.config.stopLossPercent;
+    const tp = this.config.takeProfitPercent;
+
+    const lines: string[] = [
+      "🔔 LP ARMED",
+      `${position.protocol.toUpperCase()} | chain ${position.chainId}`,
+      `position: ${position.positionKey}`,
+      `pair: ${t0} / ${t1}`,
+    ];
+    const liveLiquidity = snapshot.liquidity ?? position.liquidity;
+    if (liveLiquidity !== null && liveLiquidity !== undefined) {
+      lines.push(`liquidity: ${await this.formatLiquidity(position, liveLiquidity)}`);
+    }
+    if (tickLower !== undefined && tickUpper !== undefined) {
+      lines.push(`range: [${tickLower} → ${tickUpper}]`);
+    }
+    lines.push("");
+    lines.push(`💵 Deposit   : ${formatToken(snapshot.depositsQuote, qtDec)} ${qtSymbol}`);
+    lines.push(`🪙 Fees      : ${formatToken(snapshot.realizedQuote, qtDec)} ${qtSymbol}`);
+    lines.push(`💰 Value now : ${formatToken(snapshot.liquidationQuote, qtDec)} ${qtSymbol}`);
+    lines.push(`📈 PnL       : ${formatBps(snapshot.pnlBps)}% (${formatToken(snapshot.pnlQuote, qtDec)} ${qtSymbol})`);
+    lines.push("");
+    lines.push(`SL: ${sl}% | TP: +${tp}% | Trail: +${this.config.trailingStopActivationPercent}% / -${this.config.trailingStopDrawdownPercent}%`);
+    lines.push(`block: ${snapshot.blockNumber.toString()}`);
+
+    await this.send(lines);
+  }
+
+  async logPnL(position: PositionRecord, snapshot: PnlSnapshot): Promise<void> {
+    const t0 = await this.tokenLabel(position.token0, position.chainId);
+    const t1 = await this.tokenLabel(position.token1, position.chainId);
+    const qtSymbol = this.quoteSymbol(position.quoteToken);
+    const qtDec = await this.decimals(position.quoteToken, position.chainId);
+    const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
+    const usdg = this.config.quoteTokens.robinhood[0]?.address;
+    const usdgDec = usdg ? 6 : 0;
+    const usdgSymbol = usdg ? "USDG" : "??";
+    const feeParts: string[] = [formatToken(snapshot.feeQuote, qtDec, 2)];
+    if (snapshot.feeNonQuote) {
+      const nqSymbol = await this.tokenLabel(snapshot.feeNonQuote.token, position.chainId);
+      const nqAmount = formatToken(snapshot.feeNonQuote.amount, await this.decimals(snapshot.feeNonQuote.token, position.chainId), 2);
+      feeParts.push(`+ ${nqAmount} ${nqSymbol}`);
+    }
+    const feeDisplay = snapshot.feeNonQuote
+      ? `${feeParts.join(" ")} (≈ ${formatToken(snapshot.feeQuoteUsdg, usdgDec, 4)} ${usdgSymbol})`
+      : `${formatToken(snapshot.feeQuoteUsdg, usdgDec, 4)} ${usdgSymbol}`;
+    log.info({ Pool: `${position.positionKey} ${pair} | CV: ${formatToken(snapshot.liquidationQuote, qtDec, 2)} ${qtSymbol} | Fees: ${feeDisplay} | PnL: ${formatBps(snapshot.pnlBps)}%` });
+  }
+
+  async trigger(position: PositionRecord, snapshot: PnlSnapshot, reason: ExitTrigger): Promise<void> {
+    if (!this.bot || !this.config.telegram) return;
+    const label = reason === "stop_loss"
+      ? "stop loss"
+      : reason === "take_profit"
+        ? "take profit"
+        : "trailing take profit";
+    await this.send([
+      `LP ${label} triggered`,
+      `${position.protocol.toUpperCase()} | chain ${position.chainId}`,
+      `position: ${position.positionKey}`,
+      `PnL: ${formatBps(snapshot.pnlBps)}%`,
+      this.config.dryRun ? "DRY_RUN: transaction not broadcast" : "Auto-exit started",
+    ]);
+  }
+
+  async transaction(position: PositionRecord, stage: string, hash: string): Promise<void> {
+    await this.send(["LP transaction confirmed", `position: ${position.positionKey}`, `stage: ${stage}`, `tx: ${hash}`]);
+  }
+
+  async settled(position: PositionRecord): Promise<void> {
+    await this.send(["LP settled to quote token", `${position.protocol.toUpperCase()} | chain ${position.chainId}`, `position: ${position.positionKey}`]);
+  }
+
+  async failure(position: PositionRecord, message: string): Promise<void> {
+    await this.send(["LP auto-exit requires retry", `position: ${position.positionKey}`, `error: ${message.slice(0, 700)}`]);
+  }
+
+  async startBot(): Promise<void> {
+    if (!this.bot) return;
+    log.info("Telegram bot polling started");
+    await this.bot.start();
+  }
+
+  async stopBot(): Promise<void> {
+    if (!this.bot) return;
+    await this.bot.stop();
+  }
+
+  private async handleStatus(ctx: ChatContext, database: Database, pnl: PnlService): Promise<void> {
+    const chatId = ctx.chat.id.toString();
+    if (!this.authorized(chatId)) return;
+
+    const positions: PositionRecord[] = [];
+    const blocks: Record<number, bigint> = {};
+    for (const chain of this.config.chains) {
+      const { client, registry } = this.chains.get(chain);
+      const block = await client.getBlockNumber();
+      blocks[registry.chain.id] = block;
+      positions.push(...(await database.listActivePositions(registry.chain.id)));
+    }
+
+    const active = positions.filter(p => p.status !== "paused" && p.status !== "needs_review");
+
+    if (active.length === 0) {
+      this.lastStatusCache.delete(chatId);
+      await ctx.reply("No active positions.");
+      return;
+    }
+
+    this.lastStatusCache.set(chatId, active);
+
+    const sl = this.config.stopLossPercent;
+    const tp = this.config.takeProfitPercent;
+    let replied = false;
+    let message = "LP STATUS\n";
+
+    for (let index = 0; index < active.length; index++) {
+      const position = active[index]!;
+      const line = await this.formatStatusLine(position, pnl, blocks[position.chainId], index + 1);
+      if (message.length + line.length + 1 > 3800) {
+        await ctx.reply(message);
+        replied = true;
+        message = "";
+      }
+      message += line;
+    }
+
+    message += `\n\nSL: ${sl}% | TP: +${tp}% | Trail: +${this.config.trailingStopActivationPercent}% / -${this.config.trailingStopDrawdownPercent}%\n— /close <nomor> atau /close <key>`;
+    if (replied || message.length > 100) await ctx.reply(message);
+  }
+
+  private async formatStatusLine(position: PositionRecord, pnl: PnlService, blockNumber: bigint | undefined, index: number): Promise<string> {
+    const t0 = await this.tokenLabel(position.token0, position.chainId);
+    const t1 = await this.tokenLabel(position.token1, position.chainId);
+    const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
+    const statusLabel = statusDisplay(position.status);
+    const base = `${index}. ${statusLabel} V4 #${position.positionKey} ${pair}`;
+
+    if (!position.quoteToken || !blockNumber) return `${base}\n`;
+    try {
+      const valued = await pnl.value(position, blockNumber);
+      const qtSymbol = this.quoteSymbol(position.quoteToken);
+      const qtDec = await this.decimals(position.quoteToken, position.chainId);
+      const cv = formatToken(valued.snapshot.liquidationQuote, qtDec, 2);
+      let feeStr = formatToken(valued.snapshot.feeQuote, qtDec, 2);
+      if (valued.snapshot.feeNonQuote) {
+        const nqSymbol = await this.tokenLabel(valued.snapshot.feeNonQuote.token, position.chainId);
+        feeStr += ` + ${formatToken(valued.snapshot.feeNonQuote.amount, await this.decimals(valued.snapshot.feeNonQuote.token, position.chainId), 2)} ${nqSymbol}`;
+      }
+      const usdgDec = 6;
+      const feeDisplay = valued.snapshot.feeNonQuote
+        ? `${feeStr} (≈ ${formatToken(valued.snapshot.feeQuoteUsdg, usdgDec, 4)} USDG)`
+        : `${formatToken(valued.snapshot.feeQuoteUsdg, usdgDec, 4)} USDG`;
+      const pnlText = `${pnlEmoji(valued.snapshot.pnlBps)} ${formatBps(valued.snapshot.pnlBps)}%`;
+      const trailingPeak = trailingPeakDisplay(position.metadata);
+      return `${base} | 💰 ${cv} ${qtSymbol} | 🪙 ${feeDisplay} | 📊 ${pnlText}${trailingPeak}\n`;
+    } catch {
+      return `${base}\n`;
+    }
+  }
+
+  private async handleClose(ctx: ChatContext, database: Database, executor: Executor): Promise<void> {
+    const chatId = ctx.chat.id.toString();
+    if (!this.authorized(chatId)) return;
+
+    const key = ctx.match.trim();
+    if (!key) { await ctx.reply("Gunakan /close <nomor> atau /close <key>. Jalankan /status dulu."); return; }
+
+    let found: PositionRecord | null = null;
+
+    // Index-based lookup from last /status cache
+    const index = parseInt(key, 10);
+    if (!isNaN(index) && index >= 1) {
+      const cached = this.lastStatusCache.get(chatId);
+      if (cached && index <= cached.length) {
+        found = cached[index - 1]!;
+      }
+    }
+
+    // Fallback: search by position key across chains/protocols
+    if (!found) {
+      for (const chain of this.config.chains) {
+        const { registry } = this.chains.get(chain);
+        for (const protocol of ["v4", "v3", "v2"] as const) {
+          found = await database.findPositionByKey(registry.chain.id, protocol, key);
+          if (found) break;
+        }
+        if (found) break;
+      }
+    }
+
+    if (!found) {
+      await ctx.reply(`Posisi "${key}" tidak ditemukan. Jalankan /status dulu, lalu gunakan nomor (contoh: /close 1) atau position key (contoh: /close 33850).`);
+      return;
+    }
+    if (found.status === "closing" || found.status === "settled") {
+      await ctx.reply(`Posisi ${found.positionKey} sudah ${found.status === "closing" ? "sedang ditutup" : "settled"}.`);
+      return;
+    }
+
+    await ctx.reply(`Menutup ${found.protocol.toUpperCase()} #${found.positionKey}...`);
+    try {
+      await executor.execute(found);
+      await ctx.reply(`Posisi ${found.positionKey} — penutupan dimulai.`);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      await ctx.reply(`Close gagal: ${message.slice(0, 500)}`);
+    }
+  }
+
+  private authorized(chatId: string): boolean {
+    if (!this.config.telegram || chatId !== this.config.telegram.chatId) return false;
+    return true;
+  }
+
+  private async tokenLabel(address: Address | null, chainId?: number): Promise<string> {
+    if (!address) return "0x0";
+    const qt = this.config.quoteTokens.robinhood.concat(this.config.quoteTokens.base).find(q => q.address.toLowerCase() === address.toLowerCase());
+    if (qt) return qt.symbol;
+    const cached = this.chains.getCachedToken(address);
+    if (cached) return cached.symbol;
+    try {
+      const { client } = chainId === undefined ? this.chains.get("robinhood") : this.chains.getById(chainId);
+      const [symbol, decimals] = await Promise.all([
+        client.readContract({ address, abi: [{ name: "symbol", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] }], functionName: "symbol" }),
+        client.readContract({ address, abi: [{ name: "decimals", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "uint8" }] }], functionName: "decimals" }),
+      ]);
+      this.chains.cacheToken(address, { decimals, symbol });
+      return symbol;
+    } catch {
+      return shortAddress(address);
+    }
+  }
+
+  private quoteSymbol(address: Address | null): string {
+    if (!address) return "?";
+    for (const chain of ["robinhood", "base"] as const) {
+      const qt = this.config.quoteTokens[chain].find(q => q.address.toLowerCase() === address.toLowerCase());
+      if (qt) return qt.symbol;
+    }
+    return shortAddress(address);
+  }
+
+  private async decimals(address: Address | null, chainId?: number): Promise<number> {
+    if (!address) return 18;
+    const cached = this.chains.getCachedToken(address);
+    if (cached) return cached.decimals;
+    try {
+      const { client } = chainId === undefined ? this.chains.get("robinhood") : this.chains.getById(chainId);
+      const d = await client.readContract({ address, abi: [{ name: "decimals", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "uint8" }] }], functionName: "decimals" });
+      return d;
+    } catch {
+      return 18;
+    }
+  }
+
+  private async formatLiquidity(position: PositionRecord, liquidity: bigint): Promise<string> {
+    if (position.protocol === "v2" && position.poolAddress) {
+      const decimals = await this.decimals(position.poolAddress, position.chainId);
+      return `${formatToken(liquidity, decimals)} LP`;
+    }
+    return `${liquidity.toString()} units`;
+  }
+
+  private sendQueue: Promise<void> = Promise.resolve();
+  private lastSendAt = 0;
+
+  private async send(lines: string[]): Promise<void> {
+    if (!this.bot || !this.config.telegram) return;
+    const run = this.sendQueue.then(async () => {
+      const elapsed = Date.now() - this.lastSendAt;
+      if (elapsed < 300) await sleep(300 - elapsed);
+      this.lastSendAt = Date.now();
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          await this.bot!.api.sendMessage(this.config.telegram!.chatId, lines.join("\n"));
+          return;
+        } catch (error: unknown) {
+          const code = (error as { error_code?: number })?.error_code;
+          if (code === 429 && attempt < 3) {
+            const retryAfter = Number((error as { parameters?: { retry_after?: number } })?.parameters?.retry_after ?? 5);
+            log.warn({ retryAfter, attempt }, "Telegram rate-limited — retrying");
+            await sleep(retryAfter * 1000);
+            continue;
+          }
+          log.warn({ err: error }, "could not send Telegram notification");
+          return;
+        }
+      }
+    });
+    this.sendQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatBps(value: bigint): string {
+  const negative = value < 0n;
+  const absolute = negative ? -value : value;
+  return `${negative ? "-" : ""}${absolute / 100n}.${(absolute % 100n).toString().padStart(2, "0")}`;
+}
+
+function formatToken(value: bigint, decimals: number, maxDecimals?: number): string {
+  if (decimals === 0 || value === 0n) return value.toString();
+  const divisor = 10n ** BigInt(Math.min(decimals, 18));
+  const integer = value / divisor;
+  const fraction = value % divisor;
+  if (fraction === 0n) return integer.toString();
+  let fracStr = fraction.toString().padStart(Math.min(decimals, 18), "0").replace(/0+$/, "");
+  if (maxDecimals !== undefined && fracStr.length > maxDecimals) {
+    fracStr = fracStr.slice(0, maxDecimals);
+  }
+  return `${integer}.${fracStr}`;
+}
+
+function shortAddress(address: Address): string {
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+function statusDisplay(status: string): string {
+  if (status === "needs_review") return "⚠️ NEEDS REVIEW";
+  if (status === "closing") return "⏳ CLOSING";
+  if (status === "paused") return "⏸️ PAUSED";
+  if (status === "armed") return "🟢 ARMED";
+  if (status === "syncing") return "🔄 SYNCING";
+  if (status === "discovered") return "🆕 NEW";
+  return status.toUpperCase();
+}
+
+function pnlEmoji(pnlBps: bigint): string {
+  if (pnlBps > 0n) return "📈";
+  if (pnlBps < 0n) return "📉";
+  return "➖";
+}
+
+function trailingPeakDisplay(metadata: Record<string, unknown>): string {
+  const raw = metadata.trailingStop;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return "";
+  const peak = (raw as Record<string, unknown>).peakPnlBps;
+  if (typeof peak !== "string") return "";
+  try {
+    return ` | 🎯 Peak ${formatBps(BigInt(peak))}%`;
+  } catch {
+    return "";
+  }
+}
