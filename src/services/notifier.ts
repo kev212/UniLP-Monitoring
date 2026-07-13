@@ -13,6 +13,7 @@ import type { PoolScanner, ScoredPool } from "./pool-scanner.js";
 type ChatContext = CommandContext<Context>;
 
 const DASHBOARD_PAGE_SIZE = 6;
+const DASHBOARD_VALUE_CONCURRENCY = 3;
 
 type DashboardAction =
   | { type: "refresh"; page: number }
@@ -36,7 +37,11 @@ export class Notifier {
     private readonly config: RuntimeConfig,
     private readonly chains: ChainClients,
   ) {
-    this.bot = config.telegram ? new Bot(config.telegram.token) : undefined;
+    if (!config.telegram) return;
+    this.bot = new Bot(config.telegram.token);
+    this.bot.catch((error) => {
+      log.error({ updateId: error.ctx.update.update_id, error: errorMessage(error.error) }, "Telegram update failed");
+    });
   }
 
   registerCommands(database: Database, pnl: PnlService, executor: Executor, scanner: PoolScanner): void {
@@ -214,21 +219,21 @@ export class Notifier {
     const callback = ctx.callbackQuery;
     const message = callback?.message;
     if (!callback || !message || !("chat" in message)) {
-      await ctx.answerCallbackQuery({ text: "Dashboard tidak lagi tersedia.", show_alert: true });
+      await this.acknowledgeDashboardCallback(ctx, "Dashboard tidak lagi tersedia.", true);
       return;
     }
     const chatId = message.chat.id.toString();
     if (!this.authorized(chatId)) {
-      await ctx.answerCallbackQuery({ text: "Tidak diizinkan.", show_alert: true });
+      await this.acknowledgeDashboardCallback(ctx, "Tidak diizinkan.", true);
       return;
     }
     const action = parseDashboardAction(callback.data);
     if (!action) {
-      await ctx.answerCallbackQuery({ text: "Tombol dashboard tidak valid.", show_alert: true });
+      await this.acknowledgeDashboardCallback(ctx, "Tombol dashboard tidak valid.", true);
       return;
     }
 
-    await ctx.answerCallbackQuery(action.type === "refresh" ? { text: "Memperbarui..." } : undefined);
+    if (!await this.acknowledgeDashboardCallback(ctx, action.type === "refresh" ? "Memperbarui..." : undefined)) return;
     try {
       if (action.type === "refresh" || action.type === "status") {
         await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
@@ -255,10 +260,31 @@ export class Notifier {
 
       this.dashboardCloseInFlight.add(position.id);
       await this.editDashboardMessage(chatId, message.message_id, `⏳ Menutup ${position.protocol.toUpperCase()} #${position.positionKey}...`);
-      void this.executeDashboardClose(database, pnl, executor, chatId, message.message_id, position, action.page);
+      void this.executeDashboardClose(database, pnl, executor, chatId, message.message_id, position, action.page)
+        .catch((closeError) => log.error({ error: errorMessage(closeError), positionId: position.id }, "dashboard close flow failed"));
     } catch (error) {
-      log.warn({ err: error }, "dashboard callback failed");
-      await this.editDashboardMessage(chatId, message.message_id, "❌ Dashboard gagal diperbarui. Tekan Refresh untuk mencoba lagi.", new InlineKeyboard().text("🔄 Refresh", dashboardAction("refresh", 0)));
+      log.warn({ error: errorMessage(error) }, "dashboard callback failed");
+      try {
+        await this.editDashboardMessage(chatId, message.message_id, "❌ Dashboard gagal diperbarui. Tekan Refresh untuk mencoba lagi.", new InlineKeyboard().text("🔄 Refresh", dashboardAction("refresh", 0)));
+      } catch (editError) {
+        log.warn({ error: errorMessage(editError) }, "could not render dashboard error state");
+      }
+    }
+  }
+
+  private async acknowledgeDashboardCallback(ctx: Context, text?: string, showAlert = false): Promise<boolean> {
+    try {
+      if (text) await ctx.answerCallbackQuery({ text, show_alert: showAlert });
+      else await ctx.answerCallbackQuery();
+      return true;
+    } catch (error) {
+      const details = errorMessage(error);
+      if (isExpiredCallbackError(error)) {
+        log.info({ updateId: ctx.update.update_id }, "ignoring expired Telegram callback");
+      } else {
+        log.warn({ updateId: ctx.update.update_id, error: details }, "could not acknowledge Telegram callback");
+      }
+      return false;
     }
   }
 
@@ -268,14 +294,18 @@ export class Notifier {
       await this.refreshDashboardMessage(database, pnl, chatId, messageId, page);
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
-      await this.editDashboardMessage(chatId, messageId, `❌ Close #${position.positionKey} gagal: ${text.slice(0, 400)}`, new InlineKeyboard().text("← Dashboard", dashboardAction("status", page)));
+      try {
+        await this.editDashboardMessage(chatId, messageId, `❌ Close #${position.positionKey} gagal: ${text.slice(0, 400)}`, new InlineKeyboard().text("← Dashboard", dashboardAction("status", page)));
+      } catch (editError) {
+        log.warn({ error: errorMessage(editError), positionId: position.id }, "could not render dashboard close failure");
+      }
     } finally {
       this.dashboardCloseInFlight.delete(position.id);
     }
   }
 
   private async buildDashboard(database: Database, pnl: PnlService, requestedPage: number): Promise<DashboardView> {
-    const { active, blocks } = await this.activePositions(database);
+    const { active, blocks } = await this.activePositions(database, true);
     const pageCount = Math.max(1, Math.ceil(active.length / DASHBOARD_PAGE_SIZE));
     const page = clampDashboardPage(requestedPage, pageCount);
     const first = page * DASHBOARD_PAGE_SIZE;
@@ -284,10 +314,11 @@ export class Notifier {
     if (active.length === 0) {
       lines.push("Tidak ada posisi aktif.");
     } else {
-      for (let index = first; index < Math.min(first + DASHBOARD_PAGE_SIZE, active.length); index++) {
-        const position = active[index]!;
-        lines.push((await this.formatStatusLine(position, pnl, blocks[position.chainId], index + 1)).trimEnd());
-      }
+      const pagePositions = active.slice(first, first + DASHBOARD_PAGE_SIZE);
+      const statusLines = await mapWithConcurrency(pagePositions, DASHBOARD_VALUE_CONCURRENCY, (position, index) =>
+        this.formatStatusLine(position, pnl, blocks[position.chainId], first + index + 1),
+      );
+      lines.push(...statusLines.map((line) => line.trimEnd()));
     }
 
     lines.push("");
@@ -297,15 +328,20 @@ export class Notifier {
     return { text: lines.join("\n"), positions: active, page, pageCount };
   }
 
-  private async activePositions(database: Database): Promise<{ active: PositionRecord[]; blocks: Record<number, bigint> }> {
-    const positions: PositionRecord[] = [];
+  private async activePositions(database: Database, includeBlocks: boolean): Promise<{ active: PositionRecord[]; blocks: Record<number, bigint> }> {
     const blocks: Record<number, bigint> = {};
-    for (const chain of this.config.chains) {
+    const results = await Promise.all(this.config.chains.map(async (chain) => {
       const { client, registry } = this.chains.get(chain);
-      const block = await client.getBlockNumber();
-      blocks[registry.chain.id] = block;
-      positions.push(...(await database.listActivePositions(registry.chain.id)));
+      const [positions, block] = await Promise.all([
+        database.listActivePositions(registry.chain.id),
+        includeBlocks ? client.getBlockNumber() : Promise.resolve(undefined),
+      ]);
+      return { chainId: registry.chain.id, positions, block };
+    }));
+    for (const result of results) {
+      if (result.block !== undefined) blocks[result.chainId] = result.block;
     }
+    const positions = results.flatMap((result) => result.positions);
     return { active: positions.filter((position) => position.status !== "paused"), blocks };
   }
 
@@ -328,7 +364,7 @@ export class Notifier {
   }
 
   private async showCloseMenu(database: Database, chatId: string, messageId: number, requestedPage: number, notice?: string): Promise<void> {
-    const { active } = await this.activePositions(database);
+    const { active } = await this.activePositions(database, false);
     const closable = active.filter((position) => canRequestManualClose(position.status));
     const pageCount = Math.max(1, Math.ceil(closable.length / DASHBOARD_PAGE_SIZE));
     const page = clampDashboardPage(requestedPage, pageCount);
@@ -615,7 +651,7 @@ export class Notifier {
             await sleep(retryAfter * 1000);
             continue;
           }
-          log.warn({ err: error }, "could not send Telegram notification");
+          log.warn({ error: errorMessage(error) }, "could not send Telegram notification");
           return;
         }
       }
@@ -675,6 +711,30 @@ function isPositionAction(value: string | undefined): value is "select" | "confi
 
 function isProtocol(value: string | undefined): value is Protocol {
   return value === "v2" || value === "v3" || value === "v4";
+}
+
+export function isExpiredCallbackError(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase();
+  return message.includes("query is too old") || message.includes("response timeout expired") || message.includes("query id is invalid");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number, work: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      results[index] = await work(items[index]!, index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  return results;
 }
 
 function sleep(ms: number): Promise<void> {

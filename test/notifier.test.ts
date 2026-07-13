@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { canRequestManualClose, clampDashboardPage, parseDashboardAction } from "../src/services/notifier.js";
+import { canRequestManualClose, clampDashboardPage, isExpiredCallbackError, parseDashboardAction } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses dashboard navigation callbacks", () => {
@@ -38,5 +38,11 @@ describe("Telegram dashboard callbacks", () => {
     expect(canRequestManualClose("closing")).toBe(false);
     expect(canRequestManualClose("needs_review")).toBe(false);
     expect(canRequestManualClose("settled")).toBe(false);
+  });
+
+  it("identifies callback queries Telegram can no longer acknowledge", () => {
+    expect(isExpiredCallbackError(new Error("400: Bad Request: query is too old and response timeout expired"))).toBe(true);
+    expect(isExpiredCallbackError(new Error("400: Bad Request: query ID is invalid"))).toBe(true);
+    expect(isExpiredCallbackError(new Error("400: Bad Request: message is not modified"))).toBe(false);
   });
 });

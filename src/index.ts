@@ -52,6 +52,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-  log.fatal({ err: error }, "UniLP Guardian failed to start");
+  log.fatal({ error: error instanceof Error ? error.message : String(error) }, "UniLP Guardian failed to start");
   process.exit(1);
 });
