@@ -1,10 +1,10 @@
-import { Bot, Context, type CommandContext } from "grammy";
+import { Bot, Context, InlineKeyboard, type CommandContext } from "grammy";
 import { isAddress, zeroAddress, type Address } from "viem";
 
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ExitTrigger, PnlSnapshot, PositionRecord } from "../types.js";
+import type { ExitTrigger, PnlSnapshot, PositionRecord, PositionStatus, Protocol } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
@@ -12,9 +12,25 @@ import type { PoolScanner, ScoredPool } from "./pool-scanner.js";
 
 type ChatContext = CommandContext<Context>;
 
+const DASHBOARD_PAGE_SIZE = 6;
+
+type DashboardAction =
+  | { type: "refresh"; page: number }
+  | { type: "close"; page: number }
+  | { type: "status"; page: number }
+  | { type: "select" | "confirm"; page: number; chainId: number; protocol: Protocol; positionKey: string };
+
+interface DashboardView {
+  text: string;
+  positions: PositionRecord[];
+  page: number;
+  pageCount: number;
+}
+
 export class Notifier {
   private readonly bot?: Bot;
   private readonly lastStatusCache = new Map<string, PositionRecord[]>();
+  private readonly dashboardCloseInFlight = new Set<string>();
 
   constructor(
     private readonly config: RuntimeConfig,
@@ -27,7 +43,7 @@ export class Notifier {
     if (!this.bot) return;
     void this.bot.api.setMyCommands([
       { command: "status", description: "Tampilkan status semua posisi LP aktif" },
-      { command: "close", description: "Tutup posisi LP — /close <nomor> atau /close <key>" },
+      { command: "close", description: "Tutup posisi LP — fallback /close <nomor> atau /close <key>" },
       { command: "scan", description: "Scan pool Uniswap V3/V4 untuk token — /scan <contract>" },
     ]);
     this.bot.command("status", async (ctx: ChatContext) => {
@@ -38,6 +54,9 @@ export class Notifier {
     });
     this.bot.command("scan", async (ctx: ChatContext) => {
       await this.handleScan(ctx, scanner);
+    });
+    this.bot.callbackQuery(/^lp:/, async (ctx) => {
+      await this.handleDashboardCallback(ctx, database, pnl, executor);
     });
   }
 
@@ -186,6 +205,99 @@ export class Notifier {
     const chatId = ctx.chat.id.toString();
     if (!this.authorized(chatId)) return;
 
+    const dashboard = await this.buildDashboard(database, pnl, 0);
+    this.lastStatusCache.set(chatId, dashboard.positions);
+    await ctx.reply(dashboard.text, { reply_markup: this.dashboardKeyboard(dashboard.page, dashboard.pageCount) });
+  }
+
+  private async handleDashboardCallback(ctx: Context, database: Database, pnl: PnlService, executor: Executor): Promise<void> {
+    const callback = ctx.callbackQuery;
+    const message = callback?.message;
+    if (!callback || !message || !("chat" in message)) {
+      await ctx.answerCallbackQuery({ text: "Dashboard tidak lagi tersedia.", show_alert: true });
+      return;
+    }
+    const chatId = message.chat.id.toString();
+    if (!this.authorized(chatId)) {
+      await ctx.answerCallbackQuery({ text: "Tidak diizinkan.", show_alert: true });
+      return;
+    }
+    const action = parseDashboardAction(callback.data);
+    if (!action) {
+      await ctx.answerCallbackQuery({ text: "Tombol dashboard tidak valid.", show_alert: true });
+      return;
+    }
+
+    await ctx.answerCallbackQuery(action.type === "refresh" ? { text: "Memperbarui..." } : undefined);
+    try {
+      if (action.type === "refresh" || action.type === "status") {
+        await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
+        return;
+      }
+      if (action.type === "close") {
+        await this.showCloseMenu(database, chatId, message.message_id, action.page);
+        return;
+      }
+
+      const position = await this.findDashboardPosition(database, action);
+      if (!position || !canRequestManualClose(position.status)) {
+        await this.showCloseMenu(database, chatId, message.message_id, action.page, "Posisi sudah tidak dapat ditutup dari dashboard.");
+        return;
+      }
+      if (action.type === "select") {
+        await this.showCloseConfirmation(chatId, message.message_id, position, action.page);
+        return;
+      }
+      if (this.dashboardCloseInFlight.has(position.id)) {
+        await this.editDashboardMessage(chatId, message.message_id, "⏳ Close untuk posisi ini sedang diproses.", new InlineKeyboard().text("← Dashboard", dashboardAction("status", action.page)));
+        return;
+      }
+
+      this.dashboardCloseInFlight.add(position.id);
+      await this.editDashboardMessage(chatId, message.message_id, `⏳ Menutup ${position.protocol.toUpperCase()} #${position.positionKey}...`);
+      void this.executeDashboardClose(database, pnl, executor, chatId, message.message_id, position, action.page);
+    } catch (error) {
+      log.warn({ err: error }, "dashboard callback failed");
+      await this.editDashboardMessage(chatId, message.message_id, "❌ Dashboard gagal diperbarui. Tekan Refresh untuk mencoba lagi.", new InlineKeyboard().text("🔄 Refresh", dashboardAction("refresh", 0)));
+    }
+  }
+
+  private async executeDashboardClose(database: Database, pnl: PnlService, executor: Executor, chatId: string, messageId: number, position: PositionRecord, page: number): Promise<void> {
+    try {
+      await executor.execute(position, "manual");
+      await this.refreshDashboardMessage(database, pnl, chatId, messageId, page);
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error);
+      await this.editDashboardMessage(chatId, messageId, `❌ Close #${position.positionKey} gagal: ${text.slice(0, 400)}`, new InlineKeyboard().text("← Dashboard", dashboardAction("status", page)));
+    } finally {
+      this.dashboardCloseInFlight.delete(position.id);
+    }
+  }
+
+  private async buildDashboard(database: Database, pnl: PnlService, requestedPage: number): Promise<DashboardView> {
+    const { active, blocks } = await this.activePositions(database);
+    const pageCount = Math.max(1, Math.ceil(active.length / DASHBOARD_PAGE_SIZE));
+    const page = clampDashboardPage(requestedPage, pageCount);
+    const first = page * DASHBOARD_PAGE_SIZE;
+    const lines = ["LP DASHBOARD", `Updated: ${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC`, ""];
+
+    if (active.length === 0) {
+      lines.push("Tidak ada posisi aktif.");
+    } else {
+      for (let index = first; index < Math.min(first + DASHBOARD_PAGE_SIZE, active.length); index++) {
+        const position = active[index]!;
+        lines.push((await this.formatStatusLine(position, pnl, blocks[position.chainId], index + 1)).trimEnd());
+      }
+    }
+
+    lines.push("");
+    lines.push(`SL: ${this.config.stopLossPercent}% | TP: +${this.config.takeProfitPercent}% | Trail: +${this.config.trailingStopActivationPercent}% / -${this.config.trailingStopDrawdownPercent}%`);
+    lines.push("⚠️ NEEDS REVIEW adalah manual-only");
+    if (pageCount > 1) lines.push(`Page ${page + 1}/${pageCount} | ${active.length} posisi aktif`);
+    return { text: lines.join("\n"), positions: active, page, pageCount };
+  }
+
+  private async activePositions(database: Database): Promise<{ active: PositionRecord[]; blocks: Record<number, bigint> }> {
     const positions: PositionRecord[] = [];
     const blocks: Record<number, bigint> = {};
     for (const chain of this.config.chains) {
@@ -194,35 +306,84 @@ export class Notifier {
       blocks[registry.chain.id] = block;
       positions.push(...(await database.listActivePositions(registry.chain.id)));
     }
+    return { active: positions.filter((position) => position.status !== "paused"), blocks };
+  }
 
-    const active = positions.filter((position) => position.status !== "paused");
-
-    if (active.length === 0) {
-      this.lastStatusCache.delete(chatId);
-      await ctx.reply("No active positions.");
-      return;
+  private dashboardKeyboard(page: number, pageCount: number): InlineKeyboard {
+    const keyboard = new InlineKeyboard()
+      .text("🔄 Refresh", dashboardAction("refresh", page))
+      .text("✖️ Close position", dashboardAction("close", page));
+    if (pageCount > 1) {
+      keyboard.row();
+      if (page > 0) keyboard.text("← Prev", dashboardAction("status", page - 1));
+      if (page < pageCount - 1) keyboard.text("Next →", dashboardAction("status", page + 1));
     }
+    return keyboard;
+  }
 
-    this.lastStatusCache.set(chatId, active);
+  private async refreshDashboardMessage(database: Database, pnl: PnlService, chatId: string, messageId: number, page: number): Promise<void> {
+    const dashboard = await this.buildDashboard(database, pnl, page);
+    this.lastStatusCache.set(chatId, dashboard.positions);
+    await this.editDashboardMessage(chatId, messageId, dashboard.text, this.dashboardKeyboard(dashboard.page, dashboard.pageCount));
+  }
 
-    const sl = this.config.stopLossPercent;
-    const tp = this.config.takeProfitPercent;
-    let replied = false;
-    let message = "LP STATUS\n";
+  private async showCloseMenu(database: Database, chatId: string, messageId: number, requestedPage: number, notice?: string): Promise<void> {
+    const { active } = await this.activePositions(database);
+    const closable = active.filter((position) => canRequestManualClose(position.status));
+    const pageCount = Math.max(1, Math.ceil(closable.length / DASHBOARD_PAGE_SIZE));
+    const page = clampDashboardPage(requestedPage, pageCount);
+    const first = page * DASHBOARD_PAGE_SIZE;
+    const keyboard = new InlineKeyboard();
+    const lines = ["✖️ SELECT POSITION TO CLOSE", "Pilih posisi, lalu konfirmasi sebelum transaksi dimulai."];
+    if (notice) lines.push(`\n${notice}`);
 
-    for (let index = 0; index < active.length; index++) {
-      const position = active[index]!;
-      const line = await this.formatStatusLine(position, pnl, blocks[position.chainId], index + 1);
-      if (message.length + line.length + 1 > 3800) {
-        await ctx.reply(message);
-        replied = true;
-        message = "";
+    if (closable.length === 0) {
+      lines.push("\nTidak ada posisi yang dapat ditutup.");
+    } else {
+      for (const position of closable.slice(first, first + DASHBOARD_PAGE_SIZE)) {
+        keyboard.text(await this.closeButtonLabel(position), dashboardPositionAction("select", page, position)).row();
       }
-      message += line;
+      if (pageCount > 1) {
+        if (page > 0) keyboard.text("← Prev", dashboardAction("close", page - 1));
+        if (page < pageCount - 1) keyboard.text("Next →", dashboardAction("close", page + 1));
+        keyboard.row();
+      }
     }
+    keyboard.text("← Back", dashboardAction("status", page));
+    await this.editDashboardMessage(chatId, messageId, lines.join("\n"), keyboard);
+  }
 
-    message += `\n\nSL: ${sl}% | TP: +${tp}% | Trail: +${this.config.trailingStopActivationPercent}% / -${this.config.trailingStopDrawdownPercent}%\n⚠️ NEEDS REVIEW adalah manual-only\n— /close <nomor> atau /close <key>`;
-    if (replied || message.length > 100) await ctx.reply(message);
+  private async showCloseConfirmation(chatId: string, messageId: number, position: PositionRecord, page: number): Promise<void> {
+    const pair = await this.pairLabel(position);
+    const keyboard = new InlineKeyboard()
+      .text("✅ Confirm close", dashboardPositionAction("confirm", page, position))
+      .text("Cancel", dashboardAction("close", page));
+    await this.editDashboardMessage(chatId, messageId, [
+      "⚠️ CONFIRM CLOSE",
+      `${position.protocol.toUpperCase()} #${position.positionKey} ${pair}`,
+      "Aksi ini menghapus liquidity dan memulai settlement ke quote token.",
+    ].join("\n"), keyboard);
+  }
+
+  private async closeButtonLabel(position: PositionRecord): Promise<string> {
+    const label = `${position.protocol.toUpperCase()} #${position.positionKey} ${await this.pairLabel(position)}`;
+    return label.length <= 64 ? label : `${label.slice(0, 61)}...`;
+  }
+
+  private async findDashboardPosition(database: Database, action: Extract<DashboardAction, { type: "select" | "confirm" }>): Promise<PositionRecord | null> {
+    if (!this.config.chains.some((chain) => this.chains.get(chain).registry.chain.id === action.chainId)) return null;
+    return database.findPositionByKey(action.chainId, action.protocol, action.positionKey);
+  }
+
+  private async editDashboardMessage(chatId: string, messageId: number, text: string, replyMarkup?: InlineKeyboard): Promise<void> {
+    if (!this.bot) return;
+    try {
+      await this.bot.api.editMessageText(chatId, messageId, text, replyMarkup ? { reply_markup: replyMarkup } : { reply_markup: undefined });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("message is not modified")) return;
+      throw error;
+    }
   }
 
   private async formatStatusLine(position: PositionRecord, pnl: PnlService, blockNumber: bigint | undefined, index: number): Promise<string> {
@@ -462,6 +623,58 @@ export class Notifier {
     this.sendQueue = run.then(() => undefined, () => undefined);
     return run;
   }
+}
+
+function dashboardAction(type: "refresh" | "close" | "status", page: number): string {
+  return `lp:${type}:${page}`;
+}
+
+function dashboardPositionAction(type: "select" | "confirm", page: number, position: PositionRecord): string {
+  return `lp:${type}:${page}:${position.chainId}:${position.protocol}:${position.positionKey}`;
+}
+
+export function parseDashboardAction(data: string | undefined): DashboardAction | null {
+  if (!data) return null;
+  const parts = data.split(":");
+  if (parts.length === 3 && parts[0] === "lp" && isDashboardAction(parts[1])) {
+    const page = parseDashboardPage(parts[2]);
+    return page === null ? null : { type: parts[1], page };
+  }
+  if (parts.length === 6 && parts[0] === "lp" && isPositionAction(parts[1])) {
+    const page = parseDashboardPage(parts[2]);
+    const chainId = Number(parts[3]);
+    const protocol = parts[4];
+    const positionKey = parts[5];
+    if (page === null || !Number.isSafeInteger(chainId) || chainId <= 0 || !isProtocol(protocol) || !positionKey) return null;
+    return { type: parts[1], page, chainId, protocol, positionKey };
+  }
+  return null;
+}
+
+export function clampDashboardPage(page: number, pageCount: number): number {
+  return Math.max(0, Math.min(page, Math.max(1, pageCount) - 1));
+}
+
+export function canRequestManualClose(status: PositionStatus): boolean {
+  return status !== "closing" && status !== "settled" && status !== "needs_review";
+}
+
+function parseDashboardPage(value: string | undefined): number | null {
+  if (!value || !/^\d+$/.test(value)) return null;
+  const page = Number(value);
+  return Number.isSafeInteger(page) ? page : null;
+}
+
+function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" {
+  return value === "refresh" || value === "close" || value === "status";
+}
+
+function isPositionAction(value: string | undefined): value is "select" | "confirm" {
+  return value === "select" || value === "confirm";
+}
+
+function isProtocol(value: string | undefined): value is Protocol {
+  return value === "v2" || value === "v3" || value === "v4";
 }
 
 function sleep(ms: number): Promise<void> {
