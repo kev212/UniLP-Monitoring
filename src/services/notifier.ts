@@ -4,11 +4,11 @@ import { isAddress, zeroAddress, type Address } from "viem";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ExitTrigger, PnlSnapshot, PositionRecord, PositionStatus, Protocol } from "../types.js";
+import type { ExitTrigger, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
-import type { PoolScanner, ScoredPool } from "./pool-scanner.js";
+import type { PoolMarketScan, PoolScanFilters, PoolScanner, ScoredPool } from "./pool-scanner.js";
 
 type ChatContext = CommandContext<Context>;
 
@@ -19,7 +19,16 @@ type DashboardAction =
   | { type: "refresh"; page: number }
   | { type: "close"; page: number }
   | { type: "status"; page: number }
+  | { type: "scan"; page: number }
+  | { type: "scan_pools"; page: number }
+  | { type: "config"; page: number }
+  | { type: "config_reset"; page: number }
+  | { type: "config_edit"; key: PoolSettingKey }
+  | { type: "config_quote"; quote: string }
   | { type: "select" | "confirm"; page: number; chainId: number; protocol: Protocol; positionKey: string };
+
+type PoolSettingKey = "market_cap" | "total_tvl" | "age" | "yield" | "max_results";
+type PendingInput = { kind: "scan_token" } | { kind: "config"; key: PoolSettingKey; dashboardMessageId: number };
 
 interface DashboardView {
   text: string;
@@ -32,6 +41,8 @@ export class Notifier {
   private readonly bot?: Bot;
   private readonly lastStatusCache = new Map<string, PositionRecord[]>();
   private readonly dashboardCloseInFlight = new Set<string>();
+  private readonly pendingInput = new Map<string, PendingInput>();
+  private poolScanRunning = false;
 
   constructor(
     private readonly config: RuntimeConfig,
@@ -50,6 +61,7 @@ export class Notifier {
       { command: "status", description: "Tampilkan status semua posisi LP aktif" },
       { command: "close", description: "Tutup posisi LP — fallback /close <nomor> atau /close <key>" },
       { command: "scan", description: "Scan pool Uniswap V3/V4 untuk token — /scan <contract>" },
+      { command: "scan_pools", description: "Cari pool V3/V4 dengan estimasi yield 1 jam tertinggi" },
     ]);
     this.bot.command("status", async (ctx: ChatContext) => {
       await this.handleStatus(ctx, database, pnl);
@@ -60,8 +72,14 @@ export class Notifier {
     this.bot.command("scan", async (ctx: ChatContext) => {
       await this.handleScan(ctx, scanner);
     });
+    this.bot.command("scan_pools", async (ctx: ChatContext) => {
+      await this.handleScanPools(ctx, database, scanner);
+    });
     this.bot.callbackQuery(/^lp:/, async (ctx) => {
-      await this.handleDashboardCallback(ctx, database, pnl, executor);
+      await this.handleDashboardCallback(ctx, database, pnl, executor, scanner);
+    });
+    this.bot.on("message:text", async (ctx) => {
+      await this.handlePendingInput(ctx, database, scanner);
     });
   }
 
@@ -215,7 +233,7 @@ export class Notifier {
     await ctx.reply(dashboard.text, { reply_markup: this.dashboardKeyboard(dashboard.page, dashboard.pageCount) });
   }
 
-  private async handleDashboardCallback(ctx: Context, database: Database, pnl: PnlService, executor: Executor): Promise<void> {
+  private async handleDashboardCallback(ctx: Context, database: Database, pnl: PnlService, executor: Executor, scanner: PoolScanner): Promise<void> {
     const callback = ctx.callbackQuery;
     const message = callback?.message;
     if (!callback || !message || !("chat" in message)) {
@@ -241,6 +259,42 @@ export class Notifier {
       }
       if (action.type === "close") {
         await this.showCloseMenu(database, chatId, message.message_id, action.page);
+        return;
+      }
+      if (action.type === "scan") {
+        this.pendingInput.set(chatId, { kind: "scan_token" });
+        await ctx.reply("Kirim address token Robinhood untuk di-scan.", { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } });
+        return;
+      }
+      if (action.type === "scan_pools") {
+        await this.handleScanPools(ctx as ChatContext, database, scanner);
+        return;
+      }
+      if (action.type === "config") {
+        await this.showPoolScanConfig(database, chatId, message.message_id);
+        return;
+      }
+      if (action.type === "config_reset") {
+        await database.clearPoolScanSettings(chatId);
+        await this.showPoolScanConfig(database, chatId, message.message_id, "Config dikembalikan ke default ENV.");
+        return;
+      }
+      if (action.type === "config_edit") {
+        this.pendingInput.set(chatId, { kind: "config", key: action.key, dashboardMessageId: message.message_id });
+        await ctx.reply(configInputPrompt(action.key), { reply_markup: { force_reply: true } });
+        return;
+      }
+      if (action.type === "config_quote") {
+        const settings = await this.poolScanSettings(database, chatId);
+        const allowedQuotes = settings.allowedQuotes.includes(action.quote)
+          ? settings.allowedQuotes.filter((quote) => quote !== action.quote)
+          : [...settings.allowedQuotes, action.quote];
+        if (allowedQuotes.length === 0) {
+          await ctx.reply("Minimal satu quote token harus aktif.");
+          return;
+        }
+        await database.setPoolScanSettings(chatId, { ...settings, allowedQuotes });
+        await this.showPoolScanConfig(database, chatId, message.message_id);
         return;
       }
 
@@ -349,6 +403,10 @@ export class Notifier {
     const keyboard = new InlineKeyboard()
       .text("🔄 Refresh", dashboardAction("refresh", page))
       .text("✖️ Close position", dashboardAction("close", page));
+    keyboard.row()
+      .text("🔍 Scan token", dashboardAction("scan", page))
+      .text("🏆 Scan pools", dashboardAction("scan_pools", page));
+    keyboard.row().text("⚙️ Pool scan config", dashboardAction("config", page));
     if (pageCount > 1) {
       keyboard.row();
       if (page > 0) keyboard.text("← Prev", dashboardAction("status", page - 1));
@@ -471,6 +529,10 @@ export class Notifier {
       return;
     }
 
+    await this.runTokenScan(ctx, scanner, raw as Address);
+  }
+
+  private async runTokenScan(ctx: Context, scanner: PoolScanner, token: Address): Promise<void> {
     const elapsed = Date.now() - this.lastScanAt;
     if (elapsed < 15_000) {
       await ctx.reply(`Tunggu ${Math.ceil((15_000 - elapsed) / 1_000)} detik sebelum scan berikutnya.`);
@@ -478,13 +540,13 @@ export class Notifier {
     }
     this.lastScanAt = Date.now();
 
-    await ctx.reply(`🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(raw)} di Robinhood...`);
+    await ctx.reply(`🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(token)} di Robinhood...`);
 
     let scan;
     try {
-      scan = await scanner.scan(raw as Address);
+      scan = await scanner.scan(token);
     } catch (error) {
-      await ctx.reply(`Scan gagal: ${error instanceof Error ? error.message.slice(0, 500) : "unknown error"}`);
+      await ctx.reply(`Scan gagal: ${errorMessage(error).slice(0, 500)}`);
       return;
     }
 
@@ -494,7 +556,7 @@ export class Notifier {
     }
 
     const lines: string[] = [
-      `🔍 SCAN: ${shortAddress(raw)}`,
+      `🔍 SCAN: ${shortAddress(token)}`,
       "Chain: Robinhood (4663)",
       `Top active: ${scan.active.length} | Watchlist: ${scan.watchlist.length}`,
       "",
@@ -511,9 +573,109 @@ export class Notifier {
       }
     }
 
-    lines.push("", "Rumus: (vol6h × feeRate / TVL) × √(TVL / (TVL + $1M))");
+    lines.push("", "Yield 1h: (vol1h × feeRate / TVL). Score memakai Vol 6h dan safety factor.");
 
     await ctx.reply(lines.join("\n"));
+  }
+
+  private async handleScanPools(ctx: Context, database: Database, scanner: PoolScanner): Promise<void> {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId || !this.authorized(chatId)) return;
+    if (this.poolScanRunning) {
+      await ctx.reply("🏆 Scan pools masih berjalan. Tunggu hasil sebelumnya.");
+      return;
+    }
+    this.poolScanRunning = true;
+    await ctx.reply("🏆 Memeriksa kandidat Uniswap V3/V4 Robinhood berdasarkan yield 1h...");
+    try {
+      const filters = await this.poolScanFilters(database, chatId);
+      const scan = await scanner.scanPools(filters);
+      await this.replyLong(ctx, formatPoolMarketScan(scan, filters));
+    } catch (error) {
+      await ctx.reply(`Scan pools gagal: ${errorMessage(error).slice(0, 500)}`);
+    } finally {
+      this.poolScanRunning = false;
+    }
+  }
+
+  private async handlePendingInput(ctx: Context, database: Database, scanner: PoolScanner): Promise<void> {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId || !this.authorized(chatId)) return;
+    const pending = this.pendingInput.get(chatId);
+    const text = ctx.message?.text?.trim();
+    if (!pending || !text || text.startsWith("/")) return;
+    this.pendingInput.delete(chatId);
+    if (pending.kind === "scan_token") {
+      if (!isAddress(text)) {
+        await ctx.reply("Address token tidak valid.");
+        return;
+      }
+      await this.runTokenScan(ctx, scanner, text as Address);
+      return;
+    }
+    try {
+      const settings = await this.poolScanSettings(database, chatId);
+      const next = { ...settings, ...parsePoolScanInput(pending.key, text) };
+      await database.setPoolScanSettings(chatId, next);
+      await ctx.reply("✅ Pool scan config diperbarui.");
+      await this.showPoolScanConfig(database, chatId, pending.dashboardMessageId);
+    } catch (error) {
+      await ctx.reply(`Config tidak valid: ${errorMessage(error).slice(0, 200)}`);
+    }
+  }
+
+  private async poolScanSettings(database: Database, chatId: string): Promise<PoolScanSettings> {
+    return (await database.getPoolScanSettings(chatId)) ?? this.config.poolScanDefaults;
+  }
+
+  private async poolScanFilters(database: Database, chatId: string): Promise<PoolScanFilters> {
+    const settings = await this.poolScanSettings(database, chatId);
+    const allowedQuoteAddresses = settings.allowedQuotes.map((symbol) => {
+      const quote = this.config.quoteTokens.robinhood.find((entry) => entry.symbol === symbol);
+      if (!quote) throw new Error(`Quote token ${symbol} tidak ada di QUOTE_TOKEN_ALLOWLIST_ROBINHOOD`);
+      return quote.address;
+    });
+    return { ...settings, allowedQuoteAddresses };
+  }
+
+  private async showPoolScanConfig(database: Database, chatId: string, messageId: number, notice?: string): Promise<void> {
+    const settings = await this.poolScanSettings(database, chatId);
+    const keyboard = new InlineKeyboard()
+      .text("Min MC", "lp:cfg:market_cap")
+      .text("Min TVL", "lp:cfg:total_tvl")
+      .row()
+      .text("Min usia", "lp:cfg:age")
+      .text("Min yield/h", "lp:cfg:yield")
+      .row()
+      .text("Top N", "lp:cfg:max_results")
+      .row();
+    for (const quote of ["USDG", "WETH", "ETH"]) {
+      keyboard.text(`${settings.allowedQuotes.includes(quote) ? "✅" : "⬜"} ${quote}`, `lp:cfgquote:${quote}`);
+    }
+    keyboard.row().text("Reset ENV", "lp:cfgreset:0").text("← Back", dashboardAction("status", 0));
+    const lines = [
+      "⚙️ POOL SCAN CONFIG",
+      `Min market cap: $${fmtUsd(settings.minMarketCapUsd)}`,
+      `Min total active TVL V3/V4: $${fmtUsd(settings.minTotalActiveTvlUsd)}`,
+      `Min usia pool tertua: ${fmtDuration(settings.minPoolAgeSeconds)}`,
+      `Min gross yield/h: ${fmtPercent(settings.minYieldHourlyPercent)}`,
+      `Top results: ${settings.maxResults}`,
+      `Quote: ${settings.allowedQuotes.join(", ")}`,
+    ];
+    if (notice) lines.push("", notice);
+    await this.editDashboardMessage(chatId, messageId, lines.join("\n"), keyboard);
+  }
+
+  private async replyLong(ctx: Context, text: string): Promise<void> {
+    let message = "";
+    for (const line of text.split("\n")) {
+      if (message.length + line.length + 1 > 3_800) {
+        await ctx.reply(message);
+        message = "";
+      }
+      message += `${message ? "\n" : ""}${line}`;
+    }
+    if (message) await ctx.reply(message);
   }
 
   private async handleClose(ctx: ChatContext, database: Database, executor: Executor): Promise<void> {
@@ -661,7 +823,7 @@ export class Notifier {
   }
 }
 
-function dashboardAction(type: "refresh" | "close" | "status", page: number): string {
+function dashboardAction(type: "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset", page: number): string {
   return `lp:${type}:${page}`;
 }
 
@@ -684,6 +846,12 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
     if (page === null || !Number.isSafeInteger(chainId) || chainId <= 0 || !isProtocol(protocol) || !positionKey) return null;
     return { type: parts[1], page, chainId, protocol, positionKey };
   }
+  if (parts.length === 3 && parts[0] === "lp" && parts[1] === "cfg" && isPoolSettingKey(parts[2])) {
+    return { type: "config_edit", key: parts[2] };
+  }
+  if (parts.length === 3 && parts[0] === "lp" && parts[1] === "cfgquote" && ["USDG", "WETH", "ETH"].includes(parts[2] ?? "")) {
+    return { type: "config_quote", quote: parts[2]! };
+  }
   return null;
 }
 
@@ -701,8 +869,8 @@ function parseDashboardPage(value: string | undefined): number | null {
   return Number.isSafeInteger(page) ? page : null;
 }
 
-function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" {
-  return value === "refresh" || value === "close" || value === "status";
+function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" {
+  return value === "refresh" || value === "close" || value === "status" || value === "scan" || value === "scan_pools" || value === "config" || value === "config_reset";
 }
 
 function isPositionAction(value: string | undefined): value is "select" | "confirm" {
@@ -711,6 +879,10 @@ function isPositionAction(value: string | undefined): value is "select" | "confi
 
 function isProtocol(value: string | undefined): value is Protocol {
   return value === "v2" || value === "v3" || value === "v4";
+}
+
+function isPoolSettingKey(value: string | undefined): value is PoolSettingKey {
+  return value === "market_cap" || value === "total_tvl" || value === "age" || value === "yield" || value === "max_results";
 }
 
 export function isExpiredCallbackError(error: unknown): boolean {
@@ -807,14 +979,65 @@ function scoreStars(score: number): string {
   return "☆☆☆☆☆";
 }
 
+function parsePoolScanInput(key: PoolSettingKey, value: string): Partial<PoolScanSettings> {
+  if (key === "age") {
+    const match = value.trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*([mhd])$/);
+    if (!match?.[1] || !match[2]) throw new Error("usia harus seperti 30m, 1h, atau 2d");
+    const amount = Number(match[1]);
+    const multiplier = match[2] === "m" ? 60 : match[2] === "h" ? 3_600 : 86_400;
+    if (!Number.isFinite(amount) || amount < 0) throw new Error("usia harus angka positif");
+    return { minPoolAgeSeconds: Math.floor(amount * multiplier) };
+  }
+  const number = Number(value.replace(/[$,%\s,]/g, ""));
+  if (!Number.isFinite(number) || number < 0) throw new Error("nilai harus angka positif");
+  if (key === "market_cap") return { minMarketCapUsd: number };
+  if (key === "total_tvl") return { minTotalActiveTvlUsd: number };
+  if (key === "yield") return { minYieldHourlyPercent: number };
+  if (!Number.isInteger(number) || number < 1 || number > 20) throw new Error("Top N harus integer 1 sampai 20");
+  return { maxResults: number };
+}
+
+function configInputPrompt(key: PoolSettingKey): string {
+  if (key === "market_cap") return "Kirim Min market cap, contoh: 500000 atau $500K.";
+  if (key === "total_tvl") return "Kirim Min total active TVL V3/V4, contoh: 70000.";
+  if (key === "age") return "Kirim Min usia pool tertua, contoh: 30m, 1h, atau 2d.";
+  if (key === "yield") return "Kirim Min gross yield per jam, contoh: 1 atau 1%.";
+  return "Kirim jumlah hasil top, dari 1 sampai 20.";
+}
+
+function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters): string {
+  const lines = [
+    "🏆 TOP POOL YIELD 1H",
+    "Chain: Robinhood (4663) | Uniswap V3/V4",
+    `Kandidat: ${scan.candidateTokens} | Token lolos enrichment: ${scan.evaluatedTokens}`,
+    `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | TVL aktif > $${fmtUsd(filters.minTotalActiveTvlUsd)} | Usia > ${fmtDuration(filters.minPoolAgeSeconds)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
+    `Quote: ${filters.allowedQuotes.join(", ")}`,
+    "",
+  ];
+  if (scan.pools.length === 0) {
+    lines.push("Tidak ada kandidat yang lolos semua filter.");
+    return lines.join("\n");
+  }
+  for (let index = 0; index < scan.pools.length; index++) {
+    const pool = scan.pools[index]!;
+    const effectiveFee = pool.currentLpFee ?? pool.feeTier;
+    lines.push(`${index + 1}. ${pool.protocol.toUpperCase()} ${pool.pair} | ${(effectiveFee / 10_000).toFixed(2)}%${pool.dynamicFee ? " dynamic" : ""}`);
+    lines.push(`   Yield/h: ${fmtPercent(pool.estimatedPoolYield1hPercent)} | Vol 1h: $${fmtUsd(pool.volume1hUsd)} | Est. fees 1h: $${fmtUsd(pool.estimatedPoolFees1hUsd)}`);
+    lines.push(`   MC: $${fmtUsd(pool.tokenMarketCapUsd ?? 0)} | Total active TVL V3/V4: $${fmtUsd(pool.tokenTotalActiveTvlUsd ?? 0)} | Usia: ${fmtDuration(pool.tokenOldestPoolAgeSeconds ?? 0)}`);
+    lines.push(`   Pool TVL: $${fmtUsd(pool.tvlUsd)} | Uniswap: ${pool.uniswapUrl}`);
+  }
+  lines.push("", "Yield adalah estimasi gross pool, bukan hasil personal LP.");
+  return lines.join("\n");
+}
+
 function formatScanPool(pool: ScoredPool, label: string): string[] {
   const effectiveFee = pool.currentLpFee ?? pool.feeTier;
   const feePct = (effectiveFee / 10_000).toFixed(2);
   const dynamicLabel = pool.dynamicFee ? " (dynamic)" : "";
   const lines = [
     `${label} ${scoreStars(pool.score)} ${pool.protocol.toUpperCase()} ${pool.pair} | ${feePct}%${dynamicLabel}`,
-    `   TVL: $${fmtUsd(pool.tvlUsd)} | Vol 6h: $${fmtUsd(pool.volume6hUsd)} | Est. gross fees 6h: $${fmtUsd(pool.estimatedPoolFees6hUsd)}`,
-    `   Est. gross yield/h: ${fmtPercent(pool.estimatedPoolYieldHourlyPercent)}`,
+    `   TVL: $${fmtUsd(pool.tvlUsd)} | Vol 1h: $${fmtUsd(pool.volume1hUsd)} | Gross yield/h (1h): ${fmtPercent(pool.estimatedPoolYield1hPercent)}`,
+    `   Vol 6h: $${fmtUsd(pool.volume6hUsd)} | Est. gross fees 6h: $${fmtUsd(pool.estimatedPoolFees6hUsd)} | Yield/h 6h avg: ${fmtPercent(pool.estimatedPoolYieldHourlyPercent)}`,
     `   Score: ${pool.score.toFixed(6)} | Uniswap: ${pool.uniswapUrl}`,
   ];
   if (pool.warnings.length > 0) lines.push(`   ⚠️ ${pool.warnings.join(", ")}`);
@@ -833,4 +1056,10 @@ function fmtPercent(value: number): string {
   if (value >= 1) return `${value.toFixed(2)}%`;
   if (value >= 0.01) return `${value.toFixed(3)}%`;
   return `${value.toFixed(4)}%`;
+}
+
+function fmtDuration(seconds: number): string {
+  if (seconds >= 86_400) return `${(seconds / 86_400).toFixed(seconds % 86_400 === 0 ? 0 : 1)}d`;
+  if (seconds >= 3_600) return `${(seconds / 3_600).toFixed(seconds % 3_600 === 0 ? 0 : 1)}h`;
+  return `${Math.floor(seconds / 60)}m`;
 }

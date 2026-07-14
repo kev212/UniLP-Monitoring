@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { isAddress, type Address, type Hex } from "viem";
 import { z } from "zod";
 
-import type { ChainName, QuoteToken } from "./types.js";
+import type { ChainName, PoolScanSettings, QuoteToken } from "./types.js";
 
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
@@ -33,6 +33,12 @@ const envSchema = z.object({
   PNL_INCLUDE_GAS: z.string().default("false"),
   APPROVAL_MODE: z.literal("exact").default("exact"),
   DRY_RUN: z.string().default("true"),
+  POOL_SCAN_MIN_MARKET_CAP_USD: z.coerce.number().nonnegative().default(500_000),
+  POOL_SCAN_MIN_TOTAL_ACTIVE_TVL_USD: z.coerce.number().nonnegative().default(70_000),
+  POOL_SCAN_MIN_POOL_AGE_SECONDS: z.coerce.number().int().nonnegative().default(3_600),
+  POOL_SCAN_MIN_YIELD_HOURLY_PERCENT: z.coerce.number().nonnegative().default(1),
+  POOL_SCAN_MAX_RESULTS: z.coerce.number().int().min(1).max(20).default(10),
+  POOL_SCAN_ALLOWED_QUOTES: z.string().default("USDG,WETH,ETH"),
   UNISWAP_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
   THEGRAPH_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
   CONFIRMATIONS: z.coerce.number().int().min(1).max(32).default(2),
@@ -67,6 +73,7 @@ export interface RuntimeConfig {
   twapWindowSeconds: number;
   pnlIncludeGas: boolean;
   dryRun: boolean;
+  poolScanDefaults: PoolScanSettings;
   uniswapApiKey?: string;
   thegraphApiKey?: string;
   confirmations: number;
@@ -112,6 +119,12 @@ function parseQuoteTokens(value: string, field: string): QuoteToken[] {
     seen.add(normalized);
     return { symbol: symbol.toUpperCase(), address: address as Address };
   });
+}
+
+function parseSymbols(value: string, field: string): string[] {
+  const symbols = value.split(",").map((symbol) => symbol.trim().toUpperCase()).filter(Boolean);
+  if (symbols.length === 0) throw new Error(`${field} must include at least one symbol`);
+  return [...new Set(symbols)];
 }
 
 function loadPrivateKey(file?: string, direct?: string): Hex | undefined {
@@ -170,6 +183,14 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     twapWindowSeconds: env.TWAP_WINDOW_SECONDS,
     pnlIncludeGas: parseBoolean(env.PNL_INCLUDE_GAS, "PNL_INCLUDE_GAS"),
     dryRun: parseBoolean(env.DRY_RUN, "DRY_RUN"),
+    poolScanDefaults: {
+      minMarketCapUsd: env.POOL_SCAN_MIN_MARKET_CAP_USD,
+      minTotalActiveTvlUsd: env.POOL_SCAN_MIN_TOTAL_ACTIVE_TVL_USD,
+      minPoolAgeSeconds: env.POOL_SCAN_MIN_POOL_AGE_SECONDS,
+      minYieldHourlyPercent: env.POOL_SCAN_MIN_YIELD_HOURLY_PERCENT,
+      maxResults: env.POOL_SCAN_MAX_RESULTS,
+      allowedQuotes: parseSymbols(env.POOL_SCAN_ALLOWED_QUOTES, "POOL_SCAN_ALLOWED_QUOTES"),
+    },
     uniswapApiKey: env.UNISWAP_API_KEY,
     thegraphApiKey: env.THEGRAPH_API_KEY,
     confirmations: env.CONFIRMATIONS,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { estimatedHourlyYieldPercent, hasMinimumScanVolume6h, MIN_VOLUME_6H_USD, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
+import { estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, MIN_VOLUME_6H_USD, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
 
 describe("pool scoring formula", () => {
   const K = 1_000_000;
@@ -77,6 +77,11 @@ describe("scan pool eligibility", () => {
   it("calculates gross pool yield per hour from six-hour fees and TVL", () => {
     expect(estimatedHourlyYieldPercent(60, 1_000)).toBeCloseTo(1);
     expect(estimatedHourlyYieldPercent(60, 0)).toBe(0);
+  });
+
+  it("calculates a one-hour yield without applying the six-hour average divisor", () => {
+    expect(estimatedYieldPercent(10, 1_000, 1)).toBeCloseTo(1);
+    expect(estimatedHourlyYieldPercent(10, 1_000)).toBeCloseTo(10 / 1_000 / 6 * 100);
   });
 
   it("builds an Uniswap explorer URL from either a pool address or V4 pool ID", () => {

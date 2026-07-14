@@ -34,6 +34,12 @@ MAX_SWAP_SLIPPAGE_BPS=100
 PNL_INCLUDE_GAS=false
 APPROVAL_MODE=exact
 DRY_RUN=true
+POOL_SCAN_MIN_MARKET_CAP_USD=500000
+POOL_SCAN_MIN_TOTAL_ACTIVE_TVL_USD=70000
+POOL_SCAN_MIN_POOL_AGE_SECONDS=3600
+POOL_SCAN_MIN_YIELD_HOURLY_PERCENT=1
+POOL_SCAN_MAX_RESULTS=10
+POOL_SCAN_ALLOWED_QUOTES=USDG,WETH,ETH
 ```
 
 Gunakan endpoint Alchemy untuk initial discovery dan archive reads:
@@ -71,6 +77,10 @@ Docker membaca private key dari `./secrets/executor_private_key`; file tersebut 
 6. Kegagalan setelah close tetap berada di `closing` dan dicoba lagi otomatis; posisi tidak di-remove dua kali.
 
 ## Commands
+
+- `/status`: buka dashboard posisi dengan tombol refresh, close, scan token, scan pools, dan config filter.
+- `/scan <token-address>`: cari pool V3/V4 untuk token tertentu; menampilkan Vol 1h/yield 1h dan ranking safety Vol 6h.
+- `/scan_pools`: mode kandidat cepat untuk pool V3/V4 Robinhood dengan gross yield 1h tertinggi. Filter market cap, total active TVL V3/V4, usia pool tertua sebagai proxy usia token, quote, yield, dan hasil maksimum dapat diubah dari Dashboard > Pool scan config. Override dashboard disimpan di PostgreSQL dan Reset kembali ke default ENV.
 
 ```bash
 npm run dev

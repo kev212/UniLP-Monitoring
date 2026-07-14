@@ -1,7 +1,7 @@
 import { Pool, type PoolClient } from "pg";
 import type { Address } from "viem";
 
-import type { PnlSnapshot, PositionRecord, PositionStatus, Protocol, TrailingStopState } from "./types.js";
+import type { PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol, TrailingStopState } from "./types.js";
 
 interface PositionRow {
   id: string;
@@ -124,6 +124,11 @@ export class Database {
         observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS pool_observations_lookup_idx ON pool_observations(chain_id, protocol, pool_key, observed_at DESC);
+      CREATE TABLE IF NOT EXISTS telegram_pool_scan_settings (
+        chat_id TEXT PRIMARY KEY,
+        settings JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
     `);
   }
 
@@ -235,6 +240,27 @@ export class Database {
       chainId ? [chainId] : [],
     );
     return result.rows.map(mapPosition);
+  }
+
+  async getPoolScanSettings(chatId: string): Promise<PoolScanSettings | null> {
+    const result = await this.pool.query<{ settings: PoolScanSettings }>(
+      "SELECT settings FROM telegram_pool_scan_settings WHERE chat_id = $1",
+      [chatId],
+    );
+    return result.rowCount ? result.rows[0]!.settings : null;
+  }
+
+  async setPoolScanSettings(chatId: string, settings: PoolScanSettings): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO telegram_pool_scan_settings (chat_id, settings)
+       VALUES ($1, $2)
+       ON CONFLICT (chat_id) DO UPDATE SET settings = EXCLUDED.settings, updated_at = NOW()`,
+      [chatId, JSON.stringify(settings)],
+    );
+  }
+
+  async clearPoolScanSettings(chatId: string): Promise<void> {
+    await this.pool.query("DELETE FROM telegram_pool_scan_settings WHERE chat_id = $1", [chatId]);
   }
 
   async findPositionByKey(chainId: number, protocol: string, positionKey: string): Promise<PositionRecord | null> {

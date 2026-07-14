@@ -19,6 +19,12 @@ describe("Telegram dashboard callbacks", () => {
     });
   });
 
+  it("parses pool-scan dashboard callbacks", () => {
+    expect(parseDashboardAction("lp:scan_pools:0")).toEqual({ type: "scan_pools", page: 0 });
+    expect(parseDashboardAction("lp:cfg:yield")).toEqual({ type: "config_edit", key: "yield" });
+    expect(parseDashboardAction("lp:cfgquote:WETH")).toEqual({ type: "config_quote", quote: "WETH" });
+  });
+
   it("rejects malformed or unsupported callbacks", () => {
     expect(parseDashboardAction("lp:confirm:1:4663:v5:49339")).toBeNull();
     expect(parseDashboardAction("lp:select:-1:4663:v4:49339")).toBeNull();

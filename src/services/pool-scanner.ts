@@ -1,6 +1,7 @@
 import { isAddress, isHex, type Address, type Hex } from "viem";
 
 import { log } from "../log.js";
+import type { PoolScanSettings } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
@@ -15,7 +16,10 @@ export interface ScoredPool {
   feeTier: number;
   feeRate: number;
   tvlUsd: number;
+  volume1hUsd: number;
   volume6hUsd: number;
+  estimatedPoolFees1hUsd: number;
+  estimatedPoolYield1hPercent: number;
   estimatedPoolFees6hUsd: number;
   estimatedPoolYieldHourlyPercent: number;
   score: number;
@@ -24,11 +28,24 @@ export interface ScoredPool {
   currentLpFee?: number;
   stale: boolean;
   warnings: string[];
+  tokenMarketCapUsd?: number;
+  tokenTotalActiveTvlUsd?: number;
+  tokenOldestPoolAgeSeconds?: number;
 }
 
 export interface PoolScan {
   active: ScoredPool[];
   watchlist: ScoredPool[];
+}
+
+export interface PoolScanFilters extends PoolScanSettings {
+  allowedQuoteAddresses: Address[];
+}
+
+export interface PoolMarketScan {
+  pools: ScoredPool[];
+  candidateTokens: number;
+  evaluatedTokens: number;
 }
 
 interface VerifiedPool {
@@ -45,6 +62,7 @@ interface GeckoPool {
     name: string;
     pool_name?: string;
     reserve_in_usd: string;
+    pool_created_at?: string;
     volume_usd: { h1: string; h6: string; h24: string };
     base_token_price_usd?: string;
   };
@@ -56,10 +74,12 @@ interface GeckoPool {
 }
 
 interface GeckoTokenResponse {
-  data: Array<{ id: string; type: string; attributes: { name: string; symbol: string } }>;
+  data: { attributes: { market_cap_usd?: string | null } };
 }
 
 export class PoolScanner {
+  private marketScanCache?: { key: string; expiresAt: number; result: PoolMarketScan };
+
   constructor(
     private readonly chains: ChainClients,
   ) {}
@@ -72,15 +92,55 @@ export class PoolScanner {
 
     const scored: ScoredPool[] = [];
     for (const raw of pools) {
-      const pool = await this.toScoredPool(raw, normalized);
+      const pool = await this.toScoredPool(raw, normalized, true);
       if (pool) scored.push(pool);
     }
 
     return rankPools(scored);
   }
 
+  async scanPools(filters: PoolScanFilters): Promise<PoolMarketScan> {
+    const key = JSON.stringify({ ...filters, allowedQuoteAddresses: [...filters.allowedQuoteAddresses].sort() });
+    if (this.marketScanCache?.key === key && this.marketScanCache.expiresAt > Date.now()) return this.marketScanCache.result;
+    const [v3Pools, v4Pools] = await Promise.all([
+      this.fetchDexPools("uniswap-v3-robinhood"),
+      this.fetchDexPools("uniswap-v4-robinhood"),
+    ]);
+    const candidates = new Map<string, number>();
+    for (const raw of [...v3Pools, ...v4Pools]) {
+      const token = nonQuoteToken(raw, filters.allowedQuoteAddresses);
+      if (!token) continue;
+      const tvlUsd = Number(raw.attributes.reserve_in_usd || "0");
+      const volume1hUsd = Number(raw.attributes.volume_usd?.h1 || "0");
+      const feeRate = feeRateFromName(raw.attributes.pool_name ?? raw.attributes.name);
+      if (!Number.isFinite(tvlUsd) || tvlUsd <= 0 || !Number.isFinite(volume1hUsd) || volume1hUsd <= 0 || feeRate === null) continue;
+      const yield1h = estimatedYieldPercent(volume1hUsd * feeRate, tvlUsd, 1);
+      if (yield1h < filters.minYieldHourlyPercent) continue;
+      candidates.set(token, Math.max(candidates.get(token) ?? 0, yield1h));
+    }
+
+    const candidateTokens = [...candidates.entries()]
+      .sort(([, left], [, right]) => right - left)
+      .slice(0, 20)
+      .map(([token]) => token);
+    const enriched = await mapWithConcurrency(candidateTokens, 3, (token) => this.enrichToken(token, filters));
+    const pools = enriched.flatMap((result) => result ?? [])
+      .sort((left, right) => right.estimatedPoolYield1hPercent - left.estimatedPoolYield1hPercent || right.tvlUsd - left.tvlUsd)
+      .slice(0, filters.maxResults);
+    const result = { pools, candidateTokens: candidateTokens.length, evaluatedTokens: enriched.filter(Boolean).length };
+    this.marketScanCache = { key, expiresAt: Date.now() + 60_000, result };
+    return result;
+  }
+
   private async fetchUniswapPools(token: string): Promise<GeckoPool[]> {
-    const url = `${GECKO_BASE}/networks/robinhood/tokens/${token}/pools?page=1`;
+    return this.fetchPools(`${GECKO_BASE}/networks/robinhood/tokens/${token}/pools?page=1`, token);
+  }
+
+  private async fetchDexPools(dex: "uniswap-v3-robinhood" | "uniswap-v4-robinhood"): Promise<GeckoPool[]> {
+    return this.fetchPools(`${GECKO_BASE}/networks/robinhood/dexes/${dex}/pools?page=1`, dex);
+  }
+
+  private async fetchPools(url: string, context: string): Promise<GeckoPool[]> {
 
     let response: Response;
     try {
@@ -89,12 +149,12 @@ export class PoolScanner {
         signal: AbortSignal.timeout(15_000),
       });
     } catch (error) {
-      log.warn({ err: error, token }, "GeckoTerminal request failed");
+      log.warn({ error: error instanceof Error ? error.message : String(error), context }, "GeckoTerminal request failed");
       return [];
     }
 
     if (!response.ok) {
-      log.warn({ status: response.status, token }, "GeckoTerminal responded with error");
+      log.warn({ status: response.status, context }, "GeckoTerminal responded with error");
       return [];
     }
 
@@ -114,7 +174,7 @@ export class PoolScanner {
     });
   }
 
-  private async toScoredPool(raw: GeckoPool, token: string): Promise<ScoredPool | null> {
+  private async toScoredPool(raw: GeckoPool, token: string, requireMinimumVolume6h: boolean): Promise<ScoredPool | null> {
     const dexId = raw.relationships.dex.data.id;
     const protocol = dexId.startsWith("uniswap-v4") ? "v4" : "v3";
     const poolAddress = raw.attributes.address;
@@ -127,7 +187,7 @@ export class PoolScanner {
     if (!Number.isFinite(tvlUsd) || tvlUsd <= 0) return null;
 
     const volume6hUsd = Number(raw.attributes.volume_usd?.h6 || "0");
-    if (!hasMinimumScanVolume6h(volume6hUsd)) return null;
+    if (requireMinimumVolume6h && !hasMinimumScanVolume6h(volume6hUsd)) return null;
     const volume24hUsd = Number(raw.attributes.volume_usd?.h24 || "0");
     const stale = volume24hUsd > 0 && volume6hUsd <= 0;
 
@@ -148,6 +208,9 @@ export class PoolScanner {
     }
 
     const feeRate = feeTier / 1_000_000;
+    const volume1hUsd = Number(raw.attributes.volume_usd?.h1 || "0");
+    const estimatedPoolFees1hUsd = volume1hUsd * feeRate;
+    const estimatedPoolYield1hPercent = estimatedYieldPercent(estimatedPoolFees1hUsd, tvlUsd, 1);
     const estimatedPoolFees6hUsd = volume6hUsd * feeRate;
     const estimatedPoolYieldHourlyPercent = estimatedHourlyYieldPercent(estimatedPoolFees6hUsd, tvlUsd);
     const safetyFactor = Math.sqrt(tvlUsd / (tvlUsd + K));
@@ -170,7 +233,10 @@ export class PoolScanner {
       feeTier: verified.feeTier ?? 0,
       feeRate,
       tvlUsd,
+      volume1hUsd,
       volume6hUsd,
+      estimatedPoolFees1hUsd,
+      estimatedPoolYield1hPercent,
       estimatedPoolFees6hUsd,
       estimatedPoolYieldHourlyPercent,
       score,
@@ -180,6 +246,39 @@ export class PoolScanner {
       stale,
       warnings,
     };
+  }
+
+  private async enrichToken(token: string, filters: PoolScanFilters): Promise<ScoredPool[] | null> {
+    const [tokenResponse, rawPools] = await Promise.all([
+      this.fetchToken(token),
+      this.fetchUniswapPools(token),
+    ]);
+    const marketCapUsd = Number(tokenResponse?.data.attributes.market_cap_usd ?? "NaN");
+    if (!Number.isFinite(marketCapUsd) || marketCapUsd <= filters.minMarketCapUsd) return null;
+    const relevantRaw = rawPools.filter((pool) => nonQuoteToken(pool, filters.allowedQuoteAddresses) === token);
+    if (relevantRaw.length === 0) return null;
+    const scored = (await mapWithConcurrency(relevantRaw, 3, (pool) => this.toScoredPool(pool, token, false))).filter((pool): pool is ScoredPool => pool !== null);
+    const active = scored.filter((pool) => pool.activeLiquidity);
+    const totalActiveTvlUsd = active.reduce((total, pool) => total + pool.tvlUsd, 0);
+    const oldestCreatedAt = relevantRaw
+      .map((pool) => Date.parse(pool.attributes.pool_created_at ?? ""))
+      .filter(Number.isFinite)
+      .reduce((oldest, createdAt) => Math.min(oldest, createdAt), Number.POSITIVE_INFINITY);
+    const oldestPoolAgeSeconds = Number.isFinite(oldestCreatedAt) ? Math.max(0, Math.floor((Date.now() - oldestCreatedAt) / 1_000)) : 0;
+    if (totalActiveTvlUsd <= filters.minTotalActiveTvlUsd || oldestPoolAgeSeconds <= filters.minPoolAgeSeconds) return null;
+    return active
+      .filter((pool) => pool.estimatedPoolYield1hPercent > filters.minYieldHourlyPercent)
+      .map((pool) => ({ ...pool, tokenMarketCapUsd: marketCapUsd, tokenTotalActiveTvlUsd: totalActiveTvlUsd, tokenOldestPoolAgeSeconds: oldestPoolAgeSeconds }));
+  }
+
+  private async fetchToken(token: string): Promise<GeckoTokenResponse | null> {
+    try {
+      const response = await fetch(`${GECKO_BASE}/networks/robinhood/tokens/${token}`, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
+      if (!response.ok) return null;
+      return await response.json() as GeckoTokenResponse;
+    } catch {
+      return null;
+    }
   }
 
   private async verifyPool(
@@ -302,8 +401,12 @@ export function hasMinimumScanVolume6h(volume6hUsd: number): boolean {
 }
 
 export function estimatedHourlyYieldPercent(estimatedPoolFees6hUsd: number, tvlUsd: number): number {
-  if (!Number.isFinite(estimatedPoolFees6hUsd) || !Number.isFinite(tvlUsd) || tvlUsd <= 0) return 0;
-  return (estimatedPoolFees6hUsd / tvlUsd / 6) * 100;
+  return estimatedYieldPercent(estimatedPoolFees6hUsd, tvlUsd, 6);
+}
+
+export function estimatedYieldPercent(estimatedPoolFeesUsd: number, tvlUsd: number, hours: number): number {
+  if (!Number.isFinite(estimatedPoolFeesUsd) || !Number.isFinite(tvlUsd) || !Number.isFinite(hours) || tvlUsd <= 0 || hours <= 0) return 0;
+  return (estimatedPoolFeesUsd / tvlUsd / hours) * 100;
 }
 
 export function uniswapPoolUrl(poolIdentifier: string): string {
@@ -324,4 +427,35 @@ export function rankPools(pools: ScoredPool[]): PoolScan {
     active: pools.filter((pool) => pool.activeLiquidity).sort(byScore).slice(0, 3),
     watchlist: pools.filter((pool) => !pool.activeLiquidity).sort(byScore).slice(0, 2),
   };
+}
+
+function nonQuoteToken(pool: GeckoPool, allowedQuotes: readonly Address[]): string | null {
+  const base = pool.relationships.base_token.data.id.replace("robinhood_", "").toLowerCase();
+  const quote = pool.relationships.quote_token.data.id.replace("robinhood_", "").toLowerCase();
+  const allowed = new Set(allowedQuotes.map((address) => address.toLowerCase()));
+  const baseIsQuote = allowed.has(base);
+  const quoteIsQuote = allowed.has(quote);
+  if (baseIsQuote === quoteIsQuote) return null;
+  return baseIsQuote ? quote : base;
+}
+
+function feeRateFromName(name: string): number | null {
+  const match = name.match(/\s(\d+(?:\.\d+)?)%$/);
+  if (!match?.[1]) return null;
+  const percent = Number(match[1]);
+  return Number.isFinite(percent) && percent >= 0 ? percent / 100 : null;
+}
+
+async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number, work: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await work(items[index]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  return results;
 }

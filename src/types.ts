@@ -24,6 +24,15 @@ export interface QuoteToken {
   symbol: string;
 }
 
+export interface PoolScanSettings {
+  minMarketCapUsd: number;
+  minTotalActiveTvlUsd: number;
+  minPoolAgeSeconds: number;
+  minYieldHourlyPercent: number;
+  maxResults: number;
+  allowedQuotes: string[];
+}
+
 export interface PositionRecord {
   id: string;
   chainId: number;
