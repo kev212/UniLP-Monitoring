@@ -254,18 +254,18 @@ export class Notifier {
         return;
       }
       if (this.dashboardCloseInFlight.has(position.id)) {
-        await this.editDashboardMessage(chatId, message.message_id, "⏳ Close untuk posisi ini sedang diproses.", new InlineKeyboard().text("← Dashboard", dashboardAction("status", action.page)));
+        await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page, "⏳ Close untuk posisi ini sedang diproses.");
         return;
       }
 
       this.dashboardCloseInFlight.add(position.id);
-      await this.editDashboardMessage(chatId, message.message_id, `⏳ Menutup ${position.protocol.toUpperCase()} #${position.positionKey}...`);
       void this.executeDashboardClose(database, pnl, executor, chatId, message.message_id, position, action.page)
         .catch((closeError) => log.error({ error: errorMessage(closeError), positionId: position.id }, "dashboard close flow failed"));
+      await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page, `⏳ Menutup ${position.protocol.toUpperCase()} #${position.positionKey}...`);
     } catch (error) {
       log.warn({ error: errorMessage(error) }, "dashboard callback failed");
       try {
-        await this.editDashboardMessage(chatId, message.message_id, "❌ Dashboard gagal diperbarui. Tekan Refresh untuk mencoba lagi.", new InlineKeyboard().text("🔄 Refresh", dashboardAction("refresh", 0)));
+        await this.editDashboardMessage(chatId, message.message_id, "❌ Dashboard gagal diperbarui. Tekan Refresh untuk mencoba lagi.", this.dashboardKeyboard(0, 1));
       } catch (editError) {
         log.warn({ error: errorMessage(editError) }, "could not render dashboard error state");
       }
@@ -295,7 +295,7 @@ export class Notifier {
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
       try {
-        await this.editDashboardMessage(chatId, messageId, `❌ Close #${position.positionKey} gagal: ${text.slice(0, 400)}`, new InlineKeyboard().text("← Dashboard", dashboardAction("status", page)));
+        await this.refreshDashboardMessage(database, pnl, chatId, messageId, page, `❌ Close #${position.positionKey} gagal: ${text.slice(0, 400)}`);
       } catch (editError) {
         log.warn({ error: errorMessage(editError), positionId: position.id }, "could not render dashboard close failure");
       }
@@ -304,12 +304,12 @@ export class Notifier {
     }
   }
 
-  private async buildDashboard(database: Database, pnl: PnlService, requestedPage: number): Promise<DashboardView> {
+  private async buildDashboard(database: Database, pnl: PnlService, requestedPage: number, notice?: string): Promise<DashboardView> {
     const { active, blocks } = await this.activePositions(database, true);
     const pageCount = Math.max(1, Math.ceil(active.length / DASHBOARD_PAGE_SIZE));
     const page = clampDashboardPage(requestedPage, pageCount);
     const first = page * DASHBOARD_PAGE_SIZE;
-    const lines = ["LP DASHBOARD", `Updated: ${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC`, ""];
+    const lines = ["LP DASHBOARD", ...(notice ? [notice] : []), `Updated: ${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC`, ""];
 
     if (active.length === 0) {
       lines.push("Tidak ada posisi aktif.");
@@ -357,15 +357,15 @@ export class Notifier {
     return keyboard;
   }
 
-  private async refreshDashboardMessage(database: Database, pnl: PnlService, chatId: string, messageId: number, page: number): Promise<void> {
-    const dashboard = await this.buildDashboard(database, pnl, page);
+  private async refreshDashboardMessage(database: Database, pnl: PnlService, chatId: string, messageId: number, page: number, notice?: string): Promise<void> {
+    const dashboard = await this.buildDashboard(database, pnl, page, notice);
     this.lastStatusCache.set(chatId, dashboard.positions);
     await this.editDashboardMessage(chatId, messageId, dashboard.text, this.dashboardKeyboard(dashboard.page, dashboard.pageCount));
   }
 
   private async showCloseMenu(database: Database, chatId: string, messageId: number, requestedPage: number, notice?: string): Promise<void> {
     const { active } = await this.activePositions(database, false);
-    const closable = active.filter((position) => canRequestManualClose(position.status));
+    const closable = active.filter((position) => canRequestManualClose(position.status) && !this.dashboardCloseInFlight.has(position.id));
     const pageCount = Math.max(1, Math.ceil(closable.length / DASHBOARD_PAGE_SIZE));
     const page = clampDashboardPage(requestedPage, pageCount);
     const first = page * DASHBOARD_PAGE_SIZE;
