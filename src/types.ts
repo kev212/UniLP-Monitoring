@@ -112,4 +112,6 @@ export interface CloseHistoryRecord {
   closeTransactionHash: string | null;
   swapTransactionHash: string | null;
   settledAt: Date;
+  openedAtBlock: bigint | null;
+  openedAt: Date | null;
 }

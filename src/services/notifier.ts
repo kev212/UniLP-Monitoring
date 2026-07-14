@@ -944,7 +944,28 @@ export class Notifier {
     const qtDec = await this.decimals(record.quoteToken, record.chainId);
     const qtSymbol = this.quoteSymbol(record.quoteToken);
     const bg = await database.getPnlCardBackground(chatId);
-    const png = await renderPnlCard(record, pair, qtDec, qtSymbol, bg);
+    let durationStr: string | undefined;
+    if (record.openedAtBlock) {
+      try {
+        const { client } = this.chains.getById(record.chainId);
+        const block = await client.getBlock({ blockNumber: record.openedAtBlock });
+        const opened = Number(block.timestamp) * 1000;
+        const settled = record.settledAt.getTime();
+        const diffMs = settled - opened;
+        if (diffMs > 0) {
+          const totalMin = Math.floor(diffMs / 60_000);
+          const days = Math.floor(totalMin / 1440);
+          const hours = Math.floor((totalMin % 1440) / 60);
+          const mins = totalMin % 60;
+          const parts: string[] = [];
+          if (days > 0) parts.push(`${days}D`);
+          if (hours > 0 || days > 0) parts.push(`${hours}H`);
+          parts.push(`${mins}M`);
+          durationStr = `DURATION ${parts.join(" ")}`;
+        }
+      } catch { /* skip duration if block lookup fails */ }
+    }
+    const png = await renderPnlCard(record, pair, qtDec, qtSymbol, bg, durationStr);
     const sent = await ctx.replyWithPhoto(new InputFile(png, "pnl-card.png"));
     if (sent && "message_id" in sent) {
       await this.queueTemp(chatId, (sent as any).message_id);

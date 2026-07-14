@@ -236,7 +236,7 @@ export class Executor {
       }
       const qtLower = position.quoteToken.toLowerCase();
       const isEth = qtLower === zeroAddress || qtLower === "0x0bd7d308f8e1639fab988df18a8011f41eacad73"; // WETH Robinhood
-      const settlementUsd = isEth ? await this.computeEthUsd(position.chainId, totalReceived) : totalReceived;
+      const settlementUsd = isEth ? await this.computeEthUsd(position.chainId, totalReceived, position.quoteToken) : totalReceived;
       await this.database.setPositionStatus(position.id, "settled", {
         totalReceived: totalReceived.toString(),
         settlementUsd: settlementUsd.toString(),
@@ -246,15 +246,15 @@ export class Executor {
     }
   }
 
-  private async computeEthUsd(chainId: number, ethWei: bigint): Promise<bigint> {
+  private async computeEthUsd(chainId: number, ethWei: bigint, quoteToken: Address): Promise<bigint> {
     try {
       const { registry } = this.chains.getById(chainId);
       const usdg = this.config.quoteTokens[registry.name]?.find(q => q.symbol === "USDG");
       if (!usdg) return 0n;
       const route = await this.routes.quoteDirect(
         { chainId } as PositionRecord,
-        zeroAddress,
-        10n ** 18n, // 1 ETH
+        quoteToken,
+        10n ** 18n, // 1 unit
         usdg.address,
       );
       if (!route) return 0n;

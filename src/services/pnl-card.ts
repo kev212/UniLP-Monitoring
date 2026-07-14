@@ -36,6 +36,7 @@ export async function renderPnlCard(
   qtDecimals: number,
   qtSymbol: string,
   customBg?: Buffer | null,
+  durationStr?: string,
 ): Promise<Buffer> {
   const isProfit = record.finalPnlBps >= 0n;
   const t = rhTheme(isProfit);
@@ -107,6 +108,11 @@ export async function renderPnlCard(
     // USD line
     hasUsd
       ? `<text x="${W / 2}" y="${H / 2 + 105}" filter="url(#shadow)" font-family="${FONT}" font-size="30" fill="${TEXT_SECONDARY}" text-anchor="middle">≈ ${sign}$${pnlUsd}</text>`
+      : "",
+
+    // Duration
+    durationStr
+      ? `<text x="${W / 2}" y="${H / 2 + 165}" filter="url(#shadow)" font-family="${FONT}" font-size="44" fill="${RH_DIM}" text-anchor="middle">${durationStr}</text>`
       : "",
 
     // Divider

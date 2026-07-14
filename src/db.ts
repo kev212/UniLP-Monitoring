@@ -161,6 +161,7 @@ export class Database {
       );
       CREATE INDEX IF NOT EXISTS close_history_settled_at_idx ON close_history(settled_at DESC);
       ALTER TABLE close_history ADD COLUMN IF NOT EXISTS final_pnl_usd NUMERIC(78, 0) NOT NULL DEFAULT 0;
+      ALTER TABLE close_history ADD COLUMN IF NOT EXISTS opened_at_block NUMERIC(78, 0);
       CREATE TABLE IF NOT EXISTS telegram_pnl_card_bg (
         chat_id TEXT PRIMARY KEY,
         image BYTEA NOT NULL,
@@ -492,7 +493,7 @@ export class Database {
       position_key: string; token0: string; token1: string; quote_token: string;
       final_pnl_bps: string; final_pnl_quote: string; final_pnl_usd: string; trigger: string;
       close_transaction_hash: string | null; swap_transaction_hash: string | null;
-      settled_at: string;
+      settled_at: string; opened_at_block: string | null;
     }>(
       `SELECT * FROM close_history ORDER BY settled_at DESC LIMIT $1`,
       [limit],
@@ -511,8 +512,9 @@ export class Database {
       chain_id: number; protocol: Protocol; position_key: string;
       token0: string; token1: string; quote_token: string;
       metadata: Record<string, unknown>;
+      opened_at_block: string | null;
     }>(
-      "SELECT chain_id, protocol, position_key, token0, token1, quote_token, metadata FROM positions WHERE id = $1",
+      "SELECT chain_id, protocol, position_key, token0, token1, quote_token, metadata, opened_at_block FROM positions WHERE id = $1",
       [positionId],
     );
     if (!pos.rowCount) return;
@@ -530,8 +532,14 @@ export class Database {
       : null;
     const snapshotPnl = typeof snapshot?.pnlQuote === "string" ? BigInt(snapshot.pnlQuote) : null;
     const snapshotBps = typeof snapshot?.pnlBps === "string" ? BigInt(snapshot.pnlBps) : null;
-    const finalPnl = snapshotPnl ?? (totals.realized + totalReceived - totals.deposits);
-    const finalPnlBps = snapshotBps ?? (totals.deposits > 0n ? (finalPnl * 10000n) / totals.deposits : 0n);
+
+    const hasTotalReceived = typeof meta.totalReceived === "string";
+    const finalPnl = hasTotalReceived
+      ? (totals.realized + totalReceived - totals.deposits)
+      : (snapshotPnl ?? (totals.realized + totalReceived - totals.deposits));
+    const finalPnlBps = hasTotalReceived
+      ? (totals.deposits > 0n ? (finalPnl * 10000n) / totals.deposits : 0n)
+      : (snapshotBps ?? (totals.deposits > 0n ? (finalPnl * 10000n) / totals.deposits : 0n));
 
     if (finalPnlBps < 0n ? -finalPnlBps < 50n : finalPnlBps < 50n) return;
 
@@ -552,13 +560,14 @@ export class Database {
 
     await this.pool.query(
       `INSERT INTO close_history (position_id, chain_id, protocol, position_key, token0, token1, quote_token,
-         final_pnl_bps, final_pnl_quote, final_pnl_usd, trigger, close_transaction_hash, swap_transaction_hash, settled_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())`,
+         final_pnl_bps, final_pnl_quote, final_pnl_usd, trigger, close_transaction_hash, swap_transaction_hash, settled_at, opened_at_block)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), $14)`,
       [
         positionId, row.chain_id, row.protocol, row.position_key,
         row.token0, row.token1, row.quote_token,
         finalPnlBps.toString(), finalPnl.toString(), finalPnlUsd.toString(), trigger,
         closeTx, swapTx,
+        row.opened_at_block,
       ],
     );
   }
@@ -655,6 +664,7 @@ interface CloseHistoryRow {
   close_transaction_hash: string | null;
   swap_transaction_hash: string | null;
   settled_at: string;
+  opened_at_block: string | null;
 }
 
 function mapCloseHistory(row: CloseHistoryRow): CloseHistoryRecord {
@@ -674,5 +684,7 @@ function mapCloseHistory(row: CloseHistoryRow): CloseHistoryRecord {
     closeTransactionHash: row.close_transaction_hash,
     swapTransactionHash: row.swap_transaction_hash,
     settledAt: new Date(row.settled_at),
+    openedAtBlock: row.opened_at_block ? BigInt(row.opened_at_block) : null,
+    openedAt: null,
   };
 }
