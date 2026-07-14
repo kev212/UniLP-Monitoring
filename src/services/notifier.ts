@@ -260,7 +260,7 @@ export class Notifier {
   private startDeletionWorker(): void {
     this.deletionTimer = setInterval(() => {
       void this.runDeletionPass().catch((error) => log.warn({ error: errorMessage(error) }, "deletion worker pass failed"));
-    }, 10_000);
+    }, 1_000);
   }
 
   private async runDeletionPass(): Promise<void> {
@@ -281,19 +281,19 @@ export class Notifier {
     }
   }
 
-  private async queueTemp(chatId: string, messageId: number): Promise<void> {
+  private async queueTemp(chatId: string, messageId: number, ttlMs = 10_000): Promise<void> {
     if (!this.database) return;
-    await this.database.queueMessageDeletion(chatId, messageId, new Date(Date.now() + 60_000));
+    await this.database.queueMessageDeletion(chatId, messageId, new Date(Date.now() + ttlMs));
   }
 
-  private async replyTemp(ctx: Context | ChatContext, text: string, other?: Record<string, unknown>): Promise<void> {
+  private async replyTemp(ctx: Context | ChatContext, text: string, other?: Record<string, unknown>, ttlMs?: number): Promise<void> {
     const sent = await ctx.reply(text, other as any);
     if (sent && "message_id" in sent) {
-      await this.queueTemp(ctx.chat!.id.toString(), (sent as any).message_id);
+      await this.queueTemp(ctx.chat!.id.toString(), (sent as any).message_id, ttlMs);
     }
   }
 
-  private async sendTemp(lines: string[], chatId?: string): Promise<void> {
+  private async sendTemp(lines: string[], chatId?: string, ttlMs?: number): Promise<void> {
     if (!this.bot || !this.config.telegram) return;
     const targetId = chatId ?? this.config.telegram.chatId;
     const run = this.sendQueue.then(async () => {
@@ -303,7 +303,7 @@ export class Notifier {
       for (let attempt = 0; attempt < 4; attempt++) {
         try {
           const sent = await this.bot!.api.sendMessage(targetId, lines.join("\n"));
-          await this.queueTemp(targetId, sent.message_id);
+          await this.queueTemp(targetId, sent.message_id, ttlMs);
           return;
         } catch (error: unknown) {
           const code = (error as { error_code?: number })?.error_code;
@@ -673,18 +673,18 @@ export class Notifier {
     }
     this.lastScanAt = Date.now();
 
-    await this.replyTemp(ctx, `🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(token)} di Robinhood...`);
+    await this.replyTemp(ctx, `🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(token)} di Robinhood...`, undefined, 120_000);
 
     let scan;
     try {
       scan = await scanner.scan(token);
     } catch (error) {
-      await this.replyTemp(ctx, `Scan gagal: ${errorMessage(error).slice(0, 500)}`);
+      await this.replyTemp(ctx, `Scan gagal: ${errorMessage(error).slice(0, 500)}`, undefined, 120_000);
       return;
     }
 
     if (scan.active.length === 0 && scan.watchlist.length === 0) {
-      await this.replyTemp(ctx, `Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 6h >= $100 untuk token ini.`);
+      await this.replyTemp(ctx, `Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 6h >= $100 untuk token ini.`, undefined, 120_000);
       return;
     }
 
@@ -708,7 +708,7 @@ export class Notifier {
 
     lines.push("", "Yield 1h: (vol1h × feeRate / TVL). Score memakai Vol 6h dan safety factor.");
 
-    await this.replyTemp(ctx, lines.join("\n"));
+    await this.replyTemp(ctx, lines.join("\n"), undefined, 120_000);
   }
 
   private async handleScanPools(ctx: Context, database: Database, scanner: PoolScanner): Promise<void> {
@@ -721,6 +721,7 @@ export class Notifier {
     this.poolScanRunning = true;
     const progress = await ctx.reply("🏆 Memeriksa kandidat Uniswap V3/V4 Robinhood berdasarkan yield 1h. Scan dapat memerlukan sekitar 2 menit...");
     const messageId = progress.message_id;
+    void this.queueTemp(ctx.chat!.id.toString(), messageId, 120_000);
     void this.executePoolScan(database, scanner, chatId, messageId).catch((scanError) => log.error({ error: errorMessage(scanError) }, "pool scan background job failed"));
   }
 
@@ -736,11 +737,11 @@ export class Notifier {
         const details = errorMessage(editError);
         if (!details.includes("message is not modified")) throw editError;
       }
-      await this.queueTemp(chatId, messageId);
+      await this.queueTemp(chatId, messageId, 120_000);
     } catch (error) {
       if (this.bot) {
         await this.bot.api.editMessageText(chatId, messageId, `Scan pools gagal: ${errorMessage(error).slice(0, 500)}`).catch(() => {});
-        await this.queueTemp(chatId, messageId);
+        await this.queueTemp(chatId, messageId, 120_000);
       }
     } finally {
       this.poolScanRunning = false;
@@ -968,7 +969,7 @@ export class Notifier {
     const png = await renderPnlCard(record, pair, qtDec, qtSymbol, bg, durationStr);
     const sent = await ctx.replyWithPhoto(new InputFile(png, "pnl-card.png"));
     if (sent && "message_id" in sent) {
-      await this.queueTemp(chatId, (sent as any).message_id);
+      await this.queueTemp(chatId, (sent as any).message_id, 120_000);
     }
   }
 
