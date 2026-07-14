@@ -1,84 +1,106 @@
 import sharp from "sharp";
 import type { CloseHistoryRecord } from "../types.js";
 
-const W = 640;
-const H = 400;
-const PAD = 32;
-const RADIUS = 18;
+const W = 1440;
+const H = 900;
+const PAD = 60;
+const RADIUS = 32;
 
 const FONT = "Noto Sans Mono, monospace";
 
-const colors = {
-  profitBg: "#0a2e1a",
-  profitBorder: "#22c55e",
-  profitAccent: "#16a34a",
-  profitText: "#86efac",
-  lossBg: "#2e0a0a",
-  lossBorder: "#ef4444",
-  lossAccent: "#dc2626",
-  lossText: "#fca5a5",
-  label: "#9ca3af",
-  value: "#f3f4f6",
-  muted: "#6b7280",
-};
+const RH = "#ccff00";
+const RH_DIM = "#8ab300";
+const BG_DARK = "#0d0f0a";
+const BG_CARD = "#11150a";
+const TEXT_PRIMARY = "#f0f5d8";
+const TEXT_SECONDARY = "#aab58c";
+const TEXT_MUTED = "#5a6340";
+const RED_ACCENT = "#ff4444";
+const RED_BG = "#1a0d0d";
+const RED_TEXT = "#ffaaaa";
 
-export async function renderPnlCard(record: CloseHistoryRecord, pair: string, qtDecimals: number, qtSymbol: string): Promise<Buffer> {
+function rhTheme(isProfit: boolean) {
+  return {
+    accent: isProfit ? RH : RED_ACCENT,
+    border: isProfit ? RH_DIM : RED_ACCENT,
+    bgStart: isProfit ? BG_CARD : RED_BG,
+    bgEnd: isProfit ? BG_DARK : "#0f0808",
+    textHighlight: isProfit ? RH : RED_TEXT,
+    textSecondary: isProfit ? TEXT_PRIMARY : "#f0e0e0",
+  };
+}
+
+export async function renderPnlCard(
+  record: CloseHistoryRecord,
+  pair: string,
+  qtDecimals: number,
+  qtSymbol: string,
+): Promise<Buffer> {
   const isProfit = record.finalPnlBps >= 0n;
-  const accent = isProfit ? colors.profitAccent : colors.lossAccent;
-  const border = isProfit ? colors.profitBorder : colors.lossBorder;
-  const bgColor = isProfit ? colors.profitBg : colors.lossBg;
-  const pnlTextColor = isProfit ? colors.profitText : colors.lossText;
+  const t = rhTheme(isProfit);
   const sign = isProfit ? "+" : "";
+  const label = isProfit ? "PROFIT" : "LOSS";
 
   const pnlPct = fmtBps(record.finalPnlBps);
-  const pnlAmt = fmtToken(record.finalPnlQuote, qtDecimals);
+  const maxDec = qtSymbol === "ETH" || qtSymbol === "WETH" ? 4 : undefined;
+  const pnlAmt = fmtToken(record.finalPnlQuote, qtDecimals, maxDec);
   const pnlUsd = fmtToken(record.finalPnlUsd, 6, 2);
   const hasUsd = record.finalPnlUsd !== 0n;
   const protoLabel = record.protocol.toUpperCase();
   const settledStr = fmtUtc(record.settledAt);
   const triggerLabel = triggerDisplay(record.trigger);
 
-  const lines: string[] = [];
+  const svg = [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`,
+    `<defs>`,
+    `<linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">`,
+    `<stop offset="0%" stop-color="${t.bgStart}"/>`,
+    `<stop offset="100%" stop-color="${t.bgEnd}"/>`,
+    `</linearGradient>`,
+    `<linearGradient id="accentGrad" x1="0" y1="0" x2="1" y2="0">`,
+    `<stop offset="0%" stop-color="${t.accent}"/>`,
+    `<stop offset="100%" stop-color="${isProfit ? RH_DIM : "#cc3333"}"/>`,
+    `</linearGradient>`,
+    `</defs>`,
 
-  lines.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`);
-  lines.push(`<defs>`);
-  lines.push(`<linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">`);
-  lines.push(`<stop offset="0%" stop-color="${bgColor}"/>`);
-  lines.push(`<stop offset="100%" stop-color="#0f172a"/>`);
-  lines.push(`</linearGradient>`);
-  lines.push(`</defs>`);
+    `<rect width="${W}" height="${H}" rx="${RADIUS}" ry="${RADIUS}" fill="url(#bgGrad)" stroke="${t.border}" stroke-width="3"/>`,
 
-  lines.push(`<rect width="${W}" height="${H}" rx="${RADIUS}" ry="${RADIUS}" fill="url(#bgGrad)" stroke="${border}" stroke-width="2"/>`);
+    // Header
+    `<text x="${PAD}" y="${PAD + 38}" font-family="${FONT}" font-size="22" fill="${TEXT_SECONDARY}">${xmlEscape(pair)}</text>`,
+    `<text x="${PAD}" y="${PAD + 68}" font-family="${FONT}" font-size="16" fill="${TEXT_MUTED}">${protoLabel} · #${record.positionKey}</text>`,
 
-  // Top row: pair + protocol
-  lines.push(`<text x="${PAD}" y="54" font-family="${FONT}" font-size="15" fill="${colors.label}">${xmlEscape(pair)}${protoLabel === "V4" ? " · V4" : " · " + protoLabel}</text>`);
-  lines.push(`<text x="${W - PAD}" y="54" font-family="${FONT}" font-size="13" fill="${colors.muted}" text-anchor="end">#${record.positionKey}</text>`);
+    // Large PnL %
+    `<text x="${W / 2}" y="${H / 2 - 48}" font-family="${FONT}" font-size="120" font-weight="bold" fill="url(#accentGrad)" text-anchor="middle">${sign}${pnlPct}%</text>`,
 
-  // PnL %
-  lines.push(`<text x="${W / 2}" y="${H / 2 - 16}" font-family="${FONT}" font-size="60" font-weight="bold" fill="${accent}" text-anchor="middle">${sign}${pnlPct}%</text>`);
+    // PnL quote amount
+    `<text x="${W / 2}" y="${H / 2 + 42}" font-family="${FONT}" font-size="28" fill="${t.textSecondary}" text-anchor="middle">${sign}${pnlAmt} ${qtSymbol} ${label}</text>`,
 
-  // PnL quote
-  lines.push(`<text x="${W / 2}" y="${H / 2 + 32}" font-family="${FONT}" font-size="16" fill="${pnlTextColor}" text-anchor="middle">${sign}${pnlAmt} ${qtSymbol} ${isProfit ? "PROFIT" : "LOSS"}</text>`);
+    // USD line
+    hasUsd
+      ? `<text x="${W / 2}" y="${H / 2 + 82}" font-family="${FONT}" font-size="22" fill="${TEXT_SECONDARY}" text-anchor="middle">≈ ${sign}$${pnlUsd}</text>`
+      : "",
 
-  // USD
-  if (hasUsd) {
-    lines.push(`<text x="${W / 2}" y="${H / 2 + 56}" font-family="${FONT}" font-size="14" fill="${colors.label}" text-anchor="middle">≈ ${sign}$${pnlUsd}</text>`);
-  }
+    // Divider
+    `<line x1="${PAD}" y1="${H - 120}" x2="${W - PAD}" y2="${H - 120}" stroke="${TEXT_MUTED}" stroke-opacity="0.12" stroke-width="2"/>`,
 
-  // Divider
-  lines.push(`<line x1="${PAD}" y1="${H - 70}" x2="${W - PAD}" y2="${H - 70}" stroke="${colors.muted}" stroke-opacity="0.15" stroke-width="1"/>`);
+    // Footer left: trigger
+    `<text x="${PAD}" y="${H - 80}" font-family="${FONT}" font-size="18" fill="${TEXT_SECONDARY}">${triggerLabel}</text>`,
 
-  // Bottom: trigger + time
-  lines.push(`<text x="${PAD}" y="${H - 42}" font-family="${FONT}" font-size="12" fill="${colors.label}">${triggerLabel}</text>`);
-  lines.push(`<text x="${W - PAD}" y="${H - 42}" font-family="${FONT}" font-size="12" fill="${colors.muted}" text-anchor="end">${settledStr} UTC</text>`);
+    // Footer right: time
+    `<text x="${W - PAD}" y="${H - 80}" font-family="${FONT}" font-size="18" fill="${TEXT_MUTED}" text-anchor="end">${settledStr} UTC</text>`,
 
-  lines.push(`</svg>`);
+    `</svg>`,
+  ].join("\n");
 
-  return sharp(Buffer.from(lines.join("\n"), "utf-8")).png().toBuffer();
+  return sharp(Buffer.from(svg, "utf-8")).png().toBuffer();
 }
 
 function xmlEscape(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 function fmtBps(value: bigint): string {
@@ -95,7 +117,10 @@ function fmtToken(value: bigint, decimals: number, maxDec?: number): string {
   const integer = absolute / divisor;
   const fraction = absolute % divisor;
   if (fraction === 0n) return `${negative ? "-" : ""}${integer}`;
-  let fracStr = fraction.toString().padStart(Math.min(decimals, 18), "0").replace(/0+$/, "");
+  let fracStr = fraction
+    .toString()
+    .padStart(Math.min(decimals, 18), "0")
+    .replace(/0+$/, "");
   if (maxDec !== undefined && fracStr.length > maxDec) {
     fracStr = fracStr.slice(0, maxDec);
   }
@@ -104,11 +129,16 @@ function fmtToken(value: bigint, decimals: number, maxDec?: number): string {
 
 function triggerDisplay(trigger: string): string {
   switch (trigger) {
-    case "stop_loss": return "Stop Loss";
-    case "take_profit": return "Take Profit";
-    case "trailing_take_profit": return "Trailing Take Profit";
-    case "manual": return "Manual Close";
-    default: return trigger.replace(/_/g, " ");
+    case "stop_loss":
+      return "Stop Loss";
+    case "take_profit":
+      return "Take Profit";
+    case "trailing_take_profit":
+      return "Trailing Take Profit";
+    case "manual":
+      return "Manual Close";
+    default:
+      return trigger.replace(/_/g, " ");
   }
 }
 

@@ -828,8 +828,9 @@ export class Notifier {
       lines.push(`${prefix} ${item.protocol.toUpperCase()} #${item.positionKey} ${pair}`);
       const qtDec = await this.decimals(item.quoteToken, item.chainId);
       const qtSymbol = this.quoteSymbol(item.quoteToken);
+      const ethDec = (qtSymbol === "ETH" || qtSymbol === "WETH") ? 4 : undefined;
       const usdPart = item.finalPnlUsd !== 0n ? ` | ${sign}$${formatToken(item.finalPnlUsd, 6, 2)}` : "";
-      lines.push(`   ${sign}${formatBps(item.finalPnlBps)}% | ${sign}${formatToken(item.finalPnlQuote, qtDec)} ${qtSymbol}${usdPart} | ${triggerDisplayShort(item.trigger)}`);
+      lines.push(`   ${sign}${formatBps(item.finalPnlBps)}% | ${sign}${formatToken(item.finalPnlQuote, qtDec, ethDec)} ${qtSymbol}${usdPart} | ${triggerDisplayShort(item.trigger)}`);
       lines.push(`   Settled: ${fmtUtc(item.settledAt)} UTC`);
       lines.push("");
     }

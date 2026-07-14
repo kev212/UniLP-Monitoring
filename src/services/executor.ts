@@ -222,9 +222,33 @@ export class Executor {
         const fromCloseStr = typeof meta.settlementQuoteFromClose === "string" ? meta.settlementQuoteFromClose : "0";
         totalReceived = BigInt(fromCloseStr) + swapExpectedOut;
       }
-      await this.database.setPositionStatus(position.id, "settled", { totalReceived: totalReceived.toString() });
+      const qtLower = position.quoteToken.toLowerCase();
+      const isEth = qtLower === zeroAddress || qtLower === "0x0bd7d308f8e1639fab988df18a8011f41eacad73"; // WETH Robinhood
+      const settlementUsd = isEth ? await this.computeEthUsd(position.chainId, totalReceived) : totalReceived;
+      await this.database.setPositionStatus(position.id, "settled", {
+        totalReceived: totalReceived.toString(),
+        settlementUsd: settlementUsd.toString(),
+      });
     } catch {
       // Balance calculation is for notification only — do not block settlement.
+    }
+  }
+
+  private async computeEthUsd(chainId: number, ethWei: bigint): Promise<bigint> {
+    try {
+      const { registry } = this.chains.getById(chainId);
+      const usdg = this.config.quoteTokens[registry.name]?.find(q => q.symbol === "USDG");
+      if (!usdg) return 0n;
+      const route = await this.routes.quoteDirect(
+        { chainId } as PositionRecord,
+        zeroAddress,
+        10n ** 18n, // 1 ETH
+        usdg.address,
+      );
+      if (!route) return 0n;
+      return (ethWei * route.expectedOut) / (10n ** 18n);
+    } catch {
+      return 0n;
     }
   }
 
