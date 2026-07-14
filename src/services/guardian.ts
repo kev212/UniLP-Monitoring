@@ -8,6 +8,7 @@ import type { DiscoveryService } from "./discovery.js";
 import type { Executor } from "./executor.js";
 import type { Notifier } from "./notifier.js";
 import type { PnlService } from "./pnl.js";
+import { sqrtRatioAtTick } from "./uniswap-math.js";
 
 export class Guardian {
   private readonly lastEvaluatedBlock = new Map<number, bigint>();
@@ -268,17 +269,22 @@ export class Guardian {
   private async updateOorAboveTimer(position: PositionRecord, range?: import("../types.js").PositionRangeInfo): Promise<void> {
     if (!range) return;
     const meta = position.metadata as Record<string, unknown>;
-    meta.oorStatus = range.status;
-    if (range.status === "above") meta.oorDistanceBps = Number(range.aboveDistanceBps ?? 0n);
+    const quoteIsToken0 = position.quoteToken?.toLowerCase() === position.token0.toLowerCase();
+    const quoteStatus = quoteIsToken0
+      ? (range.status === "above" ? "below" : range.status === "below" ? "above" : "in_range")
+      : range.status;
+    const distanceBps = quoteRangeAboveDistanceBps(range, quoteIsToken0 === true);
+    meta.oorStatus = quoteStatus;
+    if (quoteStatus === "above") meta.oorDistanceBps = Number(distanceBps);
 
     if (!this.config.oorAutoCloseEnabled) return;
     const thresholdBps = BigInt(Math.round(this.config.oorAboveMinDistancePercent * 100));
-    if (range.status === "above" && (range.aboveDistanceBps ?? 0n) >= thresholdBps) {
+    if (quoteStatus === "above" && distanceBps >= thresholdBps) {
       if (meta.oorAboveSeenAt === undefined) {
         const now = Date.now();
         meta.oorAboveSeenAt = now;
         await this.database.setPositionStatus(position.id, position.status, { oorAboveSeenAt: now });
-        log.info({ positionId: position.id, distanceBps: range.aboveDistanceBps }, "OOR above timer started");
+        log.info({ positionId: position.id, distanceBps }, "OOR above timer started");
       }
     } else if (meta.oorAboveSeenAt !== undefined) {
       delete meta.oorAboveSeenAt;
@@ -322,6 +328,15 @@ function retryAt(metadata: Record<string, unknown>): number | null {
   if (typeof nextAttemptAt !== "string") return null;
   const timestamp = Date.parse(nextAttemptAt);
   return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function quoteRangeAboveDistanceBps(range: import("../types.js").PositionRangeInfo, quoteIsToken0: boolean): bigint {
+  if (!quoteIsToken0) return range.status === "above" ? range.aboveDistanceBps ?? 0n : 0n;
+  if (range.status !== "below") return 0n;
+  const sqrtLower = sqrtRatioAtTick(range.tickLower);
+  const numerator = sqrtLower * sqrtLower * 10_000n;
+  const denominator = range.currentSqrtPrice * range.currentSqrtPrice;
+  return denominator > 0n ? numerator / denominator - 10_000n : 0n;
 }
 
 function parseExitRetry(metadata: Record<string, unknown>): { reason: ExitTrigger; nextAttemptAt: number } | null {

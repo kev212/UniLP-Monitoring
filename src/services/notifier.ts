@@ -11,6 +11,7 @@ import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
 import { fmtUtc, renderPnlCard } from "./pnl-card.js";
 import type { PoolMarketScan, PoolScanFilters, PoolScanner, ScoredPool } from "./pool-scanner.js";
+import { sqrtRatioAtTick } from "./uniswap-math.js";
 
 type ChatContext = CommandContext<Context>;
 
@@ -620,8 +621,7 @@ export class Notifier {
     const reviewReason = position.status === "needs_review"
       ? ` | ${reviewReasonDisplay(position.metadata)}`
       : "";
-    const oorInfo = oorStatusDisplay(position.metadata);
-    const base = `${index}. ${statusLabel.split(" ")[0]} ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${reviewReason}${oorInfo}`;
+    const base = `${index}. ${statusLabel.split(" ")[0]} ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${reviewReason}`;
 
     if (!position.quoteToken || !blockNumber) return `${base}\n`;
     try {
@@ -640,10 +640,31 @@ export class Notifier {
         : `${formatToken(valued.snapshot.feeQuoteUsdg, usdgDec, 4)} USDG`;
       const pnlText = `PnL ${formatBps(valued.snapshot.pnlBps)}%`;
       const trailingPeak = trailingPeakDisplay(position.metadata);
-      return `${base} | 💰 ${cv} ${qtSymbol} | 🪙 ${feeDisplay} | 📊 ${pnlText}${trailingPeak}\n`;
+      const range = await this.formatPositionRange(position, valued.range, t0, t1);
+      return `${base} | 💰 ${cv} ${qtSymbol} | 🪙 ${feeDisplay} | 📊 ${pnlText}${trailingPeak}${range}\n`;
     } catch {
       return `${base}\n`;
     }
+  }
+
+  private async formatPositionRange(position: PositionRecord, range: import("../types.js").PositionRangeInfo | undefined, token0Symbol: string, token1Symbol: string): Promise<string> {
+    if (position.protocol === "v2") return "\n   Range: Full range (V2)";
+    if (!range || !position.quoteToken) return "";
+
+    const quoteIsToken0 = position.quoteToken.toLowerCase() === position.token0.toLowerCase();
+    const [token0Decimals, token1Decimals] = await Promise.all([
+      this.decimals(position.token0, position.chainId),
+      this.decimals(position.token1, position.chainId),
+    ]);
+    const lower = quotePriceScaled(sqrtRatioAtTick(range.tickLower), quoteIsToken0, token0Decimals, token1Decimals);
+    const upper = quotePriceScaled(sqrtRatioAtTick(range.tickUpper), quoteIsToken0, token0Decimals, token1Decimals);
+    const current = quotePriceScaled(range.currentSqrtPrice, quoteIsToken0, token0Decimals, token1Decimals);
+    const minimum = lower < upper ? lower : upper;
+    const maximum = lower > upper ? lower : upper;
+    const quoteSymbol = this.quoteSymbol(position.quoteToken);
+    const assetSymbol = quoteIsToken0 ? token1Symbol : token0Symbol;
+    const status = quoteRangeStatus(range.status, quoteIsToken0, position.metadata);
+    return `\n   ${status} | Range: ${formatQuotePrice(minimum, quoteSymbol)} - ${formatQuotePrice(maximum, quoteSymbol)} ${quoteSymbol}/${assetSymbol} | Now: ${formatQuotePrice(current, quoteSymbol)}`;
   }
 
   private lastScanAt = 0;
@@ -1297,17 +1318,35 @@ function reviewReasonDisplay(metadata: Record<string, unknown>): string {
   return reason.length > 120 ? `${reason.slice(0, 117)}...` : reason;
 }
 
-function oorStatusDisplay(metadata: Record<string, unknown>): string {
-  const status = metadata.oorStatus;
-  if (status === "above") {
-    const bps = typeof metadata.oorDistanceBps === "number" ? metadata.oorDistanceBps : 0;
-    const pct = (bps / 100).toFixed(2);
-    const seenAt = typeof metadata.oorAboveSeenAt === "number" ? metadata.oorAboveSeenAt : undefined;
-    const timer = seenAt ? ` ⏳${Math.floor((Date.now() - seenAt) / 60_000)}m` : "";
-    return ` | ⚠️ ABOVE +${pct}%${timer}`;
+const QUOTE_PRICE_SCALE = 10n ** 18n;
+const Q192 = 1n << 192n;
+
+function quotePriceScaled(sqrtPriceX96: bigint, quoteIsToken0: boolean, token0Decimals: number, token1Decimals: number): bigint {
+  const square = sqrtPriceX96 * sqrtPriceX96;
+  if (quoteIsToken0) {
+    return (Q192 * 10n ** BigInt(token1Decimals) * QUOTE_PRICE_SCALE) / (square * 10n ** BigInt(token0Decimals));
   }
-  if (status === "below") return " | ⚠️ BELOW";
-  return "";
+  return (square * 10n ** BigInt(token0Decimals) * QUOTE_PRICE_SCALE) / (Q192 * 10n ** BigInt(token1Decimals));
+}
+
+function formatQuotePrice(value: bigint, quoteSymbol: string): string {
+  const prefix = quoteSymbol === "USDG" || quoteSymbol === "USDC" ? "$" : "";
+  if (value === 0n) return `${prefix}0`;
+  const integer = value / QUOTE_PRICE_SCALE;
+  if (integer > 0n) return `${prefix}${formatToken(value, 18, integer >= 100n ? 2 : 4)}`;
+  const fraction = value.toString().padStart(18, "0");
+  const firstSignificant = fraction.search(/[1-9]/);
+  const decimals = Math.min(12, firstSignificant + 4);
+  return `${prefix}${formatToken(value, 18, decimals)}`;
+}
+
+function quoteRangeStatus(status: import("../types.js").PositionRangeInfo["status"], quoteIsToken0: boolean, metadata: Record<string, unknown>): string {
+  if (status === "in_range") return "🟢 IN RANGE";
+  const aboveQuoteRange = quoteIsToken0 ? status === "below" : status === "above";
+  if (!aboveQuoteRange) return "⚠️ BELOW RANGE";
+  const seenAt = typeof metadata.oorAboveSeenAt === "number" ? metadata.oorAboveSeenAt : undefined;
+  const timer = seenAt ? ` ⏳${Math.floor((Date.now() - seenAt) / 60_000)}m` : "";
+  return `⚠️ ABOVE RANGE${timer}`;
 }
 
 function triggerDisplayShort(trigger: string): string {
