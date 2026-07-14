@@ -148,6 +148,9 @@ export class Guardian {
       log.debug({ positionId: position.id, positionKey: position.positionKey, valuationMs: Date.now() - startedAt }, "position valued");
       await this.database.addPnlSnapshot(valued.snapshot);
       await this.notifier.logPnL(position, valued.snapshot);
+      if (position.metadata.autoExitDisabled === true) {
+        return true;
+      }
       const trailing = this.pnl.evaluateTrailingStop(position.metadata, valued.snapshot);
       await this.updateOorAboveTimer(position, valued.range);
 

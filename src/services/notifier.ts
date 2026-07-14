@@ -621,7 +621,8 @@ export class Notifier {
     const reviewReason = position.status === "needs_review"
       ? ` | ${reviewReasonDisplay(position.metadata)}`
       : "";
-    const base = `${index}. ${statusLabel.split(" ")[0]} ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${reviewReason}`;
+    const autoExitDisabled = position.metadata.autoExitDisabled === true ? " | ⚠️ AUTO EXIT DISABLED" : "";
+    const base = `${index}. ${statusLabel.split(" ")[0]} ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${reviewReason}${autoExitDisabled}`;
 
     if (!position.quoteToken || !blockNumber) return `${base}\n`;
     try {
