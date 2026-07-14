@@ -33,6 +33,7 @@ async function main(): Promise<void> {
   await database.connect();
   await database.migrate();
   await guardian.validateNetworks();
+  void executor.backfillStaleCloseHistoryUsd().catch(() => {});
   log.info({ chains: config.chains, dryRun: config.dryRun, executor: config.executorAddress }, "UniLP Guardian started");
 
   let botRunning = false;

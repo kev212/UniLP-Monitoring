@@ -17,6 +17,8 @@ import {
   erc20Abi,
   permit2Abi,
   v2RouterAbi,
+  v3FactoryAbi,
+  v3PoolAbi,
   v3PositionManagerAbi,
   v3SwapRouterAbi,
   v4PositionManagerAbi,
@@ -594,6 +596,51 @@ export class Executor {
       if (typeof retry.reason === "string") return retry.reason;
     }
     return "settled";
+  }
+
+  async backfillStaleCloseHistoryUsd(): Promise<void> {
+    const stale = await this.database.listStaleCloseHistoryUsd();
+    if (stale.length === 0) return;
+    log.info({ count: stale.length }, "backfilling stale close-history USD values");
+    for (const item of stale) {
+      try {
+        const hashStr = (item.swapTransactionHash || item.closeTransactionHash) as `0x${string}` | null;
+        if (!hashStr) continue;
+        const swapHash = hashStr as `0x${string}`;
+        const { client, registry } = this.chains.getById(item.chainId);
+        const receipt = await client.getTransactionReceipt({ hash: swapHash });
+        if (!receipt) continue;
+        const blockNum = receipt.blockNumber;
+        const wethAddr = (item.isNativeQuote
+          ? "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+          : item.quoteToken) as Address; // WETH Robinhood
+        const usdgAddr = "0x5fc5360d0400a0fd4f2af552add042d716f1d168" as Address;
+        let pool: Address | null = null;
+        for (const fee of [500, 3000] as const) {
+          pool = await client.readContract({
+            address: registry.contracts.v3.factory,
+            abi: v3FactoryAbi,
+            functionName: "getPool",
+            args: [wethAddr, usdgAddr, fee],
+            blockNumber: blockNum,
+          }) as Address;
+          if (pool && pool !== zeroAddress) break;
+        }
+        if (!pool || pool === zeroAddress) continue;
+        const [sqrtPriceX96] = await client.readContract({
+          address: pool,
+          abi: v3PoolAbi,
+          functionName: "slot0",
+          blockNumber: blockNum,
+        }) as readonly [bigint, ...unknown[]];
+        const price = (sqrtPriceX96 * sqrtPriceX96 * 10n ** 6n) / (1n << 192n);
+        const usdValue = (BigInt(item.finalPnlQuote) * price) / (10n ** 18n);
+        await this.database.updateCloseHistoryUsd(item.id, usdValue);
+        log.info({ positionKey: item.positionKey, usd: usdValue.toString() }, "backfilled close-history USD");
+      } catch (err) {
+        log.warn({ err, positionKey: item.positionKey }, "failed to backfill close-history USD");
+      }
+    }
   }
 }
 
