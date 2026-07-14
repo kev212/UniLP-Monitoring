@@ -4,7 +4,7 @@ import type { CloseHistoryRecord } from "../types.js";
 const W = 1440;
 const H = 900;
 const PAD = 60;
-const RADIUS = 32;
+const RADIUS = 0;
 
 const FONT = "Noto Sans Mono, monospace";
 
@@ -64,8 +64,8 @@ export async function renderPnlCard(
     `<linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">`,
   ];
   if (hasCustomBg) {
-    svgParts.push(`<stop offset="0%" stop-color="#000000" stop-opacity="0.80"/>`);
-    svgParts.push(`<stop offset="100%" stop-color="#000000" stop-opacity="0.80"/>`);
+    svgParts.push(`<stop offset="0%" stop-color="#000000" stop-opacity="0.20"/>`);
+    svgParts.push(`<stop offset="100%" stop-color="#000000" stop-opacity="0.20"/>`);
   } else {
     svgParts.push(`<stop offset="0%" stop-color="${t.bgStart}"/>`);
     svgParts.push(`<stop offset="100%" stop-color="${t.bgEnd}"/>`);
@@ -76,20 +76,17 @@ export async function renderPnlCard(
     `<stop offset="0%" stop-color="${t.accent}"/>`,
     `<stop offset="100%" stop-color="${isProfit ? RH_DIM : "#cc3333"}"/>`,
     `</linearGradient>`,
-    `<clipPath id="cardClip">`,
-    `<rect width="${W}" height="${H}" rx="${RADIUS}" ry="${RADIUS}"/>`,
-    `</clipPath>`,
     `</defs>`,
   );
 
   if (bgPngBase64) {
     svgParts.push(
-      `<image x="0" y="0" width="${W}" height="${H}" preserveAspectRatio="xMidYMid slice" clip-path="url(#cardClip)" href="data:image/png;base64,${bgPngBase64}"/>`,
+      `<image x="0" y="0" width="${W}" height="${H}" preserveAspectRatio="xMidYMid slice" href="data:image/png;base64,${bgPngBase64}"/>`,
     );
   }
 
   svgParts.push(
-    `<rect width="${W}" height="${H}" rx="${RADIUS}" ry="${RADIUS}" fill="url(#bgGrad)" stroke="${t.border}" stroke-width="3"/>`,
+    `<rect width="${W}" height="${H}" rx="0" ry="0" fill="url(#bgGrad)" stroke="${t.border}" stroke-width="3"/>`,
 
     // Header
     `<text x="${PAD}" y="${PAD + 38}" font-family="${FONT}" font-size="22" fill="${TEXT_SECONDARY}">${xmlEscape(pair)}</text>`,
