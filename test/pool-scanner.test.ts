@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, MIN_VOLUME_6H_USD, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
+import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, MIN_VOLUME_6H_USD, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
 
 describe("pool scoring formula", () => {
   const K = 1_000_000;
@@ -82,6 +82,12 @@ describe("scan pool eligibility", () => {
   it("calculates a one-hour yield without applying the six-hour average divisor", () => {
     expect(estimatedYieldPercent(10, 1_000, 1)).toBeCloseTo(1);
     expect(estimatedHourlyYieldPercent(10, 1_000)).toBeCloseTo(10 / 1_000 / 6 * 100);
+  });
+
+  it("uses FDV only when a verified market cap is unavailable", () => {
+    expect(effectiveMarketCap("1000000", "1200000")).toEqual({ value: 1_000_000, source: "market_cap" });
+    expect(effectiveMarketCap(null, "1200000")).toEqual({ value: 1_200_000, source: "fdv" });
+    expect(effectiveMarketCap(null, null)).toBeNull();
   });
 
   it("builds an Uniswap explorer URL from either a pool address or V4 pool ID", () => {

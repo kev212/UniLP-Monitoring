@@ -80,7 +80,7 @@ Docker membaca private key dari `./secrets/executor_private_key`; file tersebut 
 
 - `/status`: buka dashboard posisi dengan tombol refresh, close, scan token, scan pools, dan config filter.
 - `/scan <token-address>`: cari pool V3/V4 untuk token tertentu; menampilkan Vol 1h/yield 1h dan ranking safety Vol 6h.
-- `/scan_pools`: mode kandidat cepat untuk pool V3/V4 Robinhood dengan gross yield 1h tertinggi. Filter market cap, total active TVL V3/V4, usia pool tertua sebagai proxy usia token, quote, yield, dan hasil maksimum dapat diubah dari Dashboard > Pool scan config. Override dashboard disimpan di PostgreSQL dan Reset kembali ke default ENV.
+- `/scan_pools`: mode kandidat cepat untuk pool V3/V4 Robinhood dengan gross yield 1h tertinggi. Filter valuasi token memakai market cap dan fallback ke FDV bila market cap tidak tersedia; hasil menandai `FDV fallback`. Total active TVL V3/V4, usia pool tertua sebagai proxy usia token, quote, yield, dan hasil maksimum dapat diubah dari Dashboard > Pool scan config. Override dashboard disimpan di PostgreSQL dan Reset kembali ke default ENV.
 
 ```bash
 npm run dev

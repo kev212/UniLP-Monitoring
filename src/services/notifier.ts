@@ -1023,7 +1023,8 @@ function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters): s
     const effectiveFee = pool.currentLpFee ?? pool.feeTier;
     lines.push(`${index + 1}. ${pool.protocol.toUpperCase()} ${pool.pair} | ${(effectiveFee / 10_000).toFixed(2)}%${pool.dynamicFee ? " dynamic" : ""}`);
     lines.push(`   Yield/h: ${fmtPercent(pool.estimatedPoolYield1hPercent)} | Vol 1h: $${fmtUsd(pool.volume1hUsd)} | Est. fees 1h: $${fmtUsd(pool.estimatedPoolFees1hUsd)}`);
-    lines.push(`   MC: $${fmtUsd(pool.tokenMarketCapUsd ?? 0)} | Total active TVL V3/V4: $${fmtUsd(pool.tokenTotalActiveTvlUsd ?? 0)} | Usia: ${fmtDuration(pool.tokenOldestPoolAgeSeconds ?? 0)}`);
+    const valuationLabel = pool.tokenValuationSource === "fdv" ? "FDV fallback" : "MC";
+    lines.push(`   ${valuationLabel}: $${fmtUsd(pool.tokenMarketCapUsd ?? 0)} | Total active TVL V3/V4: $${fmtUsd(pool.tokenTotalActiveTvlUsd ?? 0)} | Usia: ${fmtDuration(pool.tokenOldestPoolAgeSeconds ?? 0)}`);
     lines.push(`   Pool TVL: $${fmtUsd(pool.tvlUsd)} | Uniswap: ${pool.uniswapUrl}`);
   }
   lines.push("", "Yield adalah estimasi gross pool, bukan hasil personal LP.");

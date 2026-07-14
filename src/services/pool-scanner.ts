@@ -29,6 +29,7 @@ export interface ScoredPool {
   stale: boolean;
   warnings: string[];
   tokenMarketCapUsd?: number;
+  tokenValuationSource?: "market_cap" | "fdv";
   tokenTotalActiveTvlUsd?: number;
   tokenOldestPoolAgeSeconds?: number;
 }
@@ -74,7 +75,7 @@ interface GeckoPool {
 }
 
 interface GeckoTokenResponse {
-  data: { attributes: { market_cap_usd?: string | null } };
+  data: { attributes: { market_cap_usd?: string | null; fdv_usd?: string | null } };
 }
 
 export class PoolScanner {
@@ -253,8 +254,8 @@ export class PoolScanner {
       this.fetchToken(token),
       this.fetchUniswapPools(token),
     ]);
-    const marketCapUsd = Number(tokenResponse?.data.attributes.market_cap_usd ?? "NaN");
-    if (!Number.isFinite(marketCapUsd) || marketCapUsd <= filters.minMarketCapUsd) return null;
+    const valuation = effectiveMarketCap(tokenResponse?.data.attributes.market_cap_usd, tokenResponse?.data.attributes.fdv_usd);
+    if (!valuation || valuation.value <= filters.minMarketCapUsd) return null;
     const relevantRaw = rawPools.filter((pool) => nonQuoteToken(pool, filters.allowedQuoteAddresses) === token);
     if (relevantRaw.length === 0) return null;
     const scored = (await mapWithConcurrency(relevantRaw, 3, (pool) => this.toScoredPool(pool, token, false))).filter((pool): pool is ScoredPool => pool !== null);
@@ -268,7 +269,7 @@ export class PoolScanner {
     if (totalActiveTvlUsd <= filters.minTotalActiveTvlUsd || oldestPoolAgeSeconds <= filters.minPoolAgeSeconds) return null;
     return active
       .filter((pool) => pool.estimatedPoolYield1hPercent > filters.minYieldHourlyPercent)
-      .map((pool) => ({ ...pool, tokenMarketCapUsd: marketCapUsd, tokenTotalActiveTvlUsd: totalActiveTvlUsd, tokenOldestPoolAgeSeconds: oldestPoolAgeSeconds }));
+      .map((pool) => ({ ...pool, tokenMarketCapUsd: valuation.value, tokenValuationSource: valuation.source, tokenTotalActiveTvlUsd: totalActiveTvlUsd, tokenOldestPoolAgeSeconds: oldestPoolAgeSeconds }));
   }
 
   private async fetchToken(token: string): Promise<GeckoTokenResponse | null> {
@@ -407,6 +408,14 @@ export function estimatedHourlyYieldPercent(estimatedPoolFees6hUsd: number, tvlU
 export function estimatedYieldPercent(estimatedPoolFeesUsd: number, tvlUsd: number, hours: number): number {
   if (!Number.isFinite(estimatedPoolFeesUsd) || !Number.isFinite(tvlUsd) || !Number.isFinite(hours) || tvlUsd <= 0 || hours <= 0) return 0;
   return (estimatedPoolFeesUsd / tvlUsd / hours) * 100;
+}
+
+export function effectiveMarketCap(marketCapUsd?: string | null, fdvUsd?: string | null): { value: number; source: "market_cap" | "fdv" } | null {
+  const marketCap = Number(marketCapUsd);
+  if (Number.isFinite(marketCap) && marketCap > 0) return { value: marketCap, source: "market_cap" };
+  const fdv = Number(fdvUsd);
+  if (Number.isFinite(fdv) && fdv > 0) return { value: fdv, source: "fdv" };
+  return null;
 }
 
 export function uniswapPoolUrl(poolIdentifier: string): string {
