@@ -6,8 +6,8 @@ import type { ChainClients } from "./chain-client.js";
 
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
 const K = 1_000_000;
-const GECKO_MIN_REQUEST_INTERVAL_MS = 2_200;
-const MAX_TOKEN_ENRICHMENT_CANDIDATES = 10;
+const GECKO_MIN_REQUEST_INTERVAL_MS = 6_500;
+const MAX_TOKEN_ENRICHMENT_CANDIDATES = 5;
 export const MIN_VOLUME_6H_USD = 100;
 
 export interface ScoredPool {
@@ -85,6 +85,7 @@ export class PoolScanner {
   private marketScanCache?: { key: string; expiresAt: number; result: PoolMarketScan };
   private geckoQueue: Promise<void> = Promise.resolve();
   private lastGeckoRequestAt = 0;
+  private geckoCooldownUntil = 0;
 
   constructor(
     private readonly chains: ChainClients,
@@ -292,10 +293,20 @@ export class PoolScanner {
     this.geckoQueue = new Promise<void>((resolve) => { resolveQueue = resolve; });
     await previous;
     try {
-      const wait = GECKO_MIN_REQUEST_INTERVAL_MS - (Date.now() - this.lastGeckoRequestAt);
-      if (wait > 0) await sleep(wait);
-      this.lastGeckoRequestAt = Date.now();
-      return await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const wait = Math.max(
+          GECKO_MIN_REQUEST_INTERVAL_MS - (Date.now() - this.lastGeckoRequestAt),
+          this.geckoCooldownUntil - Date.now(),
+        );
+        if (wait > 0) await sleep(wait);
+        this.lastGeckoRequestAt = Date.now();
+        const response = await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
+        if (response.status !== 429 || attempt === 1) return response;
+        const retryAfter = Number(response.headers.get("retry-after"));
+        this.geckoCooldownUntil = Date.now() + (Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1_000 : 60_000);
+        log.warn({ cooldownSeconds: Math.ceil((this.geckoCooldownUntil - Date.now()) / 1_000) }, "GeckoTerminal rate-limited; retrying after cooldown");
+      }
+      throw new Error("GeckoTerminal retry loop ended unexpectedly");
     } finally {
       resolveQueue();
     }

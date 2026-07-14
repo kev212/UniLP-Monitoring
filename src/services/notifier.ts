@@ -586,7 +586,7 @@ export class Notifier {
       return;
     }
     this.poolScanRunning = true;
-    await ctx.reply("🏆 Memeriksa kandidat Uniswap V3/V4 Robinhood berdasarkan yield 1h...");
+    await ctx.reply("🏆 Memeriksa kandidat Uniswap V3/V4 Robinhood berdasarkan yield 1h. Scan dapat memerlukan sekitar 2 menit agar tidak kena rate limit data provider...");
     try {
       const filters = await this.poolScanFilters(database, chatId);
       const scan = await scanner.scanPools(filters);
