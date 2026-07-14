@@ -41,6 +41,7 @@ export interface PoolScan {
 
 export interface PoolScanFilters extends PoolScanSettings {
   allowedQuoteAddresses: Address[];
+  candidatePages: number;
 }
 
 export interface PoolMarketScan {
@@ -103,18 +104,20 @@ export class PoolScanner {
   async scanPools(filters: PoolScanFilters): Promise<PoolMarketScan> {
     const key = JSON.stringify({ ...filters, allowedQuoteAddresses: [...filters.allowedQuoteAddresses].sort() });
     if (this.marketScanCache?.key === key && this.marketScanCache.expiresAt > Date.now()) return this.marketScanCache.result;
-    const [v3Pools, v4Pools] = await Promise.all([
-      this.fetchDexPools("uniswap-v3-robinhood"),
-      this.fetchDexPools("uniswap-v4-robinhood"),
+    const pages = Array.from({ length: filters.candidatePages }, (_, index) => index + 1);
+    const fetched = await Promise.all([
+      ...pages.map((page) => this.fetchDexPools("uniswap-v3-robinhood", page)),
+      ...pages.map((page) => this.fetchDexPools("uniswap-v4-robinhood", page)),
     ]);
+    const rawPools = [...new Map(fetched.flat().map((pool) => [pool.attributes.address.toLowerCase(), pool])).values()];
     const candidates = new Map<string, number>();
-    for (const raw of [...v3Pools, ...v4Pools]) {
+    for (const raw of rawPools) {
       const token = nonQuoteToken(raw, filters.allowedQuoteAddresses);
       if (!token) continue;
       const tvlUsd = Number(raw.attributes.reserve_in_usd || "0");
       const volume1hUsd = Number(raw.attributes.volume_usd?.h1 || "0");
       const feeRate = feeRateFromName(raw.attributes.pool_name ?? raw.attributes.name);
-      if (!Number.isFinite(tvlUsd) || tvlUsd <= 0 || !Number.isFinite(volume1hUsd) || volume1hUsd <= 0 || feeRate === null) continue;
+      if (!Number.isFinite(tvlUsd) || tvlUsd < filters.minPoolTvlUsd || !Number.isFinite(volume1hUsd) || volume1hUsd <= 0 || feeRate === null) continue;
       const yield1h = estimatedYieldPercent(volume1hUsd * feeRate, tvlUsd, 1);
       if (yield1h < filters.minYieldHourlyPercent) continue;
       candidates.set(token, Math.max(candidates.get(token) ?? 0, yield1h));
@@ -137,8 +140,8 @@ export class PoolScanner {
     return this.fetchPools(`${GECKO_BASE}/networks/robinhood/tokens/${token}/pools?page=1`, token);
   }
 
-  private async fetchDexPools(dex: "uniswap-v3-robinhood" | "uniswap-v4-robinhood"): Promise<GeckoPool[]> {
-    return this.fetchPools(`${GECKO_BASE}/networks/robinhood/dexes/${dex}/pools?page=1`, dex);
+  private async fetchDexPools(dex: "uniswap-v3-robinhood" | "uniswap-v4-robinhood", page: number): Promise<GeckoPool[]> {
+    return this.fetchPools(`${GECKO_BASE}/networks/robinhood/dexes/${dex}/pools?page=${page}`, `${dex}:page:${page}`);
   }
 
   private async fetchPools(url: string, context: string): Promise<GeckoPool[]> {
@@ -268,7 +271,7 @@ export class PoolScanner {
     const oldestPoolAgeSeconds = Number.isFinite(oldestCreatedAt) ? Math.max(0, Math.floor((Date.now() - oldestCreatedAt) / 1_000)) : 0;
     if (totalActiveTvlUsd <= filters.minTotalActiveTvlUsd || oldestPoolAgeSeconds <= filters.minPoolAgeSeconds) return null;
     return active
-      .filter((pool) => pool.estimatedPoolYield1hPercent > filters.minYieldHourlyPercent)
+      .filter((pool) => pool.tvlUsd >= filters.minPoolTvlUsd && pool.estimatedPoolYield1hPercent > filters.minYieldHourlyPercent)
       .map((pool) => ({ ...pool, tokenMarketCapUsd: valuation.value, tokenValuationSource: valuation.source, tokenTotalActiveTvlUsd: totalActiveTvlUsd, tokenOldestPoolAgeSeconds: oldestPoolAgeSeconds }));
   }
 

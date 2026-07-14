@@ -52,12 +52,14 @@ describe("loadConfig", () => {
     expect(config.uniswapApiKey).toBeUndefined();
     expect(config.poolScanDefaults).toEqual({
       minMarketCapUsd: 500_000,
+      minPoolTvlUsd: 10_000,
       minTotalActiveTvlUsd: 70_000,
       minPoolAgeSeconds: 3_600,
       minYieldHourlyPercent: 1,
       maxResults: 10,
       allowedQuotes: ["USDG", "WETH", "ETH"],
     });
+    expect(config.poolScanCandidatePages).toBe(3);
   });
 
   it("loads a local Uniswap Trading API key", () => {

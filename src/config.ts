@@ -34,11 +34,13 @@ const envSchema = z.object({
   APPROVAL_MODE: z.literal("exact").default("exact"),
   DRY_RUN: z.string().default("true"),
   POOL_SCAN_MIN_MARKET_CAP_USD: z.coerce.number().nonnegative().default(500_000),
+  POOL_SCAN_MIN_POOL_TVL_USD: z.coerce.number().nonnegative().default(10_000),
   POOL_SCAN_MIN_TOTAL_ACTIVE_TVL_USD: z.coerce.number().nonnegative().default(70_000),
   POOL_SCAN_MIN_POOL_AGE_SECONDS: z.coerce.number().int().nonnegative().default(3_600),
   POOL_SCAN_MIN_YIELD_HOURLY_PERCENT: z.coerce.number().nonnegative().default(1),
   POOL_SCAN_MAX_RESULTS: z.coerce.number().int().min(1).max(20).default(10),
   POOL_SCAN_ALLOWED_QUOTES: z.string().default("USDG,WETH,ETH"),
+  POOL_SCAN_CANDIDATE_PAGES: z.coerce.number().int().min(1).max(10).default(3),
   UNISWAP_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
   THEGRAPH_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
   CONFIRMATIONS: z.coerce.number().int().min(1).max(32).default(2),
@@ -74,6 +76,7 @@ export interface RuntimeConfig {
   pnlIncludeGas: boolean;
   dryRun: boolean;
   poolScanDefaults: PoolScanSettings;
+  poolScanCandidatePages: number;
   uniswapApiKey?: string;
   thegraphApiKey?: string;
   confirmations: number;
@@ -185,12 +188,14 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     dryRun: parseBoolean(env.DRY_RUN, "DRY_RUN"),
     poolScanDefaults: {
       minMarketCapUsd: env.POOL_SCAN_MIN_MARKET_CAP_USD,
+      minPoolTvlUsd: env.POOL_SCAN_MIN_POOL_TVL_USD,
       minTotalActiveTvlUsd: env.POOL_SCAN_MIN_TOTAL_ACTIVE_TVL_USD,
       minPoolAgeSeconds: env.POOL_SCAN_MIN_POOL_AGE_SECONDS,
       minYieldHourlyPercent: env.POOL_SCAN_MIN_YIELD_HOURLY_PERCENT,
       maxResults: env.POOL_SCAN_MAX_RESULTS,
       allowedQuotes: parseSymbols(env.POOL_SCAN_ALLOWED_QUOTES, "POOL_SCAN_ALLOWED_QUOTES"),
     },
+    poolScanCandidatePages: env.POOL_SCAN_CANDIDATE_PAGES,
     uniswapApiKey: env.UNISWAP_API_KEY,
     thegraphApiKey: env.THEGRAPH_API_KEY,
     confirmations: env.CONFIRMATIONS,

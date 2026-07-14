@@ -35,11 +35,13 @@ PNL_INCLUDE_GAS=false
 APPROVAL_MODE=exact
 DRY_RUN=true
 POOL_SCAN_MIN_MARKET_CAP_USD=500000
+POOL_SCAN_MIN_POOL_TVL_USD=10000
 POOL_SCAN_MIN_TOTAL_ACTIVE_TVL_USD=70000
 POOL_SCAN_MIN_POOL_AGE_SECONDS=3600
 POOL_SCAN_MIN_YIELD_HOURLY_PERCENT=1
 POOL_SCAN_MAX_RESULTS=10
 POOL_SCAN_ALLOWED_QUOTES=USDG,WETH,ETH
+POOL_SCAN_CANDIDATE_PAGES=3
 ```
 
 Gunakan endpoint Alchemy untuk initial discovery dan archive reads:
@@ -80,7 +82,7 @@ Docker membaca private key dari `./secrets/executor_private_key`; file tersebut 
 
 - `/status`: buka dashboard posisi dengan tombol refresh, close, scan token, scan pools, dan config filter.
 - `/scan <token-address>`: cari pool V3/V4 untuk token tertentu; menampilkan Vol 1h/yield 1h dan ranking safety Vol 6h.
-- `/scan_pools`: mode kandidat cepat untuk pool V3/V4 Robinhood dengan gross yield 1h tertinggi. Filter valuasi token memakai market cap dan fallback ke FDV bila market cap tidak tersedia; hasil menandai `FDV fallback`. Total active TVL V3/V4, usia pool tertua sebagai proxy usia token, quote, yield, dan hasil maksimum dapat diubah dari Dashboard > Pool scan config. Override dashboard disimpan di PostgreSQL dan Reset kembali ke default ENV.
+- `/scan_pools`: mode kandidat cepat untuk pool V3/V4 Robinhood dengan gross yield 1h tertinggi. Scanner memeriksa `POOL_SCAN_CANDIDATE_PAGES` halaman dari masing-masing DEX V3/V4. Filter valuasi token memakai market cap dan fallback ke FDV bila market cap tidak tersedia; hasil menandai `FDV fallback`. TVL minimum per pool, total active TVL V3/V4, usia pool tertua sebagai proxy usia token, quote, yield, dan hasil maksimum dapat diubah dari Dashboard > Pool scan config. Override dashboard disimpan di PostgreSQL dan Reset kembali ke default ENV.
 
 ```bash
 npm run dev

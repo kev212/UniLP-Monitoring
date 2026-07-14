@@ -27,7 +27,7 @@ type DashboardAction =
   | { type: "config_quote"; quote: string }
   | { type: "select" | "confirm"; page: number; chainId: number; protocol: Protocol; positionKey: string };
 
-type PoolSettingKey = "market_cap" | "total_tvl" | "age" | "yield" | "max_results";
+type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "max_results";
 type PendingInput = { kind: "scan_token" } | { kind: "config"; key: PoolSettingKey; dashboardMessageId: number };
 
 interface DashboardView {
@@ -625,7 +625,7 @@ export class Notifier {
   }
 
   private async poolScanSettings(database: Database, chatId: string): Promise<PoolScanSettings> {
-    return (await database.getPoolScanSettings(chatId)) ?? this.config.poolScanDefaults;
+    return { ...this.config.poolScanDefaults, ...(await database.getPoolScanSettings(chatId)) };
   }
 
   private async poolScanFilters(database: Database, chatId: string): Promise<PoolScanFilters> {
@@ -635,14 +635,16 @@ export class Notifier {
       if (!quote) throw new Error(`Quote token ${symbol} tidak ada di QUOTE_TOKEN_ALLOWLIST_ROBINHOOD`);
       return quote.address;
     });
-    return { ...settings, allowedQuoteAddresses };
+    return { ...settings, allowedQuoteAddresses, candidatePages: this.config.poolScanCandidatePages };
   }
 
   private async showPoolScanConfig(database: Database, chatId: string, messageId: number, notice?: string): Promise<void> {
     const settings = await this.poolScanSettings(database, chatId);
     const keyboard = new InlineKeyboard()
       .text("Min MC", "lp:cfg:market_cap")
-      .text("Min TVL", "lp:cfg:total_tvl")
+      .text("Min pool TVL", "lp:cfg:pool_tvl")
+      .row()
+      .text("Min total TVL", "lp:cfg:total_tvl")
       .row()
       .text("Min usia", "lp:cfg:age")
       .text("Min yield/h", "lp:cfg:yield")
@@ -656,6 +658,7 @@ export class Notifier {
     const lines = [
       "⚙️ POOL SCAN CONFIG",
       `Min market cap: $${fmtUsd(settings.minMarketCapUsd)}`,
+      `Min TVL per pool: $${fmtUsd(settings.minPoolTvlUsd)}`,
       `Min total active TVL V3/V4: $${fmtUsd(settings.minTotalActiveTvlUsd)}`,
       `Min usia pool tertua: ${fmtDuration(settings.minPoolAgeSeconds)}`,
       `Min gross yield/h: ${fmtPercent(settings.minYieldHourlyPercent)}`,
@@ -882,7 +885,7 @@ function isProtocol(value: string | undefined): value is Protocol {
 }
 
 function isPoolSettingKey(value: string | undefined): value is PoolSettingKey {
-  return value === "market_cap" || value === "total_tvl" || value === "age" || value === "yield" || value === "max_results";
+  return value === "market_cap" || value === "pool_tvl" || value === "total_tvl" || value === "age" || value === "yield" || value === "max_results";
 }
 
 export function isExpiredCallbackError(error: unknown): boolean {
@@ -991,6 +994,7 @@ function parsePoolScanInput(key: PoolSettingKey, value: string): Partial<PoolSca
   const number = Number(value.replace(/[$,%\s,]/g, ""));
   if (!Number.isFinite(number) || number < 0) throw new Error("nilai harus angka positif");
   if (key === "market_cap") return { minMarketCapUsd: number };
+  if (key === "pool_tvl") return { minPoolTvlUsd: number };
   if (key === "total_tvl") return { minTotalActiveTvlUsd: number };
   if (key === "yield") return { minYieldHourlyPercent: number };
   if (!Number.isInteger(number) || number < 1 || number > 20) throw new Error("Top N harus integer 1 sampai 20");
@@ -999,6 +1003,7 @@ function parsePoolScanInput(key: PoolSettingKey, value: string): Partial<PoolSca
 
 function configInputPrompt(key: PoolSettingKey): string {
   if (key === "market_cap") return "Kirim Min market cap, contoh: 500000 atau $500K.";
+  if (key === "pool_tvl") return "Kirim Min TVL per pool, contoh: 10000.";
   if (key === "total_tvl") return "Kirim Min total active TVL V3/V4, contoh: 70000.";
   if (key === "age") return "Kirim Min usia pool tertua, contoh: 30m, 1h, atau 2d.";
   if (key === "yield") return "Kirim Min gross yield per jam, contoh: 1 atau 1%.";
@@ -1010,7 +1015,7 @@ function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters): s
     "🏆 TOP POOL YIELD 1H",
     "Chain: Robinhood (4663) | Uniswap V3/V4",
     `Kandidat: ${scan.candidateTokens} | Token lolos enrichment: ${scan.evaluatedTokens}`,
-    `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | TVL aktif > $${fmtUsd(filters.minTotalActiveTvlUsd)} | Usia > ${fmtDuration(filters.minPoolAgeSeconds)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
+    `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | Pool TVL > $${fmtUsd(filters.minPoolTvlUsd)} | Total TVL aktif > $${fmtUsd(filters.minTotalActiveTvlUsd)} | Usia > ${fmtDuration(filters.minPoolAgeSeconds)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
     `Quote: ${filters.allowedQuotes.join(", ")}`,
     "",
   ];
