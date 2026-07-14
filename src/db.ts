@@ -161,6 +161,11 @@ export class Database {
       );
       CREATE INDEX IF NOT EXISTS close_history_settled_at_idx ON close_history(settled_at DESC);
       ALTER TABLE close_history ADD COLUMN IF NOT EXISTS final_pnl_usd NUMERIC(78, 0) NOT NULL DEFAULT 0;
+      CREATE TABLE IF NOT EXISTS telegram_pnl_card_bg (
+        chat_id TEXT PRIMARY KEY,
+        image BYTEA NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
     `);
   }
 
@@ -586,6 +591,27 @@ export class Database {
       "UPDATE close_history SET final_pnl_usd = $2 WHERE id = $1",
       [id, finalPnlUsd.toString()],
     );
+  }
+
+  async getPnlCardBackground(chatId: string): Promise<Buffer | null> {
+    const result = await this.pool.query<{ image: Buffer }>(
+      "SELECT image FROM telegram_pnl_card_bg WHERE chat_id = $1",
+      [chatId],
+    );
+    return result.rowCount ? result.rows[0]!.image : null;
+  }
+
+  async setPnlCardBackground(chatId: string, image: Buffer): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO telegram_pnl_card_bg (chat_id, image)
+       VALUES ($1, $2)
+       ON CONFLICT (chat_id) DO UPDATE SET image = EXCLUDED.image, updated_at = NOW()`,
+      [chatId, image],
+    );
+  }
+
+  async clearPnlCardBackground(chatId: string): Promise<void> {
+    await this.pool.query("DELETE FROM telegram_pnl_card_bg WHERE chat_id = $1", [chatId]);
   }
 }
 

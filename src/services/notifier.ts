@@ -29,6 +29,8 @@ type DashboardAction =
   | { type: "history"; page: number }
   | { type: "pnl_card"; page: number }
   | { type: "pnl_card_select"; page: number; historyIndex: number }
+  | { type: "bg_upload"; page: number }
+  | { type: "bg_reset"; page: number }
   | { type: "select" | "confirm"; page: number; chainId: number; protocol: Protocol; positionKey: string };
 
 type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "max_results";
@@ -47,6 +49,7 @@ export class Notifier {
   private readonly lastStatusCache = new Map<string, PositionRecord[]>();
   private readonly dashboardCloseInFlight = new Set<string>();
   private readonly pendingInput = new Map<string, PendingInput>();
+  private readonly pendingBgUpload = new Set<string>();
   private poolScanRunning = false;
   private deletionTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -92,6 +95,9 @@ export class Notifier {
     });
     this.bot.on("message:text", async (ctx) => {
       await this.handlePendingInput(ctx, database, scanner);
+    });
+    this.bot.on(":photo", async (ctx) => {
+      await this.handlePhotoUpload(ctx, database);
     });
   }
 
@@ -393,6 +399,16 @@ export class Notifier {
         await this.sendPnlCard(ctx, database, chatId, action.historyIndex);
         return;
       }
+      if (action.type === "bg_upload") {
+        this.pendingBgUpload.add(chatId);
+        await this.replyTemp(ctx, "Kirim gambar untuk background PnL card (JPEG/PNG, max 5 MB).", { reply_markup: { force_reply: true } as any });
+        return;
+      }
+      if (action.type === "bg_reset") {
+        await database.clearPnlCardBackground(chatId);
+        await this.replyTemp(ctx, "✅ Background PnL card dikembalikan ke default.");
+        return;
+      }
       if (action.type !== "select" && action.type !== "confirm") {
         await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
         return;
@@ -509,6 +525,9 @@ export class Notifier {
     keyboard.row()
       .text("📚 History ±0.5%", dashboardAction("history", 0))
       .text("🖼 PnL card", dashboardAction("pnl_card", 0));
+    keyboard.row()
+      .text("🖼 Background card", dashboardAction("bg_upload", 0))
+      .text("⬛ Reset BG", dashboardAction("bg_reset", 0));
     keyboard.row().text("⚙️ Pool scan config", dashboardAction("config", page));
     if (pageCount > 1) {
       keyboard.row();
@@ -801,6 +820,38 @@ export class Notifier {
     if (message) await this.replyTemp(ctx, message);
   }
 
+  private async handlePhotoUpload(ctx: Context, database: Database): Promise<void> {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId || !this.authorized(chatId)) return;
+    if (!this.pendingBgUpload.has(chatId)) return;
+    this.pendingBgUpload.delete(chatId);
+    const photos = ctx.message?.photo;
+    if (!photos || photos.length === 0) {
+      await this.replyTemp(ctx, "Tidak ada gambar terdeteksi.");
+      return;
+    }
+    const largest = photos[photos.length - 1]!;
+    try {
+      const file = await ctx.api.getFile(largest.file_id);
+      if (!file.file_path) {
+        await this.replyTemp(ctx, "Gagal membaca file gambar.");
+        return;
+      }
+      if (file.file_size && file.file_size > 5_000_000) {
+        await this.replyTemp(ctx, "Ukuran gambar terlalu besar (max 5 MB).");
+        return;
+      }
+      const url = `https://api.telegram.org/file/bot${this.config.telegram!.token}/${file.file_path}`;
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const buffer = Buffer.from(await response.arrayBuffer());
+      await database.setPnlCardBackground(chatId, buffer);
+      await this.replyTemp(ctx, "✅ Background PnL card tersimpan.");
+    } catch (error) {
+      await this.replyTemp(ctx, `Gagal menyimpan background: ${errorMessage(error).slice(0, 200)}`);
+    }
+  }
+
   private async handleHistoryCommand(ctx: ChatContext, database: Database): Promise<void> {
     const chatId = ctx.chat.id.toString();
     if (!this.authorized(chatId)) return;
@@ -876,7 +927,8 @@ export class Notifier {
       : `${await this.tokenLabel(record.token0, record.chainId)}/${await this.tokenLabel(record.token1, record.chainId)}`;
     const qtDec = await this.decimals(record.quoteToken, record.chainId);
     const qtSymbol = this.quoteSymbol(record.quoteToken);
-    const png = await renderPnlCard(record, pair, qtDec, qtSymbol);
+    const bg = await database.getPnlCardBackground(chatId);
+    const png = await renderPnlCard(record, pair, qtDec, qtSymbol, bg);
     const sent = await ctx.replyWithPhoto(new InputFile(png, "pnl-card.png"));
     if (sent && "message_id" in sent) {
       await this.queueTemp(chatId, (sent as any).message_id);
@@ -1028,7 +1080,7 @@ export class Notifier {
   }
 }
 
-function dashboardAction(type: "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "history" | "pnl_card", page: number): string {
+function dashboardAction(type: "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset", page: number): string {
   return `lp:${type}:${page}`;
 }
 
@@ -1080,8 +1132,8 @@ function parseDashboardPage(value: string | undefined): number | null {
   return Number.isSafeInteger(page) ? page : null;
 }
 
-function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "history" | "pnl_card" {
-  return value === "refresh" || value === "close" || value === "status" || value === "scan" || value === "scan_pools" || value === "config" || value === "config_reset" || value === "history" || value === "pnl_card";
+function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset" {
+  return value === "refresh" || value === "close" || value === "status" || value === "scan" || value === "scan_pools" || value === "config" || value === "config_reset" || value === "history" || value === "pnl_card" || value === "bg_upload" || value === "bg_reset";
 }
 
 function isPositionAction(value: string | undefined): value is "select" | "confirm" {

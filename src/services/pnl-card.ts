@@ -35,6 +35,7 @@ export async function renderPnlCard(
   pair: string,
   qtDecimals: number,
   qtSymbol: string,
+  customBg?: Buffer | null,
 ): Promise<Buffer> {
   const isProfit = record.finalPnlBps >= 0n;
   const t = rhTheme(isProfit);
@@ -50,19 +51,39 @@ export async function renderPnlCard(
   const settledStr = fmtUtc(record.settledAt);
   const triggerLabel = triggerDisplay(record.trigger);
 
-  const svg = [
+  const hasCustomBg = customBg && customBg.length > 0;
+
+  const svgParts: string[] = [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`,
     `<defs>`,
     `<linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">`,
-    `<stop offset="0%" stop-color="${t.bgStart}"/>`,
-    `<stop offset="100%" stop-color="${t.bgEnd}"/>`,
+  ];
+  if (hasCustomBg) {
+    svgParts.push(`<stop offset="0%" stop-color="#000000" stop-opacity="0.50"/>`);
+    svgParts.push(`<stop offset="100%" stop-color="#000000" stop-opacity="0.60"/>`);
+  } else {
+    svgParts.push(`<stop offset="0%" stop-color="${t.bgStart}"/>`);
+    svgParts.push(`<stop offset="100%" stop-color="${t.bgEnd}"/>`);
+  }
+  svgParts.push(
     `</linearGradient>`,
     `<linearGradient id="accentGrad" x1="0" y1="0" x2="1" y2="0">`,
     `<stop offset="0%" stop-color="${t.accent}"/>`,
     `<stop offset="100%" stop-color="${isProfit ? RH_DIM : "#cc3333"}"/>`,
     `</linearGradient>`,
+    `<clipPath id="cardClip">`,
+    `<rect width="${W}" height="${H}" rx="${RADIUS}" ry="${RADIUS}"/>`,
+    `</clipPath>`,
     `</defs>`,
+  );
 
+  if (hasCustomBg) {
+    svgParts.push(
+      `<image x="0" y="0" width="${W}" height="${H}" preserveAspectRatio="xMidYMid slice" clip-path="url(#cardClip)" href="data:image/png;base64,${customBg!.toString("base64")}"/>`,
+    );
+  }
+
+  svgParts.push(
     `<rect width="${W}" height="${H}" rx="${RADIUS}" ry="${RADIUS}" fill="url(#bgGrad)" stroke="${t.border}" stroke-width="3"/>`,
 
     // Header
@@ -90,9 +111,9 @@ export async function renderPnlCard(
     `<text x="${W - PAD}" y="${H - 80}" font-family="${FONT}" font-size="18" fill="${TEXT_MUTED}" text-anchor="end">${settledStr} UTC</text>`,
 
     `</svg>`,
-  ].join("\n");
+  );
 
-  return sharp(Buffer.from(svg, "utf-8")).png().toBuffer();
+  return sharp(Buffer.from(svgParts.join("\n"), "utf-8")).png().toBuffer();
 }
 
 function xmlEscape(text: string): string {
