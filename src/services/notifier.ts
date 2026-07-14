@@ -762,19 +762,19 @@ export class Notifier {
       } catch (editError) {
         const details = errorMessage(editError);
         if (!details.includes("message is not modified")) {
-          await this.sendTemp([text], chatId, 120_000);
+          await this.sendTemp([text], chatId, 300_000);
           return;
         }
       }
-      await this.queueTemp(chatId, messageId, 120_000);
+      await this.queueTemp(chatId, messageId, 300_000);
     } catch (error) {
       const text = `Scan pools gagal: ${errorMessage(error).slice(0, 500)}`;
       if (this.bot) {
         try {
           await this.bot.api.editMessageText(chatId, messageId, text);
-          await this.queueTemp(chatId, messageId, 120_000);
+          await this.queueTemp(chatId, messageId, 300_000);
         } catch {
-          await this.sendTemp([text], chatId, 120_000);
+          await this.sendTemp([text], chatId, 300_000);
         }
       }
     } finally {
