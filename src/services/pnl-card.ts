@@ -164,6 +164,8 @@ function triggerDisplay(trigger: string): string {
       return "Take Profit";
     case "trailing_take_profit":
       return "Trailing Take Profit";
+    case "out_of_range_above":
+      return "Out of Range Above";
     case "manual":
       return "Manual Close";
     default:

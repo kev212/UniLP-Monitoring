@@ -31,6 +31,9 @@ const envSchema = z.object({
   MAX_TWAP_DEVIATION_BPS: z.coerce.number().int().min(1).max(5_000).default(250),
   TWAP_WINDOW_SECONDS: z.coerce.number().int().min(10).max(3_600).default(300),
   PNL_INCLUDE_GAS: z.string().default("false"),
+  OOR_AUTO_CLOSE_ENABLED: z.string().default("true"),
+  OOR_ABOVE_MIN_DISTANCE_PERCENT: z.coerce.number().positive().default(10),
+  OOR_ABOVE_MIN_DURATION_MS: z.coerce.number().int().min(5_000).max(86_400_000).default(1_800_000),
   APPROVAL_MODE: z.literal("exact").default("exact"),
   DRY_RUN: z.string().default("true"),
   POOL_SCAN_MIN_MARKET_CAP_USD: z.coerce.number().nonnegative().default(500_000),
@@ -74,6 +77,9 @@ export interface RuntimeConfig {
   maxTwapDeviationBps: number;
   twapWindowSeconds: number;
   pnlIncludeGas: boolean;
+  oorAutoCloseEnabled: boolean;
+  oorAboveMinDistancePercent: number;
+  oorAboveMinDurationMs: number;
   dryRun: boolean;
   poolScanDefaults: PoolScanSettings;
   poolScanCandidatePages: number;
@@ -185,6 +191,9 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     maxTwapDeviationBps: env.MAX_TWAP_DEVIATION_BPS,
     twapWindowSeconds: env.TWAP_WINDOW_SECONDS,
     pnlIncludeGas: parseBoolean(env.PNL_INCLUDE_GAS, "PNL_INCLUDE_GAS"),
+    oorAutoCloseEnabled: parseBoolean(env.OOR_AUTO_CLOSE_ENABLED, "OOR_AUTO_CLOSE_ENABLED"),
+    oorAboveMinDistancePercent: env.OOR_ABOVE_MIN_DISTANCE_PERCENT,
+    oorAboveMinDurationMs: env.OOR_ABOVE_MIN_DURATION_MS,
     dryRun: parseBoolean(env.DRY_RUN, "DRY_RUN"),
     poolScanDefaults: {
       minMarketCapUsd: env.POOL_SCAN_MIN_MARKET_CAP_USD,

@@ -17,9 +17,9 @@ import {
   v4PositionManagerAbi,
   v4StateViewAbi,
 } from "../abi.js";
-import type { PositionRecord, Protocol, TokenAmount } from "../types.js";
+import type { PositionRangeInfo, PositionRecord, Protocol, TokenAmount } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
-import { amountsForLiquidity, applySlippage } from "./uniswap-math.js";
+import { amountsForLiquidity, applySlippage, sqrtRatioAtTick } from "./uniswap-math.js";
 
 export interface PositionValue {
   protocol: Protocol;
@@ -33,6 +33,7 @@ export interface PositionValue {
   minAmount0: bigint;
   minAmount1: bigint;
   v4PoolKey?: { currency0: Address; currency1: Address; fee: number; tickSpacing: number; hooks: Address };
+  range?: PositionRangeInfo;
   unclaimedFees0: bigint;
   unclaimedFees1: bigint;
   observedBlock: bigint;
@@ -128,6 +129,7 @@ export class PositionReader {
       minAmount1: applySlippage(principal.amount1, this.slippageBps),
       unclaimedFees0: fee0,
       unclaimedFees1: fee1,
+      range: rangeInfo(currentTick, tickLower, tickUpper, slot0[0]),
       observedBlock: blockNumber,
     };
   }
@@ -182,6 +184,7 @@ export class PositionReader {
       v4PoolKey: poolKey,
       unclaimedFees0: fee0,
       unclaimedFees1: fee1,
+      range: rangeInfo(slot0[1], tickLower, tickUpper, slot0[0]),
       observedBlock: blockNumber,
     };
   }
@@ -225,4 +228,18 @@ function v3FeeGrowthInside(
   const below = currentTick >= tickLower ? feeGrowthOutsideLower : feeGrowthGlobal - feeGrowthOutsideLower;
   const above = currentTick >= tickUpper ? feeGrowthGlobal - feeGrowthOutsideUpper : feeGrowthOutsideUpper;
   return feeGrowthGlobal - below - above;
+}
+
+function rangeInfo(currentTick: number, tickLower: number, tickUpper: number, sqrtPriceX96: bigint): import("../types.js").PositionRangeInfo {
+  if (currentTick >= tickUpper) {
+    const sqrtUpper = sqrtRatioAtTick(tickUpper);
+    const currentPrice = (sqrtPriceX96 * sqrtPriceX96) >> 96n;
+    const upperPrice = (sqrtUpper * sqrtUpper) >> 96n;
+    const distanceBps = upperPrice > 0n ? (currentPrice * 10_000n) / upperPrice - 10_000n : 0n;
+    return { tickLower, tickUpper, currentTick, currentSqrtPrice: sqrtPriceX96, status: "above", aboveDistanceBps: distanceBps > 0n ? distanceBps : 0n };
+  }
+  if (currentTick < tickLower) {
+    return { tickLower, tickUpper, currentTick, currentSqrtPrice: sqrtPriceX96, status: "below" };
+  }
+  return { tickLower, tickUpper, currentTick, currentSqrtPrice: sqrtPriceX96, status: "in_range" };
 }

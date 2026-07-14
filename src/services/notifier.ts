@@ -77,27 +77,34 @@ export class Notifier {
       { command: "history", description: "Tampilkan riwayat posisi close >= ±0.5% PnL" },
     ]);
     this.bot.command("status", async (ctx: ChatContext) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleStatus(ctx, database, pnl);
     });
     this.bot.command("close", async (ctx: ChatContext) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleClose(ctx, database, executor);
     });
     this.bot.command("scan", async (ctx: ChatContext) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleScan(ctx, scanner);
     });
     this.bot.command("scan_pools", async (ctx: ChatContext) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleScanPools(ctx, database, scanner);
     });
     this.bot.command("history", async (ctx: ChatContext) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleHistoryCommand(ctx, database);
     });
     this.bot.callbackQuery(/^lp:/, async (ctx) => {
       await this.handleDashboardCallback(ctx, database, pnl, executor, scanner);
     });
     this.bot.on("message:text", async (ctx) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handlePendingInput(ctx, database, scanner);
     });
     this.bot.on(":photo", async (ctx) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handlePhotoUpload(ctx, database);
     });
   }
@@ -183,6 +190,8 @@ export class Notifier {
         ? "take profit"
       : reason === "trailing_take_profit"
         ? "trailing take profit"
+      : reason === "out_of_range_above"
+        ? "OUT OF RANGE ABOVE"
         : "manual";
     const pair = await this.pairLabel(position);
     const qtSymbol = this.quoteSymbol(position.quoteToken);
@@ -611,7 +620,8 @@ export class Notifier {
     const reviewReason = position.status === "needs_review"
       ? ` | ${reviewReasonDisplay(position.metadata)}`
       : "";
-    const base = `${index}. ${statusLabel.split(" ")[0]} ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${reviewReason}`;
+    const oorInfo = oorStatusDisplay(position.metadata);
+    const base = `${index}. ${statusLabel.split(" ")[0]} ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${reviewReason}${oorInfo}`;
 
     if (!position.quoteToken || !blockNumber) return `${base}\n`;
     try {
@@ -1241,11 +1251,25 @@ function reviewReasonDisplay(metadata: Record<string, unknown>): string {
   return reason.length > 120 ? `${reason.slice(0, 117)}...` : reason;
 }
 
+function oorStatusDisplay(metadata: Record<string, unknown>): string {
+  const status = metadata.oorStatus;
+  if (status === "above") {
+    const bps = typeof metadata.oorDistanceBps === "number" ? metadata.oorDistanceBps : 0;
+    const pct = (bps / 100).toFixed(2);
+    const seenAt = typeof metadata.oorAboveSeenAt === "number" ? metadata.oorAboveSeenAt : undefined;
+    const timer = seenAt ? ` ⏳${Math.floor((Date.now() - seenAt) / 60_000)}m` : "";
+    return ` | ⚠️ ABOVE +${pct}%${timer}`;
+  }
+  if (status === "below") return " | ⚠️ BELOW";
+  return "";
+}
+
 function triggerDisplayShort(trigger: string): string {
   switch (trigger) {
     case "stop_loss": return "SL";
     case "take_profit": return "TP";
     case "trailing_take_profit": return "Trail";
+    case "out_of_range_above": return "OOR";
     case "manual": return "Manual";
     default: return trigger;
   }

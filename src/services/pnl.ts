@@ -3,7 +3,7 @@ import type { Address } from "viem";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ExitTrigger, LiquidationQuote, PnlSnapshot, PositionRecord, TrailingStopState } from "../types.js";
+import type { ExitTrigger, LiquidationQuote, PnlSnapshot, PositionRangeInfo, PositionRecord, TrailingStopState } from "../types.js";
 import type { PositionReader } from "./position-reader.js";
 import type { RoutePlanner } from "./route-planner.js";
 import type { UniswapTradingApi } from "./uniswap-trading-api.js";
@@ -12,6 +12,7 @@ export interface ValuedPosition {
   snapshot: PnlSnapshot;
   liquidation: LiquidationQuote;
   twapGuard: { ready: boolean; deviationBps?: bigint };
+  range?: PositionRangeInfo;
 }
 
 export type TrailingStopDecision =
@@ -106,6 +107,7 @@ export class PnlService {
         blockNumber: value.observedBlock,
       },
       twapGuard,
+      range: value.range,
     };
   }
 

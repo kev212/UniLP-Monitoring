@@ -12,7 +12,16 @@ export type PositionStatus =
   | "failed"
   | "paused";
 
-export type ExitTrigger = "stop_loss" | "take_profit" | "trailing_take_profit" | "manual";
+export type ExitTrigger = "stop_loss" | "take_profit" | "trailing_take_profit" | "out_of_range_above" | "manual";
+
+export interface PositionRangeInfo {
+  tickLower: number;
+  tickUpper: number;
+  currentTick: number;
+  currentSqrtPrice: bigint;
+  status: "in_range" | "above" | "below";
+  aboveDistanceBps?: bigint;
+}
 
 export interface TrailingStopState {
   peakPnlBps: bigint;

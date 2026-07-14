@@ -148,6 +148,7 @@ export class Guardian {
       await this.database.addPnlSnapshot(valued.snapshot);
       await this.notifier.logPnL(position, valued.snapshot);
       const trailing = this.pnl.evaluateTrailingStop(position.metadata, valued.snapshot);
+      await this.updateOorAboveTimer(position, valued.range);
 
       if (position.status === "discovered" || position.status === "syncing") {
         if (trailing.action === "activate" || trailing.action === "raise_peak") {
@@ -183,7 +184,7 @@ export class Guardian {
         }, "trailing stop updated");
       }
 
-      const trigger = staticTrigger ?? (trailing.action === "trigger" ? "trailing_take_profit" : null);
+      const trigger = staticTrigger ?? (trailing.action === "trigger" ? "trailing_take_profit" : null) ?? this.checkOorAboveTrigger(position.metadata);
       const pendingRetry = !trigger ? parseExitRetry(position.metadata) : null;
       const effectiveTrigger: ExitTrigger | null = trigger ?? pendingRetry?.reason ?? null;
       if (!effectiveTrigger) {
@@ -263,8 +264,38 @@ export class Guardian {
       this.queuedExitPositions.delete(position.id);
     }
   }
-}
 
+  private async updateOorAboveTimer(position: PositionRecord, range?: import("../types.js").PositionRangeInfo): Promise<void> {
+    if (!range) return;
+    const meta = position.metadata as Record<string, unknown>;
+    meta.oorStatus = range.status;
+    if (range.status === "above") meta.oorDistanceBps = Number(range.aboveDistanceBps ?? 0n);
+
+    if (!this.config.oorAutoCloseEnabled) return;
+    const thresholdBps = BigInt(Math.round(this.config.oorAboveMinDistancePercent * 100));
+    if (range.status === "above" && (range.aboveDistanceBps ?? 0n) >= thresholdBps) {
+      if (meta.oorAboveSeenAt === undefined) {
+        const now = Date.now();
+        meta.oorAboveSeenAt = now;
+        await this.database.setPositionStatus(position.id, position.status, { oorAboveSeenAt: now });
+        log.info({ positionId: position.id, distanceBps: range.aboveDistanceBps }, "OOR above timer started");
+      }
+    } else if (meta.oorAboveSeenAt !== undefined) {
+      delete meta.oorAboveSeenAt;
+      await this.database.setPositionStatus(position.id, position.status, { oorAboveSeenAt: null });
+      log.info({ positionId: position.id }, "OOR above timer reset");
+    }
+  }
+
+  private checkOorAboveTrigger(metadata: Record<string, unknown>): ExitTrigger | null {
+    if (!this.config.oorAutoCloseEnabled) return null;
+    const seenAt = (metadata as Record<string, unknown>).oorAboveSeenAt;
+    if (typeof seenAt !== "number") return null;
+    if (Date.now() - seenAt < this.config.oorAboveMinDurationMs) return null;
+    return "out_of_range_above";
+  }
+
+}
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
