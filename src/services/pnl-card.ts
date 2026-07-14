@@ -22,7 +22,7 @@ const colors = {
   muted: "#6b7280",
 };
 
-export async function renderPnlCard(record: CloseHistoryRecord, pair: string): Promise<Buffer> {
+export async function renderPnlCard(record: CloseHistoryRecord, pair: string, qtDecimals: number, qtSymbol: string): Promise<Buffer> {
   const isProfit = record.finalPnlBps >= 0n;
   const accent = isProfit ? colors.profitAccent : colors.lossAccent;
   const border = isProfit ? colors.profitBorder : colors.lossBorder;
@@ -31,8 +31,8 @@ export async function renderPnlCard(record: CloseHistoryRecord, pair: string): P
   const sign = isProfit ? "+" : "";
 
   const pnlPct = fmtBps(record.finalPnlBps);
-  const pnlAmt = fmtToken(record.finalPnlQuote, 6);
-  const pnlUsd = fmtToken(record.finalPnlUsd, 6);
+  const pnlAmt = fmtToken(record.finalPnlQuote, qtDecimals);
+  const pnlUsd = fmtToken(record.finalPnlUsd, 6, 2);
   const hasUsd = record.finalPnlUsd !== 0n;
   const protoLabel = record.protocol.toUpperCase();
   const settledStr = fmtUtc(record.settledAt);
@@ -58,7 +58,7 @@ export async function renderPnlCard(record: CloseHistoryRecord, pair: string): P
   lines.push(`<text x="${W / 2}" y="${H / 2 - 16}" font-family="${FONT}" font-size="60" font-weight="bold" fill="${accent}" text-anchor="middle">${sign}${pnlPct}%</text>`);
 
   // PnL quote
-  lines.push(`<text x="${W / 2}" y="${H / 2 + 32}" font-family="${FONT}" font-size="16" fill="${pnlTextColor}" text-anchor="middle">${sign}${pnlAmt} ${isProfit ? "PROFIT" : "LOSS"}</text>`);
+  lines.push(`<text x="${W / 2}" y="${H / 2 + 32}" font-family="${FONT}" font-size="16" fill="${pnlTextColor}" text-anchor="middle">${sign}${pnlAmt} ${qtSymbol} ${isProfit ? "PROFIT" : "LOSS"}</text>`);
 
   // USD
   if (hasUsd) {
@@ -87,16 +87,19 @@ function fmtBps(value: bigint): string {
   return `${negative ? "-" : ""}${absolute / 100n}.${(absolute % 100n).toString().padStart(2, "0")}`;
 }
 
-function fmtToken(value: bigint, decimals: number): string {
+function fmtToken(value: bigint, decimals: number, maxDec?: number): string {
   if (decimals === 0 || value === 0n) return value.toString();
   const negative = value < 0n;
   const absolute = negative ? -value : value;
   const divisor = 10n ** BigInt(Math.min(decimals, 18));
   const integer = absolute / divisor;
   const fraction = absolute % divisor;
-  const fracStr = fraction.toString().padStart(Math.min(decimals, 18), "0").replace(/0+$/, "");
-  const num = fracStr ? `${integer}.${fracStr}` : integer.toString();
-  return `${negative ? "-" : ""}${num}`;
+  if (fraction === 0n) return `${negative ? "-" : ""}${integer}`;
+  let fracStr = fraction.toString().padStart(Math.min(decimals, 18), "0").replace(/0+$/, "");
+  if (maxDec !== undefined && fracStr.length > maxDec) {
+    fracStr = fracStr.slice(0, maxDec);
+  }
+  return `${negative ? "-" : ""}${integer}.${fracStr}`;
 }
 
 function triggerDisplay(trigger: string): string {

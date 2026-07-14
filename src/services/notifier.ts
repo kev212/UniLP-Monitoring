@@ -833,7 +833,10 @@ export class Notifier {
       const prefix = isProfit ? "📈" : "📉";
       const sign = isProfit ? "+" : "";
       lines.push(`${prefix} ${item.protocol.toUpperCase()} #${item.positionKey} ${pair}`);
-      lines.push(`   ${sign}${formatBps(item.finalPnlBps)}% | ${sign}${formatToken(item.finalPnlQuote, 6)}${item.finalPnlUsd !== 0n ? ` | ${sign}$${formatToken(item.finalPnlUsd, 6)}` : ""} | ${triggerDisplayShort(item.trigger)}`);
+      const qtDec = await this.decimals(item.quoteToken, item.chainId);
+      const qtSymbol = this.quoteSymbol(item.quoteToken);
+      const usdPart = item.finalPnlUsd !== 0n ? ` | ${sign}$${formatToken(item.finalPnlUsd, 6, 2)}` : "";
+      lines.push(`   ${sign}${formatBps(item.finalPnlBps)}% | ${sign}${formatToken(item.finalPnlQuote, qtDec)} ${qtSymbol}${usdPart} | ${triggerDisplayShort(item.trigger)}`);
       lines.push(`   Settled: ${fmtUtc(item.settledAt)} UTC`);
       lines.push("");
     }
@@ -877,7 +880,9 @@ export class Notifier {
     const pair = record.quoteToken.toLowerCase() === record.token0.toLowerCase()
       ? `${await this.tokenLabel(record.token1, record.chainId)}/${await this.tokenLabel(record.token0, record.chainId)}`
       : `${await this.tokenLabel(record.token0, record.chainId)}/${await this.tokenLabel(record.token1, record.chainId)}`;
-    const png = await renderPnlCard(record, pair);
+    const qtDec = await this.decimals(record.quoteToken, record.chainId);
+    const qtSymbol = this.quoteSymbol(record.quoteToken);
+    const png = await renderPnlCard(record, pair, qtDec, qtSymbol);
     const sent = await ctx.replyWithPhoto(new InputFile(png, "pnl-card.png"));
     if (sent && "message_id" in sent) {
       await this.queueTemp(chatId, (sent as any).message_id);
