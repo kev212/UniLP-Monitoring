@@ -586,13 +586,27 @@ export class Notifier {
       return;
     }
     this.poolScanRunning = true;
-    await ctx.reply("🏆 Memeriksa kandidat Uniswap V3/V4 Robinhood berdasarkan yield 1h. Scan dapat memerlukan sekitar 2 menit agar tidak kena rate limit data provider...");
+    const progress = await ctx.reply("🏆 Memeriksa kandidat Uniswap V3/V4 Robinhood berdasarkan yield 1h. Scan dapat memerlukan sekitar 2 menit...");
+    const messageId = progress.message_id;
+    void this.executePoolScan(database, scanner, chatId, messageId).catch((scanError) => log.error({ error: errorMessage(scanError) }, "pool scan background job failed"));
+  }
+
+  private async executePoolScan(database: Database, scanner: PoolScanner, chatId: string, messageId: number): Promise<void> {
     try {
       const filters = await this.poolScanFilters(database, chatId);
       const scan = await scanner.scanPools(filters);
-      await this.replyLong(ctx, formatPoolMarketScan(scan, filters));
+      const text = formatPoolMarketScan(scan, filters);
+      if (!this.bot) return;
+      try {
+        await this.bot.api.editMessageText(chatId, messageId, text);
+      } catch (editError) {
+        const details = errorMessage(editError);
+        if (!details.includes("message is not modified")) throw editError;
+      }
     } catch (error) {
-      await ctx.reply(`Scan pools gagal: ${errorMessage(error).slice(0, 500)}`);
+      if (this.bot) {
+        await this.bot.api.editMessageText(chatId, messageId, `Scan pools gagal: ${errorMessage(error).slice(0, 500)}`).catch(() => {});
+      }
     } finally {
       this.poolScanRunning = false;
     }
