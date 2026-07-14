@@ -1,4 +1,5 @@
 import { loadConfig } from "./config.js";
+import { zeroAddress } from "viem";
 import { Database } from "./db.js";
 import { log } from "./log.js";
 import { ChainClients } from "./services/chain-client.js";
@@ -26,13 +27,14 @@ async function main(): Promise<void> {
   const pnl = new PnlService(database, reader, routes, config, tradingApi);
   const executor = new Executor(database, chains, reader, routes, notifier, config, tradingApi);
   const guardian = new Guardian(config, database, chains, alchemyBootstrapper, discovery, pnl, executor, notifier);
-  const scanner = new PoolScanner(chains);
+  const scanner = new PoolScanner(chains, database);
 
   notifier.registerCommands(database, pnl, executor, scanner);
 
   await database.connect();
   await database.migrate();
   await guardian.validateNetworks();
+  scanner.startCandidateRefresh([...config.quoteTokens.robinhood.map(({ address }) => address), zeroAddress], config.poolScanCandidatePages);
   void executor.backfillStaleCloseHistoryUsd().catch(() => {});
   log.info({ chains: config.chains, dryRun: config.dryRun, executor: config.executorAddress }, "UniLP Guardian started");
 

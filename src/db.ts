@@ -142,6 +142,16 @@ export class Database {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS telegram_deletion_queue_delete_at_idx ON telegram_deletion_queue(delete_at);
+      DELETE FROM telegram_deletion_queue a
+      USING telegram_deletion_queue b
+      WHERE a.chat_id = b.chat_id AND a.message_id = b.message_id AND a.id > b.id;
+      CREATE UNIQUE INDEX IF NOT EXISTS telegram_deletion_queue_message_idx ON telegram_deletion_queue(chat_id, message_id);
+      CREATE TABLE IF NOT EXISTS pool_scan_candidates (
+        token_address TEXT PRIMARY KEY,
+        seed_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS pool_scan_candidates_updated_idx ON pool_scan_candidates(updated_at DESC);
       CREATE TABLE IF NOT EXISTS close_history (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         position_id UUID NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
@@ -471,9 +481,30 @@ export class Database {
 
   async queueMessageDeletion(chatId: string, messageId: number, deleteAt: Date): Promise<void> {
     await this.pool.query(
-      "INSERT INTO telegram_deletion_queue (chat_id, message_id, delete_at) VALUES ($1, $2, $3)",
+      `INSERT INTO telegram_deletion_queue (chat_id, message_id, delete_at) VALUES ($1, $2, $3)
+       ON CONFLICT (chat_id, message_id) DO UPDATE SET delete_at = EXCLUDED.delete_at`,
       [chatId, messageId, deleteAt],
     );
+  }
+
+  async replacePoolScanCandidates(candidates: readonly { tokenAddress: string; seedScore: number }[]): Promise<void> {
+    await this.transaction(async (client) => {
+      await client.query("DELETE FROM pool_scan_candidates");
+      for (const candidate of candidates) {
+        await client.query(
+          "INSERT INTO pool_scan_candidates (token_address, seed_score) VALUES ($1, $2)",
+          [candidate.tokenAddress.toLowerCase(), candidate.seedScore],
+        );
+      }
+    });
+  }
+
+  async listPoolScanCandidates(limit: number): Promise<{ tokenAddress: string; seedScore: number; updatedAt: Date }[]> {
+    const result = await this.pool.query<{ token_address: string; seed_score: number; updated_at: string }>(
+      "SELECT token_address, seed_score, updated_at FROM pool_scan_candidates ORDER BY seed_score DESC LIMIT $1",
+      [limit],
+    );
+    return result.rows.map((row) => ({ tokenAddress: row.token_address, seedScore: row.seed_score, updatedAt: new Date(row.updated_at) }));
   }
 
   async fetchDueDeletions(): Promise<{ id: string; chatId: string; messageId: number }[]> {

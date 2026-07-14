@@ -726,25 +726,49 @@ export class Notifier {
   }
 
   private async executePoolScan(database: Database, scanner: PoolScanner, chatId: string, messageId: number): Promise<void> {
+    let stage = "Memuat kandidat cache...";
+    const startedAt = Date.now();
+    const heartbeat = setInterval(() => {
+      void this.refreshPoolScanProgress(chatId, messageId, `${stage}\nElapsed: ${Math.floor((Date.now() - startedAt) / 1_000)}s`);
+    }, 20_000);
     try {
       const filters = await this.poolScanFilters(database, chatId);
-      const scan = await scanner.scanPools(filters);
+      const scan = await scanner.scanPools(filters, (nextStage) => { stage = nextStage; });
       const text = formatPoolMarketScan(scan, filters);
       if (!this.bot) return;
       try {
         await this.bot.api.editMessageText(chatId, messageId, text);
       } catch (editError) {
         const details = errorMessage(editError);
-        if (!details.includes("message is not modified")) throw editError;
+        if (!details.includes("message is not modified")) {
+          await this.sendTemp([text], chatId, 120_000);
+          return;
+        }
       }
       await this.queueTemp(chatId, messageId, 120_000);
     } catch (error) {
+      const text = `Scan pools gagal: ${errorMessage(error).slice(0, 500)}`;
       if (this.bot) {
-        await this.bot.api.editMessageText(chatId, messageId, `Scan pools gagal: ${errorMessage(error).slice(0, 500)}`).catch(() => {});
-        await this.queueTemp(chatId, messageId, 120_000);
+        try {
+          await this.bot.api.editMessageText(chatId, messageId, text);
+          await this.queueTemp(chatId, messageId, 120_000);
+        } catch {
+          await this.sendTemp([text], chatId, 120_000);
+        }
       }
     } finally {
+      clearInterval(heartbeat);
       this.poolScanRunning = false;
+    }
+  }
+
+  private async refreshPoolScanProgress(chatId: string, messageId: number, stage: string): Promise<void> {
+    if (!this.bot) return;
+    try {
+      await this.bot.api.editMessageText(chatId, messageId, `🏆 SCAN POOLS BERJALAN\n${stage}`);
+      await this.queueTemp(chatId, messageId, 120_000);
+    } catch {
+      // Final result is sent as a new message if this progress message disappears.
     }
   }
 
@@ -1343,6 +1367,10 @@ function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters): s
     `Quote: ${filters.allowedQuotes.join(", ")}`,
     "",
   ];
+  if (scan.warming) {
+    lines.push("Discovery cache sedang dipanaskan di background. Coba lagi dalam sekitar 1 menit.");
+    return lines.join("\n");
+  }
   if (scan.pools.length === 0) {
     lines.push("Tidak ada kandidat yang lolos semua filter.");
     return lines.join("\n");
