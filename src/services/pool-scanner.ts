@@ -6,6 +6,8 @@ import type { ChainClients } from "./chain-client.js";
 
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
 const K = 1_000_000;
+const GECKO_MIN_REQUEST_INTERVAL_MS = 2_200;
+const MAX_TOKEN_ENRICHMENT_CANDIDATES = 10;
 export const MIN_VOLUME_6H_USD = 100;
 
 export interface ScoredPool {
@@ -81,6 +83,8 @@ interface GeckoTokenResponse {
 
 export class PoolScanner {
   private marketScanCache?: { key: string; expiresAt: number; result: PoolMarketScan };
+  private geckoQueue: Promise<void> = Promise.resolve();
+  private lastGeckoRequestAt = 0;
 
   constructor(
     private readonly chains: ChainClients,
@@ -125,7 +129,7 @@ export class PoolScanner {
 
     const candidateTokens = [...candidates.entries()]
       .sort(([, left], [, right]) => right - left)
-      .slice(0, 20)
+      .slice(0, MAX_TOKEN_ENRICHMENT_CANDIDATES)
       .map(([token]) => token);
     const enriched = await mapWithConcurrency(candidateTokens, 3, (token) => this.enrichToken(token, filters));
     const pools = enriched.flatMap((result) => result ?? [])
@@ -148,10 +152,7 @@ export class PoolScanner {
 
     let response: Response;
     try {
-      response = await fetch(url, {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(15_000),
-      });
+      response = await this.fetchGecko(url);
     } catch (error) {
       log.warn({ error: error instanceof Error ? error.message : String(error), context }, "GeckoTerminal request failed");
       return [];
@@ -277,11 +278,26 @@ export class PoolScanner {
 
   private async fetchToken(token: string): Promise<GeckoTokenResponse | null> {
     try {
-      const response = await fetch(`${GECKO_BASE}/networks/robinhood/tokens/${token}`, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
+      const response = await this.fetchGecko(`${GECKO_BASE}/networks/robinhood/tokens/${token}`);
       if (!response.ok) return null;
       return await response.json() as GeckoTokenResponse;
     } catch {
       return null;
+    }
+  }
+
+  private async fetchGecko(url: string): Promise<Response> {
+    let resolveQueue!: () => void;
+    const previous = this.geckoQueue;
+    this.geckoQueue = new Promise<void>((resolve) => { resolveQueue = resolve; });
+    await previous;
+    try {
+      const wait = GECKO_MIN_REQUEST_INTERVAL_MS - (Date.now() - this.lastGeckoRequestAt);
+      if (wait > 0) await sleep(wait);
+      this.lastGeckoRequestAt = Date.now();
+      return await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
+    } finally {
+      resolveQueue();
     }
   }
 
@@ -470,4 +486,8 @@ async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
   return results;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
