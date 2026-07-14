@@ -1362,7 +1362,7 @@ function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters): s
   const lines = [
     "🏆 TOP POOL YIELD 1H",
     "Chain: Robinhood (4663) | Uniswap V3/V4",
-    `Kandidat rough: ${scan.candidateTokens} | Lolos MC/FDV: ${scan.qualifiedTokens} | Lolos enrichment on-chain: ${scan.evaluatedTokens}`,
+    `Kandidat cache: ${scan.candidateTokens} | Dievaluasi DexScreener: ${scan.evaluatedTokens} | Lolos filter + on-chain: ${scan.qualifiedTokens}`,
     `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | Pool TVL > $${fmtUsd(filters.minPoolTvlUsd)} | Total TVL aktif > $${fmtUsd(filters.minTotalActiveTvlUsd)} | Usia > ${fmtDuration(filters.minPoolAgeSeconds)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
     `Quote: ${filters.allowedQuotes.join(", ")}`,
     "",

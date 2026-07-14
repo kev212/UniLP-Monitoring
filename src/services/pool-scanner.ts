@@ -151,7 +151,7 @@ export class PoolScanner {
     const pools = enriched.flatMap((result) => result ?? [])
       .sort((left, right) => right.estimatedPoolYield1hPercent - left.estimatedPoolYield1hPercent || right.tvlUsd - left.tvlUsd)
       .slice(0, filters.maxResults);
-    const result = { pools, candidateTokens: candidates.length, qualifiedTokens: enriched.filter(Boolean).length, evaluatedTokens: enriched.filter(Boolean).length };
+    const result = { pools, candidateTokens: candidates.length, qualifiedTokens: enriched.filter(Boolean).length, evaluatedTokens: candidates.length };
     this.marketScanCache = { key, expiresAt: Date.now() + 60_000, result };
     return result;
   }
