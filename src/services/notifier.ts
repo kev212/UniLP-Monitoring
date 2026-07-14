@@ -1,5 +1,6 @@
 import { Bot, Context, InlineKeyboard, InputFile, type CommandContext } from "grammy";
 import { isAddress, zeroAddress, type Address } from "viem";
+import sharp from "sharp";
 
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
@@ -845,7 +846,12 @@ export class Notifier {
       const response = await fetch(url);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const buffer = Buffer.from(await response.arrayBuffer());
-      await database.setPnlCardBackground(chatId, buffer);
+      const normalized = await sharp(buffer)
+        .rotate()
+        .resize(1440, 900, { fit: "cover" })
+        .png()
+        .toBuffer();
+      await database.setPnlCardBackground(chatId, normalized);
       await this.replyTemp(ctx, "✅ Background PnL card tersimpan.");
     } catch (error) {
       await this.replyTemp(ctx, `Gagal menyimpan background: ${errorMessage(error).slice(0, 200)}`);

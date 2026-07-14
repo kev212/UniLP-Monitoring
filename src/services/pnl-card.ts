@@ -53,14 +53,19 @@ export async function renderPnlCard(
 
   const hasCustomBg = customBg && customBg.length > 0;
 
+  let bgPngBase64: string | null = null;
+  if (hasCustomBg) {
+    bgPngBase64 = (await sharp(customBg).rotate().resize(W, H, { fit: "cover" }).png().toBuffer()).toString("base64");
+  }
+
   const svgParts: string[] = [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`,
     `<defs>`,
     `<linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">`,
   ];
   if (hasCustomBg) {
-    svgParts.push(`<stop offset="0%" stop-color="#000000" stop-opacity="0.50"/>`);
-    svgParts.push(`<stop offset="100%" stop-color="#000000" stop-opacity="0.60"/>`);
+    svgParts.push(`<stop offset="0%" stop-color="#000000" stop-opacity="0.80"/>`);
+    svgParts.push(`<stop offset="100%" stop-color="#000000" stop-opacity="0.80"/>`);
   } else {
     svgParts.push(`<stop offset="0%" stop-color="${t.bgStart}"/>`);
     svgParts.push(`<stop offset="100%" stop-color="${t.bgEnd}"/>`);
@@ -77,9 +82,9 @@ export async function renderPnlCard(
     `</defs>`,
   );
 
-  if (hasCustomBg) {
+  if (bgPngBase64) {
     svgParts.push(
-      `<image x="0" y="0" width="${W}" height="${H}" preserveAspectRatio="xMidYMid slice" clip-path="url(#cardClip)" href="data:image/png;base64,${customBg!.toString("base64")}"/>`,
+      `<image x="0" y="0" width="${W}" height="${H}" preserveAspectRatio="xMidYMid slice" clip-path="url(#cardClip)" href="data:image/png;base64,${bgPngBase64}"/>`,
     );
   }
 
