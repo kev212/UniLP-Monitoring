@@ -151,7 +151,7 @@ export class Notifier {
     lines.push(`SL: ${sl}% | TP: +${tp}% | Trail: +${this.config.trailingStopActivationPercent}% / -${this.config.trailingStopDrawdownPercent}%`);
     lines.push(`block: ${snapshot.blockNumber.toString()}`);
 
-    await this.send(lines);
+    await this.sendTemp(lines);
   }
 
   async logPnL(position: PositionRecord, snapshot: PnlSnapshot): Promise<void> {
@@ -214,7 +214,7 @@ export class Notifier {
       const qtDec = await this.decimals(position.quoteToken, position.chainId);
       lines.push(`Total: ~${formatToken(BigInt(total), qtDec, 2)} ${this.quoteSymbol(position.quoteToken)}`);
     }
-    await this.send(lines);
+    await this.sendTemp(lines);
   }
 
   async failure(position: PositionRecord, message: string): Promise<void> {

@@ -95,11 +95,11 @@ export async function renderPnlCard(
     `<rect width="${W}" height="${H}" rx="0" ry="0" fill="url(#bgGrad)" stroke="${t.border}" stroke-width="3"/>`,
 
     // Header
-    `<text x="${PAD}" y="${PAD + 38}" filter="url(#shadow)" font-family="${FONT}" font-size="22" fill="${TEXT_SECONDARY}">${xmlEscape(pair)}</text>`,
-    `<text x="${PAD}" y="${PAD + 68}" filter="url(#shadow)" font-family="${FONT}" font-size="16" fill="${TEXT_MUTED}">${protoLabel} · #${record.positionKey}</text>`,
+    `<text x="${PAD}" y="${PAD + 38}" filter="url(#shadow)" font-family="${FONT}" font-size="26" fill="${TEXT_SECONDARY}">${xmlEscape(pair)}</text>`,
+    `<text x="${PAD}" y="${PAD + 68}" filter="url(#shadow)" font-family="${FONT}" font-size="18" fill="${TEXT_MUTED}">${protoLabel} · #${record.positionKey}</text>`,
 
     // Large PnL %
-    `<text x="${W / 2}" y="${H / 2 - 48}" filter="url(#shadowStrong)" font-family="${FONT}" font-size="120" font-weight="bold" fill="url(#accentGrad)" text-anchor="middle">${sign}${pnlPct}%</text>`,
+    `<text x="${W / 2}" y="${H / 2 - 48}" filter="url(#shadowStrong)" font-family="${FONT}" font-size="140" font-weight="bold" fill="url(#accentGrad)" text-anchor="middle">${sign}${pnlPct}%</text>`,
 
     // PnL quote amount
     `<text x="${W / 2}" y="${H / 2 + 42}" filter="url(#shadow)" font-family="${FONT}" font-size="28" fill="${t.textSecondary}" text-anchor="middle">${sign}${pnlAmt} ${qtSymbol} ${label}</text>`,
