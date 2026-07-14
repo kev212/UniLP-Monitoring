@@ -632,11 +632,12 @@ export class Executor {
           functionName: "slot0",
           blockNumber: blockNum,
         }) as readonly [bigint, ...unknown[]];
-        // usdPerEth in USDG 6-decimal: (sqrtPriceX96^2 / 2^192) * 10^18_weth / 10^6_usdg
-        const usdPerEth = (sqrtPriceX96 * sqrtPriceX96 * 10n ** 12n) / (1n << 192n);
-        const usdValue = (BigInt(item.finalPnlQuote) * usdPerEth) / (10n ** 18n);
+        // usdPerEth in micro-USDG (6 dec): (sqrtPriceX96^2 / 2^192) * 10^18_weth / 10^6_usdg * 10^6_micro
+        // simplifies to: sqrtPriceX96^2 * 10^18 / 2^192
+        const usdPerEthMicro = (sqrtPriceX96 * sqrtPriceX96 * 10n ** 18n) / (1n << 192n);
+        const usdValue = (BigInt(item.finalPnlQuote) * usdPerEthMicro) / (10n ** 18n);
         await this.database.updateCloseHistoryUsd(item.id, usdValue);
-        log.info({ positionKey: item.positionKey, usd: usdValue.toString(), usdPerEth: usdPerEth.toString() }, "backfilled close-history USD");
+        log.info({ positionKey: item.positionKey, usd: usdValue.toString(), usdPerEthMicro: usdPerEthMicro.toString() }, "backfilled close-history USD");
       } catch (err) {
         log.warn({ err, positionKey: item.positionKey }, "failed to backfill close-history USD");
       }
