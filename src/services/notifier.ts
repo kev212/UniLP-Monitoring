@@ -1190,15 +1190,17 @@ function formatBps(value: bigint): string {
 
 function formatToken(value: bigint, decimals: number, maxDecimals?: number): string {
   if (decimals === 0 || value === 0n) return value.toString();
+  const negative = value < 0n;
+  const absolute = negative ? -value : value;
   const divisor = 10n ** BigInt(Math.min(decimals, 18));
-  const integer = value / divisor;
-  const fraction = value % divisor;
-  if (fraction === 0n) return integer.toString();
+  const integer = absolute / divisor;
+  const fraction = absolute % divisor;
+  if (fraction === 0n) return `${negative ? "-" : ""}${integer}`;
   let fracStr = fraction.toString().padStart(Math.min(decimals, 18), "0").replace(/0+$/, "");
   if (maxDecimals !== undefined && fracStr.length > maxDecimals) {
     fracStr = fracStr.slice(0, maxDecimals);
   }
-  return `${integer}.${fracStr}`;
+  return `${negative ? "-" : ""}${integer}.${fracStr}`;
 }
 
 function shortAddress(address: Address): string {

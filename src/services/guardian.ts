@@ -201,6 +201,13 @@ export class Guardian {
       if (this.queuedExitPositions.has(position.id)) return true;
       void this.notifier.trigger(position, valued.snapshot, effectiveTrigger);
       try {
+        await this.database.setPositionStatus(position.id, position.status, {
+          exitSnapshot: {
+            pnlBps: valued.snapshot.pnlBps.toString(),
+            pnlQuote: valued.snapshot.pnlQuote.toString(),
+            blockNumber: valued.snapshot.blockNumber.toString(),
+          },
+        });
         await this.executeExit(position, effectiveTrigger);
         await this.database.setPositionStatus(position.id, position.status, { exitRetry: null });
         return true;

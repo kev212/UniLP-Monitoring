@@ -73,13 +73,15 @@ export class Executor {
     const quoteFee = quoteIsToken0 ? value.unclaimedFees0 : value.unclaimedFees1;
     const settlementQuoteFromClose = quotePrincipal + quoteFee;
     const preCloseBalance = await this.assetBalance(position.chainId, this.config.executorAddress, position.quoteToken);
-    await this.database.setPositionStatus(position.id, "closing", {
+    const closingMetadata = {
+      ...position.metadata,
       exitStartedAt: new Date().toISOString(),
       exitRetry: null,
       exitTrigger: trigger ?? "manual",
       settlementQuoteFromClose: settlementQuoteFromClose.toString(),
       preCloseQuoteBalance: preCloseBalance.toString(),
-    });
+    };
+    await this.database.setPositionStatus(position.id, "closing", closingMetadata);
     let closeConfirmed = false;
 
     try {
@@ -110,7 +112,15 @@ export class Executor {
         pendingSwap: nonQuoteAmount > 0n ? { token: nonQuoteToken, amount: nonQuoteAmount.toString() } satisfies PendingSwap : null,
         closeTransactionHash: hash,
       });
-      await this.resume({ ...position, status: "closing", metadata: { ...position.metadata, pendingSwap: nonQuoteAmount > 0n ? { token: nonQuoteToken, amount: nonQuoteAmount.toString() } : null } });
+      await this.resume({
+        ...position,
+        status: "closing",
+        metadata: {
+          ...closingMetadata,
+          pendingSwap: nonQuoteAmount > 0n ? { token: nonQuoteToken, amount: nonQuoteAmount.toString() } : null,
+          closeTransactionHash: hash,
+        },
+      });
     } catch (error) {
       if (!closeConfirmed) {
         const message = errorMessage(error);

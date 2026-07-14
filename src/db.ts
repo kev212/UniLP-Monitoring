@@ -524,8 +524,14 @@ export class Database {
     const closeTx = typeof meta.closeTransactionHash === "string" ? meta.closeTransactionHash : null;
     const swapTx = typeof meta.swapTransactionHash === "string" ? meta.swapTransactionHash : null;
 
-    const finalPnl = totals.realized + totalReceived - totals.deposits;
-    const finalPnlBps = totals.deposits > 0n ? (finalPnl * 10000n) / totals.deposits : 0n;
+    const exitSnapshot = meta.exitSnapshot;
+    const snapshot = exitSnapshot && typeof exitSnapshot === "object" && !Array.isArray(exitSnapshot)
+      ? exitSnapshot as Record<string, unknown>
+      : null;
+    const snapshotPnl = typeof snapshot?.pnlQuote === "string" ? BigInt(snapshot.pnlQuote) : null;
+    const snapshotBps = typeof snapshot?.pnlBps === "string" ? BigInt(snapshot.pnlBps) : null;
+    const finalPnl = snapshotPnl ?? (totals.realized + totalReceived - totals.deposits);
+    const finalPnlBps = snapshotBps ?? (totals.deposits > 0n ? (finalPnl * 10000n) / totals.deposits : 0n);
 
     if (finalPnlBps < 0n ? -finalPnlBps < 50n : finalPnlBps < 50n) return;
 
