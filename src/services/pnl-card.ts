@@ -32,7 +32,7 @@ export async function renderPnlCard(record: CloseHistoryRecord, pair: string): P
   const pnlPercent = formatBps(record.finalPnlBps);
   const pnlAmount = formatToken(record.finalPnlQuote, 6);
   const protoLabel = record.protocol.toUpperCase();
-  const settledAt = record.settledAt.replace("T", " ").slice(0, 19);
+  const settledAt = fmtUtc(record.settledAt);
   const triggerLabel = triggerDisplay(record.trigger);
 
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
@@ -81,4 +81,8 @@ function triggerDisplay(trigger: string): string {
     case "manual": return "Manual Close";
     default: return trigger.replace(/_/g, " ");
   }
+}
+
+export function fmtUtc(date: Date): string {
+  return date.toISOString().replace("T", " ").slice(0, 19);
 }

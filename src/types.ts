@@ -101,5 +101,5 @@ export interface CloseHistoryRecord {
   trigger: ExitTrigger | "settled";
   closeTransactionHash: string | null;
   swapTransactionHash: string | null;
-  settledAt: string;
+  settledAt: Date;
 }

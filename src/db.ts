@@ -586,6 +586,6 @@ function mapCloseHistory(row: CloseHistoryRow): CloseHistoryRecord {
     trigger: row.trigger as CloseHistoryRecord["trigger"],
     closeTransactionHash: row.close_transaction_hash,
     swapTransactionHash: row.swap_transaction_hash,
-    settledAt: row.settled_at,
+    settledAt: new Date(row.settled_at),
   };
 }

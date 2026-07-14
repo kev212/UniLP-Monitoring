@@ -8,7 +8,7 @@ import type { CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, Po
 import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
-import { renderPnlCard } from "./pnl-card.js";
+import { fmtUtc, renderPnlCard } from "./pnl-card.js";
 import type { PoolMarketScan, PoolScanFilters, PoolScanner, ScoredPool } from "./pool-scanner.js";
 
 type ChatContext = CommandContext<Context>;
@@ -834,7 +834,7 @@ export class Notifier {
       const sign = isProfit ? "+" : "";
       lines.push(`${prefix} ${item.protocol.toUpperCase()} #${item.positionKey} ${pair}`);
       lines.push(`   ${sign}${formatBps(item.finalPnlBps)}% | ${sign}${formatToken(item.finalPnlQuote, 6)} | ${triggerDisplayShort(item.trigger)}`);
-      lines.push(`   Settled: ${item.settledAt.replace("T", " ").slice(0, 19)} UTC`);
+      lines.push(`   Settled: ${fmtUtc(item.settledAt)} UTC`);
       lines.push("");
     }
     if (pageCount > 1) lines.push(`Page ${p + 1}/${pageCount} | ${history.length} riwayat`);
