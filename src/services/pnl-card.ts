@@ -76,6 +76,12 @@ export async function renderPnlCard(
     `<stop offset="0%" stop-color="${t.accent}"/>`,
     `<stop offset="100%" stop-color="${isProfit ? RH_DIM : "#cc3333"}"/>`,
     `</linearGradient>`,
+    `<filter id="shadow" x="-10%" y="-10%" width="130%" height="130%">`,
+    `<feDropShadow dx="2" dy="3" stdDeviation="4" flood-color="#000000" flood-opacity="0.7"/>`,
+    `</filter>`,
+    `<filter id="shadowStrong" x="-10%" y="-10%" width="130%" height="130%">`,
+    `<feDropShadow dx="3" dy="5" stdDeviation="6" flood-color="#000000" flood-opacity="0.8"/>`,
+    `</filter>`,
     `</defs>`,
   );
 
@@ -89,28 +95,28 @@ export async function renderPnlCard(
     `<rect width="${W}" height="${H}" rx="0" ry="0" fill="url(#bgGrad)" stroke="${t.border}" stroke-width="3"/>`,
 
     // Header
-    `<text x="${PAD}" y="${PAD + 38}" font-family="${FONT}" font-size="22" fill="${TEXT_SECONDARY}">${xmlEscape(pair)}</text>`,
-    `<text x="${PAD}" y="${PAD + 68}" font-family="${FONT}" font-size="16" fill="${TEXT_MUTED}">${protoLabel} · #${record.positionKey}</text>`,
+    `<text x="${PAD}" y="${PAD + 38}" filter="url(#shadow)" font-family="${FONT}" font-size="22" fill="${TEXT_SECONDARY}">${xmlEscape(pair)}</text>`,
+    `<text x="${PAD}" y="${PAD + 68}" filter="url(#shadow)" font-family="${FONT}" font-size="16" fill="${TEXT_MUTED}">${protoLabel} · #${record.positionKey}</text>`,
 
     // Large PnL %
-    `<text x="${W / 2}" y="${H / 2 - 48}" font-family="${FONT}" font-size="120" font-weight="bold" fill="url(#accentGrad)" text-anchor="middle">${sign}${pnlPct}%</text>`,
+    `<text x="${W / 2}" y="${H / 2 - 48}" filter="url(#shadowStrong)" font-family="${FONT}" font-size="120" font-weight="bold" fill="url(#accentGrad)" text-anchor="middle">${sign}${pnlPct}%</text>`,
 
     // PnL quote amount
-    `<text x="${W / 2}" y="${H / 2 + 42}" font-family="${FONT}" font-size="28" fill="${t.textSecondary}" text-anchor="middle">${sign}${pnlAmt} ${qtSymbol} ${label}</text>`,
+    `<text x="${W / 2}" y="${H / 2 + 42}" filter="url(#shadow)" font-family="${FONT}" font-size="28" fill="${t.textSecondary}" text-anchor="middle">${sign}${pnlAmt} ${qtSymbol} ${label}</text>`,
 
     // USD line
     hasUsd
-      ? `<text x="${W / 2}" y="${H / 2 + 82}" font-family="${FONT}" font-size="22" fill="${TEXT_SECONDARY}" text-anchor="middle">≈ ${sign}$${pnlUsd}</text>`
+      ? `<text x="${W / 2}" y="${H / 2 + 82}" filter="url(#shadow)" font-family="${FONT}" font-size="22" fill="${TEXT_SECONDARY}" text-anchor="middle">≈ ${sign}$${pnlUsd}</text>`
       : "",
 
     // Divider
     `<line x1="${PAD}" y1="${H - 120}" x2="${W - PAD}" y2="${H - 120}" stroke="${TEXT_MUTED}" stroke-opacity="0.12" stroke-width="2"/>`,
 
     // Footer left: trigger
-    `<text x="${PAD}" y="${H - 80}" font-family="${FONT}" font-size="18" fill="${TEXT_SECONDARY}">${triggerLabel}</text>`,
+    `<text x="${PAD}" y="${H - 80}" filter="url(#shadow)" font-family="${FONT}" font-size="18" fill="${TEXT_SECONDARY}">${triggerLabel}</text>`,
 
     // Footer right: time
-    `<text x="${W - PAD}" y="${H - 80}" font-family="${FONT}" font-size="18" fill="${TEXT_MUTED}" text-anchor="end">${settledStr} UTC</text>`,
+    `<text x="${W - PAD}" y="${H - 80}" filter="url(#shadow)" font-family="${FONT}" font-size="18" fill="${TEXT_MUTED}" text-anchor="end">${settledStr} UTC</text>`,
 
     `</svg>`,
   );
