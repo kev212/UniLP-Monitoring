@@ -616,13 +616,12 @@ export class Executor {
           : item.quoteToken) as Address; // WETH Robinhood
         const usdgAddr = "0x5fc5360d0400a0fd4f2af552add042d716f1d168" as Address;
         let pool: Address | null = null;
-        for (const fee of [500, 3000] as const) {
+        for (const fee of [100, 500, 3000, 10000] as const) {
           pool = await client.readContract({
             address: registry.contracts.v3.factory,
             abi: v3FactoryAbi,
             functionName: "getPool",
             args: [wethAddr, usdgAddr, fee],
-            blockNumber: blockNum,
           }) as Address;
           if (pool && pool !== zeroAddress) break;
         }
