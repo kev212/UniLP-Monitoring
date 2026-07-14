@@ -558,8 +558,11 @@ export class Database {
       quote_token: string; close_transaction_hash: string | null; swap_transaction_hash: string | null;
     }>(
       `SELECT h.id, h.chain_id, h.position_key, h.final_pnl_quote,
-              h.quote_token, h.close_transaction_hash, h.swap_transaction_hash
+              h.quote_token,
+              NULLIF(p.metadata->>'closeTransactionHash', '') AS close_transaction_hash,
+              NULLIF(p.metadata->>'swapTransactionHash', '') AS swap_transaction_hash
        FROM close_history h
+       JOIN positions p ON p.id = h.position_id
        WHERE h.final_pnl_usd = 0
          AND (h.quote_token = '0x0000000000000000000000000000000000000000'
               OR h.quote_token = '0x0bd7d308f8e1639fab988df18a8011f41eacad73')
