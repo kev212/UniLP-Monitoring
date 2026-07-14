@@ -833,7 +833,7 @@ export class Notifier {
       const prefix = isProfit ? "📈" : "📉";
       const sign = isProfit ? "+" : "";
       lines.push(`${prefix} ${item.protocol.toUpperCase()} #${item.positionKey} ${pair}`);
-      lines.push(`   ${sign}${formatBps(item.finalPnlBps)}% | ${sign}${formatToken(item.finalPnlQuote, 6)} | ${triggerDisplayShort(item.trigger)}`);
+      lines.push(`   ${sign}${formatBps(item.finalPnlBps)}% | ${sign}${formatToken(item.finalPnlQuote, 6)}${item.finalPnlUsd !== 0n ? ` | ${sign}$${formatToken(item.finalPnlUsd, 6)}` : ""} | ${triggerDisplayShort(item.trigger)}`);
       lines.push(`   Settled: ${fmtUtc(item.settledAt)} UTC`);
       lines.push("");
     }

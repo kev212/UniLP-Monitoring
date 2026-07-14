@@ -153,12 +153,14 @@ export class Database {
         quote_token TEXT NOT NULL,
         final_pnl_bps NUMERIC(78, 0) NOT NULL,
         final_pnl_quote NUMERIC(78, 0) NOT NULL,
+        final_pnl_usd NUMERIC(78, 0) NOT NULL DEFAULT 0,
         trigger TEXT NOT NULL,
         close_transaction_hash TEXT,
         swap_transaction_hash TEXT,
         settled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS close_history_settled_at_idx ON close_history(settled_at DESC);
+      ALTER TABLE close_history ADD COLUMN IF NOT EXISTS final_pnl_usd NUMERIC(78, 0) NOT NULL DEFAULT 0;
     `);
   }
 
@@ -483,7 +485,7 @@ export class Database {
     const result = await this.pool.query<{
       id: string; position_id: string; chain_id: number; protocol: Protocol;
       position_key: string; token0: string; token1: string; quote_token: string;
-      final_pnl_bps: string; final_pnl_quote: string; trigger: string;
+      final_pnl_bps: string; final_pnl_quote: string; final_pnl_usd: string; trigger: string;
       close_transaction_hash: string | null; swap_transaction_hash: string | null;
       settled_at: string;
     }>(
@@ -522,14 +524,19 @@ export class Database {
 
     if (finalPnlBps < 0n ? -finalPnlBps < 50n : finalPnlBps < 50n) return;
 
+    const quoteTokenLower = row.quote_token.toLowerCase();
+    const isUsdStable = quoteTokenLower === "0x5fc5360d0400a0fd4f2af552add042d716f1d168" // USDG Robinhood
+      || quoteTokenLower === "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"; // USDC Base
+    const finalPnlUsd = isUsdStable ? finalPnl : 0n;
+
     await this.pool.query(
       `INSERT INTO close_history (position_id, chain_id, protocol, position_key, token0, token1, quote_token,
-         final_pnl_bps, final_pnl_quote, trigger, close_transaction_hash, swap_transaction_hash, settled_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())`,
+         final_pnl_bps, final_pnl_quote, final_pnl_usd, trigger, close_transaction_hash, swap_transaction_hash, settled_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())`,
       [
         positionId, row.chain_id, row.protocol, row.position_key,
         row.token0, row.token1, row.quote_token,
-        finalPnlBps.toString(), finalPnl.toString(), trigger,
+        finalPnlBps.toString(), finalPnl.toString(), finalPnlUsd.toString(), trigger,
         closeTx, swapTx,
       ],
     );
@@ -565,6 +572,7 @@ interface CloseHistoryRow {
   quote_token: string;
   final_pnl_bps: string;
   final_pnl_quote: string;
+  final_pnl_usd: string;
   trigger: string;
   close_transaction_hash: string | null;
   swap_transaction_hash: string | null;
@@ -583,6 +591,7 @@ function mapCloseHistory(row: CloseHistoryRow): CloseHistoryRecord {
     quoteToken: row.quote_token as Address,
     finalPnlBps: BigInt(row.final_pnl_bps),
     finalPnlQuote: BigInt(row.final_pnl_quote),
+    finalPnlUsd: BigInt(row.final_pnl_usd),
     trigger: row.trigger as CloseHistoryRecord["trigger"],
     closeTransactionHash: row.close_transaction_hash,
     swapTransactionHash: row.swap_transaction_hash,

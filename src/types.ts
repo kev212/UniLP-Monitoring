@@ -98,6 +98,7 @@ export interface CloseHistoryRecord {
   quoteToken: Address;
   finalPnlBps: bigint;
   finalPnlQuote: bigint;
+  finalPnlUsd: bigint;
   trigger: ExitTrigger | "settled";
   closeTransactionHash: string | null;
   swapTransactionHash: string | null;

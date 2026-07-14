@@ -70,11 +70,13 @@ export class Executor {
     const quotePrincipal = quoteIsToken0 ? value.token0.amount : value.token1.amount;
     const quoteFee = quoteIsToken0 ? value.unclaimedFees0 : value.unclaimedFees1;
     const settlementQuoteFromClose = quotePrincipal + quoteFee;
+    const preCloseBalance = await this.assetBalance(position.chainId, this.config.executorAddress, position.quoteToken);
     await this.database.setPositionStatus(position.id, "closing", {
       exitStartedAt: new Date().toISOString(),
       exitRetry: null,
       exitTrigger: trigger ?? "manual",
       settlementQuoteFromClose: settlementQuoteFromClose.toString(),
+      preCloseQuoteBalance: preCloseBalance.toString(),
     });
     let closeConfirmed = false;
 
@@ -208,8 +210,18 @@ export class Executor {
     if (!position.quoteToken) return;
     try {
       const meta = position.metadata as Record<string, unknown>;
-      const fromCloseStr = typeof meta.settlementQuoteFromClose === "string" ? meta.settlementQuoteFromClose : "0";
-      const totalReceived = BigInt(fromCloseStr) + swapExpectedOut;
+      const preCloseStr = typeof meta.preCloseQuoteBalance === "string" ? meta.preCloseQuoteBalance : undefined;
+      let totalReceived: bigint;
+      if (preCloseStr) {
+        const actualNow = await this.assetBalance(position.chainId, this.config.executorAddress, position.quoteToken);
+        const preClose = BigInt(preCloseStr);
+        const isNative = position.quoteToken.toLowerCase() === zeroAddress;
+        totalReceived = isNative ? (actualNow + (preClose > actualNow ? preClose - actualNow : 0n)) - preClose : actualNow - preClose;
+        if (totalReceived < 0n) totalReceived = 0n;
+      } else {
+        const fromCloseStr = typeof meta.settlementQuoteFromClose === "string" ? meta.settlementQuoteFromClose : "0";
+        totalReceived = BigInt(fromCloseStr) + swapExpectedOut;
+      }
       await this.database.setPositionStatus(position.id, "settled", { totalReceived: totalReceived.toString() });
     } catch {
       // Balance calculation is for notification only — do not block settlement.
