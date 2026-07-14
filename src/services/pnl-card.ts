@@ -95,28 +95,28 @@ export async function renderPnlCard(
     `<rect width="${W}" height="${H}" rx="0" ry="0" fill="url(#bgGrad)" stroke="${t.border}" stroke-width="3"/>`,
 
     // Header
-    `<text x="${PAD}" y="${PAD + 38}" filter="url(#shadow)" font-family="${FONT}" font-size="26" fill="${TEXT_SECONDARY}">${xmlEscape(pair)}</text>`,
-    `<text x="${PAD}" y="${PAD + 68}" filter="url(#shadow)" font-family="${FONT}" font-size="18" fill="${TEXT_MUTED}">${protoLabel} · #${record.positionKey}</text>`,
+    `<text x="${PAD}" y="${PAD + 38}" filter="url(#shadow)" font-family="${FONT}" font-size="34" fill="${TEXT_SECONDARY}">${xmlEscape(pair)}</text>`,
+    `<text x="${PAD}" y="${PAD + 68}" filter="url(#shadow)" font-family="${FONT}" font-size="22" fill="${TEXT_MUTED}">${protoLabel} · #${record.positionKey}</text>`,
 
     // Large PnL %
-    `<text x="${W / 2}" y="${H / 2 - 48}" filter="url(#shadowStrong)" font-family="${FONT}" font-size="140" font-weight="bold" fill="url(#accentGrad)" text-anchor="middle">${sign}${pnlPct}%</text>`,
+    `<text x="${W / 2}" y="${H / 2 - 48}" filter="url(#shadowStrong)" font-family="${FONT}" font-size="200" font-weight="bold" fill="url(#accentGrad)" text-anchor="middle">${sign}${pnlPct}%</text>`,
 
     // PnL quote amount
-    `<text x="${W / 2}" y="${H / 2 + 42}" filter="url(#shadow)" font-family="${FONT}" font-size="28" fill="${t.textSecondary}" text-anchor="middle">${sign}${pnlAmt} ${qtSymbol} ${label}</text>`,
+    `<text x="${W / 2}" y="${H / 2 + 54}" filter="url(#shadow)" font-family="${FONT}" font-size="38" fill="${t.textSecondary}" text-anchor="middle">${sign}${pnlAmt} ${qtSymbol} ${label}</text>`,
 
     // USD line
     hasUsd
-      ? `<text x="${W / 2}" y="${H / 2 + 82}" filter="url(#shadow)" font-family="${FONT}" font-size="22" fill="${TEXT_SECONDARY}" text-anchor="middle">≈ ${sign}$${pnlUsd}</text>`
+      ? `<text x="${W / 2}" y="${H / 2 + 105}" filter="url(#shadow)" font-family="${FONT}" font-size="30" fill="${TEXT_SECONDARY}" text-anchor="middle">≈ ${sign}$${pnlUsd}</text>`
       : "",
 
     // Divider
     `<line x1="${PAD}" y1="${H - 120}" x2="${W - PAD}" y2="${H - 120}" stroke="${TEXT_MUTED}" stroke-opacity="0.12" stroke-width="2"/>`,
 
     // Footer left: trigger
-    `<text x="${PAD}" y="${H - 80}" filter="url(#shadow)" font-family="${FONT}" font-size="18" fill="${TEXT_SECONDARY}">${triggerLabel}</text>`,
+    `<text x="${PAD}" y="${H - 80}" filter="url(#shadow)" font-family="${FONT}" font-size="24" fill="${TEXT_SECONDARY}">${triggerLabel}</text>`,
 
     // Footer right: time
-    `<text x="${W - PAD}" y="${H - 80}" filter="url(#shadow)" font-family="${FONT}" font-size="18" fill="${TEXT_MUTED}" text-anchor="end">${settledStr} UTC</text>`,
+    `<text x="${W - PAD}" y="${H - 80}" filter="url(#shadow)" font-family="${FONT}" font-size="24" fill="${TEXT_MUTED}" text-anchor="end">${settledStr} UTC</text>`,
 
     `</svg>`,
   );
