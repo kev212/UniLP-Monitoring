@@ -222,14 +222,17 @@ export class Notifier {
     if (reason) lines.push(`trigger: ${reason}`);
     if (attempt !== undefined) lines.push(`retry #${attempt}`);
     lines.push(`error: ${message.slice(0, 500)}`);
-    await this.send(lines);
+    await this.sendTemp(lines);
   }
 
   async startBot(): Promise<void> {
     if (!this.bot) return;
+    if (this.database) {
+      this.startDeletionWorker();
+      void this.runDeletionPass().catch(() => {});
+    }
     log.info("Telegram bot polling started");
     await this.bot.start();
-    if (this.database) this.startDeletionWorker();
   }
 
   async stopBot(): Promise<void> {
@@ -310,16 +313,6 @@ export class Notifier {
     const dashboard = await this.buildDashboard(database, pnl, 0);
     this.lastStatusCache.set(chatId, dashboard.positions);
 
-    const existingMessageId = await database.getDashboardMessageId(chatId);
-    if (existingMessageId !== null) {
-      try {
-        await this.editDashboardMessage(chatId, existingMessageId, dashboard.text, this.dashboardKeyboard(dashboard.page, dashboard.pageCount));
-        return;
-      } catch {
-        // Message was deleted or invalid — create a new one.
-        await database.clearDashboardMessageId(chatId);
-      }
-    }
     const sent = await ctx.reply(dashboard.text, { reply_markup: this.dashboardKeyboard(dashboard.page, dashboard.pageCount) });
     await database.setDashboardMessageId(chatId, sent.message_id);
   }
