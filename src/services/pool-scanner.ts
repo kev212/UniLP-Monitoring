@@ -49,6 +49,7 @@ export interface PoolScanFilters extends PoolScanSettings {
 export interface PoolMarketScan {
   pools: ScoredPool[];
   candidateTokens: number;
+  qualifiedTokens: number;
   evaluatedTokens: number;
 }
 
@@ -128,17 +129,40 @@ export class PoolScanner {
       candidates.set(token, Math.max(candidates.get(token) ?? 0, yield1h));
     }
 
-    const candidateTokens = [...candidates.entries()]
-      .sort(([, left], [, right]) => right - left)
-      .slice(0, MAX_TOKEN_ENRICHMENT_CANDIDATES)
-      .map(([token]) => token);
-    const enriched = await mapWithConcurrency(candidateTokens, 3, (token) => this.enrichToken(token, filters));
+    const { qualified: candidateTokens, valuations } = await this.prefilterByValuation([...candidates.keys()], filters.minMarketCapUsd);
+    const sorted = candidateTokens
+      .sort((left, right) => (candidates.get(right) ?? 0) - (candidates.get(left) ?? 0))
+      .slice(0, MAX_TOKEN_ENRICHMENT_CANDIDATES);
+    const enriched = await mapWithConcurrency(sorted, 3, async (token) =>
+      this.enrichToken(token, filters, valuations.get(token)),
+    );
     const pools = enriched.flatMap((result) => result ?? [])
       .sort((left, right) => right.estimatedPoolYield1hPercent - left.estimatedPoolYield1hPercent || right.tvlUsd - left.tvlUsd)
       .slice(0, filters.maxResults);
-    const result = { pools, candidateTokens: candidateTokens.length, evaluatedTokens: enriched.filter(Boolean).length };
+    const result = { pools, candidateTokens: candidates.size, qualifiedTokens: candidateTokens.length, evaluatedTokens: enriched.filter(Boolean).length };
     this.marketScanCache = { key, expiresAt: Date.now() + 60_000, result };
     return result;
+  }
+
+  private async prefilterByValuation(tokens: string[], minMarketCapUsd: number): Promise<{ qualified: string[]; valuations: Map<string, { value: number; source: "market_cap" | "fdv" }> }> {
+    const results = await mapWithConcurrency(tokens, 3, async (token) => ({
+      token,
+      valuation: await this.fetchTokenValuation(token),
+    }));
+    const valuations = new Map<string, { value: number; source: "market_cap" | "fdv" }>();
+    const qualified: string[] = [];
+    for (const r of results) {
+      if (r.valuation && r.valuation.value > minMarketCapUsd) {
+        valuations.set(r.token, r.valuation);
+        qualified.push(r.token);
+      }
+    }
+    return { qualified, valuations };
+  }
+
+  private async fetchTokenValuation(token: string): Promise<{ value: number; source: "market_cap" | "fdv" } | null> {
+    const tokenResponse = await this.fetchToken(token);
+    return effectiveMarketCap(tokenResponse?.data.attributes.market_cap_usd, tokenResponse?.data.attributes.fdv_usd);
   }
 
   private async fetchUniswapPools(token: string): Promise<GeckoPool[]> {
@@ -254,12 +278,13 @@ export class PoolScanner {
     };
   }
 
-  private async enrichToken(token: string, filters: PoolScanFilters): Promise<ScoredPool[] | null> {
-    const [tokenResponse, rawPools] = await Promise.all([
-      this.fetchToken(token),
-      this.fetchUniswapPools(token),
-    ]);
-    const valuation = effectiveMarketCap(tokenResponse?.data.attributes.market_cap_usd, tokenResponse?.data.attributes.fdv_usd);
+  private async enrichToken(
+    token: string,
+    filters: PoolScanFilters,
+    preValuation?: { value: number; source: "market_cap" | "fdv" },
+  ): Promise<ScoredPool[] | null> {
+    const rawPools = await this.fetchUniswapPools(token);
+    const valuation = preValuation ?? await this.fetchTokenValuation(token);
     if (!valuation || valuation.value <= filters.minMarketCapUsd) return null;
     const relevantRaw = rawPools.filter((pool) => nonQuoteToken(pool, filters.allowedQuoteAddresses) === token);
     if (relevantRaw.length === 0) return null;
