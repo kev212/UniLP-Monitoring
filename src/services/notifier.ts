@@ -1,13 +1,14 @@
-import { Bot, Context, InlineKeyboard, type CommandContext } from "grammy";
+import { Bot, Context, InlineKeyboard, InputFile, type CommandContext } from "grammy";
 import { isAddress, zeroAddress, type Address } from "viem";
 
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ExitTrigger, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol } from "../types.js";
+import type { CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
+import { renderPnlCard } from "./pnl-card.js";
 import type { PoolMarketScan, PoolScanFilters, PoolScanner, ScoredPool } from "./pool-scanner.js";
 
 type ChatContext = CommandContext<Context>;
@@ -25,6 +26,9 @@ type DashboardAction =
   | { type: "config_reset"; page: number }
   | { type: "config_edit"; key: PoolSettingKey }
   | { type: "config_quote"; quote: string }
+  | { type: "history"; page: number }
+  | { type: "pnl_card"; page: number }
+  | { type: "pnl_card_select"; page: number; historyIndex: number }
   | { type: "select" | "confirm"; page: number; chainId: number; protocol: Protocol; positionKey: string };
 
 type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "max_results";
@@ -39,15 +43,19 @@ interface DashboardView {
 
 export class Notifier {
   private readonly bot?: Bot;
+  private readonly database?: Database;
   private readonly lastStatusCache = new Map<string, PositionRecord[]>();
   private readonly dashboardCloseInFlight = new Set<string>();
   private readonly pendingInput = new Map<string, PendingInput>();
   private poolScanRunning = false;
+  private deletionTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly config: RuntimeConfig,
     private readonly chains: ChainClients,
+    database?: Database,
   ) {
+    this.database = database;
     if (!config.telegram) return;
     this.bot = new Bot(config.telegram.token);
     this.bot.catch((error) => {
@@ -62,6 +70,7 @@ export class Notifier {
       { command: "close", description: "Tutup posisi LP — fallback /close <nomor> atau /close <key>" },
       { command: "scan", description: "Scan pool Uniswap V3/V4 untuk token — /scan <contract>" },
       { command: "scan_pools", description: "Cari pool V3/V4 dengan estimasi yield 1 jam tertinggi" },
+      { command: "history", description: "Tampilkan riwayat posisi close >= ±0.5% PnL" },
     ]);
     this.bot.command("status", async (ctx: ChatContext) => {
       await this.handleStatus(ctx, database, pnl);
@@ -74,6 +83,9 @@ export class Notifier {
     });
     this.bot.command("scan_pools", async (ctx: ChatContext) => {
       await this.handleScanPools(ctx, database, scanner);
+    });
+    this.bot.command("history", async (ctx: ChatContext) => {
+      await this.handleHistoryCommand(ctx, database);
     });
     this.bot.callbackQuery(/^lp:/, async (ctx) => {
       await this.handleDashboardCallback(ctx, database, pnl, executor, scanner);
@@ -88,7 +100,7 @@ export class Notifier {
     const t0 = await this.tokenLabel(position.token0, position.chainId);
     const t1 = await this.tokenLabel(position.token1, position.chainId);
     const liq = position.liquidity === null ? "N/A" : await this.formatLiquidity(position, position.liquidity);
-    await this.send([
+    await this.sendTemp([
       "🟢 LP DETECTED",
       `${position.protocol.toUpperCase()} | chain ${position.chainId}`,
       `position: ${position.positionKey}`,
@@ -168,7 +180,7 @@ export class Notifier {
     const pair = await this.pairLabel(position);
     const qtSymbol = this.quoteSymbol(position.quoteToken);
     const qtDec = await this.decimals(position.quoteToken, position.chainId);
-    await this.send([
+    await this.sendTemp([
       `🔔 LP EXIT — ${label}`,
       `V4 #${position.positionKey} ${pair}`,
       `CV: ${formatToken(snapshot.liquidationQuote, qtDec, 2)} ${qtSymbol} | PnL: ${pnlEmoji(snapshot.pnlBps)} ${formatBps(snapshot.pnlBps)}% | Fees: ${formatToken(snapshot.feeQuoteUsdg, 6, 4)} USDG`,
@@ -183,7 +195,7 @@ export class Notifier {
       : stage === "swap_to_quote"
         ? "💱 Swap completed"
         : `✅ ${stage.replace(/_/g, " ")}`;
-    await this.send([label, `V4 #${position.positionKey} ${pair}`, `tx: ${hash}`]);
+    await this.sendTemp([label, `V4 #${position.positionKey} ${pair}`, `tx: ${hash}`]);
   }
 
   async settled(position: PositionRecord): Promise<void> {
@@ -217,11 +229,78 @@ export class Notifier {
     if (!this.bot) return;
     log.info("Telegram bot polling started");
     await this.bot.start();
+    if (this.database) this.startDeletionWorker();
   }
 
   async stopBot(): Promise<void> {
     if (!this.bot) return;
+    if (this.deletionTimer !== null) clearInterval(this.deletionTimer);
     await this.bot.stop();
+  }
+
+  private startDeletionWorker(): void {
+    this.deletionTimer = setInterval(() => {
+      void this.runDeletionPass().catch((error) => log.warn({ error: errorMessage(error) }, "deletion worker pass failed"));
+    }, 10_000);
+  }
+
+  private async runDeletionPass(): Promise<void> {
+    if (!this.bot || !this.database) return;
+    const items = await this.database.fetchDueDeletions();
+    for (const item of items) {
+      try {
+        await this.bot.api.deleteMessage(item.chatId, item.messageId);
+      } catch (error) {
+        const msg = errorMessage(error);
+        if (msg.includes("message to delete not found") || msg.includes("can't delete") || msg.includes("message can't be deleted")) {
+          // Message already gone or bot lacks permission — remove from queue.
+        } else {
+          log.warn({ chatId: item.chatId, messageId: item.messageId, error: msg }, "could not delete queued message");
+        }
+      }
+      await this.database.removeDeletion(item.id);
+    }
+  }
+
+  private async queueTemp(chatId: string, messageId: number): Promise<void> {
+    if (!this.database) return;
+    await this.database.queueMessageDeletion(chatId, messageId, new Date(Date.now() + 60_000));
+  }
+
+  private async replyTemp(ctx: Context | ChatContext, text: string, other?: Record<string, unknown>): Promise<void> {
+    const sent = await ctx.reply(text, other as any);
+    if (sent && "message_id" in sent) {
+      await this.queueTemp(ctx.chat!.id.toString(), (sent as any).message_id);
+    }
+  }
+
+  private async sendTemp(lines: string[], chatId?: string): Promise<void> {
+    if (!this.bot || !this.config.telegram) return;
+    const targetId = chatId ?? this.config.telegram.chatId;
+    const run = this.sendQueue.then(async () => {
+      const elapsed = Date.now() - this.lastSendAt;
+      if (elapsed < 300) await sleep(300 - elapsed);
+      this.lastSendAt = Date.now();
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          const sent = await this.bot!.api.sendMessage(targetId, lines.join("\n"));
+          await this.queueTemp(targetId, sent.message_id);
+          return;
+        } catch (error: unknown) {
+          const code = (error as { error_code?: number })?.error_code;
+          if (code === 429 && attempt < 3) {
+            const retryAfter = Number((error as { parameters?: { retry_after?: number } })?.parameters?.retry_after ?? 5);
+            log.warn({ retryAfter, attempt }, "Telegram rate-limited — retrying");
+            await sleep(retryAfter * 1000);
+            continue;
+          }
+          log.warn({ error: errorMessage(error) }, "could not send Telegram notification");
+          return;
+        }
+      }
+    });
+    this.sendQueue = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   private async handleStatus(ctx: ChatContext, database: Database, pnl: PnlService): Promise<void> {
@@ -230,7 +309,19 @@ export class Notifier {
 
     const dashboard = await this.buildDashboard(database, pnl, 0);
     this.lastStatusCache.set(chatId, dashboard.positions);
-    await ctx.reply(dashboard.text, { reply_markup: this.dashboardKeyboard(dashboard.page, dashboard.pageCount) });
+
+    const existingMessageId = await database.getDashboardMessageId(chatId);
+    if (existingMessageId !== null) {
+      try {
+        await this.editDashboardMessage(chatId, existingMessageId, dashboard.text, this.dashboardKeyboard(dashboard.page, dashboard.pageCount));
+        return;
+      } catch {
+        // Message was deleted or invalid — create a new one.
+        await database.clearDashboardMessageId(chatId);
+      }
+    }
+    const sent = await ctx.reply(dashboard.text, { reply_markup: this.dashboardKeyboard(dashboard.page, dashboard.pageCount) });
+    await database.setDashboardMessageId(chatId, sent.message_id);
   }
 
   private async handleDashboardCallback(ctx: Context, database: Database, pnl: PnlService, executor: Executor, scanner: PoolScanner): Promise<void> {
@@ -263,7 +354,7 @@ export class Notifier {
       }
       if (action.type === "scan") {
         this.pendingInput.set(chatId, { kind: "scan_token" });
-        await ctx.reply("Kirim address token Robinhood untuk di-scan.", { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } });
+        await this.replyTemp(ctx, "Kirim address token Robinhood untuk di-scan.", { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
         return;
       }
       if (action.type === "scan_pools") {
@@ -281,7 +372,7 @@ export class Notifier {
       }
       if (action.type === "config_edit") {
         this.pendingInput.set(chatId, { kind: "config", key: action.key, dashboardMessageId: message.message_id });
-        await ctx.reply(configInputPrompt(action.key), { reply_markup: { force_reply: true } });
+        await this.replyTemp(ctx, configInputPrompt(action.key), { reply_markup: { force_reply: true } as any });
         return;
       }
       if (action.type === "config_quote") {
@@ -290,11 +381,27 @@ export class Notifier {
           ? settings.allowedQuotes.filter((quote) => quote !== action.quote)
           : [...settings.allowedQuotes, action.quote];
         if (allowedQuotes.length === 0) {
-          await ctx.reply("Minimal satu quote token harus aktif.");
+          await this.replyTemp(ctx, "Minimal satu quote token harus aktif.");
           return;
         }
         await database.setPoolScanSettings(chatId, { ...settings, allowedQuotes });
         await this.showPoolScanConfig(database, chatId, message.message_id);
+        return;
+      }
+      if (action.type === "history") {
+        await this.showHistory(ctx, database, chatId, action.page);
+        return;
+      }
+      if (action.type === "pnl_card") {
+        await this.showPnlCardSelection(ctx, database, chatId, action.page);
+        return;
+      }
+      if (action.type === "pnl_card_select") {
+        await this.sendPnlCard(ctx, database, chatId, action.historyIndex);
+        return;
+      }
+      if (action.type !== "select" && action.type !== "confirm") {
+        await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
         return;
       }
 
@@ -406,6 +513,9 @@ export class Notifier {
     keyboard.row()
       .text("🔍 Scan token", dashboardAction("scan", page))
       .text("🏆 Scan pools", dashboardAction("scan_pools", page));
+    keyboard.row()
+      .text("📚 History ±0.5%", dashboardAction("history", 0))
+      .text("🖼 PnL card", dashboardAction("pnl_card", 0));
     keyboard.row().text("⚙️ Pool scan config", dashboardAction("config", page));
     if (pageCount > 1) {
       keyboard.row();
@@ -521,11 +631,11 @@ export class Notifier {
 
     const raw = ctx.match.trim();
     if (!raw) {
-      await ctx.reply("Gunakan /scan <token-contract-address>");
+      await this.replyTemp(ctx, "Gunakan /scan <token-contract-address>");
       return;
     }
     if (!isAddress(raw)) {
-      await ctx.reply("Address tidak valid.");
+      await this.replyTemp(ctx, "Address tidak valid.");
       return;
     }
 
@@ -535,23 +645,23 @@ export class Notifier {
   private async runTokenScan(ctx: Context, scanner: PoolScanner, token: Address): Promise<void> {
     const elapsed = Date.now() - this.lastScanAt;
     if (elapsed < 15_000) {
-      await ctx.reply(`Tunggu ${Math.ceil((15_000 - elapsed) / 1_000)} detik sebelum scan berikutnya.`);
+      await this.replyTemp(ctx, `Tunggu ${Math.ceil((15_000 - elapsed) / 1_000)} detik sebelum scan berikutnya.`);
       return;
     }
     this.lastScanAt = Date.now();
 
-    await ctx.reply(`🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(token)} di Robinhood...`);
+    await this.replyTemp(ctx, `🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(token)} di Robinhood...`);
 
     let scan;
     try {
       scan = await scanner.scan(token);
     } catch (error) {
-      await ctx.reply(`Scan gagal: ${errorMessage(error).slice(0, 500)}`);
+      await this.replyTemp(ctx, `Scan gagal: ${errorMessage(error).slice(0, 500)}`);
       return;
     }
 
     if (scan.active.length === 0 && scan.watchlist.length === 0) {
-      await ctx.reply(`Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 6h >= $100 untuk token ini.`);
+      await this.replyTemp(ctx, `Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 6h >= $100 untuk token ini.`);
       return;
     }
 
@@ -575,14 +685,14 @@ export class Notifier {
 
     lines.push("", "Yield 1h: (vol1h × feeRate / TVL). Score memakai Vol 6h dan safety factor.");
 
-    await ctx.reply(lines.join("\n"));
+    await this.replyTemp(ctx, lines.join("\n"));
   }
 
   private async handleScanPools(ctx: Context, database: Database, scanner: PoolScanner): Promise<void> {
     const chatId = ctx.chat?.id.toString();
     if (!chatId || !this.authorized(chatId)) return;
     if (this.poolScanRunning) {
-      await ctx.reply("🏆 Scan pools masih berjalan. Tunggu hasil sebelumnya.");
+      await this.replyTemp(ctx, "🏆 Scan pools masih berjalan. Tunggu hasil sebelumnya.");
       return;
     }
     this.poolScanRunning = true;
@@ -603,9 +713,11 @@ export class Notifier {
         const details = errorMessage(editError);
         if (!details.includes("message is not modified")) throw editError;
       }
+      await this.queueTemp(chatId, messageId);
     } catch (error) {
       if (this.bot) {
         await this.bot.api.editMessageText(chatId, messageId, `Scan pools gagal: ${errorMessage(error).slice(0, 500)}`).catch(() => {});
+        await this.queueTemp(chatId, messageId);
       }
     } finally {
       this.poolScanRunning = false;
@@ -621,7 +733,7 @@ export class Notifier {
     this.pendingInput.delete(chatId);
     if (pending.kind === "scan_token") {
       if (!isAddress(text)) {
-        await ctx.reply("Address token tidak valid.");
+        await this.replyTemp(ctx, "Address token tidak valid.");
         return;
       }
       await this.runTokenScan(ctx, scanner, text as Address);
@@ -631,10 +743,10 @@ export class Notifier {
       const settings = await this.poolScanSettings(database, chatId);
       const next = { ...settings, ...parsePoolScanInput(pending.key, text) };
       await database.setPoolScanSettings(chatId, next);
-      await ctx.reply("✅ Pool scan config diperbarui.");
+      await this.replyTemp(ctx, "✅ Pool scan config diperbarui.");
       await this.showPoolScanConfig(database, chatId, pending.dashboardMessageId);
     } catch (error) {
-      await ctx.reply(`Config tidak valid: ${errorMessage(error).slice(0, 200)}`);
+      await this.replyTemp(ctx, `Config tidak valid: ${errorMessage(error).slice(0, 200)}`);
     }
   }
 
@@ -684,15 +796,92 @@ export class Notifier {
   }
 
   private async replyLong(ctx: Context, text: string): Promise<void> {
+    const chatId = ctx.chat!.id.toString();
     let message = "";
     for (const line of text.split("\n")) {
       if (message.length + line.length + 1 > 3_800) {
-        await ctx.reply(message);
+        await this.replyTemp(ctx, message);
         message = "";
       }
       message += `${message ? "\n" : ""}${line}`;
     }
-    if (message) await ctx.reply(message);
+    if (message) await this.replyTemp(ctx, message);
+  }
+
+  private async handleHistoryCommand(ctx: ChatContext, database: Database): Promise<void> {
+    const chatId = ctx.chat.id.toString();
+    if (!this.authorized(chatId)) return;
+    await this.showHistory(ctx, database, chatId, 0);
+  }
+
+  private async showHistory(ctx: Context, database: Database, chatId: string, page: number): Promise<void> {
+    const history = await database.listCloseHistory(50);
+    if (history.length === 0) {
+      await this.replyTemp(ctx, "Tidak ada riwayat posisi close yang lolos ambang ±0.5%.");
+      return;
+    }
+    const pageCount = Math.max(1, Math.ceil(history.length / DASHBOARD_PAGE_SIZE));
+    const p = clampDashboardPage(page, pageCount);
+    const start = p * DASHBOARD_PAGE_SIZE;
+    const pageItems = history.slice(start, start + DASHBOARD_PAGE_SIZE);
+    const lines = ["📚 RIWAYAT CLOSE ±0.5%", ""];
+    for (const item of pageItems) {
+      const pair = item.quoteToken.toLowerCase() === item.token0.toLowerCase()
+        ? `${await this.tokenLabel(item.token1, item.chainId)}/${await this.tokenLabel(item.token0, item.chainId)}`
+        : `${await this.tokenLabel(item.token0, item.chainId)}/${await this.tokenLabel(item.token1, item.chainId)}`;
+      const isProfit = item.finalPnlBps >= 0n;
+      const prefix = isProfit ? "📈" : "📉";
+      const sign = isProfit ? "+" : "";
+      lines.push(`${prefix} ${item.protocol.toUpperCase()} #${item.positionKey} ${pair}`);
+      lines.push(`   ${sign}${formatBps(item.finalPnlBps)}% | ${sign}${formatToken(item.finalPnlQuote, 6)} | ${triggerDisplayShort(item.trigger)}`);
+      lines.push(`   Settled: ${item.settledAt.replace("T", " ").slice(0, 19)} UTC`);
+      lines.push("");
+    }
+    if (pageCount > 1) lines.push(`Page ${p + 1}/${pageCount} | ${history.length} riwayat`);
+    await this.replyTemp(ctx, lines.join("\n"));
+  }
+
+  private async showPnlCardSelection(ctx: Context, database: Database, chatId: string, page: number): Promise<void> {
+    const history = await database.listCloseHistory(50);
+    if (history.length === 0) {
+      await this.replyTemp(ctx, "Tidak ada riwayat posisi close yang lolos ±0.5% untuk dijadikan PnL card.");
+      return;
+    }
+    const pageCount = Math.max(1, Math.ceil(history.length / DASHBOARD_PAGE_SIZE));
+    const p = clampDashboardPage(page, pageCount);
+    const start = p * DASHBOARD_PAGE_SIZE;
+    const pageItems = history.slice(start, start + DASHBOARD_PAGE_SIZE);
+    const keyboard = new InlineKeyboard();
+    const lines = ["🖼 PILIH POSISI UNTUK PNL CARD", ""];
+    for (let i = 0; i < pageItems.length; i++) {
+      const item = pageItems[i]!;
+      const pair = item.quoteToken.toLowerCase() === item.token0.toLowerCase()
+        ? `${await this.tokenLabel(item.token1, item.chainId)}/${await this.tokenLabel(item.token0, item.chainId)}`
+        : `${await this.tokenLabel(item.token0, item.chainId)}/${await this.tokenLabel(item.token1, item.chainId)}`;
+      const isProfit = item.finalPnlBps >= 0n;
+      const sign = isProfit ? "+" : "";
+      keyboard.text(`${isProfit ? "📈" : "📉"} ${item.protocol.toUpperCase()} ${pair}`, `lp:pnl_cs:${p}:${start + i}`).row();
+      lines.push(`${isProfit ? "📈" : "📉"} ${item.protocol.toUpperCase()} #${item.positionKey} ${pair} | ${sign}${formatBps(item.finalPnlBps)}%`);
+    }
+    keyboard.text("← Back", dashboardAction("status", 0));
+    await this.replyTemp(ctx, lines.join("\n"), { reply_markup: keyboard as any });
+  }
+
+  private async sendPnlCard(ctx: Context, database: Database, chatId: string, historyIndex: number): Promise<void> {
+    const history = await database.listCloseHistory(50);
+    const record = history[historyIndex];
+    if (!record) {
+      await this.replyTemp(ctx, "Riwayat tidak ditemukan.");
+      return;
+    }
+    const pair = record.quoteToken.toLowerCase() === record.token0.toLowerCase()
+      ? `${await this.tokenLabel(record.token1, record.chainId)}/${await this.tokenLabel(record.token0, record.chainId)}`
+      : `${await this.tokenLabel(record.token0, record.chainId)}/${await this.tokenLabel(record.token1, record.chainId)}`;
+    const png = await renderPnlCard(record, pair);
+    const sent = await ctx.replyWithPhoto(new InputFile(png, "pnl-card.png"));
+    if (sent && "message_id" in sent) {
+      await this.queueTemp(chatId, (sent as any).message_id);
+    }
   }
 
   private async handleClose(ctx: ChatContext, database: Database, executor: Executor): Promise<void> {
@@ -700,7 +889,7 @@ export class Notifier {
     if (!this.authorized(chatId)) return;
 
     const key = ctx.match.trim();
-    if (!key) { await ctx.reply("Gunakan /close <nomor> atau /close <key>. Jalankan /status dulu."); return; }
+    if (!key) { await this.replyTemp(ctx, "Gunakan /close <nomor> atau /close <key>. Jalankan /status dulu."); return; }
 
     let found: PositionRecord | null = null;
 
@@ -726,25 +915,25 @@ export class Notifier {
     }
 
     if (!found) {
-      await ctx.reply(`Posisi "${key}" tidak ditemukan. Jalankan /status dulu, lalu gunakan nomor (contoh: /close 1) atau position key (contoh: /close 33850).`);
+      await this.replyTemp(ctx, `Posisi "${key}" tidak ditemukan. Jalankan /status dulu, lalu gunakan nomor (contoh: /close 1) atau position key (contoh: /close 33850).`);
       return;
     }
     if (found.status === "closing" || found.status === "settled") {
-      await ctx.reply(`Posisi ${found.positionKey} sudah ${found.status === "closing" ? "sedang ditutup" : "settled"}.`);
+      await this.replyTemp(ctx, `Posisi ${found.positionKey} sudah ${found.status === "closing" ? "sedang ditutup" : "settled"}.`);
       return;
     }
     if (found.status === "needs_review") {
-      await ctx.reply(`Posisi ${found.positionKey} manual-only: ${reviewReasonDisplay(found.metadata)}.`);
+      await this.replyTemp(ctx, `Posisi ${found.positionKey} manual-only: ${reviewReasonDisplay(found.metadata)}.`);
       return;
     }
 
-    await ctx.reply(`Menutup ${found.protocol.toUpperCase()} #${found.positionKey}...`);
+    await this.replyTemp(ctx, `Menutup ${found.protocol.toUpperCase()} #${found.positionKey}...`);
     try {
       await executor.execute(found, "manual");
-      await ctx.reply(`Posisi ${found.positionKey} — penutupan dimulai.`);
+      await this.replyTemp(ctx, `Posisi ${found.positionKey} — penutupan dimulai.`);
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
-      await ctx.reply(`Close gagal: ${message.slice(0, 500)}`);
+      await this.replyTemp(ctx, `Close gagal: ${message.slice(0, 500)}`);
     }
   }
 
@@ -840,7 +1029,7 @@ export class Notifier {
   }
 }
 
-function dashboardAction(type: "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset", page: number): string {
+function dashboardAction(type: "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "history" | "pnl_card", page: number): string {
   return `lp:${type}:${page}`;
 }
 
@@ -869,6 +1058,12 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
   if (parts.length === 3 && parts[0] === "lp" && parts[1] === "cfgquote" && ["USDG", "WETH", "ETH"].includes(parts[2] ?? "")) {
     return { type: "config_quote", quote: parts[2]! };
   }
+  if (parts.length === 4 && parts[0] === "lp" && parts[1] === "pnl_cs") {
+    const page = parseDashboardPage(parts[2]);
+    const historyIndex = Number(parts[3]);
+    if (page === null || !Number.isSafeInteger(historyIndex) || historyIndex < 0) return null;
+    return { type: "pnl_card_select", page, historyIndex };
+  }
   return null;
 }
 
@@ -886,8 +1081,8 @@ function parseDashboardPage(value: string | undefined): number | null {
   return Number.isSafeInteger(page) ? page : null;
 }
 
-function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" {
-  return value === "refresh" || value === "close" || value === "status" || value === "scan" || value === "scan_pools" || value === "config" || value === "config_reset";
+function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "history" | "pnl_card" {
+  return value === "refresh" || value === "close" || value === "status" || value === "scan" || value === "scan_pools" || value === "config" || value === "config_reset" || value === "history" || value === "pnl_card";
 }
 
 function isPositionAction(value: string | undefined): value is "select" | "confirm" {
@@ -985,6 +1180,16 @@ function reviewReasonDisplay(metadata: Record<string, unknown>): string {
   const reason = typeof metadata.reason === "string" ? metadata.reason : "requires manual review";
   if (reason === "native_currency_v4_requires_manual_settlement") return "native ETH requires manual settlement";
   return reason.length > 120 ? `${reason.slice(0, 117)}...` : reason;
+}
+
+function triggerDisplayShort(trigger: string): string {
+  switch (trigger) {
+    case "stop_loss": return "SL";
+    case "take_profit": return "TP";
+    case "trailing_take_profit": return "Trail";
+    case "manual": return "Manual";
+    default: return trigger;
+  }
 }
 
 function scoreStars(score: number): string {

@@ -86,3 +86,20 @@ export interface TransactionPlan {
   value?: bigint;
   description: string;
 }
+
+export interface CloseHistoryRecord {
+  id: string;
+  positionId: string;
+  chainId: number;
+  protocol: Protocol;
+  positionKey: string;
+  token0: Address;
+  token1: Address;
+  quoteToken: Address;
+  finalPnlBps: bigint;
+  finalPnlQuote: bigint;
+  trigger: ExitTrigger | "settled";
+  closeTransactionHash: string | null;
+  swapTransactionHash: string | null;
+  settledAt: string;
+}

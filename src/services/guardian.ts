@@ -218,6 +218,7 @@ export class Guardian {
         await this.database.setPositionStatus(position.id, "settled", { reason: "on_chain_liquidity_zero" });
         log.info({ positionId: position.id, reason: message }, "zero on-chain liquidity detected — marking settled");
         void this.notifier.settled(position);
+        void this.database.finalizeCloseHistory(position.id, "settled");
         return true;
       }
       if (message.includes("No safe direct Uniswap route") || message.includes("Native-currency")) {

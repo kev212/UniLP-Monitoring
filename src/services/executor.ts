@@ -73,6 +73,7 @@ export class Executor {
     await this.database.setPositionStatus(position.id, "closing", {
       exitStartedAt: new Date().toISOString(),
       exitRetry: null,
+      exitTrigger: trigger ?? "manual",
       settlementQuoteFromClose: settlementQuoteFromClose.toString(),
     });
     let closeConfirmed = false;
@@ -126,6 +127,7 @@ export class Executor {
       await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null });
       await this.saveSettlementBalance(position);
       await this.notifier.settled(position);
+      void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position));
       return;
     }
     const recoveredPosition = await this.recoverSettlementPosition(position);
@@ -142,6 +144,7 @@ export class Executor {
       await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, reason });
       log.info({ positionId: position.id, positionKey: position.positionKey, reason }, "skipping post-close settlement");
       await this.notifier.settled(position);
+      void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position));
       return;
     }
 
@@ -158,6 +161,7 @@ export class Executor {
         await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash });
         await this.saveSettlementBalance(position, expectedOut);
         await this.notifier.settled(position);
+        void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position));
         return;
       }
 
@@ -191,6 +195,7 @@ export class Executor {
       await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash });
       await this.saveSettlementBalance(position, route.expectedOut);
       await this.notifier.settled(position);
+      void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position));
     } catch (error) {
       await this.database.recordExecution(position.id, "swap_to_quote", "failed", undefined, errorMessage(error));
       await this.database.setPositionStatus(position.id, "closing", { lastExecutionError: errorMessage(error) });
@@ -233,6 +238,7 @@ export class Executor {
       await this.database.setPositionStatus(position.id, "settled", { reason: "on_chain_liquidity_zero" });
       log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 position has zero NFT liquidity — marking settled");
       void this.notifier.settled(position);
+      void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position));
       return false;
     } catch (error) {
       const message = errorMessage(error);
@@ -240,6 +246,7 @@ export class Executor {
       await this.database.setPositionStatus(position.id, "settled", { reason: "nft_burned" });
       log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 position NFT is burned — marking settled");
       void this.notifier.settled(position);
+      void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position));
       return false;
     }
   }
@@ -541,6 +548,16 @@ export class Executor {
     const { client } = this.chains.getById(chainId);
     if (token.toLowerCase() === zeroAddress) return client.getBalance({ address: owner });
     return client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
+  }
+
+  private closeTrigger(position: PositionRecord): string {
+    const meta = position.metadata as Record<string, unknown>;
+    if (typeof meta.exitTrigger === "string") return meta.exitTrigger;
+    if (meta.exitRetry) {
+      const retry = meta.exitRetry as Record<string, unknown>;
+      if (typeof retry.reason === "string") return retry.reason;
+    }
+    return "settled";
   }
 }
 

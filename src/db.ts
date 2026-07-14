@@ -1,7 +1,7 @@
 import { Pool, type PoolClient } from "pg";
 import type { Address } from "viem";
 
-import type { PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol, TrailingStopState } from "./types.js";
+import type { CloseHistoryRecord, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol, TrailingStopState } from "./types.js";
 
 interface PositionRow {
   id: string;
@@ -129,6 +129,36 @@ export class Database {
         settings JSONB NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+      CREATE TABLE IF NOT EXISTS telegram_dashboards (
+        chat_id TEXT PRIMARY KEY,
+        message_id INTEGER NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS telegram_deletion_queue (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        chat_id TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        delete_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS telegram_deletion_queue_delete_at_idx ON telegram_deletion_queue(delete_at);
+      CREATE TABLE IF NOT EXISTS close_history (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        position_id UUID NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
+        chain_id INTEGER NOT NULL,
+        protocol TEXT NOT NULL CHECK (protocol IN ('v2', 'v3', 'v4')),
+        position_key TEXT NOT NULL,
+        token0 TEXT NOT NULL,
+        token1 TEXT NOT NULL,
+        quote_token TEXT NOT NULL,
+        final_pnl_bps NUMERIC(78, 0) NOT NULL,
+        final_pnl_quote NUMERIC(78, 0) NOT NULL,
+        trigger TEXT NOT NULL,
+        close_transaction_hash TEXT,
+        swap_transaction_hash TEXT,
+        settled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS close_history_settled_at_idx ON close_history(settled_at DESC);
     `);
   }
 
@@ -409,6 +439,101 @@ export class Database {
     const row = result.rows[0]!;
     return { priceMarker: BigInt(row.price_marker), blockNumber: BigInt(row.block_number) };
   }
+
+  async getDashboardMessageId(chatId: string): Promise<number | null> {
+    const result = await this.pool.query<{ message_id: number }>(
+      "SELECT message_id FROM telegram_dashboards WHERE chat_id = $1",
+      [chatId],
+    );
+    return result.rowCount ? result.rows[0]!.message_id : null;
+  }
+
+  async setDashboardMessageId(chatId: string, messageId: number): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO telegram_dashboards (chat_id, message_id)
+       VALUES ($1, $2)
+       ON CONFLICT (chat_id) DO UPDATE SET message_id = EXCLUDED.message_id, updated_at = NOW()`,
+      [chatId, messageId],
+    );
+  }
+
+  async clearDashboardMessageId(chatId: string): Promise<void> {
+    await this.pool.query("DELETE FROM telegram_dashboards WHERE chat_id = $1", [chatId]);
+  }
+
+  async queueMessageDeletion(chatId: string, messageId: number, deleteAt: Date): Promise<void> {
+    await this.pool.query(
+      "INSERT INTO telegram_deletion_queue (chat_id, message_id, delete_at) VALUES ($1, $2, $3)",
+      [chatId, messageId, deleteAt],
+    );
+  }
+
+  async fetchDueDeletions(): Promise<{ id: string; chatId: string; messageId: number }[]> {
+    const result = await this.pool.query<{ id: string; chat_id: string; message_id: number }>(
+      "SELECT id, chat_id, message_id FROM telegram_deletion_queue WHERE delete_at <= NOW() ORDER BY delete_at ASC LIMIT 100",
+    );
+    return result.rows.map((row) => ({ id: row.id, chatId: row.chat_id, messageId: row.message_id }));
+  }
+
+  async removeDeletion(id: string): Promise<void> {
+    await this.pool.query("DELETE FROM telegram_deletion_queue WHERE id = $1", [id]);
+  }
+
+  async listCloseHistory(limit = 20): Promise<CloseHistoryRecord[]> {
+    const result = await this.pool.query<{
+      id: string; position_id: string; chain_id: number; protocol: Protocol;
+      position_key: string; token0: string; token1: string; quote_token: string;
+      final_pnl_bps: string; final_pnl_quote: string; trigger: string;
+      close_transaction_hash: string | null; swap_transaction_hash: string | null;
+      settled_at: string;
+    }>(
+      `SELECT * FROM close_history ORDER BY settled_at DESC LIMIT $1`,
+      [limit],
+    );
+    return result.rows.map(mapCloseHistory);
+  }
+
+  async finalizeCloseHistory(positionId: string, trigger: string): Promise<void> {
+    const existing = await this.pool.query("SELECT 1 FROM close_history WHERE position_id = $1", [positionId]);
+    if (existing.rowCount) return;
+
+    const totals = await this.getCashflowTotals(positionId);
+    if (totals.deposits === 0n) return;
+
+    const pos = await this.pool.query<{
+      chain_id: number; protocol: Protocol; position_key: string;
+      token0: string; token1: string; quote_token: string;
+      metadata: Record<string, unknown>;
+    }>(
+      "SELECT chain_id, protocol, position_key, token0, token1, quote_token, metadata FROM positions WHERE id = $1",
+      [positionId],
+    );
+    if (!pos.rowCount) return;
+    const row = pos.rows[0]!;
+
+    const meta = row.metadata;
+    const totalReceivedStr = typeof meta.totalReceived === "string" ? meta.totalReceived : undefined;
+    const totalReceived = totalReceivedStr ? BigInt(totalReceivedStr) : 0n;
+    const closeTx = typeof meta.closeTransactionHash === "string" ? meta.closeTransactionHash : null;
+    const swapTx = typeof meta.swapTransactionHash === "string" ? meta.swapTransactionHash : null;
+
+    const finalPnl = totals.realized + totalReceived - totals.deposits;
+    const finalPnlBps = totals.deposits > 0n ? (finalPnl * 10000n) / totals.deposits : 0n;
+
+    if (finalPnlBps < 0n ? -finalPnlBps < 50n : finalPnlBps < 50n) return;
+
+    await this.pool.query(
+      `INSERT INTO close_history (position_id, chain_id, protocol, position_key, token0, token1, quote_token,
+         final_pnl_bps, final_pnl_quote, trigger, close_transaction_hash, swap_transaction_hash, settled_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())`,
+      [
+        positionId, row.chain_id, row.protocol, row.position_key,
+        row.token0, row.token1, row.quote_token,
+        finalPnlBps.toString(), finalPnl.toString(), trigger,
+        closeTx, swapTx,
+      ],
+    );
+  }
 }
 
 function mapPosition(row: PositionRow): PositionRecord {
@@ -426,5 +551,41 @@ function mapPosition(row: PositionRow): PositionRecord {
     liquidity: row.liquidity === null ? null : BigInt(row.liquidity),
     openedAtBlock: row.opened_at_block === null ? null : BigInt(row.opened_at_block),
     metadata: row.metadata,
+  };
+}
+
+interface CloseHistoryRow {
+  id: string;
+  position_id: string;
+  chain_id: number;
+  protocol: Protocol;
+  position_key: string;
+  token0: string;
+  token1: string;
+  quote_token: string;
+  final_pnl_bps: string;
+  final_pnl_quote: string;
+  trigger: string;
+  close_transaction_hash: string | null;
+  swap_transaction_hash: string | null;
+  settled_at: string;
+}
+
+function mapCloseHistory(row: CloseHistoryRow): CloseHistoryRecord {
+  return {
+    id: row.id,
+    positionId: row.position_id,
+    chainId: row.chain_id,
+    protocol: row.protocol,
+    positionKey: row.position_key,
+    token0: row.token0 as Address,
+    token1: row.token1 as Address,
+    quoteToken: row.quote_token as Address,
+    finalPnlBps: BigInt(row.final_pnl_bps),
+    finalPnlQuote: BigInt(row.final_pnl_quote),
+    trigger: row.trigger as CloseHistoryRecord["trigger"],
+    closeTransactionHash: row.close_transaction_hash,
+    swapTransactionHash: row.swap_transaction_hash,
+    settledAt: row.settled_at,
   };
 }

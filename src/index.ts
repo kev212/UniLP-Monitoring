@@ -20,7 +20,7 @@ async function main(): Promise<void> {
   const reader = new PositionReader(chains, config.maxSwapSlippageBps);
   const routes = new RoutePlanner(chains, config.maxSwapSlippageBps, config.quoteTokens);
   const tradingApi = config.uniswapApiKey ? new UniswapTradingApi(config.uniswapApiKey, config.maxSwapSlippageBps) : undefined;
-  const notifier = new Notifier(config, chains);
+  const notifier = new Notifier(config, chains, database);
   const discovery = new DiscoveryService(database, chains, config, notifier);
   const alchemyBootstrapper = new AlchemyBootstrapper(database, chains, discovery, config);
   const pnl = new PnlService(database, reader, routes, config, tradingApi);
