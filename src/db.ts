@@ -578,13 +578,13 @@ export class Database {
     const isUsdStable = quoteTokenLower === "0x5fc5360d0400a0fd4f2af552add042d716f1d168" // USDG Robinhood
       || quoteTokenLower === "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"; // USDC Base
     const settlementUsdStr = typeof meta.settlementUsd === "string" ? meta.settlementUsd : undefined;
+    const settlementUsd = settlementUsdStr ? BigInt(settlementUsdStr) : 0n;
     let finalPnlUsd: bigint;
     if (isUsdStable) {
       finalPnlUsd = finalPnl;
-    } else if (settlementUsdStr) {
-      // For ETH/WETH: compute PnL USD from stored settlement
-      const depositUsdPerUnit = totals.deposits > 0n ? (BigInt(settlementUsdStr) * totals.deposits) / totalReceived : 0n;
-      finalPnlUsd = depositUsdPerUnit > 0n ? (finalPnl * BigInt(settlementUsdStr)) / depositUsdPerUnit : 0n;
+    } else if (totalReceived > 0n && settlementUsd > 0n) {
+      // ETH/WETH PnL converted at the final settlement price.
+      finalPnlUsd = (finalPnl * settlementUsd) / totalReceived;
     } else {
       finalPnlUsd = 0n;
     }

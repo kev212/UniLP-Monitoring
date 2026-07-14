@@ -141,7 +141,7 @@ export class Executor {
       await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null });
       await this.saveSettlementBalance(position);
       await this.notifier.settled(position);
-      void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position));
+      this.finalizeCloseHistory(position);
       return;
     }
     const recoveredPosition = await this.recoverSettlementPosition(position);
@@ -158,7 +158,7 @@ export class Executor {
       await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, reason });
       log.info({ positionId: position.id, positionKey: position.positionKey, reason }, "skipping post-close settlement");
       await this.notifier.settled(position);
-      void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position));
+      this.finalizeCloseHistory(position);
       return;
     }
 
@@ -175,7 +175,7 @@ export class Executor {
         await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash });
         await this.saveSettlementBalance(position, expectedOut);
         await this.notifier.settled(position);
-        void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position));
+        this.finalizeCloseHistory(position);
         return;
       }
 
@@ -209,7 +209,7 @@ export class Executor {
       await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash });
       await this.saveSettlementBalance(position, route.expectedOut);
       await this.notifier.settled(position);
-      void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position));
+      this.finalizeCloseHistory(position);
     } catch (error) {
       await this.database.recordExecution(position.id, "swap_to_quote", "failed", undefined, errorMessage(error));
       await this.database.setPositionStatus(position.id, "closing", { lastExecutionError: errorMessage(error) });
@@ -286,7 +286,7 @@ export class Executor {
       await this.database.setPositionStatus(position.id, "settled", { reason: "on_chain_liquidity_zero" });
       log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 position has zero NFT liquidity — marking settled");
       void this.notifier.settled(position);
-      void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position));
+      this.finalizeCloseHistory(position);
       return false;
     } catch (error) {
       const message = errorMessage(error);
@@ -294,7 +294,7 @@ export class Executor {
       await this.database.setPositionStatus(position.id, "settled", { reason: "nft_burned" });
       log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 position NFT is burned — marking settled");
       void this.notifier.settled(position);
-      void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position));
+      this.finalizeCloseHistory(position);
       return false;
     }
   }
@@ -606,6 +606,12 @@ export class Executor {
       if (typeof retry.reason === "string") return retry.reason;
     }
     return "settled";
+  }
+
+  private finalizeCloseHistory(position: PositionRecord): void {
+    void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position)).catch((error) => {
+      log.error({ err: error, positionId: position.id, positionKey: position.positionKey }, "close-history finalization failed");
+    });
   }
 
   async backfillStaleCloseHistoryUsd(): Promise<void> {
