@@ -573,6 +573,10 @@ export class Database {
     await this.pool.query("DELETE FROM telegram_deletion_queue WHERE id = $1", [id]);
   }
 
+  async deferDeletion(id: string): Promise<void> {
+    await this.pool.query("UPDATE telegram_deletion_queue SET delete_at = NOW() + INTERVAL '1 minute' WHERE id = $1", [id]);
+  }
+
   async listCloseHistory(limit = 20): Promise<CloseHistoryRecord[]> {
     return this.listCloseHistoryPage(limit, 0);
   }
@@ -699,17 +703,19 @@ export class Database {
        ORDER BY stage, updated_at DESC`,
       [positionId],
     );
-    const closeTx = typeof meta.closeTransactionHash === "string"
-      ? meta.closeTransactionHash
-      : attempts.rows.find((attempt) => attempt.stage === "remove_liquidity")?.transaction_hash ?? null;
-    const swapTx = typeof meta.swapTransactionHash === "string"
-      ? meta.swapTransactionHash
-      : attempts.rows.find((attempt) => attempt.stage === "swap_to_quote")?.transaction_hash ?? null;
+    const closeTx = attempts.rows.find((attempt) => attempt.stage === "remove_liquidity")?.transaction_hash ?? null;
+    if (!closeTx) return;
+    const metadataCloseTx = typeof meta.closeTransactionHash === "string" ? meta.closeTransactionHash : null;
+    if (metadataCloseTx && metadataCloseTx.toLowerCase() !== closeTx.toLowerCase()) return;
+    const swapTx = attempts.rows.find((attempt) => attempt.stage === "swap_to_quote")?.transaction_hash ?? null;
     const totals = await this.getCashflowTotals(positionId, [closeTx, swapTx].filter((hash): hash is string => hash !== null));
     if (totals.deposits === 0n) return;
     const finalPnl = totals.realized + totalReceived - totals.deposits;
     const finalPnlBps = (finalPnl * 10000n) / totals.deposits;
-    if (finalPnlBps > -HISTORY_MIN_PNL_BPS && finalPnlBps < HISTORY_MIN_PNL_BPS) return;
+    if (finalPnlBps > -HISTORY_MIN_PNL_BPS && finalPnlBps < HISTORY_MIN_PNL_BPS) {
+      await this.pool.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);
+      return;
+    }
     const quoteTokenLower = row.quote_token.toLowerCase();
     const isUsdStable = quoteTokenLower === "0x5fc5360d0400a0fd4f2af552add042d716f1d168" // USDG Robinhood
       || quoteTokenLower === "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"; // USDC Base

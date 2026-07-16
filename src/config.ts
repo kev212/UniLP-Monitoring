@@ -55,6 +55,7 @@ const envSchema = z.object({
   START_BLOCK_ROBINHOOD: z.coerce.bigint().min(0n).default(0n),
   TELEGRAM_BOT_TOKEN: z.string().optional(),
   TELEGRAM_CHAT_ID: z.string().optional(),
+  TELEGRAM_USER_ID: z.string().regex(/^\d+$/).optional(),
 });
 
 export interface RuntimeConfig {
@@ -91,7 +92,7 @@ export interface RuntimeConfig {
   rpcRequestDelayMs: number;
   rpcBootstrapLookbackBlocks: bigint;
   startBlocks: Record<ChainName, bigint>;
-  telegram?: { token: string; chatId: string };
+  telegram?: { token: string; chatId: string; userId: string };
 }
 
 function parseBoolean(value: string, field: string): boolean {
@@ -150,11 +151,20 @@ export function loadConfig(environment = process.env): RuntimeConfig {
   const alchemyBase = env.ALCHEMY_BASE_HTTP || undefined;
   const alchemyRobinhood = env.ALCHEMY_ROBINHOOD_HTTP || undefined;
   const telegram = env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID
-    ? { token: env.TELEGRAM_BOT_TOKEN, chatId: env.TELEGRAM_CHAT_ID }
+    ? {
+        token: env.TELEGRAM_BOT_TOKEN,
+        chatId: env.TELEGRAM_CHAT_ID,
+        // A private Telegram chat ID equals the account's user ID. Group chats
+        // must opt in explicitly with an allowlisted user ID.
+        userId: env.TELEGRAM_USER_ID ?? (env.TELEGRAM_CHAT_ID.startsWith("-") ? "" : env.TELEGRAM_CHAT_ID),
+      }
     : undefined;
 
   if ((env.TELEGRAM_BOT_TOKEN && !env.TELEGRAM_CHAT_ID) || (!env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID)) {
     throw new Error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set together");
+  }
+  if (telegram && !telegram.userId) {
+    throw new Error("TELEGRAM_USER_ID is required when TELEGRAM_CHAT_ID is a group");
   }
 
   const rpcUsesAlchemy = Boolean(detectAlchemyEndpoint(env.BASE_RPC_HTTP) || detectAlchemyEndpoint(env.ROBINHOOD_RPC_HTTP));

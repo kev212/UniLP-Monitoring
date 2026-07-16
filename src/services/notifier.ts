@@ -71,7 +71,7 @@ export class Notifier {
     if (!config.telegram) return;
     this.bot = new Bot(config.telegram.token);
     this.bot.catch((error) => {
-      log.error({ updateId: error.ctx.update.update_id, error: errorMessage(error.error) }, "Telegram update failed");
+      log.error({ updateId: error.ctx.update.update_id }, "Telegram update failed");
     });
   }
 
@@ -175,24 +175,8 @@ export class Notifier {
   }
 
   async logPnL(position: PositionRecord, snapshot: PnlSnapshot): Promise<void> {
-    const t0 = await this.tokenLabel(position.token0, position.chainId);
-    const t1 = await this.tokenLabel(position.token1, position.chainId);
-    const qtSymbol = this.quoteSymbol(position.quoteToken);
-    const qtDec = await this.decimals(position.quoteToken, position.chainId);
-    const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
-    const usdg = this.config.quoteTokens.robinhood[0]?.address;
-    const usdgDec = usdg ? 6 : 0;
-    const usdgSymbol = usdg ? "USDG" : "??";
-    const feeParts: string[] = [formatToken(snapshot.feeQuote, qtDec, 2)];
-    if (snapshot.feeNonQuote) {
-      const nqSymbol = await this.tokenLabel(snapshot.feeNonQuote.token, position.chainId);
-      const nqAmount = formatToken(snapshot.feeNonQuote.amount, await this.decimals(snapshot.feeNonQuote.token, position.chainId), 2);
-      feeParts.push(`+ ${nqAmount} ${nqSymbol}`);
-    }
-    const feeDisplay = snapshot.feeNonQuote
-      ? `${feeParts.join(" ")} (≈ ${formatToken(snapshot.feeQuoteUsdg, usdgDec, 4)} ${usdgSymbol})`
-      : `${formatToken(snapshot.feeQuoteUsdg, usdgDec, 4)} ${usdgSymbol}`;
-    log.info({ Pool: `${position.positionKey} ${pair} | CV: ${formatToken(snapshot.liquidationQuote, qtDec, 2)} ${qtSymbol} | Fees: ${feeDisplay} | PnL: ${formatBps(snapshot.pnlBps)}%` });
+    void snapshot;
+    log.debug({ positionId: position.id }, "position valuation recorded");
   }
 
   async trigger(position: PositionRecord, snapshot: PnlSnapshot, reason: ExitTrigger): Promise<void> {
@@ -250,7 +234,8 @@ export class Notifier {
     const lines = ["❌ LP close failed", `V4 #${position.positionKey} ${pair}`];
     if (reason) lines.push(`trigger: ${reason}`);
     if (attempt !== undefined) lines.push(`retry #${attempt}`);
-    lines.push(`error: ${message.slice(0, 500)}`);
+    void message;
+    lines.push("error: execution failed; inspect restricted service logs");
     await this.sendTemp(lines);
   }
 
@@ -287,7 +272,9 @@ export class Notifier {
         if (msg.includes("message to delete not found") || msg.includes("can't delete") || msg.includes("message can't be deleted")) {
           // Message already gone or bot lacks permission — remove from queue.
         } else {
-          log.warn({ chatId: item.chatId, messageId: item.messageId, error: msg }, "could not delete queued message");
+          log.warn("could not delete queued message");
+          await this.database.deferDeletion(item.id);
+          continue;
         }
       }
       await this.database.removeDeletion(item.id);
@@ -326,7 +313,7 @@ export class Notifier {
             await sleep(retryAfter * 1000);
             continue;
           }
-          log.warn({ error: errorMessage(error) }, "could not send Telegram notification");
+          log.warn("could not send Telegram notification");
           return;
         }
       }
@@ -337,7 +324,7 @@ export class Notifier {
 
   private async handleStatus(ctx: ChatContext, database: Database, pnl: PnlService): Promise<void> {
     const chatId = ctx.chat.id.toString();
-    if (!this.authorized(chatId)) return;
+    if (!this.authorized(chatId, ctx.from?.id.toString())) return;
 
     const dashboard = await this.buildDashboard(database, pnl, 0);
     this.lastStatusCache.set(chatId, dashboard.positions);
@@ -354,7 +341,7 @@ export class Notifier {
       return;
     }
     const chatId = message.chat.id.toString();
-    if (!this.authorized(chatId)) {
+    if (!this.authorized(chatId, ctx.from?.id.toString())) {
       await this.acknowledgeDashboardCallback(ctx, "Tidak diizinkan.", true);
       return;
     }
@@ -700,7 +687,7 @@ export class Notifier {
 
   private async handleScan(ctx: ChatContext, scanner: PoolScanner): Promise<void> {
     const chatId = ctx.chat.id.toString();
-    if (!this.authorized(chatId)) return;
+    if (!this.authorized(chatId, ctx.from?.id.toString())) return;
 
     const raw = ctx.match.trim();
     if (!raw) {
@@ -765,7 +752,7 @@ export class Notifier {
       lines.push("", "Yield 1h: (vol1h × feeRate / TVL). Score memakai Vol 6h dan safety factor.");
       await this.sendTemp([lines.join("\n")], chatId, 120_000);
     } catch (error) {
-      await this.sendTemp([`Scan gagal: ${errorMessage(error).slice(0, 500)}`], chatId, 120_000);
+        await this.sendTemp(["Scan gagal. Coba lagi nanti."], chatId, 120_000);
     } finally {
       this.tokenScanRunning = false;
     }
@@ -773,7 +760,7 @@ export class Notifier {
 
   private async handleScanPools(ctx: Context, database: Database, scanner: PoolScanner): Promise<void> {
     const chatId = ctx.chat?.id.toString();
-    if (!chatId || !this.authorized(chatId)) return;
+    if (!chatId || !this.authorized(chatId, ctx.from?.id.toString())) return;
     if (this.poolScanRunning) {
       await this.replyTemp(ctx, "🏆 Scan pools masih berjalan. Tunggu hasil sebelumnya.");
       return;
@@ -807,7 +794,7 @@ export class Notifier {
       }
       await this.queueTemp(chatId, messageId, 300_000);
     } catch (error) {
-      const text = `Scan pools gagal: ${errorMessage(error).slice(0, 500)}`;
+      const text = "Scan pools gagal. Coba lagi nanti.";
       if (this.bot) {
         try {
           await this.bot.api.editMessageText(chatId, messageId, text);
@@ -834,7 +821,7 @@ export class Notifier {
 
   private async handlePendingInput(ctx: Context, database: Database, scanner: PoolScanner): Promise<void> {
     const chatId = ctx.chat?.id.toString();
-    if (!chatId || !this.authorized(chatId)) return;
+    if (!chatId || !this.authorized(chatId, ctx.from?.id.toString())) return;
     const pending = this.pendingInput.get(chatId);
     const text = ctx.message?.text?.trim();
     if (!pending || !text || text.startsWith("/")) return;
@@ -854,7 +841,7 @@ export class Notifier {
       await this.replyTemp(ctx, "✅ Pool scan config diperbarui.");
       await this.showPoolScanConfig(database, chatId, pending.dashboardMessageId);
     } catch (error) {
-      await this.replyTemp(ctx, `Config tidak valid: ${errorMessage(error).slice(0, 200)}`);
+      await this.replyTemp(ctx, "Config tidak valid.");
     }
   }
 
@@ -918,7 +905,7 @@ export class Notifier {
 
   private async handlePhotoUpload(ctx: Context, database: Database): Promise<void> {
     const chatId = ctx.chat?.id.toString();
-    if (!chatId || !this.authorized(chatId)) return;
+    if (!chatId || !this.authorized(chatId, ctx.from?.id.toString())) return;
     if (!this.pendingBgUpload.has(chatId)) return;
     this.pendingBgUpload.delete(chatId);
     const photos = ctx.message?.photo;
@@ -949,19 +936,19 @@ export class Notifier {
       await database.setPnlCardBackground(chatId, normalized);
       await this.replyTemp(ctx, "✅ Background PnL card tersimpan.");
     } catch (error) {
-      await this.replyTemp(ctx, `Gagal menyimpan background: ${errorMessage(error).slice(0, 200)}`);
+      await this.replyTemp(ctx, "Gagal menyimpan background.");
     }
   }
 
   private async handleHistoryCommand(ctx: ChatContext, database: Database): Promise<void> {
     const chatId = ctx.chat.id.toString();
-    if (!this.authorized(chatId)) return;
+    if (!this.authorized(chatId, ctx.from?.id.toString())) return;
     await this.showHistory(ctx, database, chatId, 0);
   }
 
   private async handleCalendarCommand(ctx: ChatContext, database: Database): Promise<void> {
     const chatId = ctx.chat.id.toString();
-    if (!this.authorized(chatId)) return;
+    if (!this.authorized(chatId, ctx.from?.id.toString())) return;
     const now = new Date();
     await this.showPnlCalendar(ctx, database, now.getUTCFullYear(), now.getUTCMonth() + 1);
   }
@@ -1087,7 +1074,7 @@ export class Notifier {
 
   private async handleClose(ctx: ChatContext, database: Database, executor: Executor): Promise<void> {
     const chatId = ctx.chat.id.toString();
-    if (!this.authorized(chatId)) return;
+    if (!this.authorized(chatId, ctx.from?.id.toString())) return;
 
     const key = ctx.match.trim();
     if (!key) { await this.replyTemp(ctx, "Gunakan /close <nomor> atau /close <key>. Jalankan /status dulu."); return; }
@@ -1134,13 +1121,15 @@ export class Notifier {
       await this.replyTemp(ctx, `Posisi ${found.positionKey} — penutupan dimulai.`);
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
-      await this.replyTemp(ctx, `Close gagal: ${message.slice(0, 500)}`);
+      void message;
+      await this.replyTemp(ctx, "Close gagal. Periksa restricted service logs.");
     }
   }
 
-  private authorized(chatId: string): boolean {
-    if (!this.config.telegram || chatId !== this.config.telegram.chatId) return false;
-    return true;
+  private authorized(chatId: string, userId: string | undefined): boolean {
+    return Boolean(this.config.telegram
+      && chatId === this.config.telegram.chatId
+      && userId === this.config.telegram.userId);
   }
 
   private async pairLabel(position: PositionRecord): Promise<string> {

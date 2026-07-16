@@ -66,6 +66,19 @@ describe("loadConfig", () => {
     expect(loadConfig(environment({ UNISWAP_API_KEY: "api-key" })).uniswapApiKey).toBe("api-key");
   });
 
+  it("requires an allowlisted user for Telegram group chats", () => {
+    expect(() => loadConfig(environment({
+      TELEGRAM_BOT_TOKEN: "bot-token",
+      TELEGRAM_CHAT_ID: "-100123",
+    }))).toThrow("TELEGRAM_USER_ID");
+
+    expect(loadConfig(environment({
+      TELEGRAM_BOT_TOKEN: "bot-token",
+      TELEGRAM_CHAT_ID: "-100123",
+      TELEGRAM_USER_ID: "123456",
+    })).telegram).toEqual({ token: "bot-token", chatId: "-100123", userId: "123456" });
+  });
+
   it("rejects ambiguous quote-token configuration", () => {
     expect(() => loadConfig(environment({ QUOTE_TOKEN_ALLOWLIST_BASE: "USDC:0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913,FAKE:0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913" }))).toThrow("duplicate");
   });

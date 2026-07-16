@@ -36,7 +36,7 @@ async function main(): Promise<void> {
   await guardian.validateNetworks();
   scanner.startCandidateRefresh([...config.quoteTokens.robinhood.map(({ address }) => address), zeroAddress], config.poolScanCandidatePages);
   void executor.backfillStaleCloseHistoryUsd().catch(() => {});
-  log.info({ chains: config.chains, dryRun: config.dryRun, executor: config.executorAddress }, "UniLP Guardian started");
+  log.info({ chains: config.chains, dryRun: config.dryRun }, "UniLP Guardian started");
 
   let botRunning = false;
   const shutdown = async (signal: string): Promise<void> => {

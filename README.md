@@ -67,7 +67,15 @@ npm run build
 docker compose up --build -d
 ```
 
-Docker membaca private key dari `./secrets/executor_private_key`; file tersebut tidak dilacak Git. Jalankan dry-run sampai cashflow, PnL, dan simulasi transaksi cocok dengan posisi nyata. Setelah diverifikasi, set `DRY_RUN=false` pada VPS.
+Docker membaca private key dari path host pada `EXECUTOR_PRIVATE_KEY_FILE_HOST`; file tersebut tidak dilacak Git. Jalankan dry-run sampai cashflow, PnL, dan simulasi transaksi cocok dengan posisi nyata. Setelah diverifikasi, set `DRY_RUN=false` pada VPS.
+
+## Deployment Security
+
+- Set `POSTGRES_DB`, `POSTGRES_USER`, dan password unik `POSTGRES_PASSWORD` di `.env` yang memiliki permission `0600`. PostgreSQL tidak dipublish ke host secara default.
+- Deployment lama dengan credential PostgreSQL default harus menjalankan `sh scripts/rotate-postgres-credentials.sh` sekali sebelum memakai Compose versi ini.
+- Set `EXECUTOR_PRIVATE_KEY_FILE_HOST` ke file private key host. Jangan gunakan `EXECUTOR_PRIVATE_KEY` langsung di `.env`.
+- Telegram command dan callback dibatasi oleh `TELEGRAM_CHAT_ID` dan `TELEGRAM_USER_ID`. Untuk private chat, `TELEGRAM_USER_ID` dapat dikosongkan karena ID chat sama dengan ID user. Group chat wajib menyetel `TELEGRAM_USER_ID` eksplisit.
+- Jangan commit `.env`, `secrets/`, database dump, atau screenshot dashboard/PnL. `.dockerignore` mencegah item tersebut masuk Docker build context.
 
 ## Execution Flow
 

@@ -115,7 +115,7 @@ describe("Database native USD backfill", () => {
         quote_token: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
         metadata: { totalReceived: "10000", closeTransactionHash: "0xclose" }, opened_at_block: null,
       }] })
-      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ stage: "remove_liquidity", transaction_hash: "0xclose" }] })
       .mockResolvedValueOnce({ rows: [{ deposits: "10000", realized: "50" }] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [] });
     Object.defineProperty(database, "pool", { value: { query } });
@@ -127,7 +127,7 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[3]![1].slice(0, 5)).toEqual(["position", "50", "50", "50", "0xclose"]);
   });
 
-  it("does not create history below the ±0.5% threshold", async () => {
+  it("removes stale history for a manual close below the ±0.5% threshold", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn()
       .mockResolvedValueOnce({ rowCount: 1, rows: [{
@@ -136,13 +136,32 @@ describe("Database native USD backfill", () => {
         quote_token: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
         metadata: { totalReceived: "10000" }, opened_at_block: null,
       }] })
-      .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({ rows: [{ deposits: "10000", realized: "49" }] });
+      .mockResolvedValueOnce({ rows: [{ stage: "remove_liquidity", transaction_hash: "0xclose" }] })
+      .mockResolvedValueOnce({ rows: [{ deposits: "10000", realized: "0" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
     Object.defineProperty(database, "pool", { value: { query } });
 
     await database.finalizeCloseHistory("position", "manual");
 
-    expect(query).toHaveBeenCalledTimes(3);
+    expect(query).toHaveBeenCalledTimes(4);
+    expect(query.mock.calls[3]![0]).toContain("DELETE FROM close_history");
+  });
+
+  it("does not finalize history before the close receipt is confirmed", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{
+        chain_id: 4663, protocol: "v4", position_key: "position", status: "settled",
+        token0: "0x5fc5360d0400a0fd4f2af552add042d716f1d168", token1: "0xtoken",
+        quote_token: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        metadata: { totalReceived: "10000", closeTransactionHash: "0xclose" }, opened_at_block: null,
+      }] })
+      .mockResolvedValueOnce({ rows: [] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await database.finalizeCloseHistory("position", "manual");
+
+    expect(query).toHaveBeenCalledTimes(2);
   });
 
   it("does not send a closing position to review from stale burn detection", async () => {
