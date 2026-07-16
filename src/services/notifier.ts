@@ -10,6 +10,7 @@ import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
 import { fmtUtc, renderPnlCard } from "./pnl-card.js";
+import { renderPnlCalendarCard } from "./pnl-calendar-card.js";
 import type { PoolMarketScan, PoolScanFilters, PoolScanner, ScoredPool } from "./pool-scanner.js";
 import { sqrtRatioAtTick } from "./uniswap-math.js";
 
@@ -17,6 +18,8 @@ type ChatContext = CommandContext<Context>;
 
 const DASHBOARD_PAGE_SIZE = 6;
 const DASHBOARD_VALUE_CONCURRENCY = 3;
+const HISTORY_IDLE_TTL_MS = 30_000;
+const CALENDAR_IDLE_TTL_MS = 60_000;
 
 type DashboardAction =
   | { type: "refresh"; page: number }
@@ -33,6 +36,9 @@ type DashboardAction =
   | { type: "pnl_card_select"; page: number; historyIndex: number }
   | { type: "bg_upload"; page: number }
   | { type: "bg_reset"; page: number }
+  | { type: "calendar"; year: number; month: number }
+  | { type: "calendar_page"; year: number; month: number }
+  | { type: "history_page"; page: number }
   | { type: "select" | "confirm"; page: number; chainId: number; protocol: Protocol; positionKey: string };
 
 type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "max_results";
@@ -53,6 +59,7 @@ export class Notifier {
   private readonly pendingInput = new Map<string, PendingInput>();
   private readonly pendingBgUpload = new Set<string>();
   private poolScanRunning = false;
+  private tokenScanRunning = false;
   private deletionTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -76,6 +83,7 @@ export class Notifier {
       { command: "scan", description: "Scan pool Uniswap V3/V4 untuk token — /scan <contract>" },
       { command: "scan_pools", description: "Cari pool V3/V4 dengan estimasi yield 1 jam tertinggi" },
       { command: "history", description: "Tampilkan riwayat posisi close >= ±0.5% PnL" },
+      { command: "calendar", description: "Tampilkan kalender realized PnL UTC" },
     ]);
     this.bot.command("status", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
@@ -96,6 +104,10 @@ export class Notifier {
     this.bot.command("history", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleHistoryCommand(ctx, database);
+    });
+    this.bot.command("calendar", async (ctx: ChatContext) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
+      await this.handleCalendarCommand(ctx, database);
     });
     this.bot.callbackQuery(/^lp:/, async (ctx) => {
       await this.handleDashboardCallback(ctx, database, pnl, executor, scanner);
@@ -402,6 +414,20 @@ export class Notifier {
         await this.showHistory(ctx, database, chatId, action.page);
         return;
       }
+      if (action.type === "history_page") {
+        await this.queueTemp(chatId, message.message_id, HISTORY_IDLE_TTL_MS);
+        await this.showHistory(ctx, database, chatId, action.page);
+        return;
+      }
+      if (action.type === "calendar") {
+        await this.showPnlCalendar(ctx, database, action.year, action.month);
+        return;
+      }
+      if (action.type === "calendar_page") {
+        await this.queueTemp(chatId, message.message_id, CALENDAR_IDLE_TTL_MS);
+        await this.showPnlCalendar(ctx, database, action.year, action.month);
+        return;
+      }
       if (action.type === "pnl_card") {
         await this.showPnlCardSelection(ctx, database, chatId, action.page);
         return;
@@ -424,7 +450,6 @@ export class Notifier {
         await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
         return;
       }
-
       const position = await this.findDashboardPosition(database, action);
       if (!position || !canRequestManualClose(position.status)) {
         await this.showCloseMenu(database, chatId, message.message_id, action.page, "Posisi sudah tidak dapat ditutup dari dashboard.");
@@ -535,6 +560,8 @@ export class Notifier {
     keyboard.row()
       .text("📚 History ±0.5%", dashboardAction("history", 0))
       .text("🖼 PnL card", dashboardAction("pnl_card", 0));
+    const now = new Date();
+    keyboard.row().text("📅 PnL Calendar", calendarAction(now.getUTCFullYear(), now.getUTCMonth() + 1));
     keyboard.row()
       .text("🖼 Background card", dashboardAction("bg_upload", 0))
       .text("⬛ Reset BG", dashboardAction("bg_reset", 0));
@@ -642,8 +669,12 @@ export class Notifier {
       const trailingPeak = trailingPeakDisplay(position.metadata);
       const range = await this.formatPositionRange(position, valued.range);
       return `${base} | 💰 ${cv} ${qtSymbol} | 🪙 ${feeDisplay} | 📊 ${pnlText}${trailingPeak}${range}\n`;
-    } catch {
-      return `${base}\n`;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const detail = message.includes("zero liquidity")
+        ? "⚠️ SETTLEMENT RECOVERY PENDING"
+        : "⚠️ VALUATION UNAVAILABLE";
+      return `${base} | ${detail}\n`;
     }
   }
 
@@ -685,49 +716,59 @@ export class Notifier {
   }
 
   private async runTokenScan(ctx: Context, scanner: PoolScanner, token: Address): Promise<void> {
+    const chatId = ctx.chat!.id.toString();
+    if (this.tokenScanRunning) {
+      await this.replyTemp(ctx, "🔍 Scan token masih berjalan. Tunggu hasil sebelumnya.");
+      return;
+    }
     const elapsed = Date.now() - this.lastScanAt;
     if (elapsed < 15_000) {
       await this.replyTemp(ctx, `Tunggu ${Math.ceil((15_000 - elapsed) / 1_000)} detik sebelum scan berikutnya.`);
       return;
     }
     this.lastScanAt = Date.now();
+    this.tokenScanRunning = true;
 
-    await this.replyTemp(ctx, `🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(token)} di Robinhood...`, undefined, 120_000);
-
-    let scan;
     try {
-      scan = await scanner.scan(token);
+      await this.replyTemp(ctx, `🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(token)} di Robinhood...`, undefined, 120_000);
     } catch (error) {
-      await this.replyTemp(ctx, `Scan gagal: ${errorMessage(error).slice(0, 500)}`, undefined, 120_000);
-      return;
+      this.tokenScanRunning = false;
+      throw error;
     }
+    void this.executeTokenScan(scanner, token, chatId).catch((error) => log.error({ error: errorMessage(error), token }, "token scan background job failed"));
+  }
 
-    if (scan.active.length === 0 && scan.watchlist.length === 0) {
-      await this.replyTemp(ctx, `Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 6h >= $100 untuk token ini.`, undefined, 120_000);
-      return;
-    }
-
-    const lines: string[] = [
-      `🔍 SCAN: ${shortAddress(token)}`,
-      "Chain: Robinhood (4663)",
-      `Top active: ${scan.active.length} | Watchlist: ${scan.watchlist.length}`,
-      "",
-    ];
-    const medals = ["🥇", "🥈", "🥉"];
-
-    for (let i = 0; i < scan.active.length; i++) {
-      lines.push(...formatScanPool(scan.active[i]!, medals[i]!));
-    }
-    if (scan.watchlist.length > 0) {
-      lines.push("", "⚠️ WATCHLIST: zero active liquidity");
-      for (const pool of scan.watchlist) {
-        lines.push(...formatScanPool(pool, "•"));
+  private async executeTokenScan(scanner: PoolScanner, token: Address, chatId: string): Promise<void> {
+    try {
+      const scan = await scanner.scan(token);
+      if (scan.active.length === 0 && scan.watchlist.length === 0) {
+        await this.sendTemp(["Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 6h >= $100 untuk token ini."], chatId, 120_000);
+        return;
       }
+
+      const lines: string[] = [
+        `🔍 SCAN: ${shortAddress(token)}`,
+        "Chain: Robinhood (4663)",
+        `Top active: ${scan.active.length} | Watchlist: ${scan.watchlist.length}`,
+        "",
+      ];
+      const medals = ["🥇", "🥈", "🥉"];
+      for (let i = 0; i < scan.active.length; i++) {
+        lines.push(...formatScanPool(scan.active[i]!, medals[i]!));
+      }
+      if (scan.watchlist.length > 0) {
+        lines.push("", "⚠️ WATCHLIST: zero active liquidity");
+        for (const pool of scan.watchlist) {
+          lines.push(...formatScanPool(pool, "•"));
+        }
+      }
+      lines.push("", "Yield 1h: (vol1h × feeRate / TVL). Score memakai Vol 6h dan safety factor.");
+      await this.sendTemp([lines.join("\n")], chatId, 120_000);
+    } catch (error) {
+      await this.sendTemp([`Scan gagal: ${errorMessage(error).slice(0, 500)}`], chatId, 120_000);
+    } finally {
+      this.tokenScanRunning = false;
     }
-
-    lines.push("", "Yield 1h: (vol1h × feeRate / TVL). Score memakai Vol 6h dan safety factor.");
-
-    await this.replyTemp(ctx, lines.join("\n"), undefined, 120_000);
   }
 
   private async handleScanPools(ctx: Context, database: Database, scanner: PoolScanner): Promise<void> {
@@ -918,18 +959,41 @@ export class Notifier {
     await this.showHistory(ctx, database, chatId, 0);
   }
 
+  private async handleCalendarCommand(ctx: ChatContext, database: Database): Promise<void> {
+    const chatId = ctx.chat.id.toString();
+    if (!this.authorized(chatId)) return;
+    const now = new Date();
+    await this.showPnlCalendar(ctx, database, now.getUTCFullYear(), now.getUTCMonth() + 1);
+  }
+
+  private async showPnlCalendar(ctx: Context, database: Database, year: number, month: number): Promise<void> {
+    const calendar = await database.getPnlCalendarMonth(year, month);
+    const png = await renderPnlCalendarCard(calendar);
+    const previous = new Date(Date.UTC(year, month - 2, 1));
+    const next = new Date(Date.UTC(year, month, 1));
+    const now = new Date();
+    const keyboard = new InlineKeyboard()
+      .text("← Previous", calendarPageAction(previous.getUTCFullYear(), previous.getUTCMonth() + 1))
+      .text("This Month", calendarPageAction(now.getUTCFullYear(), now.getUTCMonth() + 1))
+      .text("Next →", calendarPageAction(next.getUTCFullYear(), next.getUTCMonth() + 1));
+    const sent = await ctx.replyWithPhoto(new InputFile(png, `unilp-calendar-${year}-${String(month).padStart(2, "0")}.png`), {
+      caption: `${monthLabel(year, month)} · realized settlements only · UTC`,
+      reply_markup: keyboard,
+    });
+    await this.queueTemp(ctx.chat!.id.toString(), sent.message_id, CALENDAR_IDLE_TTL_MS);
+  }
+
   private async showHistory(ctx: Context, database: Database, chatId: string, page: number): Promise<void> {
-    const history = await database.listCloseHistory(50);
-    if (history.length === 0) {
-      await this.replyTemp(ctx, "Tidak ada riwayat posisi close yang lolos ambang ±0.5%.");
+    const total = await database.countCloseHistory();
+    if (total === 0) {
+      await this.replyTemp(ctx, "Tidak ada riwayat posisi close.");
       return;
     }
-    const pageCount = Math.max(1, Math.ceil(history.length / DASHBOARD_PAGE_SIZE));
+    const pageCount = Math.max(1, Math.ceil(total / DASHBOARD_PAGE_SIZE));
     const p = clampDashboardPage(page, pageCount);
-    const start = p * DASHBOARD_PAGE_SIZE;
-    const pageItems = history.slice(start, start + DASHBOARD_PAGE_SIZE);
-    const lines = ["📚 RIWAYAT CLOSE ±0.5%", ""];
-    for (const item of pageItems) {
+    const history = await database.listCloseHistoryPage(DASHBOARD_PAGE_SIZE, p * DASHBOARD_PAGE_SIZE);
+    const lines = ["📚 RIWAYAT CLOSE", ""];
+    for (const item of history) {
       const pair = item.quoteToken.toLowerCase() === item.token0.toLowerCase()
         ? `${await this.tokenLabel(item.token1, item.chainId)}/${await this.tokenLabel(item.token0, item.chainId)}`
         : `${await this.tokenLabel(item.token0, item.chainId)}/${await this.tokenLabel(item.token1, item.chainId)}`;
@@ -945,8 +1009,12 @@ export class Notifier {
       lines.push(`   Settled: ${fmtUtc(item.settledAt)} UTC`);
       lines.push("");
     }
-    if (pageCount > 1) lines.push(`Page ${p + 1}/${pageCount} | ${history.length} riwayat`);
-    await this.replyTemp(ctx, lines.join("\n"));
+    if (pageCount > 1) lines.push(`Page ${p + 1}/${pageCount} | ${total} riwayat`);
+    const keyboard = new InlineKeyboard();
+    const hasPager = p > 0 || p < pageCount - 1;
+    if (p > 0) keyboard.text("← Prev", historyPageAction(p - 1));
+    if (p < pageCount - 1) keyboard.text("Next →", historyPageAction(p + 1));
+    await this.replyTemp(ctx, lines.join("\n"), hasPager ? { reply_markup: keyboard } : undefined, HISTORY_IDLE_TTL_MS);
   }
 
   private async showPnlCardSelection(ctx: Context, database: Database, chatId: string, page: number): Promise<void> {
@@ -1009,7 +1077,8 @@ export class Notifier {
         }
       } catch { /* skip duration if block lookup fails */ }
     }
-    const png = await renderPnlCard(record, pair, qtDec, qtSymbol, bg, durationStr);
+    const detail = await database.getPnlCardDetail(record.positionId);
+    const png = await renderPnlCard(record, pair, qtDec, qtSymbol, detail, bg, durationStr);
     const sent = await ctx.replyWithPhoto(new InputFile(png, "pnl-card.png"));
     if (sent && "message_id" in sent) {
       await this.queueTemp(chatId, (sent as any).message_id, 120_000);
@@ -1165,6 +1234,18 @@ function dashboardAction(type: "refresh" | "close" | "status" | "scan" | "scan_p
   return `lp:${type}:${page}`;
 }
 
+function calendarAction(year: number, month: number): string {
+  return `lp:calendar:${year}-${String(month).padStart(2, "0")}`;
+}
+
+function calendarPageAction(year: number, month: number): string {
+  return `lp:calnav:${year}-${String(month).padStart(2, "0")}`;
+}
+
+function historyPageAction(page: number): string {
+  return `lp:histpg:${page}`;
+}
+
 function dashboardPositionAction(type: "select" | "confirm", page: number, position: PositionRecord): string {
   return `lp:${type}:${page}:${position.chainId}:${position.protocol}:${position.positionKey}`;
 }
@@ -1172,6 +1253,24 @@ function dashboardPositionAction(type: "select" | "confirm", page: number, posit
 export function parseDashboardAction(data: string | undefined): DashboardAction | null {
   if (!data) return null;
   const parts = data.split(":");
+  if (parts.length === 3 && parts[0] === "lp" && parts[1] === "calendar") {
+    const match = /^(\d{4})-(\d{2})$/.exec(parts[2] ?? "");
+    if (!match) return null;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    return year >= 2020 && year <= 2100 && month >= 1 && month <= 12 ? { type: "calendar", year, month } : null;
+  }
+  if (parts.length === 3 && parts[0] === "lp" && parts[1] === "calnav") {
+    const match = /^(\d{4})-(\d{2})$/.exec(parts[2] ?? "");
+    if (!match) return null;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    return year >= 2020 && year <= 2100 && month >= 1 && month <= 12 ? { type: "calendar_page", year, month } : null;
+  }
+  if (parts.length === 3 && parts[0] === "lp" && parts[1] === "histpg") {
+    const page = parseDashboardPage(parts[2]);
+    return page === null ? null : { type: "history_page", page };
+  }
   if (parts.length === 3 && parts[0] === "lp" && isDashboardAction(parts[1])) {
     const page = parseDashboardPage(parts[2]);
     return page === null ? null : { type: parts[1], page };
@@ -1215,6 +1314,10 @@ function parseDashboardPage(value: string | undefined): number | null {
 
 function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset" {
   return value === "refresh" || value === "close" || value === "status" || value === "scan" || value === "scan_pools" || value === "config" || value === "config_reset" || value === "history" || value === "pnl_card" || value === "bg_upload" || value === "bg_reset";
+}
+
+function monthLabel(year: number, month: number): string {
+  return new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" }).format(new Date(Date.UTC(year, month - 1, 1))).toUpperCase();
 }
 
 function isPositionAction(value: string | undefined): value is "select" | "confirm" {

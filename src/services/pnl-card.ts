@@ -1,182 +1,106 @@
 import sharp from "sharp";
-import type { CloseHistoryRecord } from "../types.js";
 
-const W = 1440;
-const H = 900;
-const PAD = 60;
-const RADIUS = 0;
+import type { CloseHistoryRecord, PnlCardDetail } from "../types.js";
 
+const W = 1600;
+const H = 1067;
+const PAD = 64;
 const FONT = "Noto Sans Mono, monospace";
-
-const RH = "#ccff00";
-const RH_DIM = "#8ab300";
-const BG_DARK = "#0d0f0a";
-const BG_CARD = "#11150a";
-const TEXT_PRIMARY = "#f0f5d8";
-const TEXT_SECONDARY = "#aab58c";
-const TEXT_MUTED = "#5a6340";
-const RED_ACCENT = "#ff4444";
-const RED_BG = "#1a0d0d";
-const RED_TEXT = "#ffaaaa";
-
-function rhTheme(isProfit: boolean) {
-  return {
-    accent: isProfit ? RH : RED_ACCENT,
-    border: isProfit ? RH_DIM : RED_ACCENT,
-    bgStart: isProfit ? BG_CARD : RED_BG,
-    bgEnd: isProfit ? BG_DARK : "#0f0808",
-    textHighlight: isProfit ? RH : RED_TEXT,
-    textSecondary: isProfit ? TEXT_PRIMARY : "#f0e0e0",
-  };
-}
+const LIME = "#ccff00";
+const LIME_DIM = "#8ab300";
+const RED = "#ff4444";
+const BG = "#0d0f0a";
+const TEXT = "#f0f5d8";
+const MUTED = "#aab58c";
 
 export async function renderPnlCard(
   record: CloseHistoryRecord,
   pair: string,
-  qtDecimals: number,
-  qtSymbol: string,
+  quoteDecimals: number,
+  quoteSymbol: string,
+  detail: PnlCardDetail | null,
   customBg?: Buffer | null,
-  durationStr?: string,
+  duration?: string,
 ): Promise<Buffer> {
-  const isProfit = record.finalPnlBps >= 0n;
-  const t = rhTheme(isProfit);
-  const sign = isProfit ? "+" : "";
-  const label = isProfit ? "PROFIT" : "LOSS";
-
-  const pnlPct = fmtBps(record.finalPnlBps);
-  const maxDec = qtSymbol === "ETH" || qtSymbol === "WETH" ? 4 : undefined;
-  const pnlAmt = fmtToken(record.finalPnlQuote, qtDecimals, maxDec);
-  const pnlUsd = fmtToken(record.finalPnlUsd, 6, 2);
-  const hasUsd = record.finalPnlUsd !== 0n;
-  const protoLabel = record.protocol.toUpperCase();
-  const settledStr = fmtUtc(record.settledAt);
-  const triggerLabel = triggerDisplay(record.trigger);
-
-  const hasCustomBg = customBg && customBg.length > 0;
-
-  let bgPngBase64: string | null = null;
-  if (hasCustomBg) {
-    bgPngBase64 = (await sharp(customBg).rotate().resize(W, H, { fit: "cover" }).png().toBuffer()).toString("base64");
-  }
-
-  const svgParts: string[] = [
+  const profit = record.finalPnlBps >= 0n;
+  const accent = profit ? LIME : RED;
+  const pnlUsd = record.finalPnlUsd !== 0n ? formatUsd(record.finalPnlUsd) : `${formatToken(record.finalPnlQuote, quoteDecimals)} ${quoteSymbol}`;
+  const feeTier = detail?.feePips === null || detail?.feePips === undefined ? "FEE N/A" : `FEE ${formatFeeTier(detail.feePips)}`;
+  const bg = customBg?.length
+    ? (await sharp(customBg).rotate().resize(W, H, { fit: "cover" }).png().toBuffer()).toString("base64")
+    : null;
+  const details = detail ?? { depositsQuote: 0n, settlementQuote: 0n, feesQuote: 0n, feePips: null };
+  const svg = [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`,
-    `<defs>`,
-    `<linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">`,
-  ];
-  if (hasCustomBg) {
-    svgParts.push(`<stop offset="0%" stop-color="#000000" stop-opacity="0.20"/>`);
-    svgParts.push(`<stop offset="100%" stop-color="#000000" stop-opacity="0.20"/>`);
-  } else {
-    svgParts.push(`<stop offset="0%" stop-color="${t.bgStart}"/>`);
-    svgParts.push(`<stop offset="100%" stop-color="${t.bgEnd}"/>`);
-  }
-  svgParts.push(
-    `</linearGradient>`,
-    `<linearGradient id="accentGrad" x1="0" y1="0" x2="1" y2="0">`,
-    `<stop offset="0%" stop-color="${t.accent}"/>`,
-    `<stop offset="100%" stop-color="${isProfit ? RH_DIM : "#cc3333"}"/>`,
-    `</linearGradient>`,
-    `<filter id="shadow" x="-10%" y="-10%" width="130%" height="130%">`,
-    `<feDropShadow dx="2" dy="3" stdDeviation="4" flood-color="#000000" flood-opacity="0.7"/>`,
-    `</filter>`,
-    `<filter id="shadowStrong" x="-10%" y="-10%" width="130%" height="130%">`,
-    `<feDropShadow dx="3" dy="5" stdDeviation="6" flood-color="#000000" flood-opacity="0.8"/>`,
-    `</filter>`,
-    `</defs>`,
-  );
-
-  if (bgPngBase64) {
-    svgParts.push(
-      `<image x="0" y="0" width="${W}" height="${H}" preserveAspectRatio="xMidYMid slice" href="data:image/png;base64,${bgPngBase64}"/>`,
-    );
-  }
-
-  svgParts.push(
-    `<rect width="${W}" height="${H}" rx="0" ry="0" fill="url(#bgGrad)" stroke="${t.border}" stroke-width="3"/>`,
-
-    // Header
-    `<text x="${PAD}" y="${PAD + 38}" filter="url(#shadow)" font-family="${FONT}" font-size="34" fill="${TEXT_SECONDARY}">${xmlEscape(pair)}</text>`,
-    `<text x="${PAD}" y="${PAD + 68}" filter="url(#shadow)" font-family="${FONT}" font-size="22" fill="${TEXT_MUTED}">${protoLabel} · #${record.positionKey}</text>`,
-
-    // Large PnL %
-    `<text x="${W / 2}" y="${H / 2 - 48}" filter="url(#shadowStrong)" font-family="${FONT}" font-size="200" font-weight="bold" fill="url(#accentGrad)" text-anchor="middle">${sign}${pnlPct}%</text>`,
-
-    // PnL quote amount
-    `<text x="${W / 2}" y="${H / 2 + 54}" filter="url(#shadow)" font-family="${FONT}" font-size="38" fill="${t.textSecondary}" text-anchor="middle">${sign}${pnlAmt} ${qtSymbol} ${label}</text>`,
-
-    // USD line
-    hasUsd
-      ? `<text x="${W / 2}" y="${H / 2 + 105}" filter="url(#shadow)" font-family="${FONT}" font-size="30" fill="${TEXT_SECONDARY}" text-anchor="middle">≈ ${sign}$${pnlUsd}</text>`
-      : "",
-
-    // Duration
-    durationStr
-      ? `<text x="${W / 2}" y="${H / 2 + 165}" filter="url(#shadow)" font-family="${FONT}" font-size="44" fill="${RH_DIM}" text-anchor="middle">${durationStr}</text>`
-      : "",
-
-    // Divider
-    `<line x1="${PAD}" y1="${H - 120}" x2="${W - PAD}" y2="${H - 120}" stroke="${TEXT_MUTED}" stroke-opacity="0.12" stroke-width="2"/>`,
-
-    // Footer left: trigger
-    `<text x="${PAD}" y="${H - 80}" filter="url(#shadow)" font-family="${FONT}" font-size="24" fill="${TEXT_SECONDARY}">${triggerLabel}</text>`,
-
-    // Footer right: time
-    `<text x="${W - PAD}" y="${H - 80}" filter="url(#shadow)" font-family="${FONT}" font-size="24" fill="${TEXT_MUTED}" text-anchor="end">${settledStr} UTC</text>`,
-
+    `<defs><pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse"><path d="M0 0H24V24" fill="none" stroke="#354013" stroke-opacity=".14"/></pattern></defs>`,
+    `<rect width="${W}" height="${H}" fill="${BG}"/>`,
+    bg ? `<image x="0" y="0" width="${W}" height="${H}" preserveAspectRatio="xMidYMid slice" href="data:image/png;base64,${bg}" opacity=".35"/>` : `<rect width="${W}" height="${H}" fill="url(#grid)"/>`,
+    `<rect width="${W}" height="${H}" fill="#000000" opacity="${bg ? ".20" : ".10"}"/>`,
+    `<text x="${PAD}" y="86" font-family="${FONT}" font-size="30" font-weight="bold" fill="${LIME}">UNILP GUARDIAN</text>`,
+    `<text x="${W - PAD}" y="86" font-family="${FONT}" font-size="26" fill="${MUTED}" text-anchor="end">ROBINHOOD CHAIN</text>`,
+    `<text x="${PAD}" y="182" font-family="${FONT}" font-size="27" fill="${MUTED}">DURATION</text>`,
+    `<text x="${PAD}" y="258" font-family="${FONT}" font-size="62" font-weight="bold" fill="${TEXT}">${escape(duration?.replace("DURATION ", "") ?? "N/A")}</text>`,
+    badge(PAD, 326, record.protocol.toUpperCase(), "#22271b", TEXT),
+    badge(PAD + 135, 326, feeTier, "#30230d", "#ffb347"),
+    `<text x="${PAD}" y="500" font-family="${FONT}" font-size="82" font-weight="bold" fill="${TEXT}">${escape(pair)}</text>`,
+    `<text x="${PAD}" y="620" font-family="${FONT}" font-size="32" fill="${MUTED}">PNL</text>`,
+    `<rect x="${PAD + 92}" y="580" width="185" height="58" rx="10" fill="${profit ? "#103624" : "#3a1515"}"/>`,
+    `<text x="${PAD + 184}" y="620" font-family="${FONT}" font-size="31" font-weight="bold" fill="${accent}" text-anchor="middle">${formatBps(record.finalPnlBps)}</text>`,
+    `<text x="${PAD}" y="740" font-family="${FONT}" font-size="96" font-weight="bold" fill="${accent}">${pnlUsd}</text>`,
+    `<text x="920" y="182" font-family="${FONT}" font-size="30" fill="${MUTED}">DETAILS</text>`,
+    detailRow(920, 275, "TOTAL DEPOSITS", `${formatToken(details.depositsQuote, quoteDecimals)} ${quoteSymbol}`),
+    detailRow(920, 365, "SETTLEMENT RECEIVED", `${formatToken(details.settlementQuote, quoteDecimals)} ${quoteSymbol}`),
+    detailRow(920, 455, "REALIZED FEES", `${formatToken(details.feesQuote, quoteDecimals)} ${quoteSymbol}`),
+    `<rect x="${PAD}" y="${H - 137}" width="150" height="58" rx="10" fill="#283027"/>`,
+    `<text x="${PAD + 75}" y="${H - 98}" font-family="${FONT}" font-size="27" font-weight="bold" fill="${TEXT}" text-anchor="middle">CLOSED</text>`,
+    `<text x="${W - PAD}" y="${H - 94}" font-family="${FONT}" font-size="24" fill="${MUTED}" text-anchor="end">${fmtUtc(record.settledAt)} UTC</text>`,
+    `<text x="${W - PAD}" y="${H - 52}" font-family="${FONT}" font-size="18" fill="${MUTED}" text-anchor="end">${escape(triggerDisplay(record.trigger))}</text>`,
     `</svg>`,
-  );
-
-  return sharp(Buffer.from(svgParts.join("\n"), "utf-8")).png().toBuffer();
+  ];
+  return sharp(Buffer.from(svg.join("\n"))).png().toBuffer();
 }
 
-function xmlEscape(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+function badge(x: number, y: number, label: string, fill: string, color: string): string {
+  const width = Math.max(118, label.length * 18 + 32);
+  return `<rect x="${x}" y="${y}" width="${width}" height="55" rx="10" fill="${fill}"/><text x="${x + width / 2}" y="${y + 37}" font-family="${FONT}" font-size="25" font-weight="bold" fill="${color}" text-anchor="middle">${escape(label)}</text>`;
 }
 
-function fmtBps(value: bigint): string {
+function detailRow(x: number, y: number, label: string, value: string): string {
+  return `<text x="${x}" y="${y}" font-family="${FONT}" font-size="25" fill="${MUTED}">${label}</text><text x="${W - PAD}" y="${y}" font-family="${FONT}" font-size="31" font-weight="bold" fill="${TEXT}" text-anchor="end">${escape(value)}</text>`;
+}
+
+function formatFeeTier(feePips: number): string {
+  const value = feePips / 10_000;
+  return `${value.toFixed(value >= 1 ? 2 : 3).replace(/0+$/, "").replace(/\.$/, "")}%`;
+}
+
+function formatBps(value: bigint): string {
   const negative = value < 0n;
   const absolute = negative ? -value : value;
-  return `${negative ? "-" : ""}${absolute / 100n}.${(absolute % 100n).toString().padStart(2, "0")}`;
+  return `${negative ? "-" : "+"}${absolute / 100n}.${(absolute % 100n).toString().padStart(2, "0")}%`;
 }
 
-function fmtToken(value: bigint, decimals: number, maxDec?: number): string {
-  if (decimals === 0 || value === 0n) return value.toString();
+function formatUsd(value: bigint): string {
+  const negative = value < 0n;
+  const absolute = negative ? -value : value;
+  return `${negative ? "-$" : "+$"}${absolute / 1_000_000n}.${((absolute % 1_000_000n) / 10_000n).toString().padStart(2, "0")}`;
+}
+
+function formatToken(value: bigint, decimals: number): string {
   const negative = value < 0n;
   const absolute = negative ? -value : value;
   const divisor = 10n ** BigInt(Math.min(decimals, 18));
   const integer = absolute / divisor;
-  const fraction = absolute % divisor;
-  if (fraction === 0n) return `${negative ? "-" : ""}${integer}`;
-  let fracStr = fraction
-    .toString()
-    .padStart(Math.min(decimals, 18), "0")
-    .replace(/0+$/, "");
-  if (maxDec !== undefined && fracStr.length > maxDec) {
-    fracStr = fracStr.slice(0, maxDec);
-  }
-  return `${negative ? "-" : ""}${integer}.${fracStr}`;
+  const fraction = (absolute % divisor).toString().padStart(Math.min(decimals, 18), "0").slice(0, 4).replace(/0+$/, "");
+  return `${negative ? "-" : ""}${integer}${fraction ? `.${fraction}` : ""}`;
 }
 
 function triggerDisplay(trigger: string): string {
-  switch (trigger) {
-    case "stop_loss":
-      return "Stop Loss";
-    case "take_profit":
-      return "Take Profit";
-    case "trailing_take_profit":
-      return "Trailing Take Profit";
-    case "out_of_range_above":
-      return "Out of Range Above";
-    case "manual":
-      return "Manual Close";
-    default:
-      return trigger.replace(/_/g, " ");
-  }
+  return trigger.replace(/_/g, " ").toUpperCase();
+}
+
+function escape(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 export function fmtUtc(date: Date): string {

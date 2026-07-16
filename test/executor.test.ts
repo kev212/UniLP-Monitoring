@@ -61,7 +61,7 @@ describe("Executor pending settlement recovery", () => {
   });
 
   it("excludes confirmed gas from native ETH settlement PnL", async () => {
-    const database = { setPositionStatus: vi.fn() };
+    const database = { setPositionStatus: vi.fn(), getPositionMetadata: vi.fn().mockResolvedValue({ preCloseQuoteBalance: "1000", settlementGasWei: "15" }) };
     const client = { getBalance: vi.fn().mockResolvedValue(1_085n) };
     const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
     const routes = { quoteDirect: vi.fn().mockResolvedValue(null) };
@@ -79,7 +79,7 @@ describe("Executor pending settlement recovery", () => {
       status: "closing",
       liquidity: null,
       openedAtBlock: null,
-      metadata: { preCloseQuoteBalance: "1000", settlementGasWei: "15" },
+      metadata: {},
     };
 
     await (executor as unknown as { saveSettlementBalance(value: PositionRecord): Promise<void> }).saveSettlementBalance(position);
@@ -88,7 +88,7 @@ describe("Executor pending settlement recovery", () => {
   });
 
   it("keeps native ETH gas in PnL when configured", async () => {
-    const database = { setPositionStatus: vi.fn() };
+    const database = { setPositionStatus: vi.fn(), getPositionMetadata: vi.fn().mockResolvedValue({ preCloseQuoteBalance: "1000", settlementGasWei: "15" }) };
     const client = { getBalance: vi.fn().mockResolvedValue(1_085n) };
     const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
     const routes = { quoteDirect: vi.fn().mockResolvedValue(null) };
@@ -106,7 +106,7 @@ describe("Executor pending settlement recovery", () => {
       status: "closing",
       liquidity: null,
       openedAtBlock: null,
-      metadata: { preCloseQuoteBalance: "1000", settlementGasWei: "15" },
+      metadata: {},
     };
 
     await (executor as unknown as { saveSettlementBalance(value: PositionRecord): Promise<void> }).saveSettlementBalance(position);

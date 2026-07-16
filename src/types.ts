@@ -115,3 +115,27 @@ export interface CloseHistoryRecord {
   openedAtBlock: bigint | null;
   openedAt: Date | null;
 }
+
+export interface PnlCalendarDay {
+  date: string;
+  pnlUsd: bigint;
+  closeCount: number;
+  winCount: number;
+}
+
+export interface PnlCalendarMonth {
+  year: number;
+  month: number;
+  pnlUsd: bigint;
+  closeCount: number;
+  winCount: number;
+  activeDays: number;
+  days: PnlCalendarDay[];
+}
+
+export interface PnlCardDetail {
+  depositsQuote: bigint;
+  settlementQuote: bigint;
+  feesQuote: bigint;
+  feePips: number | null;
+}

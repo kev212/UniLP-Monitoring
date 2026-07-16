@@ -1,7 +1,9 @@
 import { Pool, type PoolClient } from "pg";
 import type { Address } from "viem";
 
-import type { CloseHistoryRecord, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol, TrailingStopState } from "./types.js";
+import type { CloseHistoryRecord, PnlCalendarMonth, PnlCardDetail, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol, TrailingStopState } from "./types.js";
+
+const HISTORY_MIN_PNL_BPS = 50n;
 
 interface PositionRow {
   id: string;
@@ -319,6 +321,14 @@ export class Database {
     return result.rowCount ? mapPosition(result.rows[0]!) : null;
   }
 
+  async getPositionMetadata(positionId: string): Promise<Record<string, unknown> | null> {
+    const result = await this.pool.query<{ metadata: Record<string, unknown> }>(
+      "SELECT metadata FROM positions WHERE id = $1",
+      [positionId],
+    );
+    return result.rowCount ? result.rows[0]!.metadata : null;
+  }
+
   async setPositionStatus(positionId: string, status: PositionStatus, metadata?: Record<string, unknown>): Promise<void> {
     await this.pool.query(
       "UPDATE positions SET status = $2, metadata = metadata || $3::jsonb, updated_at = NOW() WHERE id = $1",
@@ -331,12 +341,42 @@ export class Database {
       `UPDATE positions
        SET status = 'needs_review', metadata = metadata || $2::jsonb, updated_at = NOW()
        WHERE id = $1
-         AND status NOT IN ('closing', 'settled')
-         AND (NOT (metadata ? 'pendingSwap') OR metadata->'pendingSwap' = 'null'::jsonb)
-       RETURNING id`,
+          AND status NOT IN ('closing', 'settled')
+          AND (NOT (metadata ? 'pendingSwap') OR metadata->'pendingSwap' = 'null'::jsonb)
+          AND NOT EXISTS (
+            SELECT 1 FROM execution_attempts
+             WHERE execution_attempts.position_id = positions.id
+               AND execution_attempts.stage = 'remove_liquidity'
+               AND execution_attempts.status = 'confirmed'
+          )
+        RETURNING id`,
       [positionId, JSON.stringify(metadata)],
     );
     return result.rowCount === 1;
+  }
+
+  async recoverVerifiedSettlement(positionId: string): Promise<boolean> {
+    const result = await this.pool.query<{ trigger: string }>(
+      `UPDATE positions
+       SET status = 'settled',
+           metadata = metadata || jsonb_build_object('settlementRecoveredAt', NOW()::text),
+           updated_at = NOW()
+       WHERE id = $1
+         AND status <> 'settled'
+         AND jsonb_typeof(metadata->'totalReceived') = 'string'
+         AND (NOT (metadata ? 'pendingSwap') OR metadata->'pendingSwap' = 'null'::jsonb)
+         AND EXISTS (
+           SELECT 1 FROM execution_attempts
+            WHERE execution_attempts.position_id = positions.id
+              AND execution_attempts.stage = 'remove_liquidity'
+              AND execution_attempts.status = 'confirmed'
+         )
+       RETURNING COALESCE(NULLIF(metadata->>'exitTrigger', ''), 'settled') AS trigger`,
+      [positionId],
+    );
+    if (!result.rowCount) return false;
+    await this.finalizeCloseHistory(positionId, result.rows[0]!.trigger);
+    return true;
   }
 
   async setTrailingStopState(positionId: string, state: TrailingStopState): Promise<void> {
@@ -376,13 +416,15 @@ export class Database {
     );
   }
 
-  async getCashflowTotals(positionId: string): Promise<{ deposits: bigint; realized: bigint }> {
+  async getCashflowTotals(positionId: string, excludedTransactionHashes: string[] = []): Promise<{ deposits: bigint; realized: bigint }> {
     const result = await this.pool.query<{ deposits: string; realized: string }>(
       `SELECT
         COALESCE(SUM(quote_value) FILTER (WHERE flow_type = 'deposit'), 0) AS deposits,
         COALESCE(SUM(quote_value) FILTER (WHERE flow_type IN ('withdrawal', 'fee')), 0) AS realized
-       FROM cashflows WHERE position_id = $1`,
-      [positionId],
+       FROM cashflows
+       WHERE position_id = $1
+         AND (cardinality($2::text[]) = 0 OR transaction_hash <> ALL($2::text[]))`,
+      [positionId, excludedTransactionHashes],
     );
     const row = result.rows[0]!;
     return { deposits: BigInt(row.deposits), realized: BigInt(row.realized) };
@@ -532,23 +574,106 @@ export class Database {
   }
 
   async listCloseHistory(limit = 20): Promise<CloseHistoryRecord[]> {
-    const result = await this.pool.query<{
-      id: string; position_id: string; chain_id: number; protocol: Protocol;
-      position_key: string; token0: string; token1: string; quote_token: string;
-      final_pnl_bps: string; final_pnl_quote: string; final_pnl_usd: string; trigger: string;
-      close_transaction_hash: string | null; swap_transaction_hash: string | null;
-      settled_at: string; opened_at_block: string | null;
-    }>(
-      `SELECT * FROM close_history ORDER BY settled_at DESC LIMIT $1`,
-      [limit],
+    return this.listCloseHistoryPage(limit, 0);
+  }
+
+  async countCloseHistory(): Promise<number> {
+    const result = await this.pool.query<{ count: string }>("SELECT COUNT(*) AS count FROM close_history WHERE ABS(final_pnl_bps) >= 50");
+    return Number(result.rows[0]!.count);
+  }
+
+  async listCloseHistoryPage(limit: number, offset: number): Promise<CloseHistoryRecord[]> {
+    const result = await this.pool.query<CloseHistoryRow>(
+      "SELECT * FROM close_history WHERE ABS(final_pnl_bps) >= 50 ORDER BY settled_at DESC LIMIT $1 OFFSET $2",
+      [limit, offset],
     );
     return result.rows.map(mapCloseHistory);
   }
 
-  async finalizeCloseHistory(positionId: string, trigger: string): Promise<void> {
-    const totals = await this.getCashflowTotals(positionId);
-    if (totals.deposits === 0n) return;
+  async getPnlCardDetail(positionId: string): Promise<PnlCardDetail | null> {
+    const result = await this.pool.query<{
+      deposits: string; settlement: string | null; fees: string; withdrawals: string;
+      snapshot_realized: string | null; fee: string | null;
+    }>(
+      `SELECT COALESCE(SUM(c.quote_value) FILTER (WHERE c.flow_type = 'deposit'), 0) AS deposits,
+              p.metadata->>'totalReceived' AS settlement,
+              COALESCE(SUM(c.quote_value) FILTER (
+                WHERE c.flow_type = 'fee'
+                  AND c.transaction_hash IS DISTINCT FROM h.close_transaction_hash
+                  AND c.transaction_hash IS DISTINCT FROM h.swap_transaction_hash
+              ), 0) AS fees,
+              COALESCE(SUM(c.quote_value) FILTER (
+                WHERE c.flow_type = 'withdrawal'
+                  AND c.transaction_hash IS DISTINCT FROM h.close_transaction_hash
+                  AND c.transaction_hash IS DISTINCT FROM h.swap_transaction_hash
+              ), 0) AS withdrawals,
+              snapshot.realized_quote AS snapshot_realized,
+              p.metadata->>'fee' AS fee
+         FROM positions p
+         LEFT JOIN close_history h ON h.position_id = p.id
+         LEFT JOIN cashflows c ON c.position_id = p.id
+         LEFT JOIN LATERAL (
+           SELECT realized_quote
+             FROM pnl_snapshots
+            WHERE position_id = p.id
+              AND created_at <= h.settled_at
+            ORDER BY created_at DESC
+            LIMIT 1
+         ) snapshot ON TRUE
+        WHERE p.id = $1
+        GROUP BY p.id, h.close_transaction_hash, h.swap_transaction_hash, h.settled_at, snapshot.realized_quote`,
+      [positionId],
+    );
+    if (!result.rowCount) return null;
+    const row = result.rows[0]!;
+    const fees = BigInt(row.fees);
+    const withdrawals = BigInt(row.withdrawals);
+    const snapshotRealized = row.snapshot_realized ? BigInt(row.snapshot_realized) : 0n;
+    const accruedFees = snapshotRealized > withdrawals + fees ? snapshotRealized - withdrawals - fees : 0n;
+    return {
+      depositsQuote: BigInt(row.deposits),
+      settlementQuote: row.settlement && /^\d+$/.test(row.settlement) ? BigInt(row.settlement) : 0n,
+      feesQuote: fees + accruedFees,
+      feePips: row.fee && /^\d+$/.test(row.fee) ? Number(row.fee) : null,
+    };
+  }
 
+  async getPnlCalendarMonth(year: number, month: number): Promise<PnlCalendarMonth> {
+    if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) throw new Error("Invalid calendar month");
+    const start = new Date(Date.UTC(year, month - 1, 1));
+    const end = new Date(Date.UTC(year, month, 1));
+    const result = await this.pool.query<{ date: string; pnl_usd: string; close_count: string; win_count: string }>(
+      `SELECT (settled_at AT TIME ZONE 'UTC')::date::text AS date,
+              SUM(final_pnl_usd) AS pnl_usd,
+              COUNT(*) AS close_count,
+              COUNT(*) FILTER (WHERE final_pnl_usd > 0) AS win_count
+         FROM close_history
+         WHERE settled_at >= $1
+           AND settled_at < $2
+           AND ABS(final_pnl_bps) >= 50
+           AND final_pnl_usd <> 0
+        GROUP BY 1
+        ORDER BY 1`,
+      [start.toISOString(), end.toISOString()],
+    );
+    const days = result.rows.map((row) => ({
+      date: row.date,
+      pnlUsd: BigInt(row.pnl_usd),
+      closeCount: Number(row.close_count),
+      winCount: Number(row.win_count),
+    }));
+    return {
+      year,
+      month,
+      pnlUsd: days.reduce((total, day) => total + day.pnlUsd, 0n),
+      closeCount: days.reduce((total, day) => total + day.closeCount, 0),
+      winCount: days.reduce((total, day) => total + day.winCount, 0),
+      activeDays: days.length,
+      days,
+    };
+  }
+
+  async finalizeCloseHistory(positionId: string, trigger: string): Promise<void> {
     const pos = await this.pool.query<{
       chain_id: number; protocol: Protocol; position_key: string; status: PositionStatus;
       token0: string; token1: string; quote_token: string;
@@ -565,25 +690,6 @@ export class Database {
     const meta = row.metadata;
     if (typeof meta.totalReceived !== "string") return;
     const totalReceived = BigInt(meta.totalReceived);
-    const finalPnl = totals.realized + totalReceived - totals.deposits;
-    const finalPnlBps = (finalPnl * 10000n) / totals.deposits;
-
-    if (finalPnlBps < 0n ? -finalPnlBps < 50n : finalPnlBps < 50n) return;
-
-    const quoteTokenLower = row.quote_token.toLowerCase();
-    const isUsdStable = quoteTokenLower === "0x5fc5360d0400a0fd4f2af552add042d716f1d168" // USDG Robinhood
-      || quoteTokenLower === "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"; // USDC Base
-    const settlementUsdStr = typeof meta.settlementUsd === "string" ? meta.settlementUsd : undefined;
-    const settlementUsd = settlementUsdStr ? BigInt(settlementUsdStr) : 0n;
-    let finalPnlUsd: bigint;
-    if (isUsdStable) {
-      finalPnlUsd = finalPnl;
-    } else if (totalReceived > 0n && settlementUsd > 0n) {
-      // ETH/WETH PnL converted at the final settlement price.
-      finalPnlUsd = (finalPnl * settlementUsd) / totalReceived;
-    } else {
-      finalPnlUsd = 0n;
-    }
 
     const attempts = await this.pool.query<{ stage: string; transaction_hash: string }>(
       `SELECT DISTINCT ON (stage) stage, transaction_hash
@@ -599,13 +705,29 @@ export class Database {
     const swapTx = typeof meta.swapTransactionHash === "string"
       ? meta.swapTransactionHash
       : attempts.rows.find((attempt) => attempt.stage === "swap_to_quote")?.transaction_hash ?? null;
+    const totals = await this.getCashflowTotals(positionId, [closeTx, swapTx].filter((hash): hash is string => hash !== null));
+    if (totals.deposits === 0n) return;
+    const finalPnl = totals.realized + totalReceived - totals.deposits;
+    const finalPnlBps = (finalPnl * 10000n) / totals.deposits;
+    if (finalPnlBps > -HISTORY_MIN_PNL_BPS && finalPnlBps < HISTORY_MIN_PNL_BPS) return;
+    const quoteTokenLower = row.quote_token.toLowerCase();
+    const isUsdStable = quoteTokenLower === "0x5fc5360d0400a0fd4f2af552add042d716f1d168" // USDG Robinhood
+      || quoteTokenLower === "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"; // USDC Base
+    const settlementUsdStr = typeof meta.settlementUsd === "string" ? meta.settlementUsd : undefined;
+    const settlementUsd = settlementUsdStr ? BigInt(settlementUsdStr) : 0n;
+    const finalPnlUsd = isUsdStable
+      ? finalPnl
+      : totalReceived > 0n && settlementUsd > 0n
+        ? (finalPnl * settlementUsd) / totalReceived
+        : 0n;
 
     const updated = await this.pool.query(
       `UPDATE close_history
-       SET final_pnl_bps = $2, final_pnl_quote = $3, final_pnl_usd = $4, trigger = $5,
-           close_transaction_hash = $6, swap_transaction_hash = $7, settled_at = NOW(), opened_at_block = $8
-       WHERE position_id = $1`,
-      [positionId, finalPnlBps.toString(), finalPnl.toString(), finalPnlUsd.toString(), trigger, closeTx, swapTx, row.opened_at_block],
+       SET final_pnl_bps = $2, final_pnl_quote = $3, final_pnl_usd = $4,
+            close_transaction_hash = COALESCE($5, close_transaction_hash),
+            swap_transaction_hash = COALESCE($6, swap_transaction_hash), opened_at_block = $7
+        WHERE position_id = $1`,
+      [positionId, finalPnlBps.toString(), finalPnl.toString(), finalPnlUsd.toString(), closeTx, swapTx, row.opened_at_block],
     );
     if (updated.rowCount) return;
 
@@ -652,10 +774,10 @@ export class Database {
     }));
   }
 
-  async updateCloseHistoryUsd(id: string, finalPnlUsd: bigint): Promise<void> {
+  async updateCloseHistoryUsd(id: string, finalPnlUsd: bigint, settledAt?: Date): Promise<void> {
     await this.pool.query(
-      "UPDATE close_history SET final_pnl_usd = $2 WHERE id = $1",
-      [id, finalPnlUsd.toString()],
+      "UPDATE close_history SET final_pnl_usd = $2, settled_at = COALESCE($3, settled_at) WHERE id = $1",
+      [id, finalPnlUsd.toString(), settledAt?.toISOString() ?? null],
     );
   }
 

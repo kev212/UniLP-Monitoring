@@ -226,7 +226,9 @@ export class Executor {
   private async saveSettlementBalance(position: PositionRecord, swapExpectedOut = 0n): Promise<void> {
     if (!position.quoteToken) return;
     try {
-      const meta = position.metadata as Record<string, unknown>;
+      // The in-memory object predates the closing status update. Read the durable
+      // metadata so direct close proceeds and recorded gas cannot be lost on resume.
+      const meta = (await this.database.getPositionMetadata(position.id)) ?? position.metadata as Record<string, unknown>;
       const preCloseStr = typeof meta.preCloseQuoteBalance === "string" ? meta.preCloseQuoteBalance : undefined;
       let totalReceived: bigint;
       if (preCloseStr) {
@@ -650,6 +652,7 @@ export class Executor {
         const receipt = await client.getTransactionReceipt({ hash: swapHash });
         if (!receipt) continue;
         const blockNum = receipt.blockNumber;
+        const block = await client.getBlock({ blockNumber: blockNum });
         const wethAddr = (item.isNativeQuote
           ? "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
           : item.quoteToken) as Address; // WETH Robinhood
@@ -675,7 +678,7 @@ export class Executor {
         // simplifies to: sqrtPriceX96^2 * 10^18 / 2^192
         const usdPerEthMicro = (sqrtPriceX96 * sqrtPriceX96 * 10n ** 18n) / (1n << 192n);
         const usdValue = (BigInt(item.finalPnlQuote) * usdPerEthMicro) / (10n ** 18n);
-        await this.database.updateCloseHistoryUsd(item.id, usdValue);
+        await this.database.updateCloseHistoryUsd(item.id, usdValue, new Date(Number(block.timestamp) * 1_000));
         log.info({ positionKey: item.positionKey, usd: usdValue.toString(), usdPerEthMicro: usdPerEthMicro.toString() }, "backfilled close-history USD");
       } catch (err) {
         log.warn({ err, positionKey: item.positionKey }, "failed to backfill close-history USD");

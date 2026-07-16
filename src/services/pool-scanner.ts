@@ -13,6 +13,7 @@ const MAX_DEXSCREENER_CANDIDATES = 20;
 const MAX_DEXSCREENER_POOL_VERIFICATIONS = 8;
 const MAX_QUALIFIED_POOLS_PER_TOKEN = 2;
 const CANDIDATE_REFRESH_MS = 15 * 60_000;
+const TOKEN_SCAN_VERIFY_CONCURRENCY = 2;
 const DEXSCREENER_BASE = "https://api.dexscreener.com";
 const USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168" as Address;
 const WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73" as Address;
@@ -92,6 +93,8 @@ interface GeckoTokenResponse {
   data: { attributes: { market_cap_usd?: string | null; fdv_usd?: string | null } };
 }
 
+type GeckoRequestPriority = "interactive" | "background";
+
 interface DexScreenerPair {
   chainId: string;
   dexId: string;
@@ -108,28 +111,34 @@ interface DexScreenerPair {
 
 export class PoolScanner {
   private marketScanCache?: { key: string; expiresAt: number; result: PoolMarketScan };
-  private geckoQueue: Promise<void> = Promise.resolve();
+  private geckoRequestRunning = false;
+  private readonly interactiveGeckoQueue: (() => void)[] = [];
+  private readonly backgroundGeckoQueue: (() => void)[] = [];
   private lastGeckoRequestAt = 0;
   private geckoCooldownUntil = 0;
 
   constructor(
     private readonly chains: ChainClients,
     private readonly database: Database,
+    private readonly geckoMinRequestIntervalMs = GECKO_MIN_REQUEST_INTERVAL_MS,
   ) {}
 
   async scan(tokenAddress: Address): Promise<PoolScan> {
+    const startedAt = Date.now();
     const normalized = tokenAddress.toLowerCase();
 
-    const pools = await this.fetchUniswapPools(normalized);
-    if (pools.length === 0) return { active: [], watchlist: [] };
-
-    const scored: ScoredPool[] = [];
-    for (const raw of pools) {
-      const pool = await this.toScoredPool(raw, normalized, true);
-      if (pool) scored.push(pool);
+    const pools = await this.fetchUniswapPools(normalized, "interactive");
+    if (pools.length === 0) {
+      log.info({ token: normalized, rawPools: 0, durationMs: Date.now() - startedAt }, "token pool scan completed");
+      return { active: [], watchlist: [] };
     }
 
-    return rankPools(scored);
+    const scored = (await mapWithConcurrency(pools, TOKEN_SCAN_VERIFY_CONCURRENCY, (raw) =>
+      this.toScoredPool(raw, normalized, true),
+    )).filter((pool): pool is ScoredPool => pool !== null);
+    const result = rankPools(scored);
+    log.info({ token: normalized, rawPools: pools.length, scoredPools: scored.length, active: result.active.length, watchlist: result.watchlist.length, durationMs: Date.now() - startedAt }, "token pool scan completed");
+    return result;
   }
 
   startCandidateRefresh(allowedQuoteAddresses: readonly Address[], candidatePages: number): void {
@@ -163,8 +172,8 @@ export class PoolScanner {
   private async refreshCandidateCache(allowedQuoteAddresses: readonly Address[], candidatePages: number): Promise<void> {
     const pages = Array.from({ length: candidatePages }, (_, index) => index + 1);
     const fetched = await Promise.all([
-      ...pages.map((page) => this.fetchDexPools("uniswap-v3-robinhood", page)),
-      ...pages.map((page) => this.fetchDexPools("uniswap-v4-robinhood", page)),
+      ...pages.map((page) => this.fetchDexPools("uniswap-v3-robinhood", page, "background")),
+      ...pages.map((page) => this.fetchDexPools("uniswap-v4-robinhood", page, "background")),
     ]);
     const candidates = new Map<string, number>();
     for (const pool of fetched.flat()) {
@@ -305,19 +314,19 @@ export class PoolScanner {
     return effectiveMarketCap(tokenResponse?.data.attributes.market_cap_usd, tokenResponse?.data.attributes.fdv_usd);
   }
 
-  private async fetchUniswapPools(token: string): Promise<GeckoPool[]> {
-    return this.fetchPools(`${GECKO_BASE}/networks/robinhood/tokens/${token}/pools?page=1`, token);
+  private async fetchUniswapPools(token: string, priority: GeckoRequestPriority = "background"): Promise<GeckoPool[]> {
+    return this.fetchPools(`${GECKO_BASE}/networks/robinhood/tokens/${token}/pools?page=1`, token, priority);
   }
 
-  private async fetchDexPools(dex: "uniswap-v3-robinhood" | "uniswap-v4-robinhood", page: number): Promise<GeckoPool[]> {
-    return this.fetchPools(`${GECKO_BASE}/networks/robinhood/dexes/${dex}/pools?page=${page}`, `${dex}:page:${page}`);
+  private async fetchDexPools(dex: "uniswap-v3-robinhood" | "uniswap-v4-robinhood", page: number, priority: GeckoRequestPriority): Promise<GeckoPool[]> {
+    return this.fetchPools(`${GECKO_BASE}/networks/robinhood/dexes/${dex}/pools?page=${page}`, `${dex}:page:${page}`, priority);
   }
 
-  private async fetchPools(url: string, context: string): Promise<GeckoPool[]> {
+  private async fetchPools(url: string, context: string, priority: GeckoRequestPriority): Promise<GeckoPool[]> {
 
     let response: Response;
     try {
-      response = await this.fetchGecko(url);
+      response = await this.fetchGecko(url, priority);
     } catch (error) {
       log.warn({ error: error instanceof Error ? error.message : String(error), context }, "GeckoTerminal request failed");
       return [];
@@ -338,10 +347,12 @@ export class PoolScanner {
     const data = Array.isArray(body) ? body : (body as Record<string, unknown>)?.data;
     if (!Array.isArray(data)) return [];
 
-    return (data as GeckoPool[]).filter((p) => {
+    const pools = (data as GeckoPool[]).filter((p) => {
       const dexId = p.relationships?.dex?.data?.id ?? "";
       return dexId.startsWith("uniswap-v3") || dexId.startsWith("uniswap-v4");
     });
+    log.info({ context, priority, pools: pools.length }, "GeckoTerminal pool response parsed");
+    return pools;
   }
 
   private async toScoredPool(raw: GeckoPool, token: string, requireMinimumVolume6h: boolean): Promise<ScoredPool | null> {
@@ -425,7 +436,7 @@ export class PoolScanner {
     filters: PoolScanFilters,
     preValuation?: { value: number; source: "market_cap" | "fdv" },
   ): Promise<ScoredPool[] | null> {
-    const rawPools = await this.fetchUniswapPools(token);
+    const rawPools = await this.fetchUniswapPools(token, "background");
     const valuation = preValuation ?? await this.fetchTokenValuation(token);
     if (!valuation || valuation.value <= filters.minMarketCapUsd) return null;
     const relevantRaw = rawPools.filter((pool) => nonQuoteToken(pool, filters.allowedQuoteAddresses) === token);
@@ -446,7 +457,7 @@ export class PoolScanner {
 
   private async fetchToken(token: string): Promise<GeckoTokenResponse | null> {
     try {
-      const response = await this.fetchGecko(`${GECKO_BASE}/networks/robinhood/tokens/${token}`);
+      const response = await this.fetchGecko(`${GECKO_BASE}/networks/robinhood/tokens/${token}`, "background");
       if (!response.ok) return null;
       return await response.json() as GeckoTokenResponse;
     } catch {
@@ -454,29 +465,50 @@ export class PoolScanner {
     }
   }
 
-  private async fetchGecko(url: string): Promise<Response> {
-    let resolveQueue!: () => void;
-    const previous = this.geckoQueue;
-    this.geckoQueue = new Promise<void>((resolve) => { resolveQueue = resolve; });
-    await previous;
+  private async fetchGecko(url: string, priority: GeckoRequestPriority): Promise<Response> {
+    const queuedAt = Date.now();
+    await this.acquireGeckoSlot(priority);
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         const wait = Math.max(
-          GECKO_MIN_REQUEST_INTERVAL_MS - (Date.now() - this.lastGeckoRequestAt),
+          this.geckoMinRequestIntervalMs - (Date.now() - this.lastGeckoRequestAt),
           this.geckoCooldownUntil - Date.now(),
         );
         if (wait > 0) await sleep(wait);
         this.lastGeckoRequestAt = Date.now();
+        const requestedAt = Date.now();
         const response = await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
-        if (response.status !== 429 || attempt === 1) return response;
+        if (response.status !== 429 || attempt === 1) {
+          log.info({ priority, queueWaitMs: requestedAt - queuedAt, requestMs: Date.now() - requestedAt, status: response.status }, "GeckoTerminal request completed");
+          return response;
+        }
         const retryAfter = Number(response.headers.get("retry-after"));
         this.geckoCooldownUntil = Date.now() + (Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1_000 : 60_000);
         log.warn({ cooldownSeconds: Math.ceil((this.geckoCooldownUntil - Date.now()) / 1_000) }, "GeckoTerminal rate-limited; retrying after cooldown");
       }
       throw new Error("GeckoTerminal retry loop ended unexpectedly");
     } finally {
-      resolveQueue();
+      this.releaseGeckoSlot();
     }
+  }
+
+  private async acquireGeckoSlot(priority: GeckoRequestPriority): Promise<void> {
+    if (!this.geckoRequestRunning) {
+      this.geckoRequestRunning = true;
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      (priority === "interactive" ? this.interactiveGeckoQueue : this.backgroundGeckoQueue).push(resolve);
+    });
+  }
+
+  private releaseGeckoSlot(): void {
+    const next = this.interactiveGeckoQueue.shift() ?? this.backgroundGeckoQueue.shift();
+    if (next) {
+      next();
+      return;
+    }
+    this.geckoRequestRunning = false;
   }
 
   private async verifyPool(

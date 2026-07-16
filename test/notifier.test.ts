@@ -25,6 +25,13 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseDashboardAction("lp:cfgquote:WETH")).toEqual({ type: "config_quote", quote: "WETH" });
   });
 
+  it("parses UTC calendar callbacks", () => {
+    expect(parseDashboardAction("lp:calendar:2026-07")).toEqual({ type: "calendar", year: 2026, month: 7 });
+    expect(parseDashboardAction("lp:calnav:2026-06")).toEqual({ type: "calendar_page", year: 2026, month: 6 });
+    expect(parseDashboardAction("lp:histpg:2")).toEqual({ type: "history_page", page: 2 });
+    expect(parseDashboardAction("lp:calendar:2026-13")).toBeNull();
+  });
+
   it("rejects malformed or unsupported callbacks", () => {
     expect(parseDashboardAction("lp:confirm:1:4663:v5:49339")).toBeNull();
     expect(parseDashboardAction("lp:select:-1:4663:v4:49339")).toBeNull();

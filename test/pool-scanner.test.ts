@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, limitQualifiedPoolsPerToken, MIN_VOLUME_6H_USD, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
+import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, limitQualifiedPoolsPerToken, MIN_VOLUME_6H_USD, PoolScanner, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
 
 describe("pool scoring formula", () => {
   const K = 1_000_000;
@@ -143,5 +143,29 @@ describe("scan pool eligibility", () => {
 
     expect(ranked.active.map(({ pair }) => pair)).toEqual(["B", "C", "D"]);
     expect(ranked.watchlist.map(({ pair }) => pair)).toEqual(["X", "Y"]);
+  });
+});
+
+describe("Gecko request scheduling", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("runs an interactive scan ahead of queued background refreshes", async () => {
+    const scanner = new PoolScanner({} as any, {} as any, 0);
+    const calls: string[] = [];
+    let releaseFirst!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      calls.push(url);
+      if (url === "background-1") return new Promise<Response>((resolve) => { releaseFirst = resolve; });
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    }));
+
+    const first = (scanner as any).fetchGecko("background-1", "background");
+    await vi.waitFor(() => expect(calls).toEqual(["background-1"]));
+    const second = (scanner as any).fetchGecko("background-2", "background");
+    const interactive = (scanner as any).fetchGecko("interactive", "interactive");
+    releaseFirst(new Response("{}", { status: 200 }));
+    await Promise.all([first, second, interactive]);
+
+    expect(calls).toEqual(["background-1", "interactive", "background-2"]);
   });
 });

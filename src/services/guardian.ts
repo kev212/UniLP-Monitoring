@@ -218,7 +218,6 @@ export class Guardian {
           },
         });
         await this.executeExit(position, effectiveTrigger);
-        await this.database.setPositionStatus(position.id, position.status, { exitRetry: null });
         return true;
       } catch (error) {
         log.warn({ err: error, positionId: position.id, trigger: effectiveTrigger }, "exit attempt failed; waiting for fresh PnL before retry");
@@ -231,6 +230,10 @@ export class Guardian {
         return false;
       }
       if (message.includes("zero liquidity") || message.includes("NOT_MINTED") || message.includes("Invalid token ID")) {
+        if (await this.database.recoverVerifiedSettlement(position.id)) {
+          log.info({ positionId: position.id, positionKey: position.positionKey }, "recovered verified settlement after on-chain liquidity reached zero");
+          return true;
+        }
         const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(position.id, { reason: "on_chain_liquidity_zero_unverified" });
         if (!reviewed) {
           log.info({ positionId: position.id, positionKey: position.positionKey, reason: message }, "V4 liquidity is gone but settlement remains pending");
@@ -283,22 +286,27 @@ export class Guardian {
       ? (range.status === "above" ? "below" : range.status === "below" ? "above" : "in_range")
       : range.status;
     const distanceBps = quoteRangeAboveDistanceBps(range, quoteIsToken0 === true);
-    meta.oorStatus = quoteStatus;
-    if (quoteStatus === "above") meta.oorDistanceBps = Number(distanceBps);
-
     if (!this.config.oorAutoCloseEnabled) return;
     const thresholdBps = BigInt(Math.round(this.config.oorAboveMinDistancePercent * 100));
     if (quoteStatus === "above" && distanceBps >= thresholdBps) {
-      if (meta.oorAboveSeenAt === undefined) {
+      if (typeof meta.oorAboveSeenAt !== "number") {
         const now = Date.now();
-        meta.oorAboveSeenAt = now;
-        await this.database.setPositionStatus(position.id, position.status, { oorAboveSeenAt: now });
+        await this.database.setPositionStatus(position.id, position.status, {
+          oorAboveSeenAt: now,
+          oorStatus: quoteStatus,
+          oorDistanceBps: Number(distanceBps),
+        });
         log.info({ positionId: position.id, distanceBps }, "OOR above timer started");
       }
-    } else if (meta.oorAboveSeenAt !== undefined) {
-      delete meta.oorAboveSeenAt;
-      await this.database.setPositionStatus(position.id, position.status, { oorAboveSeenAt: null });
-      log.info({ positionId: position.id }, "OOR above timer reset");
+    } else {
+      if (typeof meta.oorAboveSeenAt === "number") {
+        await this.database.setPositionStatus(position.id, position.status, {
+          oorAboveSeenAt: null,
+          oorStatus: quoteStatus,
+          oorDistanceBps: null,
+        });
+        log.info({ positionId: position.id }, "OOR above timer reset");
+      }
     }
   }
 
