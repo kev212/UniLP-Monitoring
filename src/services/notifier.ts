@@ -12,6 +12,7 @@ import type { PnlService } from "./pnl.js";
 import { fmtUtc, renderPnlCard } from "./pnl-card.js";
 import { renderPnlCalendarCard } from "./pnl-calendar-card.js";
 import type { PoolMarketScan, PoolScanFilters, PoolScanner, ScoredPool } from "./pool-scanner.js";
+import { quoteRangeState } from "./quote-range.js";
 import { sqrtRatioAtTick } from "./uniswap-math.js";
 
 type ChatContext = CommandContext<Context>;
@@ -695,7 +696,7 @@ export class Notifier {
     const minimum = lower < upper ? lower : upper;
     const maximum = lower > upper ? lower : upper;
     const quoteSymbol = this.quoteSymbol(position.quoteToken);
-    const status = quoteRangeStatus(range.status, quoteIsToken0, position.metadata);
+    const status = formatQuoteRangeStatus(quoteRangeState(range, quoteIsToken0)?.status ?? "in_range", position.metadata);
     return `\n   ${status} | ${formatQuotePrice(minimum, quoteSymbol)} - ${formatQuotePrice(maximum, quoteSymbol)} ${quoteSymbol}`;
   }
 
@@ -1446,10 +1447,9 @@ function formatQuotePrice(value: bigint, quoteSymbol: string): string {
   return `${prefix}${formatToken(value, 18, decimals)}`;
 }
 
-function quoteRangeStatus(status: import("../types.js").PositionRangeInfo["status"], quoteIsToken0: boolean, metadata: Record<string, unknown>): string {
+function formatQuoteRangeStatus(status: import("../types.js").PositionRangeInfo["status"], metadata: Record<string, unknown>): string {
   if (status === "in_range") return "🟢 IN RANGE";
-  const aboveQuoteRange = quoteIsToken0 ? status === "below" : status === "above";
-  if (!aboveQuoteRange) return "⚠️ BELOW RANGE";
+  if (status === "below") return "⚠️ BELOW RANGE";
   const seenAt = typeof metadata.oorAboveSeenAt === "number" ? metadata.oorAboveSeenAt : undefined;
   const timer = seenAt ? ` ⏳${Math.floor((Date.now() - seenAt) / 60_000)}m` : "";
   return `⚠️ ABOVE RANGE${timer}`;

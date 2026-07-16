@@ -8,7 +8,7 @@ import type { DiscoveryService } from "./discovery.js";
 import type { Executor } from "./executor.js";
 import type { Notifier } from "./notifier.js";
 import type { PnlService } from "./pnl.js";
-import { sqrtRatioAtTick } from "./uniswap-math.js";
+import { quoteRangeState } from "./quote-range.js";
 
 export class Guardian {
   private readonly lastEvaluatedBlock = new Map<number, bigint>();
@@ -181,7 +181,9 @@ export class Guardian {
         log.info({ positionId: position.id, pnlBps: valued.snapshot.pnlBps }, "trailing stop reset after negative PnL");
       }
 
-      const staticTrigger = this.pnl.shouldTrigger(valued.snapshot, valued.range);
+      const quoteIsToken0 = position.quoteToken?.toLowerCase() === position.token0.toLowerCase();
+      const quoteRange = quoteRangeState(valued.range, quoteIsToken0);
+      const staticTrigger = this.pnl.shouldTrigger(valued.snapshot, valued.range, quoteIsToken0);
       if (!staticTrigger && (trailing.action === "activate" || trailing.action === "raise_peak")) {
         await this.database.setTrailingStopState(position.id, trailing.state);
         log.info({
@@ -192,14 +194,23 @@ export class Guardian {
         }, "trailing stop updated");
       }
 
-      const trigger = staticTrigger ?? (trailing.action === "trigger" ? "trailing_take_profit" : null) ?? this.checkOorAboveTrigger(position.metadata);
+      const trigger = staticTrigger
+        ?? (trailing.action === "trigger" ? "trailing_take_profit" : null)
+        ?? this.checkOorAboveTrigger(position.metadata);
       const pendingRetry = !trigger ? parseExitRetry(position.metadata) : null;
       const effectiveTrigger: ExitTrigger | null = trigger ?? pendingRetry?.reason ?? null;
       if (!effectiveTrigger) {
         return true;
       }
-      if (!valued.twapGuard.ready) {
-        log.warn({ positionId: position.id, deviationBps: valued.twapGuard.deviationBps }, "threshold reached but price guard is not ready");
+      if (effectiveTrigger !== "stop_loss" && !valued.twapGuard.ready) {
+        log.warn({
+          positionId: position.id,
+          trigger: effectiveTrigger,
+          rawRangeStatus: valued.range?.status,
+          quoteRangeStatus: quoteRange?.status,
+          quoteIsToken0,
+          deviationBps: valued.twapGuard.deviationBps,
+        }, "threshold reached but price guard is not ready");
         return true;
       }
       const nextAttemptAt = retryAt(position.metadata);
@@ -279,34 +290,27 @@ export class Guardian {
   }
 
   private async updateOorAboveTimer(position: PositionRecord, range?: import("../types.js").PositionRangeInfo): Promise<void> {
-    if (!range) return;
     const meta = position.metadata as Record<string, unknown>;
     const quoteIsToken0 = position.quoteToken?.toLowerCase() === position.token0.toLowerCase();
-    const quoteStatus = quoteIsToken0
-      ? (range.status === "above" ? "below" : range.status === "below" ? "above" : "in_range")
-      : range.status;
-    const distanceBps = quoteRangeAboveDistanceBps(range, quoteIsToken0 === true);
-    if (!this.config.oorAutoCloseEnabled) return;
+    const state = quoteRangeState(range, quoteIsToken0 === true);
+    if (!state || !this.config.oorAutoCloseEnabled) return;
     const thresholdBps = BigInt(Math.round(this.config.oorAboveMinDistancePercent * 100));
-    if (quoteStatus === "above" && distanceBps >= thresholdBps) {
-      if (typeof meta.oorAboveSeenAt !== "number") {
-        const now = Date.now();
-        await this.database.setPositionStatus(position.id, position.status, {
-          oorAboveSeenAt: now,
-          oorStatus: quoteStatus,
-          oorDistanceBps: Number(distanceBps),
-        });
-        log.info({ positionId: position.id, distanceBps }, "OOR above timer started");
-      }
-    } else {
-      if (typeof meta.oorAboveSeenAt === "number") {
-        await this.database.setPositionStatus(position.id, position.status, {
-          oorAboveSeenAt: null,
-          oorStatus: quoteStatus,
-          oorDistanceBps: null,
-        });
-        log.info({ positionId: position.id }, "OOR above timer reset");
-      }
+    const active = state.status === "above" && state.aboveDistanceBps >= thresholdBps;
+    if (active && typeof meta.oorAboveSeenAt !== "number") {
+      const now = Date.now();
+      await this.database.setPositionStatus(position.id, position.status, {
+        oorAboveSeenAt: now,
+        oorAboveDistanceBps: Number(state.aboveDistanceBps),
+        oorStatus: state.status,
+      });
+      log.info({ positionId: position.id, rawRangeStatus: range?.status, quoteRangeStatus: state.status, quoteIsToken0, distanceBps: state.aboveDistanceBps }, "OOR above timer started");
+    } else if (!active && typeof meta.oorAboveSeenAt === "number") {
+      await this.database.setPositionStatus(position.id, position.status, {
+        oorAboveSeenAt: null,
+        oorAboveDistanceBps: null,
+        oorStatus: state.status,
+      });
+      log.info({ positionId: position.id, rawRangeStatus: range?.status, quoteRangeStatus: state.status, quoteIsToken0 }, "OOR above timer reset");
     }
   }
 
@@ -345,15 +349,6 @@ function retryAt(metadata: Record<string, unknown>): number | null {
   if (typeof nextAttemptAt !== "string") return null;
   const timestamp = Date.parse(nextAttemptAt);
   return Number.isFinite(timestamp) ? timestamp : null;
-}
-
-function quoteRangeAboveDistanceBps(range: import("../types.js").PositionRangeInfo, quoteIsToken0: boolean): bigint {
-  if (!quoteIsToken0) return range.status === "above" ? range.aboveDistanceBps ?? 0n : 0n;
-  if (range.status !== "below") return 0n;
-  const sqrtLower = sqrtRatioAtTick(range.tickLower);
-  const numerator = sqrtLower * sqrtLower * 10_000n;
-  const denominator = range.currentSqrtPrice * range.currentSqrtPrice;
-  return denominator > 0n ? numerator / denominator - 10_000n : 0n;
 }
 
 function parseExitRetry(metadata: Record<string, unknown>): { reason: ExitTrigger; nextAttemptAt: number } | null {

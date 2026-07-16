@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { zeroAddress, type Address } from "viem";
 
 import type { RuntimeConfig } from "../src/config.js";
-import { Executor } from "../src/services/executor.js";
+import { Executor, nextExitRetry } from "../src/services/executor.js";
 import type { PositionRecord } from "../src/types.js";
 
 const usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as const;
@@ -18,6 +18,11 @@ const config = {
 } as RuntimeConfig;
 
 describe("Executor pending settlement recovery", () => {
+  it("increments retry attempts after a failed exit", () => {
+    const retry = nextExitRetry({ exitRetry: { reason: "stop_loss", attempts: 2 } }, "stop_loss");
+    expect(retry).toMatchObject({ reason: "stop_loss", attempts: 3 });
+  });
+
   it("restores a V4 quote token and pair from burned-position metadata", async () => {
     const database = { repairPositionAssets: vi.fn(), setPositionStatus: vi.fn() };
     const chains = { getById: vi.fn(() => ({ registry: { name: "robinhood" } })) };

@@ -67,6 +67,7 @@ export class Executor {
     const quoteToken = position.quoteToken;
     if (position.status === "closing") return this.resume(position);
     if (position.protocol === "v4" && !(await this.canCloseV4(position))) return;
+    const retryMetadata = position.metadata as Record<string, unknown>;
 
     const value = await this.reader.read(position);
     const before = await this.tokenBalances(position.chainId, position.owner, position.token0, position.token1);
@@ -132,7 +133,7 @@ export class Executor {
         await this.database.recordExecution(position.id, "remove_liquidity", "failed", undefined, message);
         await this.database.setPositionStatus(position.id, "armed", {
           lastExecutionError: message,
-          exitRetry: nextExitRetry(position.metadata, trigger),
+          exitRetry: nextExitRetry(retryMetadata, trigger),
         });
         await this.notifier.failure(position, message);
       }
@@ -710,7 +711,7 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function nextExitRetry(metadata: Record<string, unknown>, trigger?: ExitTrigger): Record<string, unknown> {
+export function nextExitRetry(metadata: Record<string, unknown>, trigger?: ExitTrigger): Record<string, unknown> {
   const existing = metadata.exitRetry;
   const previousAttempts = existing && typeof existing === "object" && !Array.isArray(existing)
     && typeof (existing as Record<string, unknown>).attempts === "number"

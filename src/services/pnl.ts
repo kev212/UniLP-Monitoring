@@ -7,6 +7,7 @@ import type { ExitTrigger, LiquidationQuote, PnlSnapshot, PositionRangeInfo, Pos
 import type { PositionReader } from "./position-reader.js";
 import type { RoutePlanner } from "./route-planner.js";
 import type { UniswapTradingApi } from "./uniswap-trading-api.js";
+import { quoteRangeState } from "./quote-range.js";
 
 export interface ValuedPosition {
   snapshot: PnlSnapshot;
@@ -111,10 +112,10 @@ export class PnlService {
     };
   }
 
-  shouldTrigger(snapshot: PnlSnapshot, range?: PositionRangeInfo): ExitTrigger | null {
+  shouldTrigger(snapshot: PnlSnapshot, range: PositionRangeInfo | undefined, quoteIsToken0: boolean): ExitTrigger | null {
     const stopLossBps = percentToBps(this.config.stopLossPercent);
     const takeProfitBps = percentToBps(this.config.takeProfitPercent);
-    if (snapshot.pnlBps <= stopLossBps && range?.status === "below") return "stop_loss";
+    if (snapshot.pnlBps <= stopLossBps && quoteRangeState(range, quoteIsToken0)?.status === "below") return "stop_loss";
     if (snapshot.pnlBps >= takeProfitBps) return "take_profit";
     return null;
   }

@@ -60,17 +60,16 @@ describe("PnL thresholds", () => {
     currentSqrtPrice: 1n,
   });
 
-  it("triggers stop-loss only when the position is OOR Below", () => {
-    expect(pnl.shouldTrigger(snapshot(-1_000n), range("below"))).toBe("stop_loss");
-    expect(pnl.shouldTrigger(snapshot(-1_000n), range("in_range"))).toBeNull();
-    expect(pnl.shouldTrigger(snapshot(-1_000n), range("above"))).toBeNull();
-    expect(pnl.shouldTrigger(snapshot(-1_000n))).toBeNull();
+  it("triggers stop-loss only for quote OOR Below", () => {
+    expect(pnl.shouldTrigger(snapshot(-1_000n), range("below"), false)).toBe("stop_loss");
+    expect(pnl.shouldTrigger(snapshot(-1_000n), range("above"), true)).toBe("stop_loss");
+    expect(pnl.shouldTrigger(snapshot(-1_000n), range("in_range"), false)).toBeNull();
+    expect(pnl.shouldTrigger(snapshot(-999n), range("below"), false)).toBeNull();
   });
 
   it("keeps take-profit independent of range state", () => {
-    expect(pnl.shouldTrigger(snapshot(2_000n))).toBe("take_profit");
-    expect(pnl.shouldTrigger(snapshot(2_000n), range("below"))).toBe("take_profit");
-    expect(pnl.shouldTrigger(snapshot(1_999n))).toBeNull();
+    expect(pnl.shouldTrigger(snapshot(2_000n), undefined, false)).toBe("take_profit");
+    expect(pnl.shouldTrigger(snapshot(1_999n), undefined, false)).toBeNull();
   });
 });
 
