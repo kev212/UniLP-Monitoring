@@ -175,8 +175,24 @@ export class Notifier {
   }
 
   async logPnL(position: PositionRecord, snapshot: PnlSnapshot): Promise<void> {
-    void snapshot;
-    log.debug({ positionId: position.id }, "position valuation recorded");
+    const t0 = await this.tokenLabel(position.token0, position.chainId);
+    const t1 = await this.tokenLabel(position.token1, position.chainId);
+    const qtSymbol = this.quoteSymbol(position.quoteToken);
+    const qtDec = await this.decimals(position.quoteToken, position.chainId);
+    const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
+    const usdg = this.config.quoteTokens.robinhood[0]?.address;
+    const usdgDec = usdg ? 6 : 0;
+    const usdgSymbol = usdg ? "USDG" : "??";
+    const feeParts: string[] = [formatToken(snapshot.feeQuote, qtDec, 2)];
+    if (snapshot.feeNonQuote) {
+      const nqSymbol = await this.tokenLabel(snapshot.feeNonQuote.token, position.chainId);
+      const nqAmount = formatToken(snapshot.feeNonQuote.amount, await this.decimals(snapshot.feeNonQuote.token, position.chainId), 2);
+      feeParts.push(`+ ${nqAmount} ${nqSymbol}`);
+    }
+    const feeDisplay = snapshot.feeNonQuote
+      ? `${feeParts.join(" ")} (≈ ${formatToken(snapshot.feeQuoteUsdg, usdgDec, 4)} ${usdgSymbol})`
+      : `${formatToken(snapshot.feeQuoteUsdg, usdgDec, 4)} ${usdgSymbol}`;
+    log.info({ Pool: `${position.positionKey} ${pair} | CV: ${formatToken(snapshot.liquidationQuote, qtDec, 2)} ${qtSymbol} | Fees: ${feeDisplay} | PnL: ${formatBps(snapshot.pnlBps)}%` });
   }
 
   async trigger(position: PositionRecord, snapshot: PnlSnapshot, reason: ExitTrigger): Promise<void> {
