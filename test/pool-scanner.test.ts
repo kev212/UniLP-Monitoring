@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, MIN_VOLUME_6H_USD, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
+import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, limitQualifiedPoolsPerToken, MIN_VOLUME_6H_USD, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
 
 describe("pool scoring formula", () => {
   const K = 1_000_000;
@@ -68,6 +68,17 @@ describe("pool scoring formula", () => {
 });
 
 describe("scan pool eligibility", () => {
+  it("keeps at most the two best qualified pools for one token", () => {
+    const pool = (pair: string, quoteToken: string, estimatedPoolYield1hPercent: number, tvlUsd: number) => ({ pair, quoteToken, estimatedPoolYield1hPercent, tvlUsd }) as ScoredPool;
+
+    expect(limitQualifiedPoolsPerToken([
+      pool("TOKEN/WETH 1%", "0x0bd7d308f8e1639fab988df18a8011f41eacad73", 4, 100_000),
+      pool("TOKEN/ETH 2%", "0x0000000000000000000000000000000000000000", 8, 50_000),
+      pool("TOKEN/USDG 3%", "0x5fc5360d0400a0fd4f2af552add042d716f1d168", 8, 200_000),
+      pool("TOKEN/USDG 4%", "0x5fc5360d0400a0fd4f2af552add042d716f1d168", 4, 300_000),
+    ]).map((item) => item.pair)).toEqual(["TOKEN/USDG 3%", "TOKEN/ETH 2%"]);
+  });
+
   it("excludes pools with less than $100 of cumulative 6h volume", () => {
     expect(hasMinimumScanVolume6h(MIN_VOLUME_6H_USD - 0.01)).toBe(false);
     expect(hasMinimumScanVolume6h(MIN_VOLUME_6H_USD)).toBe(true);

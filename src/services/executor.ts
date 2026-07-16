@@ -33,6 +33,7 @@ import type { Notifier } from "./notifier.js";
 import type { PositionReader } from "./position-reader.js";
 import type { RoutePlanner, SwapRoute } from "./route-planner.js";
 import type { UniswapTradingApi } from "./uniswap-trading-api.js";
+import { hasPendingSettlement } from "./pending-settlement.js";
 
 interface PendingSwap {
   token: Address;
@@ -63,6 +64,7 @@ export class Executor {
 
   async execute(position: PositionRecord, trigger?: ExitTrigger): Promise<void> {
     if (!position.quoteToken) throw new Error("Cannot execute a position without quote token");
+    const quoteToken = position.quoteToken;
     if (position.status === "closing") return this.resume(position);
     if (position.protocol === "v4" && !(await this.canCloseV4(position))) return;
 
@@ -80,7 +82,11 @@ export class Executor {
       exitTrigger: trigger ?? "manual",
       settlementQuoteFromClose: settlementQuoteFromClose.toString(),
       preCloseQuoteBalance: preCloseBalance.toString(),
+      ...(!this.config.pnlIncludeGas && quoteToken.toLowerCase() === zeroAddress
+        ? { settlementGasWei: "0" }
+        : {}),
     };
+    position = { ...position, status: "closing", metadata: closingMetadata };
     await this.database.setPositionStatus(position.id, "closing", closingMetadata);
     let closeConfirmed = false;
 
@@ -104,7 +110,7 @@ export class Executor {
       closeConfirmed = true;
 
       const after = await this.tokenBalances(position.chainId, position.owner, position.token0, position.token1);
-      const nonQuoteToken = position.quoteToken.toLowerCase() === position.token0.toLowerCase() ? position.token1 : position.token0;
+      const nonQuoteToken = quoteToken.toLowerCase() === position.token0.toLowerCase() ? position.token1 : position.token0;
       const nonQuoteAmount = nonQuoteToken.toLowerCase() === position.token0.toLowerCase()
         ? positiveDelta(before.token0, after.token0)
         : positiveDelta(before.token1, after.token1);
@@ -114,9 +120,8 @@ export class Executor {
       });
       await this.resume({
         ...position,
-        status: "closing",
         metadata: {
-          ...closingMetadata,
+          ...position.metadata,
           pendingSwap: nonQuoteAmount > 0n ? { token: nonQuoteToken, amount: nonQuoteAmount.toString() } : null,
           closeTransactionHash: hash,
         },
@@ -230,6 +235,7 @@ export class Executor {
         const isNative = position.quoteToken.toLowerCase() === zeroAddress;
         totalReceived = isNative ? (actualNow + (preClose > actualNow ? preClose - actualNow : 0n)) - preClose : actualNow - preClose;
         if (totalReceived < 0n) totalReceived = 0n;
+        if (isNative && !this.config.pnlIncludeGas) totalReceived += settlementGasWei(meta);
       } else {
         const fromCloseStr = typeof meta.settlementQuoteFromClose === "string" ? meta.settlementQuoteFromClose : "0";
         totalReceived = BigInt(fromCloseStr) + swapExpectedOut;
@@ -265,6 +271,10 @@ export class Executor {
   }
 
   private async canCloseV4(position: PositionRecord): Promise<boolean> {
+    if (hasPendingSettlement(position.status, position.metadata)) {
+      log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 NFT state is irrelevant while settlement remains pending");
+      return false;
+    }
     const { client, registry } = this.chains.getById(position.chainId);
     try {
       const owner = await client.readContract({
@@ -283,18 +293,22 @@ export class Executor {
         args: [BigInt(position.positionKey)],
       });
       if (liquidity > 0n) return true;
-      await this.database.setPositionStatus(position.id, "settled", { reason: "on_chain_liquidity_zero" });
-      log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 position has zero NFT liquidity — marking settled");
-      void this.notifier.settled(position);
-      this.finalizeCloseHistory(position);
+      const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(position.id, { reason: "on_chain_liquidity_zero_unverified" });
+      if (!reviewed) {
+        log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 liquidity is gone but settlement remains pending");
+        return false;
+      }
+      log.warn({ positionId: position.id, positionKey: position.positionKey }, "V4 position has zero liquidity without a verified settlement");
       return false;
     } catch (error) {
       const message = errorMessage(error);
       if (!message.includes("NOT_MINTED")) throw error;
-      await this.database.setPositionStatus(position.id, "settled", { reason: "nft_burned" });
-      log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 position NFT is burned — marking settled");
-      void this.notifier.settled(position);
-      this.finalizeCloseHistory(position);
+      const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(position.id, { reason: "nft_burned_unverified" });
+      if (!reviewed) {
+        log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 NFT is burned but settlement remains pending");
+        return false;
+      }
+      log.warn({ positionId: position.id, positionKey: position.positionKey }, "V4 NFT is burned without a verified settlement");
       return false;
     }
   }
@@ -576,8 +590,17 @@ export class Executor {
     const receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
     if (receipt.status !== "success") throw new Error(`${stage} transaction reverted: ${hash}`);
     await this.database.recordExecution(position.id, stage, "confirmed", hash);
+    await this.recordNativeSettlementGas(position, receipt.gasUsed * receipt.effectiveGasPrice);
     await this.notifier.transaction(position, stage, hash);
     return hash;
+  }
+
+  private async recordNativeSettlementGas(position: PositionRecord, gasWei: bigint): Promise<void> {
+    if (this.config.pnlIncludeGas || position.quoteToken?.toLowerCase() !== zeroAddress || gasWei === 0n) return;
+    const metadata = position.metadata as Record<string, unknown>;
+    const totalGasWei = settlementGasWei(metadata) + gasWei;
+    metadata.settlementGasWei = totalGasWei.toString();
+    await this.database.setPositionStatus(position.id, "closing", { settlementGasWei: totalGasWei.toString() });
   }
 
   private async tokenBalances(chainId: number, owner: Address, token0: Address, token1: Address): Promise<{ token0: bigint; token1: bigint }> {
@@ -672,6 +695,12 @@ function parsePendingSwap(value: unknown): { token: Address; amount: bigint } | 
 
 function positiveDelta(before: bigint, after: bigint): bigint {
   return after > before ? after - before : 0n;
+}
+
+function settlementGasWei(metadata: Record<string, unknown>): bigint {
+  const value = metadata.settlementGasWei;
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return 0n;
+  return BigInt(value);
 }
 
 function errorMessage(error: unknown): string {

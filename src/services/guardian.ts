@@ -102,7 +102,11 @@ export class Guardian {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           if (message.includes("NOT_MINTED")) {
-            await this.database.setPositionStatus(candidate.id, "settled", { reason: "nft_burned" });
+            const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(candidate.id, { reason: "nft_burned_unverified" });
+            log[reviewed ? "warn" : "info"](
+              { positionId: candidate.id, positionKey: candidate.positionKey },
+              reviewed ? "V4 NFT is burned without a verified settlement" : "V4 NFT is burned but settlement remains pending",
+            );
           }
           continue;
         }
@@ -177,7 +181,7 @@ export class Guardian {
         log.info({ positionId: position.id, pnlBps: valued.snapshot.pnlBps }, "trailing stop reset after negative PnL");
       }
 
-      const staticTrigger = this.pnl.shouldTrigger(valued.snapshot);
+      const staticTrigger = this.pnl.shouldTrigger(valued.snapshot, valued.range);
       if (!staticTrigger && (trailing.action === "activate" || trailing.action === "raise_peak")) {
         await this.database.setTrailingStopState(position.id, trailing.state);
         log.info({
@@ -227,12 +231,12 @@ export class Guardian {
         return false;
       }
       if (message.includes("zero liquidity") || message.includes("NOT_MINTED") || message.includes("Invalid token ID")) {
-        await this.database.setPositionStatus(position.id, "settled", { reason: "on_chain_liquidity_zero" });
-        log.info({ positionId: position.id, reason: message }, "zero on-chain liquidity detected — marking settled");
-        void this.notifier.settled(position);
-        void this.database.finalizeCloseHistory(position.id, "settled").catch((finalizeError) => {
-          log.error({ err: finalizeError, positionId: position.id }, "close-history finalization failed");
-        });
+        const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(position.id, { reason: "on_chain_liquidity_zero_unverified" });
+        if (!reviewed) {
+          log.info({ positionId: position.id, positionKey: position.positionKey, reason: message }, "V4 liquidity is gone but settlement remains pending");
+          return true;
+        }
+        log.warn({ positionId: position.id, reason: message }, "zero on-chain liquidity requires settlement review");
         return true;
       }
       if (message.includes("No safe direct Uniswap route") || message.includes("Native-currency")) {

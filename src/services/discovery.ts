@@ -399,25 +399,29 @@ export class DiscoveryService {
           burned
             ? { chain: name, tokenId: tokenId.toString() }
             : { err: error, chain: name, tokenId: tokenId.toString() },
-          burned ? "V4 candidate NFT is burned — marking settled" : "could not resolve V4 candidate; marking needs_review",
+          burned ? "V4 candidate NFT is burned — requesting settlement review" : "could not resolve V4 candidate; marking needs_review",
         );
         try {
           if (burned) {
             const existing = await this.database.findPositionByKey(registry.chain.id, "v4", tokenId.toString());
             if (existing) {
-              await this.database.setPositionStatus(existing.id, "settled", { reason: "nft_burned" });
+              const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(existing.id, { reason: "nft_burned_unverified" });
+              log[reviewed ? "warn" : "info"](
+                { chain: name, tokenId: tokenId.toString() },
+                reviewed ? "V4 NFT is burned without a verified settlement" : "V4 NFT is burned but settlement remains pending",
+              );
               continue;
             }
           }
           await this.database.upsertPosition({
             chainId: registry.chain.id, protocol: "v4", positionKey: tokenId.toString(),
             owner: this.config.executorAddress, poolAddress: null, token0: "0x",
-            token1: "0x", quoteToken: null, status: burned ? "settled" : "needs_review", liquidity: 0n,
+            token1: "0x", quoteToken: null, status: "needs_review", liquidity: 0n,
             openedAtBlock: candidate.blockNumber,
             metadata: {
               positionManager: registry.contracts.v4.positionManager,
               source: "nft_transfer",
-              reason: burned ? "nft_burned" : "v4_read_failed",
+              reason: burned ? "nft_burned_unverified" : "v4_read_failed",
               ...(burned ? {} : { error: message }),
               historyTrusted: candidate.historyTrusted,
             },
@@ -753,7 +757,11 @@ export class DiscoveryService {
           openedAtBlock: position.openedAtBlock, metadata: position.metadata,
         });
       } else if (net <= 0n) {
-        await this.database.setPositionStatus(position.id, "settled", { reason: "liquidity_reconciled_to_zero" });
+        const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(position.id, { reason: "liquidity_reconciled_to_zero_unverified" });
+        if (!reviewed) {
+          log.info({ chain: name, positionKey: position.positionKey }, "V4 liquidity reconciled to zero but settlement remains pending");
+          continue;
+        }
         settledCount += 1;
       }
     }

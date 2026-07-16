@@ -52,11 +52,25 @@ describe("PnL thresholds", () => {
     feeQuoteUsdg: 0n,
   });
 
-  it("triggers only at configured stop-loss and take-profit boundaries", () => {
-    expect(pnl.shouldTrigger(snapshot(-1_000n))).toBe("stop_loss");
+  const range = (status: "in_range" | "above" | "below") => ({
+    status,
+    tickLower: -1,
+    tickUpper: 1,
+    currentTick: 0,
+    currentSqrtPrice: 1n,
+  });
+
+  it("triggers stop-loss only when the position is OOR Below", () => {
+    expect(pnl.shouldTrigger(snapshot(-1_000n), range("below"))).toBe("stop_loss");
+    expect(pnl.shouldTrigger(snapshot(-1_000n), range("in_range"))).toBeNull();
+    expect(pnl.shouldTrigger(snapshot(-1_000n), range("above"))).toBeNull();
+    expect(pnl.shouldTrigger(snapshot(-1_000n))).toBeNull();
+  });
+
+  it("keeps take-profit independent of range state", () => {
     expect(pnl.shouldTrigger(snapshot(2_000n))).toBe("take_profit");
+    expect(pnl.shouldTrigger(snapshot(2_000n), range("below"))).toBe("take_profit");
     expect(pnl.shouldTrigger(snapshot(1_999n))).toBeNull();
-    expect(pnl.shouldTrigger(snapshot(-999n))).toBeNull();
   });
 });
 

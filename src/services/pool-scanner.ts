@@ -1,4 +1,4 @@
-import { isAddress, isHex, type Address, type Hex } from "viem";
+import { isAddress, isHex, zeroAddress, type Address, type Hex } from "viem";
 
 import type { Database } from "../db.js";
 import { log } from "../log.js";
@@ -11,13 +11,17 @@ const GECKO_MIN_REQUEST_INTERVAL_MS = 6_500;
 const MAX_TOKEN_ENRICHMENT_CANDIDATES = 5;
 const MAX_DEXSCREENER_CANDIDATES = 20;
 const MAX_DEXSCREENER_POOL_VERIFICATIONS = 8;
+const MAX_QUALIFIED_POOLS_PER_TOKEN = 2;
 const CANDIDATE_REFRESH_MS = 15 * 60_000;
 const DEXSCREENER_BASE = "https://api.dexscreener.com";
+const USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168" as Address;
+const WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73" as Address;
 export const MIN_VOLUME_6H_USD = 100;
 
 export interface ScoredPool {
   protocol: "v3" | "v4";
   pair: string;
+  quoteToken: Address;
   uniswapUrl: string;
   activeLiquidity: boolean;
   feeTier: number;
@@ -148,7 +152,7 @@ export class PoolScanner {
       this.enrichDexScreenerToken(tokenAddress, filters),
     );
     onProgress?.("Memverifikasi pool Uniswap final on-chain...");
-    const pools = enriched.flatMap((result) => result ?? [])
+    const pools = enriched.flatMap((result) => limitQualifiedPoolsPerToken(result ?? []))
       .sort((left, right) => right.estimatedPoolYield1hPercent - left.estimatedPoolYield1hPercent || right.tvlUsd - left.tvlUsd)
       .slice(0, filters.maxResults);
     const result = { pools, candidateTokens: candidates.length, qualifiedTokens: enriched.filter(Boolean).length, evaluatedTokens: candidates.length };
@@ -249,6 +253,7 @@ export class PoolScanner {
     const estimatedPoolFees1hUsd = volume1hUsd * feeRate;
     const estimatedPoolFees6hUsd = volume6hUsd * feeRate;
     const baseIsToken = pair.baseToken.address.toLowerCase() === token;
+    const quoteToken = (baseIsToken ? pair.quoteToken.address : pair.baseToken.address).toLowerCase() as Address;
     const warnings: string[] = [];
     const dynamicFee = protocol === "v4" && currentLpFee !== undefined && currentLpFee !== feeTier;
     if (dynamicFee) warnings.push("dynamic fee");
@@ -258,6 +263,7 @@ export class PoolScanner {
     return {
       protocol,
       pair: baseIsToken ? `${pair.baseToken.symbol}/${pair.quoteToken.symbol}` : `${pair.quoteToken.symbol}/${pair.baseToken.symbol}`,
+      quoteToken,
       uniswapUrl: uniswapPoolUrl(pair.pairAddress),
       activeLiquidity: verified.activeLiquidity,
       feeTier,
@@ -382,6 +388,7 @@ export class PoolScanner {
 
     const baseId = raw.relationships.base_token.data.id;
     const isTokenBase = baseId.toLowerCase().replace("robinhood_", "") === token;
+    const quoteToken = (isTokenBase ? raw.relationships.quote_token.data.id : baseId).replace("robinhood_", "").toLowerCase() as Address;
     const pair = poolPair(raw.attributes.pool_name ?? raw.attributes.name, isTokenBase);
 
     const warnings: string[] = [];
@@ -392,6 +399,7 @@ export class PoolScanner {
     return {
       protocol,
       pair,
+      quoteToken,
       uniswapUrl: uniswapPoolUrl(poolAddress),
       activeLiquidity: verified.activeLiquidity,
       feeTier: verified.feeTier ?? 0,
@@ -632,6 +640,26 @@ export function rankPools(pools: ScoredPool[]): PoolScan {
     active: pools.filter((pool) => pool.activeLiquidity).sort(byScore).slice(0, 3),
     watchlist: pools.filter((pool) => !pool.activeLiquidity).sort(byScore).slice(0, 2),
   };
+}
+
+export function limitQualifiedPoolsPerToken(pools: readonly ScoredPool[]): ScoredPool[] {
+  const best = new Map<"native" | "usdg", ScoredPool>();
+  for (const pool of [...pools].sort(compareQualifiedPool)) {
+    const bucket = quoteBucket(pool.quoteToken);
+    if (bucket && !best.has(bucket)) best.set(bucket, pool);
+  }
+  return [...best.values()].sort(compareQualifiedPool).slice(0, MAX_QUALIFIED_POOLS_PER_TOKEN);
+}
+
+function compareQualifiedPool(left: ScoredPool, right: ScoredPool): number {
+  return right.estimatedPoolYield1hPercent - left.estimatedPoolYield1hPercent || right.tvlUsd - left.tvlUsd;
+}
+
+function quoteBucket(quoteToken: Address): "native" | "usdg" | null {
+  const normalized = quoteToken.toLowerCase();
+  if (normalized === USDG) return "usdg";
+  if (normalized === WETH || normalized === zeroAddress) return "native";
+  return null;
 }
 
 function nonQuoteToken(pool: GeckoPool, allowedQuotes: readonly Address[]): string | null {

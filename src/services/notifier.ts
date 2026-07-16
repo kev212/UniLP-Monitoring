@@ -503,8 +503,7 @@ export class Notifier {
     }
 
     lines.push("");
-    lines.push(`SL: ${this.config.stopLossPercent}% | TP: +${this.config.takeProfitPercent}% | Trail: +${this.config.trailingStopActivationPercent}% / -${this.config.trailingStopDrawdownPercent}%`);
-    lines.push("⚠️ NEEDS REVIEW adalah manual-only");
+    lines.push(`SL: ${this.config.stopLossPercent}% (OOR Below only) | TP: +${this.config.takeProfitPercent}% | Trail: +${this.config.trailingStopActivationPercent}% / -${this.config.trailingStopDrawdownPercent}%`);
     if (pageCount > 1) lines.push(`Page ${page + 1}/${pageCount} | ${active.length} posisi aktif`);
     return { text: lines.join("\n"), positions: active, page, pageCount };
   }
@@ -641,14 +640,14 @@ export class Notifier {
         : `${formatToken(valued.snapshot.feeQuoteUsdg, usdgDec, 4)} USDG`;
       const pnlText = `PnL ${formatBps(valued.snapshot.pnlBps)}%`;
       const trailingPeak = trailingPeakDisplay(position.metadata);
-      const range = await this.formatPositionRange(position, valued.range, t0, t1);
+      const range = await this.formatPositionRange(position, valued.range);
       return `${base} | 💰 ${cv} ${qtSymbol} | 🪙 ${feeDisplay} | 📊 ${pnlText}${trailingPeak}${range}\n`;
     } catch {
       return `${base}\n`;
     }
   }
 
-  private async formatPositionRange(position: PositionRecord, range: import("../types.js").PositionRangeInfo | undefined, token0Symbol: string, token1Symbol: string): Promise<string> {
+  private async formatPositionRange(position: PositionRecord, range: import("../types.js").PositionRangeInfo | undefined): Promise<string> {
     if (position.protocol === "v2") return "\n   Range: Full range (V2)";
     if (!range || !position.quoteToken) return "";
 
@@ -659,13 +658,11 @@ export class Notifier {
     ]);
     const lower = quotePriceScaled(sqrtRatioAtTick(range.tickLower), quoteIsToken0, token0Decimals, token1Decimals);
     const upper = quotePriceScaled(sqrtRatioAtTick(range.tickUpper), quoteIsToken0, token0Decimals, token1Decimals);
-    const current = quotePriceScaled(range.currentSqrtPrice, quoteIsToken0, token0Decimals, token1Decimals);
     const minimum = lower < upper ? lower : upper;
     const maximum = lower > upper ? lower : upper;
     const quoteSymbol = this.quoteSymbol(position.quoteToken);
-    const assetSymbol = quoteIsToken0 ? token1Symbol : token0Symbol;
     const status = quoteRangeStatus(range.status, quoteIsToken0, position.metadata);
-    return `\n   ${status} | Range: ${formatQuotePrice(minimum, quoteSymbol)} - ${formatQuotePrice(maximum, quoteSymbol)} ${quoteSymbol}/${assetSymbol} | Now: ${formatQuotePrice(current, quoteSymbol)}`;
+    return `\n   ${status} | ${formatQuotePrice(minimum, quoteSymbol)} - ${formatQuotePrice(maximum, quoteSymbol)} ${quoteSymbol}`;
   }
 
   private lastScanAt = 0;

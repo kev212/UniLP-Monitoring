@@ -326,6 +326,19 @@ export class Database {
     );
   }
 
+  async markNeedsReviewIfNoPendingSettlement(positionId: string, metadata: Record<string, unknown>): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE positions
+       SET status = 'needs_review', metadata = metadata || $2::jsonb, updated_at = NOW()
+       WHERE id = $1
+         AND status NOT IN ('closing', 'settled')
+         AND (NOT (metadata ? 'pendingSwap') OR metadata->'pendingSwap' = 'null'::jsonb)
+       RETURNING id`,
+      [positionId, JSON.stringify(metadata)],
+    );
+    return result.rowCount === 1;
+  }
+
   async setTrailingStopState(positionId: string, state: TrailingStopState): Promise<void> {
     await this.pool.query(
       `UPDATE positions
@@ -533,44 +546,27 @@ export class Database {
   }
 
   async finalizeCloseHistory(positionId: string, trigger: string): Promise<void> {
-    const existing = await this.pool.query("SELECT 1 FROM close_history WHERE position_id = $1", [positionId]);
-    if (existing.rowCount) return;
-
     const totals = await this.getCashflowTotals(positionId);
     if (totals.deposits === 0n) return;
 
     const pos = await this.pool.query<{
-      chain_id: number; protocol: Protocol; position_key: string;
+      chain_id: number; protocol: Protocol; position_key: string; status: PositionStatus;
       token0: string; token1: string; quote_token: string;
       metadata: Record<string, unknown>;
       opened_at_block: string | null;
     }>(
-      "SELECT chain_id, protocol, position_key, token0, token1, quote_token, metadata, opened_at_block FROM positions WHERE id = $1",
+      "SELECT chain_id, protocol, position_key, status, token0, token1, quote_token, metadata, opened_at_block FROM positions WHERE id = $1",
       [positionId],
     );
     if (!pos.rowCount) return;
     const row = pos.rows[0]!;
+    if (row.status !== "settled") return;
 
     const meta = row.metadata;
-    const totalReceivedStr = typeof meta.totalReceived === "string" ? meta.totalReceived : undefined;
-    const totalReceived = totalReceivedStr ? BigInt(totalReceivedStr) : 0n;
-    const closeTx = typeof meta.closeTransactionHash === "string" ? meta.closeTransactionHash : null;
-    const swapTx = typeof meta.swapTransactionHash === "string" ? meta.swapTransactionHash : null;
-
-    const exitSnapshot = meta.exitSnapshot;
-    const snapshot = exitSnapshot && typeof exitSnapshot === "object" && !Array.isArray(exitSnapshot)
-      ? exitSnapshot as Record<string, unknown>
-      : null;
-    const snapshotPnl = typeof snapshot?.pnlQuote === "string" ? BigInt(snapshot.pnlQuote) : null;
-    const snapshotBps = typeof snapshot?.pnlBps === "string" ? BigInt(snapshot.pnlBps) : null;
-
-    const hasTotalReceived = typeof meta.totalReceived === "string";
-    const finalPnl = hasTotalReceived
-      ? (totals.realized + totalReceived - totals.deposits)
-      : (snapshotPnl ?? (totals.realized + totalReceived - totals.deposits));
-    const finalPnlBps = hasTotalReceived
-      ? (totals.deposits > 0n ? (finalPnl * 10000n) / totals.deposits : 0n)
-      : (snapshotBps ?? (totals.deposits > 0n ? (finalPnl * 10000n) / totals.deposits : 0n));
+    if (typeof meta.totalReceived !== "string") return;
+    const totalReceived = BigInt(meta.totalReceived);
+    const finalPnl = totals.realized + totalReceived - totals.deposits;
+    const finalPnlBps = (finalPnl * 10000n) / totals.deposits;
 
     if (finalPnlBps < 0n ? -finalPnlBps < 50n : finalPnlBps < 50n) return;
 
@@ -588,6 +584,30 @@ export class Database {
     } else {
       finalPnlUsd = 0n;
     }
+
+    const attempts = await this.pool.query<{ stage: string; transaction_hash: string }>(
+      `SELECT DISTINCT ON (stage) stage, transaction_hash
+       FROM execution_attempts
+       WHERE position_id = $1 AND status = 'confirmed' AND transaction_hash IS NOT NULL
+         AND stage IN ('remove_liquidity', 'swap_to_quote')
+       ORDER BY stage, updated_at DESC`,
+      [positionId],
+    );
+    const closeTx = typeof meta.closeTransactionHash === "string"
+      ? meta.closeTransactionHash
+      : attempts.rows.find((attempt) => attempt.stage === "remove_liquidity")?.transaction_hash ?? null;
+    const swapTx = typeof meta.swapTransactionHash === "string"
+      ? meta.swapTransactionHash
+      : attempts.rows.find((attempt) => attempt.stage === "swap_to_quote")?.transaction_hash ?? null;
+
+    const updated = await this.pool.query(
+      `UPDATE close_history
+       SET final_pnl_bps = $2, final_pnl_quote = $3, final_pnl_usd = $4, trigger = $5,
+           close_transaction_hash = $6, swap_transaction_hash = $7, settled_at = NOW(), opened_at_block = $8
+       WHERE position_id = $1`,
+      [positionId, finalPnlBps.toString(), finalPnl.toString(), finalPnlUsd.toString(), trigger, closeTx, swapTx, row.opened_at_block],
+    );
+    if (updated.rowCount) return;
 
     await this.pool.query(
       `INSERT INTO close_history (position_id, chain_id, protocol, position_key, token0, token1, quote_token,
@@ -610,9 +630,9 @@ export class Database {
     }>(
       `SELECT h.id, h.chain_id, h.position_key, h.final_pnl_quote,
               h.quote_token,
-              NULLIF(p.metadata->>'closeTransactionHash', '') AS close_transaction_hash,
-              NULLIF(p.metadata->>'swapTransactionHash', '') AS swap_transaction_hash
-       FROM close_history h
+              COALESCE(NULLIF(p.metadata->>'closeTransactionHash', ''), h.close_transaction_hash) AS close_transaction_hash,
+              COALESCE(NULLIF(p.metadata->>'swapTransactionHash', ''), h.swap_transaction_hash) AS swap_transaction_hash
+        FROM close_history h
        JOIN positions p ON p.id = h.position_id
        WHERE h.final_pnl_usd = 0
          AND (h.quote_token = '0x0000000000000000000000000000000000000000'

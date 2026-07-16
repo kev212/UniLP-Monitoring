@@ -1,12 +1,14 @@
 import { zeroAddress, type Address, type Hex } from "viem";
 
 import { v2FactoryAbi, v2RouterAbi, v3FactoryAbi, v3QuoterAbi, v4QuoterAbi } from "../abi.js";
+import { log } from "../log.js";
 import type { ChainName, PositionRecord, QuoteToken } from "../types.js";
 import { applySlippage } from "./uniswap-math.js";
 import type { ChainClients } from "./chain-client.js";
 
 const V3_FEES = [100, 500, 3_000, 10_000] as const;
 const MAX_CONCURRENT_ROUTE_QUOTES = 4;
+const V4_QUOTE_ATTEMPTS = 3;
 
 export interface V4PoolKey {
   currency0: Address;
@@ -170,32 +172,37 @@ export class RoutePlanner {
 
     const { client, registry } = this.chains.getById(position.chainId);
     const poolKey: V4PoolKey = { currency0, currency1, fee, tickSpacing, hooks };
-    try {
-      const simulation = await client.simulateContract({
-        address: registry.contracts.v4.quoter,
-        abi: v4QuoterAbi,
-        functionName: "quoteExactInputSingle",
-        args: [{ poolKey, zeroForOne, exactAmount: amountIn, hookData: "0x" }],
-      });
-      const expectedOut = simulation.result[0];
-      if (expectedOut === 0n) return null;
-      return {
-        protocol: "v4",
-        pool: zeroAddress,
-        pools: [],
-        router: registry.contracts.v4.universalRouter,
-        tokenIn,
-        tokenOut,
-        path: [tokenIn, tokenOut],
-        amountIn,
-        expectedOut,
-        minimumOut: applySlippage(expectedOut, this.slippageBps),
-        fees: [fee],
-        v4PoolKey: poolKey,
-      };
-    } catch {
-      return null;
+    for (let attempt = 1; attempt <= V4_QUOTE_ATTEMPTS; attempt += 1) {
+      try {
+        const simulation = await client.simulateContract({
+          address: registry.contracts.v4.quoter,
+          abi: v4QuoterAbi,
+          functionName: "quoteExactInputSingle",
+          args: [{ poolKey, zeroForOne, exactAmount: amountIn, hookData: "0x" }],
+        });
+        const expectedOut = simulation.result[0];
+        if (expectedOut === 0n) return null;
+        return {
+          protocol: "v4",
+          pool: zeroAddress,
+          pools: [],
+          router: registry.contracts.v4.universalRouter,
+          tokenIn,
+          tokenOut,
+          path: [tokenIn, tokenOut],
+          amountIn,
+          expectedOut,
+          minimumOut: applySlippage(expectedOut, this.slippageBps),
+          fees: [fee],
+          v4PoolKey: poolKey,
+        };
+      } catch (error) {
+        if (attempt === V4_QUOTE_ATTEMPTS) {
+          log.warn({ err: error, positionId: position.id, tokenIn, tokenOut, attempts: attempt }, "V4 quote failed after retries");
+        }
+      }
     }
+    return null;
   }
 }
 

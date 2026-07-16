@@ -13,6 +13,7 @@ const config = {
   executorAddress: owner,
   executorPrivateKey: undefined,
   dryRun: true,
+  pnlIncludeGas: false,
   quoteTokens: { base: [], robinhood: [{ symbol: "USDG", address: usdg }] },
 } as RuntimeConfig;
 
@@ -57,5 +58,84 @@ describe("Executor pending settlement recovery", () => {
     expect(balance).toBe(123n);
     expect(client.getBalance).toHaveBeenCalledWith({ address: owner });
     expect(client.readContract).not.toHaveBeenCalled();
+  });
+
+  it("excludes confirmed gas from native ETH settlement PnL", async () => {
+    const database = { setPositionStatus: vi.fn() };
+    const client = { getBalance: vi.fn().mockResolvedValue(1_085n) };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const routes = { quoteDirect: vi.fn().mockResolvedValue(null) };
+    const executor = new Executor(database as never, chains as never, {} as never, routes as never, {} as never, config);
+    const position: PositionRecord = {
+      id: "position",
+      chainId: 4663,
+      protocol: "v4",
+      positionKey: "1",
+      owner,
+      poolAddress: null,
+      token0: zeroAddress,
+      token1: token,
+      quoteToken: zeroAddress,
+      status: "closing",
+      liquidity: null,
+      openedAtBlock: null,
+      metadata: { preCloseQuoteBalance: "1000", settlementGasWei: "15" },
+    };
+
+    await (executor as unknown as { saveSettlementBalance(value: PositionRecord): Promise<void> }).saveSettlementBalance(position);
+
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "settled", expect.objectContaining({ totalReceived: "100" }));
+  });
+
+  it("keeps native ETH gas in PnL when configured", async () => {
+    const database = { setPositionStatus: vi.fn() };
+    const client = { getBalance: vi.fn().mockResolvedValue(1_085n) };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const routes = { quoteDirect: vi.fn().mockResolvedValue(null) };
+    const executor = new Executor(database as never, chains as never, {} as never, routes as never, {} as never, { ...config, pnlIncludeGas: true });
+    const position: PositionRecord = {
+      id: "position",
+      chainId: 4663,
+      protocol: "v4",
+      positionKey: "1",
+      owner,
+      poolAddress: null,
+      token0: zeroAddress,
+      token1: token,
+      quoteToken: zeroAddress,
+      status: "closing",
+      liquidity: null,
+      openedAtBlock: null,
+      metadata: { preCloseQuoteBalance: "1000", settlementGasWei: "15" },
+    };
+
+    await (executor as unknown as { saveSettlementBalance(value: PositionRecord): Promise<void> }).saveSettlementBalance(position);
+
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "settled", expect.objectContaining({ totalReceived: "85" }));
+  });
+
+  it("persists each confirmed native settlement gas cost", async () => {
+    const database = { setPositionStatus: vi.fn() };
+    const executor = new Executor(database as never, {} as never, {} as never, {} as never, {} as never, config);
+    const position: PositionRecord = {
+      id: "position",
+      chainId: 4663,
+      protocol: "v4",
+      positionKey: "1",
+      owner,
+      poolAddress: null,
+      token0: zeroAddress,
+      token1: token,
+      quoteToken: zeroAddress,
+      status: "closing",
+      liquidity: null,
+      openedAtBlock: null,
+      metadata: { settlementGasWei: "15" },
+    };
+
+    await (executor as unknown as { recordNativeSettlementGas(value: PositionRecord, gasWei: bigint): Promise<void> }).recordNativeSettlementGas(position, 8n);
+
+    expect(position.metadata).toMatchObject({ settlementGasWei: "23" });
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "closing", { settlementGasWei: "23" });
   });
 });
