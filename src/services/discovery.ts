@@ -988,17 +988,27 @@ async function throttledGetLogs(
 
 async function getLogsWithRetry(client: PublicClient, params: Parameters<PublicClient["getLogs"]>[0]): Promise<Log[]> {
   let lastError: unknown;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
       return (await client.getLogs(params)) as Log[];
     } catch (error) {
       lastError = error;
-      const code = (error as { code?: number })?.code;
-      if (code !== 429) throw error;
+      if (!isTransientRpcError(error)) throw error;
       await sleep(500 * 2 ** attempt);
     }
   }
   throw lastError;
+}
+
+function isTransientRpcError(error: unknown): boolean {
+  const value = error as { code?: unknown; status?: unknown; message?: unknown; cause?: { code?: unknown; status?: unknown; message?: unknown } };
+  const code = value?.code ?? value?.cause?.code;
+  const status = value?.status ?? value?.cause?.status;
+  if (code === 429 || status === 429) return true;
+  if (typeof status === "number" && status >= 500) return true;
+  if (typeof code === "number" && [-32000, -32005, -32603].includes(code)) return true;
+  const message = `${value?.message ?? ""} ${value?.cause?.message ?? ""}`.toLowerCase();
+  return /timeout|timed out|fetch failed|network|socket|econnreset|econnrefused|rate limit|too many requests|service unavailable|gateway/.test(message);
 }
 
 function sleep(ms: number): Promise<void> {
