@@ -590,7 +590,7 @@ export class Executor {
     const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport });
     const hash = await wallet.sendTransaction({ to: plan.to, data: plan.data, value: plan.value ?? 0n });
     await this.database.recordExecution(position.id, stage, "submitted", hash);
-    const receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
+    const receipt = await waitForReceipt(client, hash, this.config.confirmations);
     if (receipt.status !== "success") throw new Error(`${stage} transaction reverted: ${hash}`);
     await this.database.recordExecution(position.id, stage, "confirmed", hash);
     await this.recordNativeSettlementGas(position, receipt.gasUsed * receipt.effectiveGasPrice);
@@ -709,6 +709,19 @@ function settlementGasWei(metadata: Record<string, unknown>): bigint {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function waitForReceipt(client: PublicClient, hash: Hex, confirmations: number) {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try {
+      return await client.waitForTransactionReceipt({ hash, confirmations });
+    } catch (error) {
+      lastError = error;
+      if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, 5_000));
+    }
+  }
+  throw lastError;
 }
 
 export function nextExitRetry(metadata: Record<string, unknown>, trigger?: ExitTrigger): Record<string, unknown> {
