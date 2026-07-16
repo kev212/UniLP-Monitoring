@@ -158,6 +158,27 @@ export class Executor {
 
     const actualBalance = await this.tokenBalance(position.chainId, pending.token);
     if (actualBalance < pending.amount) {
+      const submittedSwap = await this.database.getSubmittedSwapAttempt(position.id);
+      if (submittedSwap) {
+        try {
+          const { client } = this.chains.getById(position.chainId);
+          const receipt = await client.getTransactionReceipt({ hash: submittedSwap as Hex });
+          if (receipt && receipt.status === "success") {
+            await this.database.recordExecution(position.id, "swap_to_quote", "confirmed", submittedSwap);
+            log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "reconciled submitted swap receipt after restart");
+            await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null });
+            await this.saveSettlementBalance(position);
+            await this.notifier.settled(position);
+            this.finalizeCloseHistory(position);
+            return;
+          }
+        } catch {
+          // Receipt not yet available — keep position closing and retry later.
+        }
+        log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "swap was broadcast but receipt not yet confirmed; retrying");
+        return;
+      }
+
       const reason = actualBalance === 0n
         ? "pending swap token is no longer held — position externally settled"
         : `pending swap balance (${actualBalance}) is below expected (${pending.amount}) — externally settled`;

@@ -494,6 +494,14 @@ export class Database {
     );
   }
 
+  async getSubmittedSwapAttempt(positionId: string): Promise<string | null> {
+    const result = await this.pool.query<{ transaction_hash: string }>(
+      "SELECT transaction_hash FROM execution_attempts WHERE position_id = $1 AND stage = 'swap_to_quote' AND status = 'submitted' AND transaction_hash IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+      [positionId],
+    );
+    return result.rowCount ? result.rows[0]!.transaction_hash : null;
+  }
+
   async recordPoolObservation(chainId: number, protocol: Protocol, poolKey: string, priceMarker: bigint, blockNumber: bigint): Promise<void> {
     await this.pool.query(
       "INSERT INTO pool_observations (chain_id, protocol, pool_key, price_marker, block_number) VALUES ($1, $2, $3, $4, $5)",
