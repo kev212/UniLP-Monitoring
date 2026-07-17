@@ -326,7 +326,55 @@ export class DiscoveryService {
         historyTrusted: Boolean(existing?.historyTrusted || (args.from?.toLowerCase() === zeroAddress && args.to?.toLowerCase() === this.config.executorAddress.toLowerCase())),
       });
     }
+    const liquidityEvents = await this.discoverV4FromLiquidityEvents(name, fromBlock, toBlock);
+    for (const candidate of liquidityEvents) candidates.set(candidate.tokenId, candidate);
+
     await this.discoverV4Candidates(name, [...candidates.values()]);
+  }
+
+  private async discoverV4FromLiquidityEvents(name: ChainName, fromBlock: bigint, toBlock: bigint): Promise<NftActivity[]> {
+    const { client, registry } = this.chains.get(name);
+    const candidates: NftActivity[] = [];
+    try {
+      const events = await this.getLogsChunked(name, {
+        address: registry.contracts.v4.poolManager,
+        event: v4PoolManagerModifyLiquidityEvent,
+        args: { sender: registry.contracts.v4.positionManager },
+        fromBlock,
+        toBlock,
+      });
+      const known = new Map<string, boolean>();
+      for (const event of events) {
+        const args = logArgs<{ salt?: Hex; liquidityDelta?: bigint }>(event);
+        if (!args.salt || !args.liquidityDelta || args.liquidityDelta <= 0n || !event.transactionHash || !event.blockNumber) continue;
+        const saltHex = args.salt.toLowerCase() as Hex;
+        if (known.has(saltHex)) continue;
+        known.set(saltHex, true);
+        try {
+          const owner = await client.readContract({
+            address: registry.contracts.v4.positionManager,
+            abi: v4PositionManagerAbi,
+            functionName: "ownerOf",
+            args: [BigInt(args.salt)],
+          });
+          if (owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) continue;
+          const existing = await this.database.findPositionByKey(registry.chain.id, "v4", BigInt(args.salt).toString());
+          if (existing) continue;
+          candidates.push({
+            asset: registry.contracts.v4.positionManager,
+            transactionHash: event.transactionHash,
+            blockNumber: event.blockNumber,
+            tokenId: BigInt(args.salt),
+            historyTrusted: true,
+          });
+        } catch {
+          // NOT_MINTED or other error — skip this salt.
+        }
+      }
+    } catch (error) {
+      log.warn({ err: error, chain: name }, "could not discover V4 positions from liquidity events");
+    }
+    return candidates;
   }
 
   async discoverV4Candidates(name: ChainName, candidates: NftActivity[]): Promise<PositionRecord[]> {
