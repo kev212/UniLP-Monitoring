@@ -283,9 +283,11 @@ export class Executor {
       const { registry } = this.chains.getById(chainId);
       const stable = this.config.quoteTokens[registry.name]?.[0];
       if (!stable) return 0n;
+      const weth = this.config.quoteTokens[registry.name]?.find(q => q.symbol === "WETH" || q.symbol === "ETH");
+      const tokenIn = weth ? weth.address : zeroAddress;
       const route = await this.routes.quoteDirect(
         { chainId } as PositionRecord,
-        registry.chain.nativeCurrency.symbol === "ETH" ? zeroAddress : stable.address,
+        tokenIn,
         10n ** 18n,
         stable.address,
       );
