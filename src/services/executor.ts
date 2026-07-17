@@ -265,8 +265,10 @@ export class Executor {
         totalReceived = BigInt(fromCloseStr) + swapExpectedOut;
       }
       const qtLower = position.quoteToken.toLowerCase();
-      const isEth = qtLower === zeroAddress || qtLower === "0x0bd7d308f8e1639fab988df18a8011f41eacad73"; // WETH Robinhood
-      const settlementUsd = isEth ? await this.computeEthUsd(position.chainId, totalReceived, position.quoteToken) : totalReceived;
+      const { registry } = this.chains.getById(position.chainId);
+      const weth = this.config.quoteTokens[registry.name]?.find(q => q.symbol === "WETH" || q.symbol === "ETH");
+      const isEth = qtLower === zeroAddress || (weth ? qtLower === weth.address.toLowerCase() : false);
+      const settlementUsd = isEth ? await this.computeEthUsd(position.chainId, totalReceived) : totalReceived;
       await this.database.setPositionStatus(position.id, "settled", {
         totalReceived: totalReceived.toString(),
         settlementUsd: settlementUsd.toString(),
@@ -276,16 +278,16 @@ export class Executor {
     }
   }
 
-  private async computeEthUsd(chainId: number, ethWei: bigint, quoteToken: Address): Promise<bigint> {
+  private async computeEthUsd(chainId: number, ethWei: bigint): Promise<bigint> {
     try {
       const { registry } = this.chains.getById(chainId);
-      const usdg = this.config.quoteTokens[registry.name]?.find(q => q.symbol === "USDG");
-      if (!usdg) return 0n;
+      const stable = this.config.quoteTokens[registry.name]?.[0];
+      if (!stable) return 0n;
       const route = await this.routes.quoteDirect(
         { chainId } as PositionRecord,
-        quoteToken,
-        10n ** 18n, // 1 unit
-        usdg.address,
+        registry.chain.nativeCurrency.symbol === "ETH" ? zeroAddress : stable.address,
+        10n ** 18n,
+        stable.address,
       );
       if (!route) return 0n;
       return (ethWei * route.expectedOut) / (10n ** 18n);
@@ -676,16 +678,17 @@ export class Executor {
         const blockNum = receipt.blockNumber;
         const block = await client.getBlock({ blockNumber: blockNum });
         const wethAddr = (item.isNativeQuote
-          ? "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
-          : item.quoteToken) as Address; // WETH Robinhood
-        const usdgAddr = "0x5fc5360d0400a0fd4f2af552add042d716f1d168" as Address;
+          ? (this.config.quoteTokens[registry.name]?.find(q => q.symbol === "WETH" || q.symbol === "ETH")?.address ?? item.quoteToken)
+          : item.quoteToken) as Address;
+        const stableAddr = (this.config.quoteTokens[registry.name]?.[0]?.address) as Address;
+        if (!stableAddr) continue;
         let pool: Address | null = null;
         for (const fee of [100, 500, 3000, 10000] as const) {
           pool = await client.readContract({
             address: registry.contracts.v3.factory,
             abi: v3FactoryAbi,
             functionName: "getPool",
-            args: [wethAddr, usdgAddr, fee],
+            args: [wethAddr, stableAddr, fee],
           }) as Address;
           if (pool && pool !== zeroAddress) break;
         }

@@ -770,10 +770,11 @@ export class Database {
               COALESCE(NULLIF(p.metadata->>'swapTransactionHash', ''), h.swap_transaction_hash) AS swap_transaction_hash
         FROM close_history h
        JOIN positions p ON p.id = h.position_id
-       WHERE h.final_pnl_usd = 0
-         AND (h.quote_token = '0x0000000000000000000000000000000000000000'
-              OR h.quote_token = '0x0bd7d308f8e1639fab988df18a8011f41eacad73')
-       ORDER BY h.settled_at DESC
+        WHERE h.final_pnl_usd = 0
+          AND (h.quote_token = '0x0000000000000000000000000000000000000000'
+               OR h.quote_token = '0x0bd7d308f8e1639fab988df18a8011f41eacad73'
+               OR h.quote_token = '0x4200000000000000000000000000000000000006')
+        ORDER BY h.settled_at DESC
        LIMIT 50`,
     );
     return result.rows.map(row => ({

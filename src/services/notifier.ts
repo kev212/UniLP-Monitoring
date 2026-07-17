@@ -181,9 +181,11 @@ export class Notifier {
     const qtSymbol = this.quoteSymbol(position.quoteToken);
     const qtDec = await this.decimals(position.quoteToken, position.chainId);
     const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
-    const usdg = this.config.quoteTokens.robinhood[0]?.address;
-    const usdgDec = usdg ? 6 : 0;
-    const usdgSymbol = usdg ? "USDG" : "??";
+    const stableToken = this.config.chains
+      .map((name) => this.config.quoteTokens[name]?.[0])
+      .find((q) => q !== undefined);
+    const stableDec = stableToken ? await this.decimals(stableToken.address, position.chainId) : 0;
+    const stableSymbol = stableToken?.symbol ?? "??";
     const feeParts: string[] = [formatToken(snapshot.feeQuote, qtDec, 2)];
     if (snapshot.feeNonQuote) {
       const nqSymbol = await this.tokenLabel(snapshot.feeNonQuote.token, position.chainId);
@@ -191,8 +193,8 @@ export class Notifier {
       feeParts.push(`+ ${nqAmount} ${nqSymbol}`);
     }
     const feeDisplay = snapshot.feeNonQuote
-      ? `${feeParts.join(" ")} (≈ ${formatToken(snapshot.feeQuoteUsdg, usdgDec, 4)} ${usdgSymbol})`
-      : `${formatToken(snapshot.feeQuoteUsdg, usdgDec, 4)} ${usdgSymbol}`;
+      ? `${feeParts.join(" ")} (≈ ${formatToken(snapshot.feeQuoteUsdg, stableDec, 4)} ${stableSymbol})`
+      : `${formatToken(snapshot.feeQuoteUsdg, stableDec, 4)} ${stableSymbol}`;
     log.info({ Pool: `${position.positionKey} ${pair} | CV: ${formatToken(snapshot.liquidationQuote, qtDec, 2)} ${qtSymbol} | Fees: ${feeDisplay} | PnL: ${formatBps(snapshot.pnlBps)}%` });
   }
 
