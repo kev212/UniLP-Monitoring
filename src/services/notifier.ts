@@ -183,7 +183,7 @@ export class Notifier {
     const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
     const chainName = this.chains.getById(position.chainId).registry.name;
     const stableToken = this.config.quoteTokens[chainName]?.[0];
-    const stableDec = stableToken ? await this.decimals(stableToken.address, position.chainId) : 0;
+    const stableDec = stableToken ? (stableToken.symbol === "USDC" || stableToken.symbol === "USDG" ? 6 : 18) : 0;
     const stableSymbol = stableToken?.symbol ?? "??";
     const feeParts: string[] = [formatToken(snapshot.feeQuote, qtDec, 2)];
     if (snapshot.feeNonQuote) {
