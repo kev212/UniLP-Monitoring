@@ -62,6 +62,7 @@ export class Notifier {
   private poolScanRunning = false;
   private tokenScanRunning = false;
   private deletionTimer: ReturnType<typeof setInterval> | null = null;
+  private botReady = false;
 
   constructor(
     private readonly config: RuntimeConfig,
@@ -261,14 +262,16 @@ export class Notifier {
     if (!this.bot) return;
     if (this.database) {
       this.startDeletionWorker();
-      void this.runDeletionPass().catch(() => {});
     }
     log.info("Telegram bot polling started");
     await this.bot.start();
+    this.botReady = true;
+    if (this.database) void this.runDeletionPass().catch(() => {});
   }
 
   async stopBot(): Promise<void> {
     if (!this.bot) return;
+    this.botReady = false;
     if (this.deletionTimer !== null) clearInterval(this.deletionTimer);
     await this.bot.stop();
   }
@@ -280,7 +283,7 @@ export class Notifier {
   }
 
   private async runDeletionPass(): Promise<void> {
-    if (!this.bot || !this.database) return;
+    if (!this.bot || !this.database || !this.botReady) return;
     const items = await this.database.fetchDueDeletions();
     for (const item of items) {
       try {
