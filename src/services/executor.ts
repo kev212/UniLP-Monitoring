@@ -270,7 +270,7 @@ export class Executor {
       }
       const qtLower = position.quoteToken.toLowerCase();
       const { registry } = this.chains.getById(position.chainId);
-      const weth = this.config.quoteTokens[registry.name]?.find(q => q.symbol === "WETH" || q.symbol === "ETH");
+      const weth = this.config.quoteTokens[registry.name]?.find(q => q.symbol === "WETH") ?? this.config.quoteTokens[registry.name]?.find(q => q.symbol === "ETH");
       const isEth = qtLower === zeroAddress || (weth ? qtLower === weth.address.toLowerCase() : false);
       const settlementUsd = isEth ? await this.computeEthUsd(position.chainId, totalReceived) : totalReceived;
       await this.database.setPositionStatus(position.id, "settled", {
@@ -287,7 +287,7 @@ export class Executor {
       const { registry } = this.chains.getById(chainId);
       const stable = this.config.quoteTokens[registry.name]?.[0];
       if (!stable) return 0n;
-      const weth = this.config.quoteTokens[registry.name]?.find(q => q.symbol === "WETH" || q.symbol === "ETH");
+      const weth = this.config.quoteTokens[registry.name]?.find(q => q.symbol === "WETH") ?? this.config.quoteTokens[registry.name]?.find(q => q.symbol === "ETH");
       const tokenIn = weth ? weth.address : zeroAddress;
       const route = await this.routes.quoteDirect(
         { chainId } as PositionRecord,
