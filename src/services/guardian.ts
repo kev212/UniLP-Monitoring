@@ -15,6 +15,7 @@ export class Guardian {
   private exitQueue: Promise<void> = Promise.resolve();
   private readonly queuedExitPositions = new Set<string>();
   private monitorRunning = false;
+  private readonly chainMonitorRunning = new Set<string>();
   private discoveryRunning = false;
 
   constructor(
@@ -41,12 +42,16 @@ export class Guardian {
 
   async runOnce(): Promise<void> {
     await this.runDiscoveryOnce();
-    await this.runMonitorOnce();
+    await Promise.all(this.config.chains.map((name) => this.runChainMonitorOnce(name)));
   }
 
   async runForever(): Promise<void> {
+    const monitorLoops = this.config.chains.map((name: ChainName) => {
+      const interval = this.config.chainMonitorIntervalMs[name] ?? this.config.positionMonitorIntervalMs;
+      return this.runLoop(() => this.runChainMonitorOnce(name), interval);
+    });
     await Promise.all([
-      this.runLoop(() => this.runMonitorOnce(), this.config.positionMonitorIntervalMs),
+      ...monitorLoops,
       this.runLoop(() => this.runDiscoveryOnce(), this.config.discoveryIntervalMs),
     ]);
   }
@@ -69,20 +74,21 @@ export class Guardian {
     }
   }
 
-  private async runMonitorOnce(): Promise<void> {
-    if (this.monitorRunning) return;
-    this.monitorRunning = true;
+  private async runChainMonitorOnce(name: ChainName): Promise<void> {
+    if (this.chainMonitorRunning.has(name)) return;
+    this.chainMonitorRunning.add(name);
     try {
-      await Promise.all(this.config.chains.map(async (name) => {
-        try {
-          await this.evaluateChain(name);
-        } catch (error) {
-          log.error({ err: error, chain: name }, "monitor cycle failed");
-        }
-      }));
-      await this.resumeClosingPositions();
+      try {
+        await this.evaluateChain(name);
+      } catch (error) {
+        log.error({ err: error, chain: name }, "monitor cycle failed");
+      }
+      if (!this.monitorRunning) {
+        this.monitorRunning = true;
+        try { await this.resumeClosingPositions(); } finally { this.monitorRunning = false; }
+      }
     } finally {
-      this.monitorRunning = false;
+      this.chainMonitorRunning.delete(name);
     }
   }
 

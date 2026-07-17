@@ -27,6 +27,8 @@ const envSchema = z.object({
   TRAILING_STOP_ACTIVATION_PERCENT: z.coerce.number().positive().default(5),
   TRAILING_STOP_DRAWDOWN_PERCENT: z.coerce.number().positive().default(1.5),
   POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).default(5_000),
+  BASE_POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).optional(),
+  ROBINHOOD_POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).optional(),
   DISCOVERY_INTERVAL_MS: z.coerce.number().int().min(5_000).max(300_000).default(30_000),
   POSITION_MONITOR_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(2),
   MAX_SWAP_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(100),
@@ -76,6 +78,7 @@ export interface RuntimeConfig {
   trailingStopDrawdownPercent: number;
   positionMonitorIntervalMs: number;
   discoveryIntervalMs: number;
+  chainMonitorIntervalMs: Partial<Record<ChainName, number>>;
   positionMonitorConcurrency: number;
   maxSwapSlippageBps: number;
   maxTwapDeviationBps: number;
@@ -203,6 +206,10 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     trailingStopDrawdownPercent: env.TRAILING_STOP_DRAWDOWN_PERCENT,
     positionMonitorIntervalMs: env.POSITION_MONITOR_INTERVAL_MS,
     discoveryIntervalMs: env.DISCOVERY_INTERVAL_MS,
+    chainMonitorIntervalMs: {
+      ...(env.BASE_POSITION_MONITOR_INTERVAL_MS !== undefined ? { base: env.BASE_POSITION_MONITOR_INTERVAL_MS } : {}),
+      ...(env.ROBINHOOD_POSITION_MONITOR_INTERVAL_MS !== undefined ? { robinhood: env.ROBINHOOD_POSITION_MONITOR_INTERVAL_MS } : {}),
+    },
     positionMonitorConcurrency: env.POSITION_MONITOR_CONCURRENCY,
     maxSwapSlippageBps: env.MAX_SWAP_SLIPPAGE_BPS,
     maxTwapDeviationBps: env.MAX_TWAP_DEVIATION_BPS,
