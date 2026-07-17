@@ -236,7 +236,7 @@ export class Database {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        ON CONFLICT (chain_id, protocol, position_key) DO UPDATE SET
          owner = EXCLUDED.owner, pool_address = EXCLUDED.pool_address, token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
-         quote_token = EXCLUDED.quote_token, status = CASE WHEN positions.status IN ('closing', 'settled') THEN positions.status ELSE EXCLUDED.status END,
+          quote_token = EXCLUDED.quote_token, status = CASE WHEN positions.status IN ('closing', 'settled', 'armed') THEN positions.status ELSE EXCLUDED.status END,
          liquidity = EXCLUDED.liquidity, opened_at_block = COALESCE(positions.opened_at_block, EXCLUDED.opened_at_block),
          metadata = positions.metadata || EXCLUDED.metadata, updated_at = NOW()
        RETURNING *`,
