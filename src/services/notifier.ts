@@ -181,9 +181,8 @@ export class Notifier {
     const qtSymbol = this.quoteSymbol(position.quoteToken);
     const qtDec = await this.decimals(position.quoteToken, position.chainId);
     const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
-    const stableToken = this.config.chains
-      .map((name) => this.config.quoteTokens[name]?.[0])
-      .find((q) => q !== undefined);
+    const chainName = this.chains.getById(position.chainId).registry.name;
+    const stableToken = this.config.quoteTokens[chainName]?.[0];
     const stableDec = stableToken ? await this.decimals(stableToken.address, position.chainId) : 0;
     const stableSymbol = stableToken?.symbol ?? "??";
     const feeParts: string[] = [formatToken(snapshot.feeQuote, qtDec, 2)];
