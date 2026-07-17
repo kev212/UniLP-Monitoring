@@ -260,6 +260,7 @@ export class Guardian {
           log.info({ positionId: position.id, positionKey: position.positionKey }, "recovered verified settlement after on-chain liquidity reached zero");
           return true;
         }
+        if (await this.executor.autoSettleZeroLiquidityV4(name, position)) return true;
         const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(position.id, { reason: "on_chain_liquidity_zero_unverified" });
         if (!reviewed) {
           log.info({ positionId: position.id, positionKey: position.positionKey, reason: message }, "V4 liquidity is gone but settlement remains pending");

@@ -7,6 +7,7 @@ import {
   encodeFunctionData,
   http,
   isAddress,
+  keccak256,
   zeroAddress,
   type Address,
   type Hex,
@@ -21,7 +22,9 @@ import {
   v3PoolAbi,
   v3PositionManagerAbi,
   v3SwapRouterAbi,
+  v4PoolManagerModifyLiquidityEvent,
   v4PositionManagerAbi,
+  v4StateViewAbi,
   v4UniversalRouterAbi,
 } from "../abi.js";
 import type { RuntimeConfig } from "../config.js";
@@ -34,6 +37,7 @@ import type { PositionReader } from "./position-reader.js";
 import type { RoutePlanner, SwapRoute } from "./route-planner.js";
 import type { UniswapTradingApi } from "./uniswap-trading-api.js";
 import { hasPendingSettlement } from "./pending-settlement.js";
+import { receiptTokenTransfers } from "./discovery.js";
 
 interface PendingSwap {
   token: Address;
@@ -711,6 +715,80 @@ export class Executor {
         log.warn({ err, positionKey: item.positionKey }, "failed to backfill close-history USD");
       }
     }
+  }
+
+  async autoSettleZeroLiquidityV4(name: string, position: PositionRecord): Promise<boolean> {
+    if (position.protocol !== "v4" || !position.quoteToken) return false;
+    const metadata = position.metadata as Record<string, unknown>;
+    const salt = metadata.salt as Hex | undefined;
+    if (!salt) return false;
+    const { client, registry } = this.chains.getById(position.chainId);
+    try {
+      const events = await client.getLogs({
+        address: registry.contracts.v4.poolManager,
+        event: v4PoolManagerModifyLiquidityEvent,
+        args: { sender: registry.contracts.v4.positionManager },
+        fromBlock: position.openedAtBlock ?? 0n,
+        toBlock: "latest" as never,
+      });
+      let withdrawalEvent: (typeof events)[number] | null = null;
+      for (const event of events) {
+        const args = (event as unknown as { args: { salt?: Hex; liquidityDelta?: bigint } }).args;
+        if (args.salt?.toLowerCase() === salt.toLowerCase() && (args.liquidityDelta ?? 0n) < 0n) {
+          withdrawalEvent = event;
+          break;
+        }
+      }
+      if (!withdrawalEvent || !withdrawalEvent.transactionHash || !withdrawalEvent.blockNumber) return false;
+      const receipt = await client.getTransactionReceipt({ hash: withdrawalEvent.transactionHash });
+      if (!receipt) return false;
+      const amounts = receiptTokenTransfers(receipt.logs, position.token0, position.token1, position.owner, registry.contracts.v4.poolManager);
+      const quoteValue = await this.quoteV4AmountsAtBlock(position, amounts.outOfPool0, amounts.outOfPool1, withdrawalEvent.blockNumber);
+      if (quoteValue > 0n) {
+        await this.database.addCashflow(position.id, withdrawalEvent.blockNumber, withdrawalEvent.transactionHash, "withdrawal", quoteValue, {
+          protocol: "v4", token0Amount: amounts.outOfPool0.toString(), token1Amount: amounts.outOfPool1.toString(), source: "auto_settle",
+        });
+      }
+      await this.database.setPositionStatus(position.id, "settled", {
+        totalReceived: quoteValue.toString(),
+        reason: "auto_settle_zero_liquidity",
+      });
+      this.finalizeCloseHistory({ ...position, status: "settled", metadata: { ...position.metadata, totalReceived: quoteValue.toString() } });
+      log.info({ positionId: position.id, positionKey: position.positionKey, quoteValue: quoteValue.toString() }, "auto-settled zero-liquidity V4 position");
+      await this.notifier.settled(position);
+      return true;
+    } catch (error) {
+      log.warn({ err: error, positionId: position.id }, "auto-settle zero liquidity failed");
+      return false;
+    }
+  }
+
+  private async quoteV4AmountsAtBlock(position: PositionRecord, amount0: bigint, amount1: bigint, blockNumber: bigint): Promise<bigint> {
+    if (!position.quoteToken) return 0n;
+    const { client, registry } = this.chains.getById(position.chainId);
+    const metadata = position.metadata as Record<string, unknown>;
+    const currency0 = metadata.currency0 as Address;
+    const currency1 = metadata.currency1 as Address;
+    const fee = metadata.fee as number;
+    const tickSpacing = metadata.tickSpacing as number;
+    const hooks = metadata.hooks as Address;
+    if (!currency0 || !currency1 || fee === undefined || tickSpacing === undefined || !hooks) return 0n;
+    const poolId = keccak256(encodeAbiParameters(
+      [{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }],
+      [currency0, currency1, fee, tickSpacing, hooks],
+    ));
+    const slot0 = await client.readContract({
+      address: registry.contracts.v4.stateView,
+      abi: v4StateViewAbi,
+      functionName: "getSlot0",
+      args: [poolId],
+      blockNumber,
+    });
+    const square = slot0[0] * slot0[0];
+    const q192 = 1n << 192n;
+    return position.quoteToken.toLowerCase() === position.token0.toLowerCase()
+      ? amount0 + ((amount1 * q192) / square)
+      : amount1 + ((amount0 * square) / q192);
   }
 }
 

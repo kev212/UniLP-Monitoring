@@ -998,7 +998,7 @@ function tryDecodeV4Modification(logEntry: { data: Hex; topics: readonly Hex[] }
   }
 }
 
-function receiptTokenTransfers(logs: readonly { address: Address; data: Hex; topics: readonly Hex[] }[], token0: Address, token1: Address, owner: Address, poolManager: Address): {
+export function receiptTokenTransfers(logs: readonly { address: Address; data: Hex; topics: readonly Hex[] }[], token0: Address, token1: Address, owner: Address, poolManager: Address): {
   intoPool0: bigint;
   intoPool1: bigint;
   outOfPool0: bigint;
