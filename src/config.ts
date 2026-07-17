@@ -14,8 +14,10 @@ const envSchema = z.object({
   EXECUTOR_PRIVATE_KEY: z.string().optional(),
   BASE_RPC_HTTP: z.string().url(),
   BASE_RPC_WSS: z.string().url().optional().or(z.literal("")),
+  BASE_RPC_HTTP_FALLBACK: z.string().url().optional().or(z.literal("")),
   ROBINHOOD_RPC_HTTP: z.string().url(),
   ROBINHOOD_RPC_WSS: z.string().url().optional().or(z.literal("")),
+  ROBINHOOD_RPC_HTTP_FALLBACK: z.string().url().optional().or(z.literal("")),
   ALCHEMY_BASE_HTTP: z.string().url().optional().or(z.literal("")),
   ALCHEMY_ROBINHOOD_HTTP: z.string().url().optional().or(z.literal("")),
   QUOTE_TOKEN_ALLOWLIST_BASE: z.string().default(""),
@@ -65,6 +67,7 @@ export interface RuntimeConfig {
   executorPrivateKey?: Hex;
   rpcHttp: Record<ChainName, string>;
   rpcWss: Partial<Record<ChainName, string>>;
+  rpcHttpFallback: Partial<Record<ChainName, string>>;
   alchemyHttp: Partial<Record<ChainName, string>>;
   quoteTokens: Record<ChainName, QuoteToken[]>;
   stopLossPercent: number;
@@ -181,6 +184,10 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     rpcWss: {
       ...(env.BASE_RPC_WSS ? { base: env.BASE_RPC_WSS } : {}),
       ...(env.ROBINHOOD_RPC_WSS ? { robinhood: env.ROBINHOOD_RPC_WSS } : {}),
+    },
+    rpcHttpFallback: {
+      ...(env.BASE_RPC_HTTP_FALLBACK ? { base: env.BASE_RPC_HTTP_FALLBACK } : {}),
+      ...(env.ROBINHOOD_RPC_HTTP_FALLBACK ? { robinhood: env.ROBINHOOD_RPC_HTTP_FALLBACK } : {}),
     },
     alchemyHttp: {
       ...(alchemyBase ? { base: alchemyBase } : {}),

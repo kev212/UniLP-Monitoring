@@ -1,4 +1,4 @@
-import { createPublicClient, http, webSocket, type Address, type PublicClient } from "viem";
+import { createPublicClient, fallback, http, webSocket, type Address, type PublicClient } from "viem";
 
 import { chainRegistry, type ChainRegistry } from "../chains.js";
 import type { RuntimeConfig } from "../config.js";
@@ -17,13 +17,18 @@ export class ChainClients {
     for (const name of config.chains) {
       const registry = chainRegistry[name];
       const wsUrl = config.rpcWss[name];
+      const primary = config.rpcHttp[name];
+      const fallbackUrl = config.rpcHttpFallback[name];
+      const fallbackUrls = fallbackUrl ? [fallbackUrl] : [];
       this.clients.set(name, {
         registry,
         client: createPublicClient({
           chain: registry.chain,
           transport: wsUrl
             ? webSocket(wsUrl, { retryCount: 3, retryDelay: 250, timeout: 20_000 })
-            : http(config.rpcHttp[name], { retryCount: 3, timeout: 20_000 }),
+            : fallbackUrls.length > 0
+              ? fallback([http(primary, { retryCount: 3, timeout: 20_000 }), http(fallbackUrl, { retryCount: 3, timeout: 20_000 })], { retryCount: 1 })
+              : http(primary, { retryCount: 3, timeout: 20_000 }),
           pollingInterval: 4_000,
         }),
       });
