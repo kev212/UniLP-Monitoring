@@ -154,6 +154,15 @@ export class Guardian {
           log.warn({ err: error, positionId: position.id }, "V4 opening cashflow retry failed");
         }
       }
+      if (position.protocol === "v3" && position.status === "syncing") {
+        try {
+          const totals = await this.database.getCashflowTotals(position.id);
+          const force = totals.deposits === 0n;
+          await this.discovery.retryHydrateV3OpeningCashflow(name, position, force);
+        } catch (error) {
+          log.warn({ err: error, positionId: position.id }, "V3 opening cashflow retry failed");
+        }
+      }
       const valued = await this.pnl.value(position, blockNumber);
       log.debug({ positionId: position.id, positionKey: position.positionKey, valuationMs: Date.now() - startedAt }, "position valued");
       await this.database.addPnlSnapshot(valued.snapshot);

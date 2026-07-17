@@ -562,6 +562,38 @@ export class DiscoveryService {
     await this.hydrateV4OpeningCashflow(name, position);
   }
 
+  async retryHydrateV3OpeningCashflow(name: ChainName, position: PositionRecord, force = false): Promise<void> {
+    if (!force && (position.metadata as Record<string, unknown>).openingCashflowHydrated === true) return;
+    if (!position.quoteToken || position.openedAtBlock === null) return;
+    const { registry } = this.chains.get(name);
+    const tokenId = BigInt(position.positionKey);
+    try {
+      const events = await this.getLogsChunked(name, {
+        address: registry.contracts.v3.positionManager,
+        event: v3IncreaseLiquidityEvent,
+        args: { tokenId },
+        fromBlock: position.openedAtBlock,
+        toBlock: position.openedAtBlock,
+      });
+      for (const event of events) {
+        if (!event.transactionHash || !event.blockNumber) continue;
+        const args = logArgs<{ amount0?: bigint; amount1?: bigint }>(event);
+        if (args.amount0 === undefined || args.amount1 === undefined) continue;
+        const quoteValue = await this.quoteV3AmountsAtBlock(position, args.amount0, args.amount1, event.blockNumber);
+        if (quoteValue > 0n) {
+          await this.database.addCashflow(position.id, event.blockNumber, event.transactionHash, "deposit", quoteValue, {
+            protocol: "v3",
+            token0Amount: args.amount0.toString(),
+            token1Amount: args.amount1.toString(),
+          });
+        }
+      }
+      await this.database.setPositionStatus(position.id, position.status, { openingCashflowHydrated: true });
+    } catch (error) {
+      log.warn({ err: error, positionId: position.id }, "V3 opening cashflow retry failed");
+    }
+  }
+
   private async hydrateV4OpeningCashflow(name: ChainName, position: PositionRecord): Promise<void> {
     if (!position.quoteToken || position.openedAtBlock === null) return;
     const metadata = position.metadata as Record<string, unknown>;
