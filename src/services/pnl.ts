@@ -1,5 +1,6 @@
 import type { Address } from "viem";
 
+import { chainRegistry } from "../chains.js";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
@@ -72,7 +73,7 @@ export class PnlService {
     if (totals.deposits === 0n) throw new Error("Position cost basis has not been reconstructed");
 
     let feeQuoteUsdg = feeQuote;
-    const chainName = this.config.chains[0];
+    const chainName = this.config.chains.find((name) => chainRegistry[name].chain.id === position.chainId);
     if (chainName) {
       const stable = this.config.quoteTokens[chainName]?.[0]?.address;
       if (stable && position.quoteToken.toLowerCase() !== stable.toLowerCase() && feeQuote > 0n) {
