@@ -751,8 +751,10 @@ export class Executor {
       }
       await this.database.setPositionStatus(position.id, "settled", {
         totalReceived: quoteValue.toString(),
+        closeTransactionHash: withdrawalEvent.transactionHash,
         reason: "auto_settle_zero_liquidity",
       });
+      await this.database.recordExecution(position.id, "remove_liquidity", "confirmed", withdrawalEvent.transactionHash);
       this.finalizeCloseHistory({ ...position, status: "settled", metadata: { ...position.metadata, totalReceived: quoteValue.toString() } });
       log.info({ positionId: position.id, positionKey: position.positionKey, quoteValue: quoteValue.toString() }, "auto-settled zero-liquidity V4 position");
       await this.notifier.settled(position);
