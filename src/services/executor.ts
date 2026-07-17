@@ -38,6 +38,7 @@ import type { RoutePlanner, SwapRoute } from "./route-planner.js";
 import type { UniswapTradingApi } from "./uniswap-trading-api.js";
 import { hasPendingSettlement } from "./pending-settlement.js";
 import { receiptTokenTransfers } from "./discovery.js";
+import { applySlippage } from "./uniswap-math.js";
 
 interface PendingSwap {
   token: Address;
@@ -193,8 +194,11 @@ export class Executor {
       return;
     }
 
+    const retryCount = swapRetryCount(position.metadata);
+    const effectiveSlippageBps = Math.min(500, 100 * (1 + retryCount));
+
     try {
-      const apiResult = await this.tradingApiSwapPlan(position, pending.token, actualBalance, quoteToken);
+      const apiResult = retryCount >= 2 ? undefined : await this.tradingApiSwapPlan(position, pending.token, actualBalance, quoteToken);
       if (apiResult === null) return;
       if (apiResult) {
         const { plan, expectedOut } = apiResult;
@@ -212,7 +216,10 @@ export class Executor {
 
       const route = await this.routes.quoteDirect(position, pending.token, actualBalance, quoteToken);
       if (!route) throw new Error("No safe route remains for post-close settlement");
-      log.info({ positionKey: position.positionKey, protocol: route.protocol, path: route.path, expectedOut: route.expectedOut.toString(), minimumOut: route.minimumOut.toString() }, "local swap route selected");
+      const plan = retryCount > 0
+        ? { ...route, minimumOut: applySlippage(route.expectedOut, effectiveSlippageBps) }
+        : route;
+      log.info({ positionKey: position.positionKey, protocol: route.protocol, path: route.path, expectedOut: route.expectedOut.toString(), minimumOut: plan.minimumOut.toString(), slippageBps: effectiveSlippageBps }, "local swap route selected");
       if (route.protocol === "v4") {
         const { registry } = this.chains.getById(position.chainId);
         const tokenApprovalChanged = await this.ensureExactApproval(position, pending.token, registry.contracts.v4.permit2, actualBalance, "approve_permit2");
@@ -232,13 +239,13 @@ export class Executor {
           return;
         }
       }
-      const hash = await this.send(position, "swap_to_quote", this.swapPlan(position, route));
+      const hash = await this.send(position, "swap_to_quote", this.swapPlan(position, plan));
       if (!hash) {
         await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "swap_to_quote" });
         return;
       }
       await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash });
-      await this.saveSettlementBalance(position, route.expectedOut);
+      await this.saveSettlementBalance(position, plan.expectedOut);
       await this.notifier.settled(position);
       this.finalizeCloseHistory(position);
     } catch (error) {
@@ -859,4 +866,12 @@ function approvalSpender(approval: { to: Address; data: Hex }, token: Address, a
 
 function addressFromMetadata(value: unknown): Address | null {
   return typeof value === "string" && isAddress(value) ? value : null;
+}
+
+function swapRetryCount(metadata: Record<string, unknown>): number {
+  const retry = metadata.exitRetry;
+  if (!retry || typeof retry !== "object" || Array.isArray(retry)) return 0;
+  const attempts = (retry as Record<string, unknown>).attempts;
+  if (typeof attempts !== "number" || !Number.isSafeInteger(attempts) || attempts < 0) return 0;
+  return attempts;
 }
