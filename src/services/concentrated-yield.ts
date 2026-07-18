@@ -18,6 +18,16 @@ export interface OhlcvCandle {
   volumeUsd: number;
 }
 
+export function normalizeOhlcvPrices(high: number, low: number, baseAddress: string, quoteAddress: string, searchToken: string): { high: number; low: number } {
+  const base = baseAddress.toLowerCase();
+  const quote = quoteAddress.toLowerCase();
+  const search = searchToken.toLowerCase();
+  if (quote === search && base !== search) {
+    return { high: low > 0 ? 1 / low : 0, low: high > 0 ? 1 / high : 0 };
+  }
+  return { high, low };
+}
+
 export interface ConcentratedEstimate {
   currentTick: number;
   lowerTick: number;
@@ -124,7 +134,7 @@ export async function estimateConcentratedYield(
   };
 }
 
-export async function fetchOhlcv(chain: ChainName, pool: Address): Promise<OhlcvCandle[]> {
+export async function fetchOhlcv(chain: ChainName, pool: Address, searchToken?: Address): Promise<OhlcvCandle[]> {
   const url = `https://api.geckoterminal.com/api/v2/networks/${chain}/pools/${pool}/ohlcv/minute?aggregate=5&limit=288`;
   const wait = Math.max(0, GECKO_REQUEST_INTERVAL_MS - (Date.now() - lastGeckoOhlcvRequestAt));
   if (wait > 0) await sleep(wait);
@@ -134,11 +144,15 @@ export async function fetchOhlcv(chain: ChainName, pool: Address): Promise<Ohlcv
     throw new Error("GeckoTerminal rate limited OHLCV");
   }
   if (!response.ok) throw new Error(`OHLCV request failed: ${response.status}`);
-  const body = await response.json() as { data?: { attributes?: { ohlcv_list?: unknown[][] } } };
+  const body = await response.json() as {
+    data?: { attributes?: { ohlcv_list?: unknown[][] } };
+    meta?: { base?: { address?: string }; quote?: { address?: string } };
+  };
+  const baseAddress = body.meta?.base?.address;
+  const quoteAddress = body.meta?.quote?.address;
   return (body.data?.attributes?.ohlcv_list ?? []).map((row) => ({
     timestamp: Number(row[0]) * 1_000,
-    high: Number(row[2]),
-    low: Number(row[3]),
+    ...normalizeOhlcvPrices(Number(row[2]), Number(row[3]), baseAddress ?? "", quoteAddress ?? "", searchToken ?? ""),
     volumeUsd: Number(row[5]),
   })).filter((c) => Number.isFinite(c.timestamp) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.volumeUsd));
 }

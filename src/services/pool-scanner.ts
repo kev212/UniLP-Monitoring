@@ -158,7 +158,7 @@ export class PoolScanner {
       if (!pool) continue;
       onProgress?.(completed, activeRaw.length);
       try {
-        const candles = await withTimeout(fetchOhlcv(chain, raw.attributes.address as Address), 30_000);
+        const candles = await withTimeout(fetchOhlcv(chain, raw.attributes.address as Address, tokenAddress), 30_000);
         const currentLpFee = pool.currentLpFee;
         const estimate = await estimateConcentratedYield(this.chains, chain, pool.protocol, raw.attributes.address as Address, tokenAddress, pool.feeTier, currentLpFee, downsidePercent, candles);
         if (estimate) scored.push({ ...pool, concentrated: estimate });

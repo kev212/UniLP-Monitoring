@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, limitQualifiedPoolsPerToken, MIN_VOLUME_6H_USD, PoolScanner, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
-import { overlapFraction, snapRange } from "../src/services/concentrated-yield.js";
+import { normalizeOhlcvPrices, overlapFraction, snapRange } from "../src/services/concentrated-yield.js";
 
 describe("pool scoring formula", () => {
   const K = 1_000_000;
@@ -81,6 +81,16 @@ describe("concentrated yield range math", () => {
     expect(overlapFraction(70, 80, 70, 100)).toBeGreaterThan(0);
     expect(overlapFraction(100, 110, 70, 100)).toBe(0);
     expect(overlapFraction(70, 100, 70, 100)).toBe(1);
+  });
+
+  it("inverts OHLCV when the search token is GeckoTerminal's quote asset", () => {
+    const result = normalizeOhlcvPrices(2_000, 1_800, "0xweth", "0xtoken", "0xtoken");
+    expect(result.high).toBeCloseTo(1 / 1_800);
+    expect(result.low).toBeCloseTo(1 / 2_000);
+  });
+
+  it("keeps OHLCV orientation when the search token is the base asset", () => {
+    expect(normalizeOhlcvPrices(2_000, 1_800, "0xtoken", "0xweth", "0xtoken")).toEqual({ high: 2_000, low: 1_800 });
   });
 });
 
