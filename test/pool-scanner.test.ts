@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, limitQualifiedPoolsPerToken, MIN_VOLUME_6H_USD, PoolScanner, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
-import { normalizeOhlcvPrices, overlapFraction, snapRange } from "../src/services/concentrated-yield.js";
+import { calibrateOhlcvPrices, normalizeOhlcvPrices, overlapFraction, snapRange } from "../src/services/concentrated-yield.js";
 
 describe("pool scoring formula", () => {
   const K = 1_000_000;
@@ -91,6 +91,19 @@ describe("concentrated yield range math", () => {
 
   it("keeps OHLCV orientation when the search token is the base asset", () => {
     expect(normalizeOhlcvPrices(2_000, 1_800, "0xtoken", "0xweth", "0xtoken")).toEqual({ high: 2_000, low: 1_800 });
+  });
+
+  it("corrects a consistent decimal-scale mismatch against the current pool price", () => {
+    const candles = [{ timestamp: Date.now(), high: 0.0011, low: 0.0009, volumeUsd: 100 }];
+    const result = calibrateOhlcvPrices(candles, 0.000001);
+    expect(result.scale).toBe(0.001);
+    expect(result.candles[0]!.high).toBeCloseTo(0.0000011);
+    expect(result.candles[0]!.low).toBeCloseTo(0.0000009);
+  });
+
+  it("does not rescale normal OHLCV data", () => {
+    const candles = [{ timestamp: Date.now(), high: 1.1, low: 0.9, volumeUsd: 100 }];
+    expect(calibrateOhlcvPrices(candles, 1).scale).toBe(1);
   });
 });
 

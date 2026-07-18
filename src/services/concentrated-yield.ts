@@ -28,6 +28,22 @@ export function normalizeOhlcvPrices(high: number, low: number, baseAddress: str
   return { high, low };
 }
 
+export function calibrateOhlcvPrices(candles: readonly OhlcvCandle[], referencePrice: number): { candles: OhlcvCandle[]; scale: number } {
+  if (!(referencePrice > 0) || !Number.isFinite(referencePrice)) return { candles: [...candles], scale: 1 };
+  const sample = candles.slice(0, 12)
+    .map((candle) => Math.sqrt(candle.low * candle.high))
+    .filter((price) => price > 0 && Number.isFinite(price));
+  if (sample.length === 0) return { candles: [...candles], scale: 1 };
+  const observedPrice = Math.exp(sample.reduce((sum, price) => sum + Math.log(price), 0) / sample.length);
+  const exponent = Math.round(Math.log10(referencePrice / observedPrice));
+  if (Math.abs(exponent) < 2 || Math.abs(exponent) > 4) return { candles: [...candles], scale: 1 };
+  const scale = 10 ** exponent;
+  return {
+    candles: candles.map((candle) => ({ ...candle, high: candle.high * scale, low: candle.low * scale })),
+    scale,
+  };
+}
+
 export interface ConcentratedEstimate {
   currentTick: number;
   lowerTick: number;
@@ -105,7 +121,9 @@ export async function estimateConcentratedYield(
   if (!(capitalPerLiquidity > 0)) return null;
   const referenceLiquidity = REFERENCE_CAPITAL_USD / capitalPerLiquidity;
   const feeRate = (currentLpFee ?? fee) / 1_000_000;
-  const windows = [1, 6, 24].map((hours) => candles.filter((c) => c.timestamp >= Date.now() - hours * 3_600_000));
+  const currentPrice = priceAtTick(pool.currentTick, pool);
+  const calibrated = calibrateOhlcvPrices(candles, currentPrice);
+  const windows = [1, 6, 24].map((hours) => calibrated.candles.filter((c) => c.timestamp >= Date.now() - hours * 3_600_000));
   const yieldHourlyPercent = { h1: 0, h6: 0, h24: 0 };
   const volumeInRangePercent = { h1: 0, h6: 0, h24: 0 };
   for (const [index, window] of windows.entries()) {
@@ -115,7 +133,6 @@ export async function estimateConcentratedYield(
     yieldHourlyPercent[key] = result.feesUsd / REFERENCE_CAPITAL_USD / hours * 100;
     volumeInRangePercent[key] = result.totalVolumeUsd > 0 ? result.inRangeVolumeUsd / result.totalVolumeUsd * 100 : 0;
   }
-  const currentPrice = priceAtTick(pool.currentTick, pool);
   const tickPriceA = priceAtTick(range.lowerTick, pool);
   const tickPriceB = priceAtTick(range.upperTick, pool);
   const lowerPrice = Math.min(tickPriceA, tickPriceB);
@@ -130,7 +147,10 @@ export async function estimateConcentratedYield(
     rangeCapitalUsd: capitalPerLiquidity * referenceLiquidity,
     volumeInRangePercent,
     yieldHourlyPercent,
-    warnings: currentLpFee !== undefined && currentLpFee !== fee ? ["dynamic fee"] : [],
+    warnings: [
+      ...(currentLpFee !== undefined && currentLpFee !== fee ? ["dynamic fee"] : []),
+      ...(calibrated.scale !== 1 ? [`OHLCV scale ${calibrated.scale}x`] : []),
+    ],
   };
 }
 
