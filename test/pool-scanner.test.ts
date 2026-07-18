@@ -101,6 +101,11 @@ describe("scan pool eligibility", () => {
     expect(effectiveMarketCap(null, null)).toBeNull();
   });
 
+  it("builds pool links for Base and Robinhood", () => {
+    expect(uniswapPoolUrl("0xpool", "base")).toBe("https://app.uniswap.org/explore/pools/base/0xpool");
+    expect(uniswapPoolUrl("0xpool")).toBe("https://app.uniswap.org/explore/pools/robinhood/0xpool");
+  });
+
   it("builds an Uniswap explorer URL from either a pool address or V4 pool ID", () => {
     expect(uniswapPoolUrl("0xe39078fc024188927e10b26d91e4720a600fba85"))
       .toBe("https://app.uniswap.org/explore/pools/robinhood/0xe39078fc024188927e10b26d91e4720a600fba85");

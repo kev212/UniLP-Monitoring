@@ -5,7 +5,7 @@ import sharp from "sharp";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol } from "../types.js";
+import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
@@ -43,7 +43,7 @@ type DashboardAction =
   | { type: "select" | "confirm"; page: number; chainId: number; protocol: Protocol; positionKey: string };
 
 type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "max_results";
-type PendingInput = { kind: "scan_token" } | { kind: "config"; key: PoolSettingKey; dashboardMessageId: number };
+type PendingInput = { kind: "scan_token"; chain: ChainName } | { kind: "config"; key: PoolSettingKey; dashboardMessageId: number };
 
 interface DashboardView {
   text: string;
@@ -81,7 +81,7 @@ export class Notifier {
     void this.bot.api.setMyCommands([
       { command: "status", description: "Tampilkan status semua posisi LP aktif" },
       { command: "close", description: "Tutup posisi LP — fallback /close <nomor> atau /close <key>" },
-      { command: "scan", description: "Scan pool Uniswap V3/V4 untuk token — /scan <contract>" },
+      { command: "scan", description: "Scan token — /scan [base|robinhood] <contract>" },
       { command: "scan_pools", description: "Cari pool V3/V4 dengan estimasi yield 1 jam tertinggi" },
       { command: "history", description: "Tampilkan riwayat posisi close >= ±0.5% PnL" },
       { command: "calendar", description: "Tampilkan kalender realized PnL UTC" },
@@ -380,8 +380,8 @@ export class Notifier {
         return;
       }
       if (action.type === "scan") {
-        this.pendingInput.set(chatId, { kind: "scan_token" });
-        await this.replyTemp(ctx, "Kirim address token Robinhood untuk di-scan.", { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
+        this.pendingInput.set(chatId, { kind: "scan_token", chain: "robinhood" });
+        await this.replyTemp(ctx, "Kirim address token Robinhood untuk di-scan, atau gunakan /scan base <address>.", { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
         return;
       }
       if (action.type === "scan_pools") {
@@ -707,20 +707,16 @@ export class Notifier {
     const chatId = ctx.chat.id.toString();
     if (!this.authorized(chatId, ctx.from?.id.toString())) return;
 
-    const raw = ctx.match.trim();
-    if (!raw) {
-      await this.replyTemp(ctx, "Gunakan /scan <token-contract-address>");
-      return;
-    }
-    if (!isAddress(raw)) {
-      await this.replyTemp(ctx, "Address tidak valid.");
+    const parsed = parseScanInput(ctx.match.trim());
+    if (!parsed) {
+      await this.replyTemp(ctx, "Gunakan /scan <token-address> atau /scan base|robinhood <token-address>.");
       return;
     }
 
-    await this.runTokenScan(ctx, scanner, raw as Address);
+    await this.runTokenScan(ctx, scanner, parsed.token, parsed.chain);
   }
 
-  private async runTokenScan(ctx: Context, scanner: PoolScanner, token: Address): Promise<void> {
+  private async runTokenScan(ctx: Context, scanner: PoolScanner, token: Address, chain: ChainName): Promise<void> {
     const chatId = ctx.chat!.id.toString();
     if (this.tokenScanRunning) {
       await this.replyTemp(ctx, "🔍 Scan token masih berjalan. Tunggu hasil sebelumnya.");
@@ -735,17 +731,17 @@ export class Notifier {
     this.tokenScanRunning = true;
 
     try {
-      await this.replyTemp(ctx, `🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(token)} di Robinhood...`, undefined, 120_000);
+      await this.replyTemp(ctx, `🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(token)} di ${chain}...`, undefined, 120_000);
     } catch (error) {
       this.tokenScanRunning = false;
       throw error;
     }
-    void this.executeTokenScan(scanner, token, chatId).catch((error) => log.error({ error: errorMessage(error), token }, "token scan background job failed"));
+    void this.executeTokenScan(scanner, token, chain, chatId).catch((error) => log.error({ error: errorMessage(error), token, chain }, "token scan background job failed"));
   }
 
-  private async executeTokenScan(scanner: PoolScanner, token: Address, chatId: string): Promise<void> {
+  private async executeTokenScan(scanner: PoolScanner, token: Address, chain: ChainName, chatId: string): Promise<void> {
     try {
-      const scan = await scanner.scan(token);
+      const scan = await scanner.scan(token, chain);
       if (scan.active.length === 0 && scan.watchlist.length === 0) {
         await this.sendTemp(["Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 6h >= $100 untuk token ini."], chatId, 120_000);
         return;
@@ -753,7 +749,7 @@ export class Notifier {
 
       const lines: string[] = [
         `🔍 SCAN: ${shortAddress(token)}`,
-        "Chain: Robinhood (4663)",
+        `Chain: ${chain === "base" ? "Base (8453)" : "Robinhood (4663)"}`,
         `Top active: ${scan.active.length} | Watchlist: ${scan.watchlist.length}`,
         "",
       ];
@@ -845,11 +841,12 @@ export class Notifier {
     if (!pending || !text || text.startsWith("/")) return;
     this.pendingInput.delete(chatId);
     if (pending.kind === "scan_token") {
-      if (!isAddress(text)) {
-        await this.replyTemp(ctx, "Address token tidak valid.");
+      const parsed = parseScanInput(text);
+      if (!parsed) {
+        await this.replyTemp(ctx, "Gunakan address token atau format: base <token-address>.");
         return;
       }
-      await this.runTokenScan(ctx, scanner, text as Address);
+      await this.runTokenScan(ctx, scanner, parsed.token, parsed.chain);
       return;
     }
     try {
@@ -1390,6 +1387,14 @@ function formatToken(value: bigint, decimals: number, maxDecimals?: number): str
 
 function shortAddress(address: Address): string {
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+export function parseScanInput(raw: string): { chain: ChainName; token: Address } | null {
+  const parts = raw.trim().split(/\s+/).filter(Boolean);
+  const chain = parts.length === 2 ? parts[0]?.toLowerCase() : "robinhood";
+  const token = parts.length === 2 ? parts[1] : parts[0];
+  if ((chain !== "base" && chain !== "robinhood") || !token || !isAddress(token, { strict: false })) return null;
+  return { chain, token: token as Address };
 }
 
 function statusDisplay(status: string): string {

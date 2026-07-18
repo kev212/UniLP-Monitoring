@@ -11,10 +11,12 @@ export interface ChainClient {
 
 export class ChainClients {
   private readonly clients = new Map<ChainName, ChainClient>();
+  private readonly enabledChains: Set<ChainName>;
   private readonly tokenMetadata = new Map<string, { decimals: number; symbol: string }>();
 
   constructor(config: RuntimeConfig) {
-    for (const name of config.chains) {
+    this.enabledChains = new Set(config.chains);
+    for (const name of ["base", "robinhood"] as const) {
       const registry = chainRegistry[name];
       const wsUrl = config.rpcWss[name];
       const primary = config.rpcHttp[name];
@@ -37,12 +39,19 @@ export class ChainClients {
 
   get(name: ChainName): ChainClient {
     const item = this.clients.get(name);
-    if (!item) throw new Error(`Chain ${name} is not enabled`);
+    if (!item || !this.enabledChains.has(name)) throw new Error(`Chain ${name} is not enabled`);
+    return item;
+  }
+
+  getForScan(name: ChainName): ChainClient {
+    const item = this.clients.get(name);
+    if (!item) throw new Error(`Chain ${name} is not configured for scanning`);
     return item;
   }
 
   getById(chainId: number): ChainClient {
     for (const item of this.clients.values()) {
+      if (!this.enabledChains.has(item.registry.name)) continue;
       if (item.registry.chain.id === chainId) return item;
     }
     throw new Error(`Chain ID ${chainId} is not enabled`);

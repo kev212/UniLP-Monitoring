@@ -2,7 +2,7 @@ import { isAddress, isHex, zeroAddress, type Address, type Hex } from "viem";
 
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { PoolScanSettings } from "../types.js";
+import type { ChainName, PoolScanSettings } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
@@ -123,18 +123,18 @@ export class PoolScanner {
     private readonly geckoMinRequestIntervalMs = GECKO_MIN_REQUEST_INTERVAL_MS,
   ) {}
 
-  async scan(tokenAddress: Address): Promise<PoolScan> {
+  async scan(tokenAddress: Address, chain: ChainName = "robinhood"): Promise<PoolScan> {
     const startedAt = Date.now();
     const normalized = tokenAddress.toLowerCase();
 
-    const pools = await this.fetchUniswapPools(normalized, "interactive");
+    const pools = await this.fetchUniswapPools(normalized, chain, "interactive");
     if (pools.length === 0) {
       log.info({ token: normalized, rawPools: 0, durationMs: Date.now() - startedAt }, "token pool scan completed");
       return { active: [], watchlist: [] };
     }
 
     const scored = (await mapWithConcurrency(pools, TOKEN_SCAN_VERIFY_CONCURRENCY, (raw) =>
-      this.toScoredPool(raw, normalized, true),
+      this.toScoredPool(raw, normalized, true, chain),
     )).filter((pool): pool is ScoredPool => pool !== null);
     const result = rankPools(scored);
     log.info({ token: normalized, rawPools: pools.length, scoredPools: scored.length, active: result.active.length, watchlist: result.watchlist.length, durationMs: Date.now() - startedAt }, "token pool scan completed");
@@ -252,7 +252,7 @@ export class PoolScanner {
     const volume1hUsd = Number(pair.volume?.h1 ?? 0);
     const volume6hUsd = Number(pair.volume?.h6 ?? 0);
     if (!Number.isFinite(tvlUsd) || tvlUsd <= 0 || !Number.isFinite(volume1hUsd) || volume1hUsd < 0 || !Number.isFinite(volume6hUsd) || volume6hUsd < 0) return null;
-    const verified = await this.verifyPool(protocol, pair.pairAddress as Address, token);
+    const verified = await this.verifyPool(protocol, pair.pairAddress as Address, token, "robinhood");
     if (!verified) return null;
     const feeTier = verified.feeTier ?? 0;
     const currentLpFee = verified.currentLpFee;
@@ -273,7 +273,7 @@ export class PoolScanner {
       protocol,
       pair: baseIsToken ? `${pair.baseToken.symbol}/${pair.quoteToken.symbol}` : `${pair.quoteToken.symbol}/${pair.baseToken.symbol}`,
       quoteToken,
-      uniswapUrl: uniswapPoolUrl(pair.pairAddress),
+      uniswapUrl: uniswapPoolUrl(pair.pairAddress, "robinhood"),
       activeLiquidity: verified.activeLiquidity,
       feeTier,
       feeRate,
@@ -314,8 +314,8 @@ export class PoolScanner {
     return effectiveMarketCap(tokenResponse?.data.attributes.market_cap_usd, tokenResponse?.data.attributes.fdv_usd);
   }
 
-  private async fetchUniswapPools(token: string, priority: GeckoRequestPriority = "background"): Promise<GeckoPool[]> {
-    return this.fetchPools(`${GECKO_BASE}/networks/robinhood/tokens/${token}/pools?page=1`, token, priority);
+  private async fetchUniswapPools(token: string, chain: ChainName, priority: GeckoRequestPriority = "background"): Promise<GeckoPool[]> {
+    return this.fetchPools(`${GECKO_BASE}/networks/${chain}/tokens/${token}/pools?page=1`, token, priority);
   }
 
   private async fetchDexPools(dex: "uniswap-v3-robinhood" | "uniswap-v4-robinhood", page: number, priority: GeckoRequestPriority): Promise<GeckoPool[]> {
@@ -355,7 +355,7 @@ export class PoolScanner {
     return pools;
   }
 
-  private async toScoredPool(raw: GeckoPool, token: string, requireMinimumVolume6h: boolean): Promise<ScoredPool | null> {
+  private async toScoredPool(raw: GeckoPool, token: string, requireMinimumVolume6h: boolean, chain: ChainName): Promise<ScoredPool | null> {
     const dexId = raw.relationships.dex.data.id;
     const protocol = dexId.startsWith("uniswap-v4") ? "v4" : "v3";
     const poolAddress = raw.attributes.address;
@@ -372,7 +372,7 @@ export class PoolScanner {
     const volume24hUsd = Number(raw.attributes.volume_usd?.h24 || "0");
     const stale = volume24hUsd > 0 && volume6hUsd <= 0;
 
-    const verified = await this.verifyPool(protocol, poolAddress as Address, token);
+    const verified = await this.verifyPool(protocol, poolAddress as Address, token, chain);
     if (!verified) return null;
 
     let feeTier = verified.feeTier ?? 0;
@@ -398,8 +398,8 @@ export class PoolScanner {
     const score = (estimatedPoolFees6hUsd / tvlUsd) * safetyFactor;
 
     const baseId = raw.relationships.base_token.data.id;
-    const isTokenBase = baseId.toLowerCase().replace("robinhood_", "") === token;
-    const quoteToken = (isTokenBase ? raw.relationships.quote_token.data.id : baseId).replace("robinhood_", "").toLowerCase() as Address;
+    const isTokenBase = normalizeNetworkToken(baseId) === token;
+    const quoteToken = normalizeNetworkToken(isTokenBase ? raw.relationships.quote_token.data.id : baseId) as Address;
     const pair = poolPair(raw.attributes.pool_name ?? raw.attributes.name, isTokenBase);
 
     const warnings: string[] = [];
@@ -411,7 +411,7 @@ export class PoolScanner {
       protocol,
       pair,
       quoteToken,
-      uniswapUrl: uniswapPoolUrl(poolAddress),
+      uniswapUrl: uniswapPoolUrl(poolAddress, chain),
       activeLiquidity: verified.activeLiquidity,
       feeTier: verified.feeTier ?? 0,
       feeRate,
@@ -436,12 +436,12 @@ export class PoolScanner {
     filters: PoolScanFilters,
     preValuation?: { value: number; source: "market_cap" | "fdv" },
   ): Promise<ScoredPool[] | null> {
-    const rawPools = await this.fetchUniswapPools(token, "background");
+    const rawPools = await this.fetchUniswapPools(token, "robinhood", "background");
     const valuation = preValuation ?? await this.fetchTokenValuation(token);
     if (!valuation || valuation.value <= filters.minMarketCapUsd) return null;
     const relevantRaw = rawPools.filter((pool) => nonQuoteToken(pool, filters.allowedQuoteAddresses) === token);
     if (relevantRaw.length === 0) return null;
-    const scored = (await mapWithConcurrency(relevantRaw, 3, (pool) => this.toScoredPool(pool, token, false))).filter((pool): pool is ScoredPool => pool !== null);
+    const scored = (await mapWithConcurrency(relevantRaw, 3, (pool) => this.toScoredPool(pool, token, false, "robinhood"))).filter((pool): pool is ScoredPool => pool !== null);
     const active = scored.filter((pool) => pool.activeLiquidity);
     const totalActiveTvlUsd = active.reduce((total, pool) => total + pool.tvlUsd, 0);
     const oldestCreatedAt = relevantRaw
@@ -515,13 +515,14 @@ export class PoolScanner {
     protocol: "v3" | "v4",
     poolAddress: Address,
     searchToken: string,
+    chain: ChainName,
   ): Promise<VerifiedPool | null> {
-    if (protocol === "v3") return this.verifyV3Pool(poolAddress, searchToken);
-    return this.verifyV4Pool(poolAddress, searchToken);
+    if (protocol === "v3") return this.verifyV3Pool(poolAddress, searchToken, chain);
+    return this.verifyV4Pool(poolAddress, searchToken, chain);
   }
 
-  private async verifyV3Pool(pool: Address, searchToken: string): Promise<VerifiedPool | null> {
-    const { client, registry } = this.chains.get("robinhood");
+  private async verifyV3Pool(pool: Address, searchToken: string, chain: ChainName): Promise<VerifiedPool | null> {
+    const { client, registry } = this.chains.getForScan(chain);
     try {
       const [token0, token1, fee, liquidity] = await Promise.all([
         client.readContract({
@@ -566,10 +567,11 @@ export class PoolScanner {
   private async verifyV4Pool(
     poolId: Address,
     searchToken: string,
+    chain: ChainName,
   ): Promise<VerifiedPool | null> {
     if (!isHex(poolId) || poolId.length !== 66) return null;
 
-    const { client, registry } = this.chains.get("robinhood");
+    const { client, registry } = this.chains.getForScan(chain);
     const { stateView, positionManager } = registry.contracts.v4;
 
     try {
@@ -654,8 +656,13 @@ function dexValuation(pairs: readonly DexScreenerPair[]): { value: number; sourc
   return fdv > 0 ? { value: fdv, source: "fdv" } : null;
 }
 
-export function uniswapPoolUrl(poolIdentifier: string): string {
-  return `https://app.uniswap.org/explore/pools/robinhood/${poolIdentifier}`;
+export function uniswapPoolUrl(poolIdentifier: string, chain: ChainName = "robinhood"): string {
+  return `https://app.uniswap.org/explore/pools/${chain}/${poolIdentifier}`;
+}
+
+function normalizeNetworkToken(value: string): string {
+  const separator = value.indexOf("_");
+  return (separator >= 0 ? value.slice(separator + 1) : value).toLowerCase();
 }
 
 export function poolPair(poolName: string, tokenIsBase: boolean): string {

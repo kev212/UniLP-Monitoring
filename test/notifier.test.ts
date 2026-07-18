@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
 
-import { canRequestManualClose, clampDashboardPage, isExpiredCallbackError, parseDashboardAction } from "../src/services/notifier.js";
+import { canRequestManualClose, clampDashboardPage, isExpiredCallbackError, parseDashboardAction, parseScanInput } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
+  it("parses chain-aware token scan input", () => {
+    const token = "0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913";
+    expect(parseScanInput(`base ${token}`)).toEqual({ chain: "base", token });
+    expect(parseScanInput(token)).toEqual({ chain: "robinhood", token });
+    expect(parseScanInput("base 0xinvalid")).toBeNull();
+  });
+
   it("parses dashboard navigation callbacks", () => {
     expect(parseDashboardAction("lp:refresh:2")).toEqual({ type: "refresh", page: 2 });
     expect(parseDashboardAction("lp:close:0")).toEqual({ type: "close", page: 0 });
