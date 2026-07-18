@@ -96,9 +96,20 @@ describe("concentrated yield range math", () => {
   it("corrects a consistent decimal-scale mismatch against the current pool price", () => {
     const candles = [{ timestamp: Date.now(), high: 0.0011, low: 0.0009, volumeUsd: 100 }];
     const result = calibrateOhlcvPrices(candles, 0.000001);
-    expect(result.scale).toBe(0.001);
-    expect(result.candles[0]!.high).toBeCloseTo(0.0000011);
-    expect(result.candles[0]!.low).toBeCloseTo(0.0000009);
+    expect(result.scale).toBeCloseTo(0.0010050378);
+    expect(result.candles[0]!.high).toBeCloseTo(0.0000011055416);
+    expect(result.candles[0]!.low).toBeCloseTo(0.0000009045340);
+  });
+
+  it("uses the exact recent median ratio for non-decimal OHLCV mismatches", () => {
+    const candles = [
+      { timestamp: Date.now(), high: 0.0005, low: 0.0005, volumeUsd: 100 },
+      { timestamp: Date.now() - 300_000, high: 0.0006, low: 0.0006, volumeUsd: 100 },
+      { timestamp: Date.now() - 600_000, high: 0.0004, low: 0.0004, volumeUsd: 100 },
+    ];
+    const result = calibrateOhlcvPrices(candles, 0.18);
+    expect(result.scale).toBeCloseTo(360);
+    expect(result.candles[0]!.low).toBeCloseTo(0.18);
   });
 
   it("does not rescale normal OHLCV data", () => {

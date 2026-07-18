@@ -32,12 +32,13 @@ export function calibrateOhlcvPrices(candles: readonly OhlcvCandle[], referenceP
   if (!(referencePrice > 0) || !Number.isFinite(referencePrice)) return { candles: [...candles], scale: 1 };
   const sample = candles.slice(0, 12)
     .map((candle) => Math.sqrt(candle.low * candle.high))
-    .filter((price) => price > 0 && Number.isFinite(price));
+    .filter((price) => price > 0 && Number.isFinite(price))
+    .sort((a, b) => a - b);
   if (sample.length === 0) return { candles: [...candles], scale: 1 };
-  const observedPrice = Math.exp(sample.reduce((sum, price) => sum + Math.log(price), 0) / sample.length);
-  const exponent = Math.round(Math.log10(referencePrice / observedPrice));
-  if (Math.abs(exponent) < 2 || Math.abs(exponent) > 4) return { candles: [...candles], scale: 1 };
-  const scale = 10 ** exponent;
+  const middle = Math.floor(sample.length / 2);
+  const observedPrice = sample.length % 2 === 0 ? (sample[middle - 1]! + sample[middle]!) / 2 : sample[middle]!;
+  const scale = referencePrice / observedPrice;
+  if (!Number.isFinite(scale) || scale < 0.000001 || scale > 1_000_000 || (scale >= 0.01 && scale <= 100)) return { candles: [...candles], scale: 1 };
   return {
     candles: candles.map((candle) => ({ ...candle, high: candle.high * scale, low: candle.low * scale })),
     scale,
