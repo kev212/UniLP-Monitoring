@@ -20,6 +20,8 @@ import {
   v2RouterAbi,
   v3FactoryAbi,
   v3PoolAbi,
+  v3CollectEvent,
+  v3DecreaseLiquidityEvent,
   v3PositionManagerAbi,
   v3SwapRouterAbi,
   v4PoolManagerModifyLiquidityEvent,
@@ -768,6 +770,67 @@ export class Executor {
       return true;
     } catch (error) {
       log.warn({ err: error, positionId: position.id }, "auto-settle zero liquidity failed");
+      return false;
+    }
+  }
+
+  async autoSettleZeroLiquidityV3(name: string, position: PositionRecord): Promise<boolean> {
+    if (position.protocol !== "v3" || !position.quoteToken) return false;
+    const tokenId = BigInt(position.positionKey);
+    const { client, registry } = this.chains.getById(position.chainId);
+    try {
+      const state = await client.readContract({
+        address: registry.contracts.v3.positionManager,
+        abi: v3PositionManagerAbi,
+        functionName: "positions",
+        args: [tokenId],
+      });
+      if (state[7] !== 0n) return false;
+
+      const [decreases, collects] = await Promise.all([
+        client.getLogs({
+          address: registry.contracts.v3.positionManager,
+          event: v3DecreaseLiquidityEvent,
+          args: { tokenId },
+          fromBlock: position.openedAtBlock ?? 0n,
+          toBlock: "latest" as never,
+        }),
+        client.getLogs({
+          address: registry.contracts.v3.positionManager,
+          event: v3CollectEvent,
+          args: { tokenId },
+          fromBlock: position.openedAtBlock ?? 0n,
+          toBlock: "latest" as never,
+        }),
+      ]);
+      const collectByTx = new Map(collects.map((event) => [event.transactionHash, event]));
+      const withdrawal = [...decreases].reverse().find((event) => event.transactionHash && collectByTx.has(event.transactionHash));
+      if (!withdrawal?.transactionHash || !withdrawal.blockNumber) return false;
+      const collect = collectByTx.get(withdrawal.transactionHash);
+      if (!collect || collect.args.recipient?.toLowerCase() !== position.owner.toLowerCase()) return false;
+
+      const receipt = await client.getTransactionReceipt({ hash: withdrawal.transactionHash });
+      if (receipt.status !== "success") return false;
+      const quoteValue = await this.database.getCashflowQuoteValue(position.id, withdrawal.transactionHash, "withdrawal");
+      if (quoteValue === null) return false;
+
+      await this.database.setPositionStatus(position.id, "settled", {
+        pendingSwap: null,
+        totalReceived: quoteValue.toString(),
+        closeTransactionHash: withdrawal.transactionHash,
+        reason: "auto_settle_zero_liquidity_v3",
+      });
+      await this.database.recordExecution(position.id, "remove_liquidity", "confirmed", withdrawal.transactionHash);
+      this.finalizeCloseHistory({
+        ...position,
+        status: "settled",
+        metadata: { ...position.metadata, totalReceived: quoteValue.toString(), closeTransactionHash: withdrawal.transactionHash },
+      });
+      log.info({ positionId: position.id, positionKey: position.positionKey, quoteValue: quoteValue.toString(), closeTransactionHash: withdrawal.transactionHash }, "auto-settled zero-liquidity V3 position");
+      await this.notifier.settled(position);
+      return true;
+    } catch (error) {
+      log.warn({ err: error, positionId: position.id }, "auto-settle zero liquidity V3 failed");
       return false;
     }
   }

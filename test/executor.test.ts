@@ -143,4 +143,42 @@ describe("Executor pending settlement recovery", () => {
     expect(position.metadata).toMatchObject({ settlementGasWei: "23" });
     expect(database.setPositionStatus).toHaveBeenCalledWith("position", "closing", { settlementGasWei: "23" });
   });
+
+  it("auto-settles a V3 position only from a full remove and collect transaction", async () => {
+    const hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
+    const database = {
+      getCashflowQuoteValue: vi.fn().mockResolvedValue(249978708n),
+      setPositionStatus: vi.fn(),
+      recordExecution: vi.fn(),
+      finalizeCloseHistory: vi.fn().mockResolvedValue(undefined),
+    };
+    const client = {
+      readContract: vi.fn().mockResolvedValue([0n, "0x", usdg, token, 10000, 0, 0, 0n, 0n, 0n, 0n, 0n]),
+      getLogs: vi.fn()
+        .mockResolvedValueOnce([{ transactionHash: hash, blockNumber: 100n, args: { tokenId: 207488n, liquidity: 1n } }])
+        .mockResolvedValueOnce([{ transactionHash: hash, blockNumber: 100n, args: { tokenId: 207488n, recipient: owner, amount0: 1n, amount1: 2n } }]),
+      getTransactionReceipt: vi.fn().mockResolvedValue({ status: "success" }),
+    };
+    const chains = {
+      getById: vi.fn(() => ({
+        client,
+        registry: { contracts: { v3: { positionManager: "0x0000000000000000000000000000000000000001" } } },
+      })),
+    };
+    const notifier = { settled: vi.fn() };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, notifier as never, config);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v3", positionKey: "207488", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "needs_review", liquidity: 1n,
+      openedAtBlock: 1n, metadata: {},
+    } as PositionRecord;
+
+    await expect(executor.autoSettleZeroLiquidityV3("robinhood", position)).resolves.toBe(true);
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "settled", expect.objectContaining({
+      totalReceived: "249978708",
+      closeTransactionHash: hash,
+    }));
+    expect(database.recordExecution).toHaveBeenCalledWith("position", "remove_liquidity", "confirmed", hash);
+    expect(notifier.settled).toHaveBeenCalledWith(position);
+  });
 });

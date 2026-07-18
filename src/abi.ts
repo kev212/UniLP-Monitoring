@@ -54,6 +54,7 @@ export const v3PositionManagerAbi = parseAbi([
 ]);
 
 export const v3IncreaseLiquidityEvent = parseAbiItem("event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)");
+export const v3DecreaseLiquidityEvent = parseAbiItem("event DecreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)");
 export const v3CollectEvent = parseAbiItem("event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)");
 
 export const v3QuoterAbi = parseAbi([

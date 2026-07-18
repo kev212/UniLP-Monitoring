@@ -416,6 +416,14 @@ export class Database {
     );
   }
 
+  async getCashflowQuoteValue(positionId: string, transactionHash: string, flowType: "deposit" | "withdrawal" | "fee"): Promise<bigint | null> {
+    const result = await this.pool.query<{ quote_value: string }>(
+      "SELECT quote_value FROM cashflows WHERE position_id = $1 AND transaction_hash = $2 AND flow_type = $3 LIMIT 1",
+      [positionId, transactionHash, flowType],
+    );
+    return result.rowCount ? BigInt(result.rows[0]!.quote_value) : null;
+  }
+
   async getCashflowTotals(positionId: string, excludedTransactionHashes: string[] = []): Promise<{ deposits: bigint; realized: bigint }> {
     const result = await this.pool.query<{ deposits: string; realized: string }>(
       `SELECT
