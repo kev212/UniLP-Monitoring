@@ -83,7 +83,7 @@ export class Notifier {
       { command: "status", description: "Tampilkan status semua posisi LP aktif" },
       { command: "close", description: "Tutup posisi LP — fallback /close <nomor> atau /close <key>" },
       { command: "scan", description: "Scan token — /scan [base|robinhood] <contract>" },
-      { command: "scanv2", description: "Scan concentrated yield — /scanv2 [chain] <contract> [range%]" },
+      ...(this.config.scanV2Enabled ? [{ command: "scanv2", description: "Scan concentrated yield — /scanv2 [chain] <contract> [range%]" }] : []),
       { command: "scan_pools", description: "Cari pool V3/V4 dengan estimasi yield 1 jam tertinggi" },
       { command: "history", description: "Tampilkan riwayat posisi close >= ±0.5% PnL" },
       { command: "calendar", description: "Tampilkan kalender realized PnL UTC" },
@@ -725,6 +725,10 @@ export class Notifier {
   private async handleScanV2(ctx: ChatContext, scanner: PoolScanner): Promise<void> {
     const chatId = ctx.chat.id.toString();
     if (!this.authorized(chatId, ctx.from?.id.toString())) return;
+    if (!this.config.scanV2Enabled) {
+      await this.replyTemp(ctx, "Scanv2 sementara dimatikan.");
+      return;
+    }
     const parsed = parseScanV2Input(ctx.match.trim());
     if (!parsed) {
       await this.replyTemp(ctx, "Gunakan /scanv2 <token>, /scanv2 base <token>, atau tambahkan range 5-90%.");

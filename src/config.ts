@@ -48,6 +48,7 @@ const envSchema = z.object({
   POOL_SCAN_MAX_RESULTS: z.coerce.number().int().min(1).max(20).default(10),
   POOL_SCAN_ALLOWED_QUOTES: z.string().default("USDG,WETH,ETH"),
   POOL_SCAN_CANDIDATE_PAGES: z.coerce.number().int().min(1).max(10).default(3),
+  SCANV2_ENABLED: z.string().default("false"),
   UNISWAP_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
   THEGRAPH_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
   CONFIRMATIONS: z.coerce.number().int().min(1).max(32).default(2),
@@ -90,6 +91,7 @@ export interface RuntimeConfig {
   dryRun: boolean;
   poolScanDefaults: PoolScanSettings;
   poolScanCandidatePages: number;
+  scanV2Enabled: boolean;
   uniswapApiKey?: string;
   thegraphApiKey?: string;
   confirmations: number;
@@ -229,6 +231,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
       allowedQuotes: parseSymbols(env.POOL_SCAN_ALLOWED_QUOTES, "POOL_SCAN_ALLOWED_QUOTES"),
     },
     poolScanCandidatePages: env.POOL_SCAN_CANDIDATE_PAGES,
+    scanV2Enabled: parseBoolean(env.SCANV2_ENABLED, "SCANV2_ENABLED"),
     uniswapApiKey: env.UNISWAP_API_KEY,
     thegraphApiKey: env.THEGRAPH_API_KEY,
     confirmations: env.CONFIRMATIONS,

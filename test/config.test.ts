@@ -60,6 +60,12 @@ describe("loadConfig", () => {
       allowedQuotes: ["USDG", "WETH", "ETH"],
     });
     expect(config.poolScanCandidatePages).toBe(3);
+    expect(config.scanV2Enabled).toBe(false);
+  });
+
+  it("enables scanv2 only when explicitly configured", () => {
+    expect(loadConfig(environment({ SCANV2_ENABLED: "true" })).scanV2Enabled).toBe(true);
+    expect(() => loadConfig(environment({ SCANV2_ENABLED: "yes" }))).toThrow("SCANV2_ENABLED");
   });
 
   it("loads a local Uniswap Trading API key", () => {
