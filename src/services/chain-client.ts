@@ -11,6 +11,7 @@ export interface ChainClient {
 
 export class ChainClients {
   private readonly clients = new Map<ChainName, ChainClient>();
+  private readonly scanClients = new Map<ChainName, ChainClient>();
   private readonly enabledChains: Set<ChainName>;
   private readonly tokenMetadata = new Map<string, { decimals: number; symbol: string }>();
 
@@ -34,6 +35,21 @@ export class ChainClients {
           pollingInterval: 4_000,
         }),
       });
+      const alchemy = config.alchemyHttp[name];
+      const scanFallbacks = [
+        ...(alchemy ? [config.rpcHttp[name]] : []),
+        ...(config.rpcHttpFallback[name] ? [config.rpcHttpFallback[name]!] : []),
+      ];
+      this.scanClients.set(name, {
+        registry,
+        client: createPublicClient({
+          chain: registry.chain,
+          transport: scanFallbacks.length > 0
+            ? fallback([http(alchemy ?? config.rpcHttp[name], { retryCount: 3, timeout: 20_000 }), ...scanFallbacks.map((url) => http(url, { retryCount: 3, timeout: 20_000 }))], { retryCount: 1 })
+            : http(alchemy ?? config.rpcHttp[name], { retryCount: 3, timeout: 20_000 }),
+          pollingInterval: 4_000,
+        }),
+      });
     }
   }
 
@@ -44,7 +60,7 @@ export class ChainClients {
   }
 
   getForScan(name: ChainName): ChainClient {
-    const item = this.clients.get(name);
+    const item = this.scanClients.get(name);
     if (!item) throw new Error(`Chain ${name} is not configured for scanning`);
     return item;
   }

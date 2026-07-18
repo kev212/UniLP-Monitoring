@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, limitQualifiedPoolsPerToken, MIN_VOLUME_6H_USD, PoolScanner, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
+import { overlapFraction, snapRange } from "../src/services/concentrated-yield.js";
 
 describe("pool scoring formula", () => {
   const K = 1_000_000;
@@ -64,6 +65,22 @@ describe("pool scoring formula", () => {
     pools.sort((a, b) => b.score - a.score);
     expect(pools[0]!.pair).toBe("B");
     expect(pools[2]!.pair).toBe("C");
+  });
+});
+
+describe("concentrated yield range math", () => {
+  it("snaps a downside range and places the upper boundary above current", () => {
+    const range = snapRange(-345946, 200, 35);
+    expect(Math.abs(range.lowerTick % 200)).toBe(0);
+    expect(Math.abs(range.upperTick % 200)).toBe(0);
+    expect(range.lowerTick).toBeLessThan(-345946);
+    expect(range.upperTick).toBeGreaterThan(-345946);
+  });
+
+  it("weights only the logarithmic price overlap", () => {
+    expect(overlapFraction(70, 80, 70, 100)).toBeGreaterThan(0);
+    expect(overlapFraction(100, 110, 70, 100)).toBe(0);
+    expect(overlapFraction(70, 100, 70, 100)).toBe(1);
   });
 });
 

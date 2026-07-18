@@ -61,6 +61,7 @@ export class Notifier {
   private readonly pendingBgUpload = new Set<string>();
   private poolScanRunning = false;
   private tokenScanRunning = false;
+  private scanV2Running = false;
   private deletionTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -82,6 +83,7 @@ export class Notifier {
       { command: "status", description: "Tampilkan status semua posisi LP aktif" },
       { command: "close", description: "Tutup posisi LP — fallback /close <nomor> atau /close <key>" },
       { command: "scan", description: "Scan token — /scan [base|robinhood] <contract>" },
+      { command: "scanv2", description: "Scan concentrated yield — /scanv2 [chain] <contract> [range%]" },
       { command: "scan_pools", description: "Cari pool V3/V4 dengan estimasi yield 1 jam tertinggi" },
       { command: "history", description: "Tampilkan riwayat posisi close >= ±0.5% PnL" },
       { command: "calendar", description: "Tampilkan kalender realized PnL UTC" },
@@ -97,6 +99,10 @@ export class Notifier {
     this.bot.command("scan", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleScan(ctx, scanner);
+    });
+    this.bot.command("scanv2", async (ctx: ChatContext) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
+      await this.handleScanV2(ctx, scanner);
     });
     this.bot.command("scan_pools", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
@@ -714,6 +720,45 @@ export class Notifier {
     }
 
     await this.runTokenScan(ctx, scanner, parsed.token, parsed.chain);
+  }
+
+  private async handleScanV2(ctx: ChatContext, scanner: PoolScanner): Promise<void> {
+    const chatId = ctx.chat.id.toString();
+    if (!this.authorized(chatId, ctx.from?.id.toString())) return;
+    const parsed = parseScanV2Input(ctx.match.trim());
+    if (!parsed) {
+      await this.replyTemp(ctx, "Gunakan /scanv2 <token>, /scanv2 base <token>, atau tambahkan range 5-90%.");
+      return;
+    }
+    if (this.scanV2Running) {
+      await this.replyTemp(ctx, "🔬 Scanv2 masih berjalan. Tunggu hasil sebelumnya.");
+      return;
+    }
+    this.scanV2Running = true;
+    await this.replyTemp(ctx, `🔬 Menghitung concentrated yield ${parsed.range}% untuk ${shortAddress(parsed.token)} di ${parsed.chain}...`, undefined, 180_000);
+    void this.executeScanV2(scanner, parsed.token, parsed.chain, parsed.range, chatId).catch((error) => log.error({ error: errorMessage(error), token: parsed.token, chain: parsed.chain }, "scanv2 background job failed"));
+  }
+
+  private async executeScanV2(scanner: PoolScanner, token: Address, chain: ChainName, range: number, chatId: string): Promise<void> {
+    try {
+      const scan = await scanner.scanV2(token, chain, range);
+      if (scan.active.length === 0 && scan.watchlist.length === 0) {
+        await this.sendTemp(["Tidak ditemukan pool aktif yang bisa dihitung concentrated yield-nya."], chatId, 180_000);
+        return;
+      }
+      const lines = [`🔬 SCAN V2: ${shortAddress(token)}`, `Chain: ${chain === "base" ? "Base (8453)" : "Robinhood (4663)"}`, `Requested range: -${range}%`, ""];
+      for (let i = 0; i < scan.active.length; i++) lines.push(...formatScanV2Pool(scan.active[i]!, `${i + 1}.`));
+      if (scan.watchlist.length > 0) {
+        lines.push("", "⚠️ WATCHLIST");
+        for (const pool of scan.watchlist) lines.push(...formatScanV2Pool(pool, "•"));
+      }
+      lines.push("", "Estimasi gross marginal LP berdasarkan current liquidity map + OHLCV historis. Bukan jaminan return.");
+      await this.sendTemp([lines.join("\n")], chatId, 180_000);
+    } catch {
+      await this.sendTemp(["Scanv2 gagal. Coba lagi nanti."], chatId, 180_000);
+    } finally {
+      this.scanV2Running = false;
+    }
   }
 
   private async runTokenScan(ctx: Context, scanner: PoolScanner, token: Address, chain: ChainName): Promise<void> {
@@ -1397,6 +1442,16 @@ export function parseScanInput(raw: string): { chain: ChainName; token: Address 
   return { chain, token: token as Address };
 }
 
+export function parseScanV2Input(raw: string): { chain: ChainName; token: Address; range: number } | null {
+  const parts = raw.trim().split(/\s+/).filter(Boolean);
+  const hasChain = parts.length >= 2 && (parts[0] === "base" || parts[0] === "robinhood");
+  const chain = (hasChain ? parts.shift() : "robinhood") as ChainName;
+  const token = parts.shift();
+  const range = parts.length === 0 ? 35 : Number(parts.shift()?.replace("%", ""));
+  if (parts.length > 0 || !token || !isAddress(token, { strict: false }) || !Number.isFinite(range) || range < 5 || range > 90) return null;
+  return { chain, token: token as Address, range };
+}
+
 function statusDisplay(status: string): string {
   if (status === "needs_review") return "⚠️ NEEDS REVIEW";
   if (status === "closing") return "⏳ CLOSING";
@@ -1550,6 +1605,21 @@ function formatScanPool(pool: ScoredPool, label: string): string[] {
     `   Score: ${pool.score.toFixed(6)} | Uniswap: ${pool.uniswapUrl}`,
   ];
   if (pool.warnings.length > 0) lines.push(`   ⚠️ ${pool.warnings.join(", ")}`);
+  return lines;
+}
+
+function formatScanV2Pool(pool: ScoredPool, label: string): string[] {
+  const estimate = pool.concentrated;
+  if (!estimate) return [`${label} ${pool.protocol.toUpperCase()} ${pool.pair} | concentrated estimate unavailable`];
+  const effectiveFee = pool.currentLpFee ?? pool.feeTier;
+  const lines = [
+    `${label} ${pool.protocol.toUpperCase()} ${pool.pair} | ${(effectiveFee / 10_000).toFixed(2)}%${pool.dynamicFee ? " dynamic" : ""}`,
+    `   Range: -${estimate.actualDownsidePercent.toFixed(2)}% → +${estimate.actualUpsidePercent.toFixed(2)}% | Capital ref: $${fmtUsd(estimate.rangeCapitalUsd)}`,
+    `   Yield/h: 1h ${fmtPercent(estimate.yieldHourlyPercent.h1)} | 6h ${fmtPercent(estimate.yieldHourlyPercent.h6)} | 24h ${fmtPercent(estimate.yieldHourlyPercent.h24)}`,
+    `   Volume in range: 1h ${fmtPercent(estimate.volumeInRangePercent.h1)} | 6h ${fmtPercent(estimate.volumeInRangePercent.h6)} | 24h ${fmtPercent(estimate.volumeInRangePercent.h24)}`,
+    `   TVL: $${fmtUsd(pool.tvlUsd)} | Uniswap: ${pool.uniswapUrl}`,
+  ];
+  if (estimate.warnings.length > 0) lines.push(`   ⚠️ ${estimate.warnings.join(", ")}`);
   return lines;
 }
 

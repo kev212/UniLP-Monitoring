@@ -4,6 +4,7 @@ import type { Database } from "../db.js";
 import { log } from "../log.js";
 import type { ChainName, PoolScanSettings } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
+import { estimateConcentratedYield, fetchOhlcv, type ConcentratedEstimate } from "./concentrated-yield.js";
 
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
 const K = 1_000_000;
@@ -44,6 +45,7 @@ export interface ScoredPool {
   tokenValuationSource?: "market_cap" | "fdv";
   tokenTotalActiveTvlUsd?: number;
   tokenOldestPoolAgeSeconds?: number;
+  concentrated?: ConcentratedEstimate;
 }
 
 export interface PoolScan {
@@ -139,6 +141,27 @@ export class PoolScanner {
     const result = rankPools(scored);
     log.info({ token: normalized, rawPools: pools.length, scoredPools: scored.length, active: result.active.length, watchlist: result.watchlist.length, durationMs: Date.now() - startedAt }, "token pool scan completed");
     return result;
+  }
+
+  async scanV2(tokenAddress: Address, chain: ChainName = "robinhood", downsidePercent = 35): Promise<PoolScan> {
+    const normalized = tokenAddress.toLowerCase();
+    const rawPools = await this.fetchUniswapPools(normalized, chain, "interactive");
+    const scored: ScoredPool[] = [];
+    for (const raw of rawPools) {
+      const pool = await this.toScoredPool(raw, normalized, false, chain);
+      if (!pool || !pool.activeLiquidity) continue;
+      try {
+        const candles = await fetchOhlcv(chain, raw.attributes.address as Address);
+        const currentLpFee = pool.currentLpFee;
+        const estimate = await estimateConcentratedYield(this.chains, chain, pool.protocol, raw.attributes.address as Address, tokenAddress, pool.feeTier, currentLpFee, downsidePercent, candles);
+        if (estimate) scored.push({ ...pool, concentrated: estimate });
+      } catch (error) {
+        log.warn({ error: error instanceof Error ? error.message : String(error), pool: raw.attributes.address }, "concentrated yield estimate failed");
+      }
+    }
+    const active = scored.filter((pool) => pool.activeLiquidity).sort((a, b) => b.concentrated!.yieldHourlyPercent.h6 - a.concentrated!.yieldHourlyPercent.h6);
+    const watchlist = scored.filter((pool) => !pool.activeLiquidity).sort((a, b) => b.concentrated!.yieldHourlyPercent.h6 - a.concentrated!.yieldHourlyPercent.h6);
+    return { active: active.slice(0, 3), watchlist: watchlist.slice(0, 2) };
   }
 
   startCandidateRefresh(allowedQuoteAddresses: readonly Address[], candidatePages: number): void {

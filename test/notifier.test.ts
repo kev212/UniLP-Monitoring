@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { canRequestManualClose, clampDashboardPage, isExpiredCallbackError, parseDashboardAction, parseScanInput } from "../src/services/notifier.js";
+import { canRequestManualClose, clampDashboardPage, isExpiredCallbackError, parseDashboardAction, parseScanInput, parseScanV2Input } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -8,6 +8,13 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseScanInput(`base ${token}`)).toEqual({ chain: "base", token });
     expect(parseScanInput(token)).toEqual({ chain: "robinhood", token });
     expect(parseScanInput("base 0xinvalid")).toBeNull();
+  });
+
+  it("parses concentrated scan input with default and custom ranges", () => {
+    const token = "0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913";
+    expect(parseScanV2Input(token)).toEqual({ chain: "robinhood", token, range: 35 });
+    expect(parseScanV2Input(`base ${token} 40%`)).toEqual({ chain: "base", token, range: 40 });
+    expect(parseScanV2Input(`base ${token} 4`)).toBeNull();
   });
 
   it("parses dashboard navigation callbacks", () => {
