@@ -131,10 +131,7 @@ export async function fetchOhlcv(chain: ChainName, pool: Address): Promise<Ohlcv
   lastGeckoOhlcvRequestAt = Date.now();
   let response = await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
   if (response.status === 429) {
-    const retryAfter = Number(response.headers.get("retry-after"));
-    await sleep((Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : 60) * 1_000);
-    lastGeckoOhlcvRequestAt = Date.now();
-    response = await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
+    throw new Error("GeckoTerminal rate limited OHLCV");
   }
   if (!response.ok) throw new Error(`OHLCV request failed: ${response.status}`);
   const body = await response.json() as { data?: { attributes?: { ohlcv_list?: unknown[][] } } };

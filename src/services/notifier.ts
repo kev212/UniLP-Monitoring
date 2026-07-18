@@ -741,7 +741,9 @@ export class Notifier {
 
   private async executeScanV2(scanner: PoolScanner, token: Address, chain: ChainName, range: number, chatId: string): Promise<void> {
     try {
-      const scan = await scanner.scanV2(token, chain, range);
+      const scan = await scanner.scanV2(token, chain, range, (completed, total) => {
+        if (completed < total) void this.sendTemp([`🔬 Menganalisis concentrated pool ${completed + 1}/${total}...`], chatId, 30_000);
+      });
       if (scan.active.length === 0 && scan.watchlist.length === 0) {
         await this.sendTemp(["Tidak ditemukan pool aktif yang bisa dihitung concentrated yield-nya."], chatId, 180_000);
         return;

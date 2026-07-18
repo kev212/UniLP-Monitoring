@@ -143,22 +143,31 @@ export class PoolScanner {
     return result;
   }
 
-  async scanV2(tokenAddress: Address, chain: ChainName = "robinhood", downsidePercent = 35): Promise<PoolScan> {
+  async scanV2(tokenAddress: Address, chain: ChainName = "robinhood", downsidePercent = 35, onProgress?: (completed: number, total: number) => void): Promise<PoolScan> {
     const normalized = tokenAddress.toLowerCase();
     const rawPools = await this.fetchUniswapPools(normalized, chain, "interactive");
+    const verified = (await mapWithConcurrency(rawPools, TOKEN_SCAN_VERIFY_CONCURRENCY, (raw) => this.toScoredPool(raw, normalized, false, chain)))
+      .filter((pool): pool is ScoredPool => pool !== null && pool.activeLiquidity)
+      .sort((a, b) => b.volume6hUsd - a.volume6hUsd)
+      .slice(0, 3);
+    const activeRaw = rawPools.filter((raw) => verified.some((pool) => pool.uniswapUrl.endsWith(raw.attributes.address)));
     const scored: ScoredPool[] = [];
-    for (const raw of rawPools) {
-      const pool = await this.toScoredPool(raw, normalized, false, chain);
-      if (!pool || !pool.activeLiquidity) continue;
+    let completed = 0;
+    for (const raw of activeRaw) {
+      const pool = verified.find((item) => item.uniswapUrl.endsWith(raw.attributes.address));
+      if (!pool) continue;
+      onProgress?.(completed, activeRaw.length);
       try {
-        const candles = await fetchOhlcv(chain, raw.attributes.address as Address);
+        const candles = await withTimeout(fetchOhlcv(chain, raw.attributes.address as Address), 30_000);
         const currentLpFee = pool.currentLpFee;
         const estimate = await estimateConcentratedYield(this.chains, chain, pool.protocol, raw.attributes.address as Address, tokenAddress, pool.feeTier, currentLpFee, downsidePercent, candles);
         if (estimate) scored.push({ ...pool, concentrated: estimate });
       } catch (error) {
         log.warn({ error: error instanceof Error ? error.message : String(error), pool: raw.attributes.address }, "concentrated yield estimate failed");
       }
+      completed += 1;
     }
+    onProgress?.(completed, activeRaw.length);
     const active = scored.filter((pool) => pool.activeLiquidity).sort((a, b) => b.concentrated!.yieldHourlyPercent.h6 - a.concentrated!.yieldHourlyPercent.h6);
     const watchlist = scored.filter((pool) => !pool.activeLiquidity).sort((a, b) => b.concentrated!.yieldHourlyPercent.h6 - a.concentrated!.yieldHourlyPercent.h6);
     return { active: active.slice(0, 3), watchlist: watchlist.slice(0, 2) };
@@ -753,6 +762,20 @@ async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
   return results;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`concentrated pool timeout after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function sleep(ms: number): Promise<void> {
