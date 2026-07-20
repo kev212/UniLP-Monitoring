@@ -153,8 +153,8 @@ export class Executor {
   async resume(position: PositionRecord): Promise<void> {
     const pending = parsePendingSwap(position.metadata.pendingSwap);
     if (!pending || pending.amount === 0n) {
-      await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null });
       await this.saveSettlementBalance(position);
+      await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null });
       await this.notifier.settled(position);
       this.finalizeCloseHistory(position);
       return;
@@ -261,41 +261,47 @@ export class Executor {
   }
 
   private async saveSettlementBalance(position: PositionRecord, swapExpectedOut = 0n, swapTransactionHash?: Hex): Promise<void> {
-    if (!position.quoteToken) return;
-    try {
-      // The in-memory object predates the closing status update. Read the durable
-      // metadata so direct close proceeds and recorded gas cannot be lost on resume.
-      const meta = (await this.database.getPositionMetadata(position.id)) ?? position.metadata as Record<string, unknown>;
-      const preCloseStr = typeof meta.preCloseQuoteBalance === "string" ? meta.preCloseQuoteBalance : undefined;
-      let totalReceived: bigint;
-      const closeSettlement = BigInt(typeof meta.settlementQuoteFromClose === "string" ? meta.settlementQuoteFromClose : "0");
-      const receiptSwapOutput = swapTransactionHash
-        ? await this.quoteOutputFromReceipt(position, swapTransactionHash)
-        : 0n;
-      if (swapTransactionHash && receiptSwapOutput > 0n) {
-        totalReceived = closeSettlement + receiptSwapOutput;
-      } else if (preCloseStr) {
-        const actualNow = await this.assetBalance(position.chainId, this.config.executorAddress, position.quoteToken);
-        const preClose = BigInt(preCloseStr);
-        const isNative = position.quoteToken.toLowerCase() === zeroAddress;
-        totalReceived = isNative ? (actualNow + (preClose > actualNow ? preClose - actualNow : 0n)) - preClose : actualNow - preClose;
-        if (totalReceived < 0n) totalReceived = 0n;
-        if (isNative && !this.config.pnlIncludeGas) totalReceived += settlementGasWei(meta);
-      } else {
-        totalReceived = closeSettlement + swapExpectedOut;
-      }
-      const qtLower = position.quoteToken.toLowerCase();
-      const { registry } = this.chains.getById(position.chainId);
-      const weth = this.config.quoteTokens[registry.name]?.find(q => q.symbol === "WETH") ?? this.config.quoteTokens[registry.name]?.find(q => q.symbol === "ETH");
-      const isEth = qtLower === zeroAddress || (weth ? qtLower === weth.address.toLowerCase() : false);
-      const settlementUsd = isEth ? await this.computeEthUsd(position.chainId, totalReceived) : totalReceived;
-      await this.database.setPositionStatus(position.id, "settled", {
-        totalReceived: totalReceived.toString(),
-        settlementUsd: settlementUsd.toString(),
-      });
-    } catch {
-      // Balance calculation is for notification only — do not block settlement.
+    if (!position.quoteToken) throw new Error("Cannot record settlement without a quote token");
+    // The in-memory object predates the closing status update. Read the durable
+    // metadata so direct close proceeds and recorded gas cannot be lost on resume.
+    const meta = (await this.database.getPositionMetadata(position.id)) ?? position.metadata as Record<string, unknown>;
+    const preCloseStr = typeof meta.preCloseQuoteBalance === "string" ? meta.preCloseQuoteBalance : undefined;
+    let totalReceived: bigint;
+    const closeSettlement = BigInt(typeof meta.settlementQuoteFromClose === "string" ? meta.settlementQuoteFromClose : "0");
+    const receiptSwapOutput = swapTransactionHash
+      ? await this.quoteOutputFromReceipt(position, swapTransactionHash)
+      : 0n;
+    if (swapTransactionHash) {
+      const swapOutput = receiptSwapOutput || swapExpectedOut;
+      if (swapOutput === 0n) throw new Error("Confirmed swap receipt has no quote-token output");
+      totalReceived = closeSettlement + swapOutput;
+    } else if (preCloseStr) {
+      const actualNow = await this.assetBalance(position.chainId, this.config.executorAddress, position.quoteToken);
+      const preClose = BigInt(preCloseStr);
+      const isNative = position.quoteToken.toLowerCase() === zeroAddress;
+      totalReceived = isNative ? (actualNow + (preClose > actualNow ? preClose - actualNow : 0n)) - preClose : actualNow - preClose;
+      if (totalReceived < 0n) totalReceived = 0n;
+      if (isNative && !this.config.pnlIncludeGas) totalReceived += settlementGasWei(meta);
+    } else {
+      totalReceived = closeSettlement + swapExpectedOut;
     }
+    const qtLower = position.quoteToken.toLowerCase();
+    const { registry } = this.chains.getById(position.chainId);
+    const weth = this.config.quoteTokens[registry.name]?.find(q => q.symbol === "WETH") ?? this.config.quoteTokens[registry.name]?.find(q => q.symbol === "ETH");
+    const isEth = qtLower === zeroAddress || (weth ? qtLower === weth.address.toLowerCase() : false);
+    let settlementUsd = totalReceived;
+    if (isEth) {
+      try {
+        settlementUsd = await this.computeEthUsd(position.chainId, totalReceived);
+      } catch (error) {
+        log.warn({ error: errorMessage(error), positionId: position.id, positionKey: position.positionKey }, "could not value settlement in USD");
+        settlementUsd = 0n;
+      }
+    }
+    await this.database.setPositionStatus(position.id, "closing", {
+      totalReceived: totalReceived.toString(),
+      settlementUsd: settlementUsd.toString(),
+    });
   }
 
   private async quoteOutputFromReceipt(position: PositionRecord, transactionHash: Hex): Promise<bigint> {

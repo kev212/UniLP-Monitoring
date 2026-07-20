@@ -89,7 +89,7 @@ describe("Executor pending settlement recovery", () => {
 
     await (executor as unknown as { saveSettlementBalance(value: PositionRecord): Promise<void> }).saveSettlementBalance(position);
 
-    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "settled", expect.objectContaining({ totalReceived: "100" }));
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "closing", expect.objectContaining({ totalReceived: "100" }));
   });
 
   it("keeps native ETH gas in PnL when configured", async () => {
@@ -116,7 +116,44 @@ describe("Executor pending settlement recovery", () => {
 
     await (executor as unknown as { saveSettlementBalance(value: PositionRecord): Promise<void> }).saveSettlementBalance(position);
 
-    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "settled", expect.objectContaining({ totalReceived: "85" }));
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "closing", expect.objectContaining({ totalReceived: "85" }));
+  });
+
+  it("persists receipt-confirmed swap output before a position can settle", async () => {
+    const database = { setPositionStatus: vi.fn(), getPositionMetadata: vi.fn().mockResolvedValue({ settlementQuoteFromClose: "10" }) };
+    const chains = { getById: vi.fn(() => ({ registry: { name: "robinhood" } })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
+    vi.spyOn(executor as any, "quoteOutputFromReceipt").mockResolvedValue(5n);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v3", positionKey: "1", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    await (executor as unknown as { saveSettlementBalance(value: PositionRecord, expected: bigint, hash: `0x${string}`): Promise<void> })
+      .saveSettlementBalance(position, 0n, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "closing", {
+      totalReceived: "15",
+      settlementUsd: "15",
+    });
+  });
+
+  it("rejects a confirmed swap without a measurable quote output", async () => {
+    const database = { setPositionStatus: vi.fn(), getPositionMetadata: vi.fn().mockResolvedValue({ settlementQuoteFromClose: "10" }) };
+    const chains = { getById: vi.fn(() => ({ registry: { name: "robinhood" } })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
+    vi.spyOn(executor as any, "quoteOutputFromReceipt").mockResolvedValue(0n);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v3", positionKey: "1", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    await expect((executor as unknown as { saveSettlementBalance(value: PositionRecord, expected: bigint, hash: `0x${string}`): Promise<void> })
+      .saveSettlementBalance(position, 0n, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+      .rejects.toThrow("no quote-token output");
+    expect(database.setPositionStatus).not.toHaveBeenCalled();
   });
 
   it("persists each confirmed native settlement gas cost", async () => {
