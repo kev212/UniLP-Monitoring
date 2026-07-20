@@ -4,12 +4,12 @@ import { privateKeyToAccount } from "viem/accounts";
 import {
   createPublicClient,
   createWalletClient,
-  decodeFunctionData,
   decodeEventLog,
   encodeAbiParameters,
   encodeFunctionData,
   http,
   isAddress,
+  isHex,
   keccak256,
   zeroAddress,
   type Address,
@@ -42,7 +42,8 @@ import type { ChainClients } from "./chain-client.js";
 import type { Notifier } from "./notifier.js";
 import type { PositionReader } from "./position-reader.js";
 import type { RoutePlanner, SwapRoute } from "./route-planner.js";
-import type { UniswapTradingApi } from "./uniswap-trading-api.js";
+import { UNISWAP_API_ROUTER, type TradingApiQuote, type UniswapTradingApi } from "./uniswap-trading-api.js";
+import type { KyberSwapAggregatorApi, KyberSwapQuote } from "./kyberswap-aggregator-api.js";
 import { hasPendingSettlement } from "./pending-settlement.js";
 import { receiptTokenTransfers } from "./discovery.js";
 import { applySlippage } from "./uniswap-math.js";
@@ -52,11 +53,46 @@ interface PendingSwap {
   amount: string;
 }
 
+interface PendingRawTransaction {
+  stage: string;
+  hash: Hex;
+  serializedTransaction: Hex;
+}
+
+type ApiSwapCandidate =
+  | { provider: "uniswap"; expectedOut: bigint; minimumOut: bigint; quote: TradingApiQuote }
+  | { provider: "kyberswap"; expectedOut: bigint; minimumOut: bigint; quote: KyberSwapQuote };
+
+interface PreparedSwap {
+  provider: "uniswap" | "kyberswap" | "local";
+  expectedOut: bigint;
+  minimumOut: bigint;
+  plan: TransactionPlan;
+  approvalChanged?: boolean;
+}
+
+export interface SwapRetryState {
+  broadcastAttempts: number;
+  planningFailures: number;
+  lastProvider?: string;
+  nextAttemptAt?: string;
+}
+
+class PendingExecutionError extends Error {
+  constructor(readonly stage: string, readonly transactionHash: Hex, cause: unknown) {
+    super(`${stage} transaction ${transactionHash} is pending reconciliation: ${errorMessage(cause)}`);
+    this.name = "PendingExecutionError";
+  }
+}
+
+class RevertedExecutionError extends Error {}
+
 export class Executor {
   private readonly account;
   private readonly executorClientCache = new Map<string, PublicClient>();
   private readonly confirmedReceipts = new Map<Hex, TransactionReceipt>();
   private readonly settlementJobs = new Map<string, Promise<void>>();
+  private readonly activeSettlementLeases = new Map<string, string>();
   private transactionTail: Promise<unknown> = Promise.resolve();
 
   constructor(
@@ -67,6 +103,7 @@ export class Executor {
     private readonly notifier: Notifier,
     private readonly config: RuntimeConfig,
     private readonly tradingApi?: UniswapTradingApi,
+    private readonly kyberswapApi?: KyberSwapAggregatorApi,
   ) {
     this.account = config.executorPrivateKey ? privateKeyToAccount(config.executorPrivateKey) : undefined;
     if (this.account && this.account.address.toLowerCase() !== config.executorAddress.toLowerCase()) {
@@ -84,6 +121,7 @@ export class Executor {
   private async executeUnlocked(position: PositionRecord, trigger?: ExitTrigger): Promise<void> {
     if (!position.quoteToken) throw new Error("Cannot execute a position without quote token");
     const quoteToken = position.quoteToken;
+    if (await this.recoverPendingApproval(position)) return;
     if (position.status === "closing") return this.resumeUnlocked(position);
     if (position.protocol === "v4" && !(await this.canCloseV4(position))) return;
     const retryMetadata = position.metadata as Record<string, unknown>;
@@ -165,6 +203,14 @@ export class Executor {
       });
     } catch (error) {
       if (!closeConfirmed) {
+        if (error instanceof PendingExecutionError) {
+          await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+            ...(error.stage === "remove_liquidity" ? { closeTransactionHash: error.transactionHash } : {}),
+            settlementPhase: "removing_liquidity",
+            lastExecutionError: error.message,
+          });
+          return;
+        }
         const message = errorMessage(error);
         await this.database.recordExecution(position.id, "remove_liquidity", "failed", undefined, message);
         await this.database.setPositionStatusUnlessSettled(position.id, "armed", {
@@ -185,6 +231,7 @@ export class Executor {
   private async resumeUnlocked(position: PositionRecord): Promise<void> {
     const durableMetadata = await this.database.getPositionMetadata(position.id);
     if (durableMetadata) position = { ...position, metadata: durableMetadata };
+    if (await this.recoverPendingApproval(position)) return;
     if (position.metadata.settlementPhase === "removing_liquidity") {
       const recovered = await this.recoverConfirmedClose(position);
       if (!recovered) return;
@@ -211,28 +258,46 @@ export class Executor {
     const quoteToken = recoveredPosition.quoteToken;
     if (!quoteToken) return;
 
+    let retry = swapRetryState(position.metadata);
     const submittedSwap = await this.database.getSubmittedSwapAttempt(position.id);
     if (submittedSwap) {
+      let receipt: TransactionReceipt;
       try {
-        const receipt = await this.getConfirmedReceipt(position.chainId, submittedSwap as Hex);
-        if (receipt.status === "success") {
-          await this.database.recordExecution(position.id, "swap_to_quote", "confirmed", submittedSwap);
-          await this.saveSettlementBalance(position, 0n, submittedSwap as Hex);
-          await this.database.setPositionStatus(position.id, "settled", {
-            pendingSwap: null,
-            swapTransactionHash: submittedSwap,
-            settlementPhase: "settled",
-          });
-          log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "reconciled submitted swap receipt");
-          await this.notifier.settled(position);
-          this.finalizeCloseHistory(position);
-          return;
-        }
-        await this.database.recordExecution(position.id, "swap_to_quote", "failed", submittedSwap, "transaction reverted");
+        receipt = await this.getConfirmedReceipt(position.chainId, submittedSwap as Hex);
       } catch {
+        await this.rebroadcastPendingTransaction(position, submittedSwap as Hex);
         log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "swap was broadcast but receipt is not yet available");
         return;
       }
+      if (receipt.status === "success") {
+        await this.database.recordExecution(position.id, "swap_to_quote", "confirmed", submittedSwap);
+        await this.saveSettlementBalance(position, 0n, submittedSwap as Hex);
+        await this.database.setPositionStatus(position.id, "settled", {
+          pendingSwap: null,
+          swapTransactionHash: submittedSwap,
+          settlementPhase: "settled",
+          swapRetry: null,
+          pendingRawTransaction: null,
+        });
+        log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "reconciled submitted swap receipt");
+        await this.notifier.settled(position);
+        this.finalizeCloseHistory(position);
+        return;
+      }
+      await this.database.recordExecution(position.id, "swap_to_quote", "failed", submittedSwap, "transaction reverted");
+      retry = nextSwapRetry(position.metadata, typeof position.metadata.swapProvider === "string" ? position.metadata.swapProvider : undefined, true);
+      position = { ...position, metadata: { ...position.metadata, swapRetry: retry } };
+      if (retry.broadcastAttempts >= 2) {
+        await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
+          reason: "swap_reverted_twice",
+          settlementRetryDisabled: true,
+          swapRetry: retry,
+          pendingRawTransaction: null,
+        });
+        await this.notifier.failure(position, "Swap reverted twice after fresh quotes and simulations");
+        return;
+      }
+      await this.database.setPositionStatusUnlessSettled(position.id, "closing", { swapRetry: retry, pendingRawTransaction: null });
     }
 
     const actualBalance = await this.tokenBalance(position.chainId, pending.token);
@@ -248,64 +313,61 @@ export class Executor {
       return;
     }
 
-    const retryCount = swapRetryCount(position.metadata);
-    const effectiveSlippageBps = Math.min(500, 100 * (1 + retryCount));
+    if (retry.nextAttemptAt && Date.parse(retry.nextAttemptAt) > Date.now()) return;
+    const effectiveSlippageBps = Math.min(
+      this.config.settlementSwapMaxSlippageBps,
+      this.config.settlementSwapSlippageBps + retry.broadcastAttempts * 100,
+    );
 
     try {
-      const apiResult = retryCount >= 2 ? undefined : await this.tradingApiSwapPlan(position, pending.token, pending.amount, quoteToken);
-      if (apiResult === null) return;
-      if (apiResult) {
-        const { plan, expectedOut } = apiResult;
-        const hash = await this.send(position, "swap_to_quote", plan);
-        if (!hash) {
-          await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "swap_to_quote" });
-          return;
-        }
-        await this.saveSettlementBalance(position, expectedOut, hash);
-        await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash, settlementPhase: "settled" });
-        await this.notifier.settled(position);
-        this.finalizeCloseHistory(position);
-        return;
-      }
-
-      const route = await this.routes.quoteDirect(position, pending.token, pending.amount, quoteToken);
-      if (!route) throw new Error("No safe route remains for post-close settlement");
-      const plan = retryCount > 0
-        ? { ...route, minimumOut: applySlippage(route.expectedOut, effectiveSlippageBps) }
-        : route;
-      log.info({ positionKey: position.positionKey, protocol: route.protocol, path: route.path, expectedOut: route.expectedOut.toString(), minimumOut: plan.minimumOut.toString(), slippageBps: effectiveSlippageBps }, "local swap route selected");
-      if (route.protocol === "v4") {
-        const { registry } = this.chains.getById(position.chainId);
-        const tokenApprovalChanged = await this.ensureExactApproval(position, pending.token, registry.contracts.v4.permit2, pending.amount, "approve_permit2");
-        if (this.config.dryRun && tokenApprovalChanged) {
-          await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve_permit2 then permit2_approve then swap_to_quote" });
-          return;
-        }
-        const permit2ApprovalChanged = await this.ensurePermit2Approval(position, pending.token, route.router, pending.amount);
-        if (this.config.dryRun && permit2ApprovalChanged) {
-          await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "permit2_approve then swap_to_quote" });
-          return;
-        }
-      } else {
-        const approvalChanged = await this.ensureExactApproval(position, pending.token, route.router, pending.amount, "approve_swap");
-        if (this.config.dryRun && approvalChanged) {
-          await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve_swap then swap_to_quote" });
-          return;
-        }
-      }
-      const hash = await this.send(position, "swap_to_quote", this.swapPlan(position, plan));
+      const prepared = await this.prepareBestSettlementSwap(position, pending.token, pending.amount, quoteToken, effectiveSlippageBps, retry.lastProvider);
+      if (!prepared) return;
+      await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+        swapProvider: prepared.provider,
+        swapExpectedOut: prepared.expectedOut.toString(),
+        swapMinimumOut: prepared.minimumOut.toString(),
+        swapSlippageBps: effectiveSlippageBps,
+        swapRetry: retry,
+      });
+      position = { ...position, metadata: { ...position.metadata, swapProvider: prepared.provider, swapRetry: retry } };
+      const hash = await this.send(position, "swap_to_quote", prepared.plan);
       if (!hash) {
         await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "swap_to_quote" });
         return;
       }
-      await this.saveSettlementBalance(position, plan.expectedOut, hash);
-      await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash, settlementPhase: "settled" });
+      await this.saveSettlementBalance(position, prepared.expectedOut, hash);
+      await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash, settlementPhase: "settled", swapRetry: null });
       await this.notifier.settled(position);
       this.finalizeCloseHistory(position);
     } catch (error) {
-      await this.database.recordExecution(position.id, "swap_to_quote", "failed", undefined, errorMessage(error));
-      await this.database.setPositionStatusUnlessSettled(position.id, "closing", { lastExecutionError: errorMessage(error) });
-      await this.notifier.failure(position, errorMessage(error));
+      if (error instanceof PendingExecutionError) return;
+      if (error instanceof RevertedExecutionError) {
+        const failedProvider = typeof position.metadata.swapProvider === "string" ? position.metadata.swapProvider : retry.lastProvider;
+        const revertedRetry = nextSwapRetry(position.metadata, failedProvider, true);
+        position = { ...position, metadata: { ...position.metadata, swapRetry: revertedRetry } };
+        if (revertedRetry.broadcastAttempts >= 2) {
+          await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
+            reason: "swap_reverted_twice",
+            settlementRetryDisabled: true,
+            swapRetry: revertedRetry,
+            pendingRawTransaction: null,
+          });
+          await this.notifier.failure(position, "Swap reverted twice after fresh quotes and simulations");
+          return;
+        }
+        await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+          lastExecutionError: error.message,
+          swapRetry: revertedRetry,
+          pendingRawTransaction: null,
+        });
+        return this.resumeUnlocked(position);
+      }
+      const message = errorMessage(error);
+      const currentProvider = typeof position.metadata.swapProvider === "string" ? position.metadata.swapProvider : retry.lastProvider;
+      const nextRetry = nextSwapRetry(position.metadata, currentProvider, false);
+      await this.database.recordExecution(position.id, "swap_to_quote", "failed", undefined, message);
+      await this.database.setPositionStatusUnlessSettled(position.id, "closing", { lastExecutionError: message, swapRetry: nextRetry });
+      await this.notifier.failure(position, message);
       throw error;
     }
   }
@@ -320,9 +382,21 @@ export class Executor {
         log.info({ positionId }, "settlement already claimed by another worker");
         return;
       }
+      this.activeSettlementLeases.set(positionId, leaseToken);
+      const heartbeat = setInterval(() => {
+        void this.database.renewSettlementLease(positionId, leaseToken).then((renewed) => {
+          if (!renewed) {
+            if (this.activeSettlementLeases.get(positionId) === leaseToken) this.activeSettlementLeases.delete(positionId);
+            log.error({ positionId }, "settlement lease heartbeat lost ownership");
+          }
+        }).catch((error) => log.warn({ error: errorMessage(error), positionId }, "settlement lease heartbeat failed"));
+      }, 60_000);
+      heartbeat.unref();
       try {
         await work();
       } finally {
+        clearInterval(heartbeat);
+        if (this.activeSettlementLeases.get(positionId) === leaseToken) this.activeSettlementLeases.delete(positionId);
         try {
           await this.database.releaseSettlementLease(positionId, leaseToken);
         } catch (error) {
@@ -356,6 +430,7 @@ export class Executor {
     try {
       receipt = await this.getConfirmedReceipt(position.chainId, closeHash as Hex);
     } catch {
+      await this.rebroadcastPendingTransaction(position, closeHash as Hex);
       return null;
     }
     if (receipt.status !== "success") {
@@ -365,6 +440,7 @@ export class Executor {
         settlementPhase: null,
         exitRetry: nextExitRetry(meta, trigger),
         reason: "close_transaction_reverted",
+        pendingRawTransaction: null,
       });
       return null;
     }
@@ -378,6 +454,7 @@ export class Executor {
       settlementQuoteFromClose: closeAmounts.quoteAmount.toString(),
       closeReceiptAccounted: true,
       settlementPhase: closeAmounts.nonQuoteAmount > 0n ? "pending_swap" : "accounting",
+      pendingRawTransaction: null,
     };
     await this.database.recordExecution(position.id, "remove_liquidity", "confirmed", closeHash);
     await this.database.setPositionStatusUnlessSettled(position.id, "closing", nextMetadata);
@@ -465,6 +542,11 @@ export class Executor {
       for (const client of clients) {
         try {
           const receipt = await client.getTransactionReceipt({ hash: transactionHash });
+          if (this.config.confirmations > 1) {
+            const confirmedHead = await client.getBlockNumber();
+            const requiredHead = receipt.blockNumber + BigInt(this.config.confirmations - 1);
+            if (confirmedHead < requiredHead) throw new Error(`Transaction ${transactionHash} does not have ${this.config.confirmations} confirmations yet`);
+          }
           this.confirmedReceipts.set(transactionHash, receipt);
           return receipt;
         } catch (error) {
@@ -599,30 +681,174 @@ export class Executor {
     return { ...position, token0: currency0, token1: currency1, quoteToken };
   }
 
-  private async tradingApiSwapPlan(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address): Promise<{ plan: TransactionPlan; expectedOut: bigint } | undefined | null> {
-    if (!this.tradingApi) return undefined;
-    let quote = await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut);
-    if (!quote) return undefined;
+  private async prepareBestSettlementSwap(
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    slippageBps: number,
+    lastFailedProvider?: string,
+    approvalRefreshes = 0,
+  ): Promise<PreparedSwap | null> {
+    const quoteJobs: Promise<ApiSwapCandidate | null>[] = [];
+    if (this.tradingApi) {
+      quoteJobs.push(this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
+        .then((quote) => quote ? { provider: "uniswap" as const, expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote } : null));
+    }
+    if (this.kyberswapApi) {
+      quoteJobs.push(this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
+        .then((quote) => quote ? { provider: "kyberswap" as const, expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote } : null));
+    }
+    const results = await Promise.allSettled(quoteJobs);
+    const errors: string[] = [];
+    const candidates: ApiSwapCandidate[] = [];
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        if (result.value) candidates.push(result.value);
+      } else {
+        errors.push(errorMessage(result.reason));
+      }
+    }
+    candidates.sort((left, right) => {
+      if (lastFailedProvider && left.provider !== right.provider) {
+        if (left.provider === lastFailedProvider) return 1;
+        if (right.provider === lastFailedProvider) return -1;
+      }
+      return left.expectedOut === right.expectedOut ? 0 : left.expectedOut > right.expectedOut ? -1 : 1;
+    });
 
-    const approval = tokenIn.toLowerCase() === zeroAddress
-      ? null
-      : await this.tradingApi.approval(position, tokenIn, amountIn);
-    if (approval) {
-      const spender = approvalSpender(approval, tokenIn, amountIn);
-      const approvalChanged = await this.ensureExactApproval(position, tokenIn, spender, amountIn, "approve_swap");
+    for (const [candidateIndex, candidate] of candidates.entries()) {
+      try {
+        const prepared = await this.prepareApiSwap(position, tokenIn, amountIn, tokenOut, slippageBps, candidate, candidateIndex === 0 && approvalRefreshes < 1);
+        if (!prepared) return null;
+        if (prepared === "approval_changed") {
+          log.info({ positionKey: position.positionKey, provider: candidate.provider }, "refreshing and re-ranking providers after approval");
+          return this.prepareBestSettlementSwap(position, tokenIn, amountIn, tokenOut, slippageBps, lastFailedProvider, approvalRefreshes + 1);
+        }
+        await this.simulatePlan(position, prepared.plan);
+        log.info({
+          positionKey: position.positionKey,
+          provider: prepared.provider,
+          expectedOut: prepared.expectedOut.toString(),
+          minimumOut: prepared.minimumOut.toString(),
+          slippageBps,
+          to: prepared.plan.to,
+        }, "settlement swap candidate selected");
+        return prepared;
+      } catch (error) {
+        if (error instanceof PendingExecutionError) throw error;
+        const reason = errorMessage(error);
+        errors.push(`${candidate.provider}: ${reason}`);
+        log.warn({ positionKey: position.positionKey, provider: candidate.provider, error: reason }, "settlement swap candidate rejected before broadcast");
+      }
+    }
+
+    try {
+      const local = await this.prepareLocalSwap(position, tokenIn, amountIn, tokenOut, slippageBps);
+      if (!local) return null;
+      await this.simulatePlan(position, local.plan);
+      return local;
+    } catch (error) {
+      if (error instanceof PendingExecutionError) throw error;
+      errors.push(`local: ${errorMessage(error)}`);
+    }
+    const details = errors.filter(Boolean).slice(0, 4).join(" | ");
+    throw new Error(`No executable settlement route${details ? `: ${details}` : ""}`);
+  }
+
+  private async prepareApiSwap(
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    slippageBps: number,
+    candidate: ApiSwapCandidate,
+    refreshAllAfterApproval: boolean,
+  ): Promise<PreparedSwap | "approval_changed" | null> {
+    if (candidate.provider === "uniswap") {
+      if (!this.tradingApi) throw new Error("Uniswap Trading API is unavailable");
+      let quote = candidate.quote;
+      let approvalChanged = false;
+      if (tokenIn.toLowerCase() !== zeroAddress) {
+        approvalChanged = await this.ensureExactApproval(position, tokenIn, UNISWAP_API_ROUTER, amountIn, "approve_swap");
+        if (this.config.dryRun && approvalChanged) {
+          await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve_swap then swap_to_quote" });
+          return null;
+        }
+        if (approvalChanged && refreshAllAfterApproval) return "approval_changed";
+        if (approvalChanged) {
+          const refreshed = await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+          if (!refreshed) throw new Error("Uniswap route disappeared after approval");
+          quote = refreshed;
+        }
+      }
+      const plan = await this.tradingApi.createSwap(position, quote);
+      return { provider: "uniswap", expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, plan, approvalChanged };
+    }
+
+    if (!this.kyberswapApi) throw new Error("KyberSwap API is unavailable");
+    let quote = candidate.quote;
+    let approvalChanged = false;
+    if (tokenIn.toLowerCase() !== zeroAddress) {
+      approvalChanged = await this.ensureExactApproval(position, tokenIn, this.kyberswapApi.approvalSpender(quote), amountIn, "approve_swap");
       if (this.config.dryRun && approvalChanged) {
         await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve_swap then swap_to_quote" });
         return null;
       }
+      if (approvalChanged && refreshAllAfterApproval) return "approval_changed";
       if (approvalChanged) {
-        quote = await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut);
-        if (!quote) return undefined;
+        const refreshed = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+        if (!refreshed) throw new Error("KyberSwap route disappeared after approval");
+        quote = refreshed;
       }
     }
+    const plan = await this.kyberswapApi.createSwap(position, quote);
+    return { provider: "kyberswap", expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, plan, approvalChanged };
+  }
 
-    const plan = await this.tradingApi.createSwap(position, quote);
-    log.info({ positionKey: position.positionKey, routing: quote.routing, expectedOut: quote.expectedOut.toString(), minimumOut: quote.minimumOut.toString(), to: plan.to }, "Trading API swap selected");
-    return { plan, expectedOut: quote.expectedOut };
+  private async prepareLocalSwap(
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    slippageBps: number,
+  ): Promise<PreparedSwap | null> {
+    if (tokenIn.toLowerCase() === zeroAddress) throw new Error("Local native-token settlement is unsupported");
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const quoted = await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
+      if (!quoted) throw new Error("No safe local route remains for post-close settlement");
+      const route = { ...quoted, minimumOut: applySlippage(quoted.expectedOut, slippageBps) };
+      let approvalChanged = false;
+      if (route.protocol === "v4") {
+        const { registry } = this.chains.getById(position.chainId);
+        approvalChanged = await this.ensureExactApproval(position, tokenIn, registry.contracts.v4.permit2, amountIn, "approve_permit2");
+        if (this.config.dryRun && approvalChanged) {
+          await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve_permit2 then permit2_approve then swap_to_quote" });
+          return null;
+        }
+        const permitChanged = await this.ensurePermit2Approval(position, tokenIn, route.router, amountIn);
+        approvalChanged ||= permitChanged;
+        if (this.config.dryRun && permitChanged) {
+          await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "permit2_approve then swap_to_quote" });
+          return null;
+        }
+      } else {
+        approvalChanged = await this.ensureExactApproval(position, tokenIn, route.router, amountIn, "approve_swap");
+        if (this.config.dryRun && approvalChanged) {
+          await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve_swap then swap_to_quote" });
+          return null;
+        }
+      }
+      if (approvalChanged && attempt < 2) continue;
+      const plan = this.swapPlan(position, route);
+      log.info({ positionKey: position.positionKey, protocol: route.protocol, path: route.path, expectedOut: route.expectedOut.toString(), minimumOut: route.minimumOut.toString(), slippageBps }, "local settlement route selected");
+      return { provider: "local", expectedOut: route.expectedOut, minimumOut: route.minimumOut, plan };
+    }
+    throw new Error("Local settlement route did not stabilize after approval");
+  }
+
+  private simulatePlan(position: PositionRecord, plan: TransactionPlan): Promise<unknown> {
+    return this.executorClient(plan.chainId).call({ account: position.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n });
   }
 
   private closePlan(position: PositionRecord, value: Awaited<ReturnType<PositionReader["read"]>>): TransactionPlan {
@@ -833,7 +1059,16 @@ export class Executor {
   }
 
   private send(position: PositionRecord, stage: string, plan: TransactionPlan): Promise<Hex | null> {
-    const run = this.transactionTail.then(() => this.sendUnlocked(position, stage, plan));
+    const run = this.transactionTail.then(() => this.database.withExecutionLock(
+      plan.chainId,
+      this.config.executorAddress,
+      async () => {
+        if (await this.database.hasPendingRawTransaction(plan.chainId)) {
+          throw new Error(`Chain ${plan.chainId} has an unresolved signed transaction`);
+        }
+        return this.sendUnlocked(position, stage, plan);
+      },
+    ));
     this.transactionTail = run.catch(() => undefined);
     return run;
   }
@@ -848,20 +1083,91 @@ export class Executor {
       return null;
     }
     if (!this.account) throw new Error("No executor account is configured");
+    const leaseToken = this.activeSettlementLeases.get(position.id);
+    if (!leaseToken) throw new Error("Settlement lease is required before broadcast");
+    if (!(await this.database.renewSettlementLease(position.id, leaseToken))) {
+      throw new Error("Settlement lease ownership was lost before broadcast");
+    }
     const alchemyUrl = this.config.alchemyHttp[registry.name];
     const transport = alchemyUrl ? http(alchemyUrl) : http(this.config.rpcHttp[registry.name]);
     const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport });
-    const hash = await wallet.sendTransaction({ to: plan.to, data: plan.data, value: plan.value ?? 0n });
-    await this.database.recordExecution(position.id, stage, "submitted", hash);
-    const receipt = await waitForReceipt(client, hash, this.config.confirmations);
-    if (receipt.status !== "success") throw new Error(`${stage} transaction reverted: ${hash}`);
-    if (stage === "remove_liquidity" || stage === "swap_to_quote" || stage === "unwrap_quote") {
-      this.confirmedReceipts.set(hash, receipt);
+    const request = await wallet.prepareTransactionRequest({ account: this.account, to: plan.to, data: plan.data, value: plan.value ?? 0n });
+    const serializedTransaction = await wallet.signTransaction(request);
+    const hash = keccak256(serializedTransaction);
+    try {
+      await this.database.recordSignedExecution(position.id, stage, hash, serializedTransaction, leaseToken);
+    } catch (error) {
+      if (this.activeSettlementLeases.get(position.id) === leaseToken) this.activeSettlementLeases.delete(position.id);
+      throw error;
     }
-    await this.database.recordExecution(position.id, stage, "confirmed", hash);
-    await this.recordNativeSettlementGas(position, receipt.gasUsed * receipt.effectiveGasPrice);
-    await this.notifier.transaction(position, stage, hash);
+    try {
+      const broadcastHash = await wallet.sendRawTransaction({ serializedTransaction });
+      if (broadcastHash.toLowerCase() !== hash.toLowerCase()) throw new Error(`${stage} broadcast returned an unexpected transaction hash`);
+      const receipt = await waitForReceipt(client, hash, this.config.confirmations);
+      if (receipt.status !== "success") {
+        await this.database.recordExecution(position.id, stage, "failed", hash, "transaction reverted");
+        await this.database.setPositionStatusUnlessSettled(position.id, "closing", { pendingRawTransaction: null });
+        throw new RevertedExecutionError(`${stage} transaction reverted: ${hash}`);
+      }
+      if (stage === "remove_liquidity" || stage === "swap_to_quote" || stage === "unwrap_quote") {
+        this.confirmedReceipts.set(hash, receipt);
+      }
+      await this.database.recordExecution(position.id, stage, "confirmed", hash);
+      await this.database.setPositionStatusUnlessSettled(position.id, "closing", { pendingRawTransaction: null });
+      await this.recordNativeSettlementGas(position, receipt.gasUsed * receipt.effectiveGasPrice);
+    } catch (error) {
+      if (error instanceof RevertedExecutionError) throw error;
+      throw new PendingExecutionError(stage, hash, error);
+    }
+    try {
+      await this.notifier.transaction(position, stage, hash);
+    } catch (error) {
+      log.warn({ positionId: position.id, stage, hash, reason: errorMessage(error) }, "transaction notification failed after confirmation");
+    }
     return hash;
+  }
+
+  private async recoverPendingApproval(position: PositionRecord): Promise<boolean> {
+    const pending = parsePendingRawTransaction(position.metadata.pendingRawTransaction);
+    if (!pending || (!pending.stage.startsWith("approve") && pending.stage !== "permit2_approve")) return false;
+    try {
+      const receipt = await this.getConfirmedReceipt(position.chainId, pending.hash);
+      if (receipt.status !== "success") {
+        await this.database.recordExecution(position.id, pending.stage, "failed", pending.hash, "transaction reverted");
+        await this.database.setPositionStatusUnlessSettled(position.id, "closing", { pendingRawTransaction: null });
+        throw new Error(`${pending.stage} transaction reverted: ${pending.hash}`);
+      }
+      await this.database.recordExecution(position.id, pending.stage, "confirmed", pending.hash);
+      await this.database.setPositionStatusUnlessSettled(position.id, "closing", { pendingRawTransaction: null });
+      return false;
+    } catch (error) {
+      if (errorMessage(error).includes("transaction reverted")) throw error;
+      await this.rebroadcastPendingTransaction(position, pending.hash);
+      return true;
+    }
+  }
+
+  private async rebroadcastPendingTransaction(position: PositionRecord, expectedHash: Hex): Promise<void> {
+    const pending = parsePendingRawTransaction(position.metadata.pendingRawTransaction);
+    if (!pending || pending.hash.toLowerCase() !== expectedHash.toLowerCase()) return;
+    if (!this.account) return;
+    const { registry } = this.chains.getById(position.chainId);
+    const alchemyUrl = this.config.alchemyHttp[registry.name];
+    const wallet = createWalletClient({
+      account: this.account,
+      chain: registry.chain,
+      transport: alchemyUrl ? http(alchemyUrl) : http(this.config.rpcHttp[registry.name]),
+    });
+    try {
+      const hash = await wallet.sendRawTransaction({ serializedTransaction: pending.serializedTransaction });
+      if (hash.toLowerCase() !== expectedHash.toLowerCase()) throw new Error("Rebroadcast returned an unexpected transaction hash");
+      log.info({ positionId: position.id, stage: pending.stage, hash }, "rebroadcast pending signed transaction");
+    } catch (error) {
+      const reason = errorMessage(error);
+      if (!/already known|known transaction|nonce too low/i.test(reason)) {
+        log.warn({ positionId: position.id, stage: pending.stage, hash: expectedHash, reason }, "pending signed transaction rebroadcast deferred");
+      }
+    }
   }
 
   private async recordNativeSettlementGas(position: PositionRecord, gasWei: bigint): Promise<void> {
@@ -1172,25 +1478,43 @@ export function nextExitRetry(metadata: Record<string, unknown>, trigger?: ExitT
   };
 }
 
-function approvalSpender(approval: { to: Address; data: Hex }, token: Address, amount: bigint): Address {
-  if (approval.to.toLowerCase() !== token.toLowerCase()) throw new Error("Trading API approval targets an unexpected contract");
-  const decoded = decodeFunctionData({ abi: erc20Abi, data: approval.data });
-  if (decoded.functionName !== "approve" || !decoded.args || decoded.args[1] < amount) {
-    throw new Error("Trading API approval is not a standard approval");
-  }
-  // The API may request max approval; execute the same spender with this bot's exact amount policy.
-  if (amount === 0n) throw new Error("Cannot approve a zero swap amount");
-  return decoded.args[0] as Address;
-}
-
 function addressFromMetadata(value: unknown): Address | null {
   return typeof value === "string" && isAddress(value) ? value : null;
 }
 
-function swapRetryCount(metadata: Record<string, unknown>): number {
-  const retry = metadata.exitRetry;
-  if (!retry || typeof retry !== "object" || Array.isArray(retry)) return 0;
-  const attempts = (retry as Record<string, unknown>).attempts;
-  if (typeof attempts !== "number" || !Number.isSafeInteger(attempts) || attempts < 0) return 0;
-  return attempts;
+function parsePendingRawTransaction(value: unknown): PendingRawTransaction | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.stage !== "string" || !raw.stage || typeof raw.hash !== "string" || !isHex(raw.hash) || raw.hash.length !== 66) return null;
+  if (typeof raw.serializedTransaction !== "string" || !isHex(raw.serializedTransaction) || raw.serializedTransaction === "0x") return null;
+  if (keccak256(raw.serializedTransaction as Hex) !== raw.hash.toLowerCase()) return null;
+  return { stage: raw.stage, hash: raw.hash as Hex, serializedTransaction: raw.serializedTransaction as Hex };
+}
+
+function swapRetryState(metadata: Record<string, unknown>): SwapRetryState {
+  const value = metadata.swapRetry;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { broadcastAttempts: 0, planningFailures: 0 };
+  const retry = value as Record<string, unknown>;
+  const broadcastAttempts = safeAttemptCount(retry.broadcastAttempts);
+  const planningFailures = safeAttemptCount(retry.planningFailures);
+  return {
+    broadcastAttempts,
+    planningFailures,
+    ...(typeof retry.lastProvider === "string" ? { lastProvider: retry.lastProvider } : {}),
+    ...(typeof retry.nextAttemptAt === "string" ? { nextAttemptAt: retry.nextAttemptAt } : {}),
+  };
+}
+
+export function nextSwapRetry(metadata: Record<string, unknown>, lastProvider: string | undefined, broadcastFailed: boolean): SwapRetryState {
+  const previous = swapRetryState(metadata);
+  return {
+    broadcastAttempts: previous.broadcastAttempts + (broadcastFailed ? 1 : 0),
+    planningFailures: broadcastFailed ? 0 : previous.planningFailures + 1,
+    ...(lastProvider ? { lastProvider } : {}),
+    nextAttemptAt: new Date(Date.now() + (broadcastFailed ? 0 : 1_000)).toISOString(),
+  };
+}
+
+function safeAttemptCount(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }

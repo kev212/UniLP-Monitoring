@@ -1,11 +1,22 @@
 import { describe, expect, it } from "vitest";
+import { encodeFunctionData, parseAbi } from "viem";
 
 import type { PositionRecord } from "../src/types.js";
-import { UniswapTradingApi } from "../src/services/uniswap-trading-api.js";
+import { UNISWAP_API_ROUTER, UniswapTradingApi } from "../src/services/uniswap-trading-api.js";
 
 const owner = "0x0000000000000000000000000000000000000001" as const;
 const tokenIn = "0x0000000000000000000000000000000000000002" as const;
 const tokenOut = "0x0000000000000000000000000000000000000003" as const;
+const robinhoodUniversalRouter = "0x8876789976decbfcbbbe364623c63652db8c0904" as const;
+const swapProxyAbi = parseAbi(["function execute(address,address,uint256,bytes,bytes[],uint256) payable"]);
+
+function proxyCalldata(amount = 1_000n) {
+  return encodeFunctionData({
+    abi: swapProxyAbi,
+    functionName: "execute",
+    args: [robinhoodUniversalRouter, tokenIn, amount, "0x01", ["0x01"], BigInt(Math.floor(Date.now() / 1_000) + 120)],
+  });
+}
 
 const position: PositionRecord = {
   id: "position",
@@ -34,7 +45,13 @@ describe("UniswapTradingApi", () => {
       captured = init;
       return json({
         routing: "CLASSIC",
-        quote: { output: { amount: "1000", minimumAmount: "990" } },
+        quote: {
+          chainId: 4663,
+          swapper: owner,
+          input: { token: tokenIn, amount: "1000" },
+          output: { token: tokenOut, recipient: owner, amount: "1000", minimumAmount: "990" },
+          txFailureReasons: [],
+        },
         permitData: null,
       });
     });
@@ -65,9 +82,9 @@ describe("UniswapTradingApi", () => {
       return json({
         swap: {
           chainId: 4663,
-          to: "0x0000000000000000000000000000000000000004",
+          to: UNISWAP_API_ROUTER,
           from: owner,
-          data: "0x1234",
+          data: proxyCalldata(),
           value: "0",
         },
       });
@@ -75,13 +92,25 @@ describe("UniswapTradingApi", () => {
     const quote = {
       raw: {
         routing: "CLASSIC",
-        quote: { output: { amount: "1000", minimumAmount: "990" } },
+        quote: {
+          chainId: 4663,
+          swapper: owner,
+          input: { token: tokenIn, amount: "1000" },
+          output: { token: tokenOut, recipient: owner, amount: "1000", minimumAmount: "990" },
+        },
         permitData: null,
         permitTransaction: { ignored: true },
       },
       routing: "CLASSIC" as const,
       expectedOut: 1_000n,
       minimumOut: 990n,
+      tokenIn,
+      tokenOut,
+      amountIn: 1_000n,
+      chainId: 4663,
+      owner,
+      slippageBps: 100,
+      validUntilMs: Date.now() + 10_000,
     };
 
     const plan = await api.createSwap(position, quote);
@@ -90,6 +119,43 @@ describe("UniswapTradingApi", () => {
     expect(request).not.toHaveProperty("permitTransaction");
     expect(request).toMatchObject({ refreshGasPrice: true, safetyMode: "SAFE" });
     expect(request).not.toHaveProperty("simulateTransaction");
-    expect(plan).toMatchObject({ chainId: 4663, to: "0x0000000000000000000000000000000000000004", data: "0x1234", value: 0n });
+    expect(plan).toMatchObject({ chainId: 4663, to: UNISWAP_API_ROUTER, data: proxyCalldata(), value: 0n });
+  });
+
+  it("rejects quote and transaction context mismatches", async () => {
+    const mismatchedQuote = new UniswapTradingApi("test-key", 100, async () => json({
+      routing: "CLASSIC",
+      quote: {
+        chainId: 4663,
+        swapper: owner,
+        input: { token: tokenIn, amount: "999" },
+        output: { token: tokenOut, recipient: owner, amount: "1000", minimumAmount: "990" },
+      },
+    }));
+    await expect(mismatchedQuote.quote(position, tokenIn, 1_000n, tokenOut)).rejects.toThrow("input amount");
+
+    const api = new UniswapTradingApi("test-key", 100, async () => json({
+      swap: { chainId: 4663, to: "0x0000000000000000000000000000000000000004", from: owner, data: proxyCalldata(), value: "0" },
+    }));
+    const quote = {
+      raw: { routing: "CLASSIC", quote: {} }, routing: "CLASSIC" as const, expectedOut: 1_000n, minimumOut: 990n,
+      tokenIn, tokenOut, amountIn: 1_000n, chainId: 4663, owner, slippageBps: 100, validUntilMs: Date.now() + 10_000,
+    };
+    await expect(api.createSwap(position, quote)).rejects.toThrow("unexpected swap router");
+  });
+
+  it("rejects nested integrator fees", async () => {
+    const api = new UniswapTradingApi("test-key", 100, async () => json({
+      routing: "CLASSIC",
+      quote: {
+        chainId: 4663,
+        swapper: owner,
+        input: { token: tokenIn, amount: "1000" },
+        output: { token: tokenOut, recipient: owner, amount: "1000", minimumAmount: "990" },
+        portionBips: "10",
+      },
+    }));
+
+    await expect(api.quote(position, tokenIn, 1_000n, tokenOut)).rejects.toThrow("integrator fee");
   });
 });

@@ -199,6 +199,26 @@ export class Database {
     }
   }
 
+  async withExecutionLock<T>(chainId: number, executorAddress: string, work: () => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    let locked = false;
+    try {
+      await client.query("SELECT pg_advisory_lock($1, hashtext($2))", [chainId, executorAddress.toLowerCase()]);
+      locked = true;
+      return await work();
+    } finally {
+      if (locked) {
+        try {
+          await client.query("SELECT pg_advisory_unlock($1, hashtext($2))", [chainId, executorAddress.toLowerCase()]);
+        } catch (error) {
+          client.release(error instanceof Error ? error : new Error(String(error)));
+          throw error;
+        }
+      }
+      client.release();
+    }
+  }
+
   async getCursor(chainId: number): Promise<bigint | null> {
     const result = await this.pool.query<{ block_number: string }>("SELECT block_number FROM chain_cursors WHERE chain_id = $1", [chainId]);
     return result.rowCount ? BigInt(result.rows[0]!.block_number) : null;
@@ -372,6 +392,19 @@ export class Database {
     );
   }
 
+  async renewSettlementLease(positionId: string, token: string, ttlMs = 300_000): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE positions
+       SET settlement_lease_until = NOW() + ($3 * INTERVAL '1 millisecond')
+       WHERE id = $1
+         AND settlement_lease_token = $2
+         AND status <> 'settled'
+       RETURNING id`,
+      [positionId, token, ttlMs],
+    );
+    return result.rowCount === 1;
+  }
+
   async markNeedsReviewIfNoPendingSettlement(positionId: string, metadata: Record<string, unknown>): Promise<boolean> {
     const result = await this.pool.query(
       `UPDATE positions
@@ -538,9 +571,63 @@ export class Database {
     );
   }
 
+  async hasPendingRawTransaction(chainId: number): Promise<boolean> {
+    const result = await this.pool.query(
+      `SELECT 1
+       FROM positions
+       WHERE chain_id = $1
+         AND status <> 'settled'
+         AND metadata ? 'pendingRawTransaction'
+         AND metadata->'pendingRawTransaction' <> 'null'::jsonb
+       LIMIT 1`,
+      [chainId],
+    );
+    return result.rowCount === 1;
+  }
+
+  async recordSignedExecution(positionId: string, stage: string, transactionHash: string, serializedTransaction: string, leaseToken: string): Promise<void> {
+    await this.transaction(async (client) => {
+      const updated = await client.query(
+        `UPDATE positions
+         SET status = 'closing',
+             metadata = metadata || jsonb_build_object(
+               'pendingRawTransaction',
+               jsonb_build_object('stage', $2::text, 'hash', $3::text, 'serializedTransaction', $4::text)
+             ),
+             updated_at = NOW()
+         WHERE id = $1
+           AND status <> 'settled'
+           AND settlement_lease_token = $5
+           AND settlement_lease_until > NOW()
+         RETURNING id`,
+        [positionId, stage, transactionHash, serializedTransaction, leaseToken],
+      );
+      if (updated.rowCount !== 1) throw new Error("Position cannot accept a signed execution");
+      await client.query(
+        "INSERT INTO execution_attempts (position_id, stage, status, transaction_hash) VALUES ($1, $2, 'submitted', $3)",
+        [positionId, stage, transactionHash],
+      );
+    });
+  }
+
   async getSubmittedSwapAttempt(positionId: string): Promise<string | null> {
     const result = await this.pool.query<{ transaction_hash: string }>(
-      "SELECT transaction_hash FROM execution_attempts WHERE position_id = $1 AND stage = 'swap_to_quote' AND status = 'submitted' AND transaction_hash IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+      `SELECT submitted.transaction_hash
+       FROM execution_attempts submitted
+       WHERE submitted.position_id = $1
+         AND submitted.stage = 'swap_to_quote'
+         AND submitted.status = 'submitted'
+         AND submitted.transaction_hash IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1
+           FROM execution_attempts terminal
+           WHERE terminal.position_id = submitted.position_id
+             AND terminal.stage = submitted.stage
+             AND terminal.transaction_hash = submitted.transaction_hash
+             AND terminal.status = 'failed'
+         )
+       ORDER BY submitted.created_at DESC
+       LIMIT 1`,
       [positionId],
     );
     return result.rowCount ? result.rows[0]!.transaction_hash : null;

@@ -25,6 +25,17 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[0]![0]).toContain("status <> 'settled'");
   });
 
+  it("renews a settlement lease only while the worker still owns it", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ id: "position" }] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.renewSettlementLease("position", "worker", 300_000)).resolves.toBe(true);
+
+    expect(query.mock.calls[0]![0]).toContain("settlement_lease_token = $2");
+    expect(query.mock.calls[0]![0]).toContain("status <> 'settled'");
+  });
+
   it("retries legacy receipt-accounting reviews even before pendingSwap exists", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn().mockResolvedValue({ rows: [] });
@@ -33,6 +44,42 @@ describe("Database native USD backfill", () => {
     await database.listPendingSwapPositions();
 
     expect(query.mock.calls[0]![0]).toContain("metadata->>'settlementPhase' = 'removing_liquidity'");
+  });
+
+  it("excludes swap submissions already recorded as reverted", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 0, rows: [] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await database.getSubmittedSwapAttempt("position");
+
+    expect(query.mock.calls[0]![0]).toContain("NOT EXISTS");
+    expect(query.mock.calls[0]![0]).toContain("terminal.status = 'failed'");
+  });
+
+  it("persists signed transaction recovery data and the submitted hash atomically", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "position" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+    const client = { query };
+    vi.spyOn(database, "transaction").mockImplementation(async (work) => work(client as never));
+
+    await database.recordSignedExecution("position", "swap_to_quote", "0xhash", "0xraw", "worker");
+
+    expect(query.mock.calls[0]![0]).toContain("pendingRawTransaction");
+    expect(query.mock.calls[1]![0]).toContain("'submitted'");
+  });
+
+  it("blocks new account transactions while a signed transaction is unresolved", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ value: 1 }] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.hasPendingRawTransaction(4663)).resolves.toBe(true);
+
+    expect(query.mock.calls[0]![0]).toContain("pendingRawTransaction");
+    expect(query.mock.calls[0]![1]).toEqual([4663]);
   });
 
   it("aggregates calendar days in UTC without a history limit", async () => {

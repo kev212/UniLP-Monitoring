@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { encodeAbiParameters, keccak256, pad, stringToHex, zeroAddress, type Address, type Hex } from "viem";
 
 import type { RuntimeConfig } from "../src/config.js";
-import { Executor, nextExitRetry, receiptErc20NetReceived } from "../src/services/executor.js";
+import { Executor, nextExitRetry, nextSwapRetry, receiptErc20NetReceived } from "../src/services/executor.js";
 import type { PositionRecord } from "../src/types.js";
 
 const usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as const;
@@ -31,6 +31,9 @@ const config = {
   alchemyHttp: {},
   rpcHttp: { base: "https://base.invalid", robinhood: "https://robinhood.invalid" },
   quoteTokens: { base: [], robinhood: [{ symbol: "USDG", address: usdg }] },
+  settlementSwapSlippageBps: 200,
+  settlementSwapMaxSlippageBps: 500,
+  confirmations: 1,
 } as RuntimeConfig;
 
 describe("Executor pending settlement recovery", () => {
@@ -86,6 +89,26 @@ describe("Executor pending settlement recovery", () => {
     expect(client.getTransactionReceipt).not.toHaveBeenCalled();
   });
 
+  it("does not reconcile an uncached receipt before the configured confirmation depth", async () => {
+    vi.useFakeTimers();
+    const receipt = { status: "success", blockNumber: 100n, logs: [] };
+    const client = {
+      getTransactionReceipt: vi.fn().mockResolvedValue(receipt),
+      getBlockNumber: vi.fn().mockResolvedValue(100n),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, { ...config, confirmations: 2 });
+
+    const pending = (executor as unknown as {
+      getConfirmedReceipt(chainId: number, transactionHash: Hex): Promise<unknown>;
+    }).getConfirmedReceipt(4663, hash);
+    const assertion = expect(pending).rejects.toThrow("2 confirmations");
+    await vi.runAllTimersAsync();
+    await assertion;
+    expect(client.getTransactionReceipt).toHaveBeenCalledTimes(4);
+    vi.useRealTimers();
+  });
+
   it("derives native proceeds at the receipt block and restores transaction gas", async () => {
     const client = {
       getBalance: vi.fn()
@@ -107,6 +130,89 @@ describe("Executor pending settlement recovery", () => {
   it("increments retry attempts after a failed exit", () => {
     const retry = nextExitRetry({ exitRetry: { reason: "stop_loss", attempts: 2 } }, "stop_loss");
     expect(retry).toMatchObject({ reason: "stop_loss", attempts: 3 });
+  });
+
+  it("tracks mined swap reverts separately from planning failures", () => {
+    const planning = nextSwapRetry({}, "uniswap", false);
+    const reverted = nextSwapRetry({ swapRetry: planning }, "uniswap", true);
+
+    expect(planning).toMatchObject({ broadcastAttempts: 0, planningFailures: 1, lastProvider: "uniswap" });
+    expect(reverted).toMatchObject({ broadcastAttempts: 1, planningFailures: 0, lastProvider: "uniswap" });
+    expect(Date.parse(planning.nextAttemptAt!)).toBeGreaterThan(Date.now());
+    expect(Date.parse(reverted.nextAttemptAt!)).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("quotes providers in parallel and selects the best simulated output", async () => {
+    const client = {
+      readContract: vi.fn().mockResolvedValue(5n),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const uniswapQuote = { routing: "CLASSIC" as const, expectedOut: 100n, minimumOut: 98n, raw: {} };
+    const tradingApi = {
+      quote: vi.fn().mockResolvedValue(uniswapQuote),
+      approval: vi.fn().mockResolvedValue(null),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: sender, data: "0x11", description: "uniswap" }),
+    };
+    const kyberQuote = { source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: sender };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue(kyberQuote),
+      approvalSpender: vi.fn().mockReturnValue(sender),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: sender, data: "0x22", description: "kyber" }),
+    };
+    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config, tradingApi as never, kyberswapApi as never);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    const prepared = await (executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string; expectedOut: bigint }>;
+    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
+
+    expect(prepared).toMatchObject({ provider: "kyberswap", expectedOut: 110n });
+    expect(tradingApi.quote).toHaveBeenCalledTimes(1);
+    expect(kyberswapApi.quote).toHaveBeenCalledTimes(1);
+    expect(kyberswapApi.createSwap).toHaveBeenCalledTimes(1);
+    expect(tradingApi.createSwap).not.toHaveBeenCalled();
+    expect(client.call).toHaveBeenCalledWith(expect.objectContaining({ data: "0x22" }));
+  });
+
+  it("falls back before broadcast when the best provider fails simulation", async () => {
+    const uniswapTarget = "0x0000000000000000000000000000000000000004" as const;
+    const kyberTarget = "0x0000000000000000000000000000000000000005" as const;
+    const client = {
+      readContract: vi.fn().mockResolvedValue(5n),
+      call: vi.fn().mockImplementation(({ to }: { to: Address }) => to === uniswapTarget
+        ? Promise.reject(new Error("simulation reverted"))
+        : Promise.resolve({ data: "0x" })),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const tradingApi = {
+      quote: vi.fn().mockResolvedValue({ routing: "CLASSIC", expectedOut: 120n, minimumOut: 117n, raw: {} }),
+      approval: vi.fn().mockResolvedValue(null),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: uniswapTarget, data: "0x11", description: "uniswap" }),
+    };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: kyberTarget }),
+      approvalSpender: vi.fn().mockReturnValue(kyberTarget),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: kyberTarget, data: "0x22", description: "kyber" }),
+    };
+    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config, tradingApi as never, kyberswapApi as never);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    const prepared = await (executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string }>;
+    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
+
+    expect(prepared.provider).toBe("kyberswap");
+    expect(client.call).toHaveBeenNthCalledWith(1, expect.objectContaining({ to: uniswapTarget }));
+    expect(client.call).toHaveBeenNthCalledWith(2, expect.objectContaining({ to: kyberTarget }));
   });
 
   it("restores a V4 quote token and pair from burned-position metadata", async () => {
@@ -272,7 +378,7 @@ describe("Executor pending settlement recovery", () => {
       openedAtBlock: null, metadata: { pendingSwap: { token, amount: "5" } },
     } as PositionRecord;
 
-    await expect(executor.resume(position)).rejects.toThrow("No safe route");
+    await expect(executor.resume(position)).rejects.toThrow("No executable settlement route");
     expect(routes.quoteDirect).toHaveBeenCalledWith(position, token, 5n, usdg);
   });
 

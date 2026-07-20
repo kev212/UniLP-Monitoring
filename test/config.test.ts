@@ -52,6 +52,11 @@ describe("loadConfig", () => {
     expect(config.oorAboveMinDurationMs).toBe(3_600_000);
     expect(config.positionMonitorConcurrency).toBe(2);
     expect(config.uniswapApiKey).toBeUndefined();
+    expect(config.kyberswapEnabled).toBe(true);
+    expect(config.kyberswapClientId).toBe("UniLP-Monitoring-kev212");
+    expect(config.settlementSwapSlippageBps).toBe(200);
+    expect(config.settlementSwapMaxSlippageBps).toBe(500);
+    expect(config.swapApiTimeoutMs).toBe(2_500);
     expect(config.poolScanDefaults).toEqual({
       minMarketCapUsd: 500_000,
       minPoolTvlUsd: 10_000,
@@ -72,6 +77,23 @@ describe("loadConfig", () => {
 
   it("loads a local Uniswap Trading API key", () => {
     expect(loadConfig(environment({ UNISWAP_API_KEY: "api-key" })).uniswapApiKey).toBe("api-key");
+  });
+
+  it("validates dual-provider settlement settings", () => {
+    const config = loadConfig(environment({
+      KYBERSWAP_ENABLED: "false",
+      KYBERSWAP_CLIENT_ID: "custom-client",
+      SETTLEMENT_SWAP_SLIPPAGE_BPS: "250",
+      SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS: "400",
+      SWAP_API_TIMEOUT_MS: "1500",
+    }));
+
+    expect(config.kyberswapEnabled).toBe(false);
+    expect(config.kyberswapClientId).toBe("custom-client");
+    expect(config.settlementSwapSlippageBps).toBe(250);
+    expect(config.settlementSwapMaxSlippageBps).toBe(400);
+    expect(config.swapApiTimeoutMs).toBe(1_500);
+    expect(() => loadConfig(environment({ SETTLEMENT_SWAP_SLIPPAGE_BPS: "500", SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS: "200" }))).toThrow("MAX_SLIPPAGE");
   });
 
   it("requires an allowlisted user for Telegram group chats", () => {

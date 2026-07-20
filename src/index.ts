@@ -13,6 +13,7 @@ import { PositionReader } from "./services/position-reader.js";
 import { RoutePlanner } from "./services/route-planner.js";
 import { UniswapTradingApi } from "./services/uniswap-trading-api.js";
 import { PoolScanner } from "./services/pool-scanner.js";
+import { KyberSwapAggregatorApi } from "./services/kyberswap-aggregator-api.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -20,12 +21,20 @@ async function main(): Promise<void> {
   const chains = new ChainClients(config);
   const reader = new PositionReader(chains, config.maxSwapSlippageBps);
   const routes = new RoutePlanner(chains, config.maxSwapSlippageBps, config.quoteTokens);
-  const tradingApi = config.uniswapApiKey ? new UniswapTradingApi(config.uniswapApiKey, config.maxSwapSlippageBps) : undefined;
+  const tradingApi = config.uniswapApiKey ? new UniswapTradingApi(config.uniswapApiKey, config.maxSwapSlippageBps, globalThis.fetch, config.swapApiTimeoutMs) : undefined;
+  const kyberswapApi = config.kyberswapEnabled
+    ? new KyberSwapAggregatorApi(
+        config.kyberswapClientId,
+        config.settlementSwapSlippageBps,
+        config.swapApiTimeoutMs,
+        config.kyberswapMaxRouteAgeMs,
+      )
+    : undefined;
   const notifier = new Notifier(config, chains, database);
   const discovery = new DiscoveryService(database, chains, config, notifier);
   const alchemyBootstrapper = new AlchemyBootstrapper(database, chains, discovery, config);
   const pnl = new PnlService(database, reader, routes, config, tradingApi);
-  const executor = new Executor(database, chains, reader, routes, notifier, config, tradingApi);
+  const executor = new Executor(database, chains, reader, routes, notifier, config, tradingApi, kyberswapApi);
   const guardian = new Guardian(config, database, chains, alchemyBootstrapper, discovery, pnl, executor, notifier);
   const scanner = new PoolScanner(chains, database);
 

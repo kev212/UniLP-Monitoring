@@ -32,6 +32,9 @@ const envSchema = z.object({
   DISCOVERY_INTERVAL_MS: z.coerce.number().int().min(5_000).max(300_000).default(30_000),
   POSITION_MONITOR_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(2),
   MAX_SWAP_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(100),
+  SETTLEMENT_SWAP_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(200),
+  SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(500),
+  SWAP_API_TIMEOUT_MS: z.coerce.number().int().min(500).max(10_000).default(2_500),
   MAX_TWAP_DEVIATION_BPS: z.coerce.number().int().min(1).max(5_000).default(250),
   TWAP_WINDOW_SECONDS: z.coerce.number().int().min(10).max(3_600).default(300),
   PNL_INCLUDE_GAS: z.string().default("false"),
@@ -50,6 +53,9 @@ const envSchema = z.object({
   POOL_SCAN_CANDIDATE_PAGES: z.coerce.number().int().min(1).max(10).default(3),
   SCANV2_ENABLED: z.string().default("false"),
   UNISWAP_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
+  KYBERSWAP_ENABLED: z.string().default("true"),
+  KYBERSWAP_CLIENT_ID: z.string().trim().min(1).max(64).regex(/^[A-Za-z0-9._-]+$/).default("UniLP-Monitoring-kev212"),
+  KYBERSWAP_MAX_ROUTE_AGE_MS: z.coerce.number().int().min(2_000).max(30_000).default(10_000),
   THEGRAPH_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
   CONFIRMATIONS: z.coerce.number().int().min(1).max(32).default(2),
   SCAN_BLOCK_RANGE: z.coerce.number().int().min(100).max(100_000).default(2_000),
@@ -82,6 +88,9 @@ export interface RuntimeConfig {
   chainMonitorIntervalMs: Partial<Record<ChainName, number>>;
   positionMonitorConcurrency: number;
   maxSwapSlippageBps: number;
+  settlementSwapSlippageBps: number;
+  settlementSwapMaxSlippageBps: number;
+  swapApiTimeoutMs: number;
   maxTwapDeviationBps: number;
   twapWindowSeconds: number;
   pnlIncludeGas: boolean;
@@ -93,6 +102,9 @@ export interface RuntimeConfig {
   poolScanCandidatePages: number;
   scanV2Enabled: boolean;
   uniswapApiKey?: string;
+  kyberswapEnabled: boolean;
+  kyberswapClientId: string;
+  kyberswapMaxRouteAgeMs: number;
   thegraphApiKey?: string;
   confirmations: number;
   scanBlockRange: bigint;
@@ -176,6 +188,12 @@ export function loadConfig(environment = process.env): RuntimeConfig {
   }
 
   const rpcUsesAlchemy = Boolean(detectAlchemyEndpoint(env.BASE_RPC_HTTP) || detectAlchemyEndpoint(env.ROBINHOOD_RPC_HTTP));
+  if (env.SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS < env.SETTLEMENT_SWAP_SLIPPAGE_BPS) {
+    throw new Error("SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS must be at least SETTLEMENT_SWAP_SLIPPAGE_BPS");
+  }
+  if (env.KYBERSWAP_MAX_ROUTE_AGE_MS < env.SWAP_API_TIMEOUT_MS + 1_000) {
+    throw new Error("KYBERSWAP_MAX_ROUTE_AGE_MS must exceed SWAP_API_TIMEOUT_MS by at least 1000ms");
+  }
 
   return {
     databaseUrl: env.DATABASE_URL,
@@ -214,6 +232,9 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     },
     positionMonitorConcurrency: env.POSITION_MONITOR_CONCURRENCY,
     maxSwapSlippageBps: env.MAX_SWAP_SLIPPAGE_BPS,
+    settlementSwapSlippageBps: env.SETTLEMENT_SWAP_SLIPPAGE_BPS,
+    settlementSwapMaxSlippageBps: env.SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS,
+    swapApiTimeoutMs: env.SWAP_API_TIMEOUT_MS,
     maxTwapDeviationBps: env.MAX_TWAP_DEVIATION_BPS,
     twapWindowSeconds: env.TWAP_WINDOW_SECONDS,
     pnlIncludeGas: parseBoolean(env.PNL_INCLUDE_GAS, "PNL_INCLUDE_GAS"),
@@ -233,6 +254,9 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     poolScanCandidatePages: env.POOL_SCAN_CANDIDATE_PAGES,
     scanV2Enabled: parseBoolean(env.SCANV2_ENABLED, "SCANV2_ENABLED"),
     uniswapApiKey: env.UNISWAP_API_KEY,
+    kyberswapEnabled: parseBoolean(env.KYBERSWAP_ENABLED, "KYBERSWAP_ENABLED"),
+    kyberswapClientId: env.KYBERSWAP_CLIENT_ID,
+    kyberswapMaxRouteAgeMs: env.KYBERSWAP_MAX_ROUTE_AGE_MS,
     thegraphApiKey: env.THEGRAPH_API_KEY,
     confirmations: env.CONFIRMATIONS,
     scanBlockRange: BigInt(env.SCAN_BLOCK_RANGE),
