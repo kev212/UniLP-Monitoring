@@ -277,10 +277,10 @@ export class Database {
     const result = await this.pool.query<PositionRow>(
       `SELECT * FROM positions
        WHERE status = 'closing'
-           OR (status = 'needs_review'
-               AND metadata ? 'pendingSwap'
-               AND COALESCE(metadata->>'settlementRetryDisabled', 'false') <> 'true'
-               AND metadata->'pendingSwap' <> 'null'::jsonb)
+            OR (status = 'needs_review'
+                AND COALESCE(metadata->>'settlementRetryDisabled', 'false') <> 'true'
+                AND ((metadata ? 'pendingSwap' AND metadata->'pendingSwap' <> 'null'::jsonb)
+                     OR metadata->>'settlementPhase' = 'removing_liquidity'))
        ORDER BY updated_at ASC`,
     );
     return result.rows.map(mapPosition);

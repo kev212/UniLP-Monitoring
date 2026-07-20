@@ -25,6 +25,16 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[0]![0]).toContain("status <> 'settled'");
   });
 
+  it("retries legacy receipt-accounting reviews even before pendingSwap exists", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rows: [] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await database.listPendingSwapPositions();
+
+    expect(query.mock.calls[0]![0]).toContain("metadata->>'settlementPhase' = 'removing_liquidity'");
+  });
+
   it("aggregates calendar days in UTC without a history limit", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn().mockResolvedValue({ rows: [{ date: "2026-07-01", pnl_usd: "1250000", close_count: "2", win_count: "1" }] });

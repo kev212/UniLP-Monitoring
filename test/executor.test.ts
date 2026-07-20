@@ -28,6 +28,8 @@ const config = {
   executorPrivateKey: undefined,
   dryRun: true,
   pnlIncludeGas: false,
+  alchemyHttp: {},
+  rpcHttp: { base: "https://base.invalid", robinhood: "https://robinhood.invalid" },
   quoteTokens: { base: [], robinhood: [{ symbol: "USDG", address: usdg }] },
 } as RuntimeConfig;
 
@@ -48,7 +50,7 @@ describe("Executor pending settlement recovery", () => {
       logs: [transferLog(usdg, sender, owner, 23n), transferLog(token, sender, owner, 118n)],
     };
     const client = { getTransactionReceipt: vi.fn().mockResolvedValue(receipt) };
-    const chains = { getById: vi.fn(() => ({ client })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
     const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
     const basePosition = {
       id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
@@ -63,6 +65,27 @@ describe("Executor pending settlement recovery", () => {
     }).closeReceiptAmounts({ ...basePosition, quoteToken: token }, hash)).resolves.toEqual({ quoteAmount: 118n, nonQuoteAmount: 23n });
   });
 
+  it("reuses the receipt confirmed by the transaction provider", async () => {
+    const receipt = {
+      status: "success",
+      logs: [transferLog(usdg, sender, owner, 23n), transferLog(token, sender, owner, 118n)],
+    };
+    const client = { getTransactionReceipt: vi.fn().mockRejectedValue(new Error("lagging RPC")) };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
+    (executor as unknown as { confirmedReceipts: Map<Hex, unknown> }).confirmedReceipts.set(hash, receipt);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    await expect((executor as unknown as {
+      closeReceiptAmounts(value: PositionRecord, transactionHash: Hex): Promise<{ quoteAmount: bigint; nonQuoteAmount: bigint }>;
+    }).closeReceiptAmounts(position, hash)).resolves.toEqual({ quoteAmount: 23n, nonQuoteAmount: 118n });
+    expect(client.getTransactionReceipt).not.toHaveBeenCalled();
+  });
+
   it("derives native proceeds at the receipt block and restores transaction gas", async () => {
     const client = {
       getBalance: vi.fn()
@@ -70,7 +93,7 @@ describe("Executor pending settlement recovery", () => {
         .mockResolvedValueOnce(1_085n),
       getTransaction: vi.fn().mockResolvedValue({ value: 0n }),
     };
-    const chains = { getById: vi.fn(() => ({ client })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
     const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
     const receipt = { blockNumber: 100n, gasUsed: 5n, effectiveGasPrice: 3n, logs: [] };
 

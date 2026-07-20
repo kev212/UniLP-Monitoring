@@ -55,6 +55,7 @@ interface PendingSwap {
 export class Executor {
   private readonly account;
   private readonly executorClientCache = new Map<string, PublicClient>();
+  private readonly confirmedReceipts = new Map<Hex, TransactionReceipt>();
   private readonly settlementJobs = new Map<string, Promise<void>>();
   private transactionTail: Promise<unknown> = Promise.resolve();
 
@@ -134,13 +135,14 @@ export class Executor {
         closeAmounts = await this.closeReceiptAmounts(position, hash);
       } catch (error) {
         const reason = errorMessage(error);
-        await this.database.setPositionStatus(position.id, "needs_review", {
+        await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
           pendingSwap: null,
           closeTransactionHash: hash,
-          reason: "close_receipt_accounting_failed",
+          settlementPhase: "removing_liquidity",
+          reason: "close_receipt_temporarily_unavailable",
           lastExecutionError: reason,
         });
-        await this.notifier.failure(position, reason);
+        log.warn({ error: reason, positionId: position.id, positionKey: position.positionKey, closeHash: hash }, "close receipt accounting deferred");
         return;
       }
       await this.database.setPositionStatus(position.id, "closing", {
@@ -212,8 +214,7 @@ export class Executor {
     const submittedSwap = await this.database.getSubmittedSwapAttempt(position.id);
     if (submittedSwap) {
       try {
-        const { client } = this.chains.getById(position.chainId);
-        const receipt = await client.getTransactionReceipt({ hash: submittedSwap as Hex });
+        const receipt = await this.getConfirmedReceipt(position.chainId, submittedSwap as Hex);
         if (receipt.status === "success") {
           await this.database.recordExecution(position.id, "swap_to_quote", "confirmed", submittedSwap);
           await this.saveSettlementBalance(position, 0n, submittedSwap as Hex);
@@ -351,10 +352,9 @@ export class Executor {
       return null;
     }
 
-    const { client } = this.chains.getById(position.chainId);
-    let receipt: Awaited<ReturnType<typeof client.getTransactionReceipt>>;
+    let receipt: TransactionReceipt;
     try {
-      receipt = await client.getTransactionReceipt({ hash: closeHash as Hex });
+      receipt = await this.getConfirmedReceipt(position.chainId, closeHash as Hex);
     } catch {
       return null;
     }
@@ -431,25 +431,49 @@ export class Executor {
   }
 
   private async quoteOutputFromReceipt(position: PositionRecord, transactionHash: Hex): Promise<bigint> {
-    const { client } = this.chains.getById(position.chainId);
-    const receipt = await client.getTransactionReceipt({ hash: transactionHash });
+    const receipt = await this.getConfirmedReceipt(position.chainId, transactionHash);
     if (!position.quoteToken) return 0n;
-    return this.assetReceivedFromReceipt(position.chainId, position.quoteToken, this.config.executorAddress, transactionHash, receipt);
+    const output = await this.assetReceivedFromReceipt(position.chainId, position.quoteToken, this.config.executorAddress, transactionHash, receipt);
+    this.confirmedReceipts.delete(transactionHash);
+    return output;
   }
 
   private async closeReceiptAmounts(position: PositionRecord, transactionHash: Hex): Promise<{ quoteAmount: bigint; nonQuoteAmount: bigint }> {
     if (!position.quoteToken) throw new Error("Cannot inspect close receipt without a quote token");
-    const { client } = this.chains.getById(position.chainId);
-    const receipt = await client.getTransactionReceipt({ hash: transactionHash });
+    const receipt = await this.getConfirmedReceipt(position.chainId, transactionHash);
     if (receipt.status !== "success") throw new Error(`Close receipt is not successful: ${transactionHash}`);
     const [amount0, amount1] = await Promise.all([
       this.assetReceivedFromReceipt(position.chainId, position.token0, position.owner, transactionHash, receipt),
       this.assetReceivedFromReceipt(position.chainId, position.token1, position.owner, transactionHash, receipt),
     ]);
     const quoteIsToken0 = position.quoteToken.toLowerCase() === position.token0.toLowerCase();
-    return quoteIsToken0
+    const amounts = quoteIsToken0
       ? { quoteAmount: amount0, nonQuoteAmount: amount1 }
       : { quoteAmount: amount1, nonQuoteAmount: amount0 };
+    this.confirmedReceipts.delete(transactionHash);
+    return amounts;
+  }
+
+  private async getConfirmedReceipt(chainId: number, transactionHash: Hex): Promise<TransactionReceipt> {
+    const cached = this.confirmedReceipts.get(transactionHash);
+    if (cached) return cached;
+    const nativeClient = this.chains.getById(chainId).client;
+    const executorClient = this.executorClient(chainId);
+    const clients = executorClient === nativeClient ? [executorClient] : [executorClient, nativeClient];
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      for (const client of clients) {
+        try {
+          const receipt = await client.getTransactionReceipt({ hash: transactionHash });
+          this.confirmedReceipts.set(transactionHash, receipt);
+          return receipt;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
+    throw lastError;
   }
 
   private async assetReceivedFromReceipt(chainId: number, token: Address, owner: Address, transactionHash: Hex, receipt: TransactionReceipt): Promise<bigint> {
@@ -463,12 +487,24 @@ export class Executor {
       return positiveDelta(before, after);
     }
 
-    const { client } = this.chains.getById(chainId);
-    const [before, after, transaction] = await Promise.all([
-      client.getBalance({ address: owner, blockNumber: receipt.blockNumber - 1n }),
-      client.getBalance({ address: owner, blockNumber: receipt.blockNumber }),
-      client.getTransaction({ hash: transactionHash }),
-    ]);
+    const nativeClient = this.chains.getById(chainId).client;
+    const executorClient = this.executorClient(chainId);
+    let nativeState: readonly [bigint, bigint, Awaited<ReturnType<PublicClient["getTransaction"]>>];
+    try {
+      nativeState = await Promise.all([
+        executorClient.getBalance({ address: owner, blockNumber: receipt.blockNumber - 1n }),
+        executorClient.getBalance({ address: owner, blockNumber: receipt.blockNumber }),
+        executorClient.getTransaction({ hash: transactionHash }),
+      ]);
+    } catch (error) {
+      if (executorClient === nativeClient) throw error;
+      nativeState = await Promise.all([
+        nativeClient.getBalance({ address: owner, blockNumber: receipt.blockNumber - 1n }),
+        nativeClient.getBalance({ address: owner, blockNumber: receipt.blockNumber }),
+        nativeClient.getTransaction({ hash: transactionHash }),
+      ]);
+    }
+    const [before, after, transaction] = nativeState;
     const l1Fee = (receipt as TransactionReceipt & { l1Fee?: bigint }).l1Fee ?? 0n;
     const adjustedAfter = after + receipt.gasUsed * receipt.effectiveGasPrice + l1Fee + transaction.value;
     return positiveDelta(before, adjustedAfter);
@@ -819,6 +855,9 @@ export class Executor {
     await this.database.recordExecution(position.id, stage, "submitted", hash);
     const receipt = await waitForReceipt(client, hash, this.config.confirmations);
     if (receipt.status !== "success") throw new Error(`${stage} transaction reverted: ${hash}`);
+    if (stage === "remove_liquidity" || stage === "swap_to_quote" || stage === "unwrap_quote") {
+      this.confirmedReceipts.set(hash, receipt);
+    }
     await this.database.recordExecution(position.id, stage, "confirmed", hash);
     await this.recordNativeSettlementGas(position, receipt.gasUsed * receipt.effectiveGasPrice);
     await this.notifier.transaction(position, stage, hash);
@@ -844,9 +883,17 @@ export class Executor {
   }
 
   private async assetBalanceAt(chainId: number, owner: Address, token: Address, blockNumber: bigint): Promise<bigint> {
-    const { client } = this.chains.getById(chainId);
-    if (token.toLowerCase() === zeroAddress) return client.getBalance({ address: owner, blockNumber });
-    return client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner], blockNumber });
+    const nativeClient = this.chains.getById(chainId).client;
+    const executorClient = this.executorClient(chainId);
+    const read = (client: PublicClient) => token.toLowerCase() === zeroAddress
+      ? client.getBalance({ address: owner, blockNumber })
+      : client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner], blockNumber });
+    try {
+      return await read(executorClient);
+    } catch (error) {
+      if (executorClient === nativeClient) throw error;
+      return read(nativeClient);
+    }
   }
 
   private closeTrigger(position: PositionRecord): string {
