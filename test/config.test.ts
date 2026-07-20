@@ -48,6 +48,8 @@ describe("loadConfig", () => {
     expect(config.trailingStopDrawdownPercent).toBe(1.5);
     expect(config.positionMonitorIntervalMs).toBe(5_000);
     expect(config.discoveryIntervalMs).toBe(30_000);
+    expect(config.oorAboveMinDistancePercent).toBe(10);
+    expect(config.oorAboveMinDurationMs).toBe(3_600_000);
     expect(config.positionMonitorConcurrency).toBe(2);
     expect(config.uniswapApiKey).toBeUndefined();
     expect(config.poolScanDefaults).toEqual({

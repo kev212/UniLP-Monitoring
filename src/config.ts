@@ -37,7 +37,7 @@ const envSchema = z.object({
   PNL_INCLUDE_GAS: z.string().default("false"),
   OOR_AUTO_CLOSE_ENABLED: z.string().default("true"),
   OOR_ABOVE_MIN_DISTANCE_PERCENT: z.coerce.number().positive().default(10),
-  OOR_ABOVE_MIN_DURATION_MS: z.coerce.number().int().min(5_000).max(86_400_000).default(1_800_000),
+  OOR_ABOVE_MIN_DURATION_MS: z.coerce.number().int().min(5_000).max(86_400_000).default(3_600_000),
   APPROVAL_MODE: z.literal("exact").default("exact"),
   DRY_RUN: z.string().default("true"),
   POOL_SCAN_MIN_MARKET_CAP_USD: z.coerce.number().nonnegative().default(500_000),
