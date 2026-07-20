@@ -1058,8 +1058,9 @@ export class Notifier {
       const qtSymbol = this.quoteSymbol(item.quoteToken);
       const ethDec = (qtSymbol === "ETH" || qtSymbol === "WETH") ? 4 : undefined;
       const usdPart = item.finalPnlUsd !== 0n ? ` | ${sign}$${formatToken(item.finalPnlUsd, 6, 2)}` : "";
-      lines.push(`   ${sign}${formatBps(item.finalPnlBps)}% | ${sign}${formatToken(item.finalPnlQuote, qtDec, ethDec)} ${qtSymbol}${usdPart} | ${triggerDisplayShort(item.trigger)}`);
-      lines.push(`   Settled: ${fmtUtc(item.settledAt)} UTC`);
+       lines.push(`   ${sign}${formatBps(item.finalPnlBps)}% | ${sign}${formatToken(item.finalPnlQuote, qtDec, ethDec)} ${qtSymbol}${usdPart} | ${triggerDisplayShort(item.trigger)}`);
+       if (item.swapTransactionHash) lines.push(`   Swap: ${shortHash(item.swapTransactionHash)}`);
+       lines.push(`   Settled: ${fmtUtc(item.settledAt)} UTC`);
       lines.push("");
     }
     if (pageCount > 1) lines.push(`Page ${p + 1}/${pageCount} | ${total} riwayat`);
@@ -1438,6 +1439,10 @@ function formatToken(value: bigint, decimals: number, maxDecimals?: number): str
 
 function shortAddress(address: Address): string {
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+function shortHash(hash: string): string {
+  return `${hash.slice(0, 10)}...${hash.slice(-8)}`;
 }
 
 export function parseScanInput(raw: string): { chain: ChainName; token: Address } | null {

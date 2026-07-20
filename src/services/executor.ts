@@ -3,6 +3,7 @@ import {
   createPublicClient,
   createWalletClient,
   decodeFunctionData,
+  decodeEventLog,
   encodeAbiParameters,
   encodeFunctionData,
   http,
@@ -16,6 +17,7 @@ import {
 
 import {
   erc20Abi,
+  erc20TransferEvent,
   permit2Abi,
   v2RouterAbi,
   v3FactoryAbi,
@@ -173,8 +175,8 @@ export class Executor {
           if (receipt && receipt.status === "success") {
             await this.database.recordExecution(position.id, "swap_to_quote", "confirmed", submittedSwap);
             log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "reconciled submitted swap receipt after restart");
-            await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null });
-            await this.saveSettlementBalance(position);
+            await this.saveSettlementBalance(position, 0n, submittedSwap as Hex);
+            await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: submittedSwap });
             await this.notifier.settled(position);
             this.finalizeCloseHistory(position);
             return;
@@ -209,8 +211,8 @@ export class Executor {
           await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "swap_to_quote" });
           return;
         }
+        await this.saveSettlementBalance(position, expectedOut, hash);
         await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash });
-        await this.saveSettlementBalance(position, expectedOut);
         await this.notifier.settled(position);
         this.finalizeCloseHistory(position);
         return;
@@ -246,8 +248,8 @@ export class Executor {
         await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "swap_to_quote" });
         return;
       }
+      await this.saveSettlementBalance(position, plan.expectedOut, hash);
       await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash });
-      await this.saveSettlementBalance(position, plan.expectedOut);
       await this.notifier.settled(position);
       this.finalizeCloseHistory(position);
     } catch (error) {
@@ -258,7 +260,7 @@ export class Executor {
     }
   }
 
-  private async saveSettlementBalance(position: PositionRecord, swapExpectedOut = 0n): Promise<void> {
+  private async saveSettlementBalance(position: PositionRecord, swapExpectedOut = 0n, swapTransactionHash?: Hex): Promise<void> {
     if (!position.quoteToken) return;
     try {
       // The in-memory object predates the closing status update. Read the durable
@@ -266,7 +268,13 @@ export class Executor {
       const meta = (await this.database.getPositionMetadata(position.id)) ?? position.metadata as Record<string, unknown>;
       const preCloseStr = typeof meta.preCloseQuoteBalance === "string" ? meta.preCloseQuoteBalance : undefined;
       let totalReceived: bigint;
-      if (preCloseStr) {
+      const closeSettlement = BigInt(typeof meta.settlementQuoteFromClose === "string" ? meta.settlementQuoteFromClose : "0");
+      const receiptSwapOutput = swapTransactionHash
+        ? await this.quoteOutputFromReceipt(position, swapTransactionHash)
+        : 0n;
+      if (swapTransactionHash && receiptSwapOutput > 0n) {
+        totalReceived = closeSettlement + receiptSwapOutput;
+      } else if (preCloseStr) {
         const actualNow = await this.assetBalance(position.chainId, this.config.executorAddress, position.quoteToken);
         const preClose = BigInt(preCloseStr);
         const isNative = position.quoteToken.toLowerCase() === zeroAddress;
@@ -274,8 +282,7 @@ export class Executor {
         if (totalReceived < 0n) totalReceived = 0n;
         if (isNative && !this.config.pnlIncludeGas) totalReceived += settlementGasWei(meta);
       } else {
-        const fromCloseStr = typeof meta.settlementQuoteFromClose === "string" ? meta.settlementQuoteFromClose : "0";
-        totalReceived = BigInt(fromCloseStr) + swapExpectedOut;
+        totalReceived = closeSettlement + swapExpectedOut;
       }
       const qtLower = position.quoteToken.toLowerCase();
       const { registry } = this.chains.getById(position.chainId);
@@ -289,6 +296,23 @@ export class Executor {
     } catch {
       // Balance calculation is for notification only — do not block settlement.
     }
+  }
+
+  private async quoteOutputFromReceipt(position: PositionRecord, transactionHash: Hex): Promise<bigint> {
+    const { client } = this.chains.getById(position.chainId);
+    const receipt = await client.getTransactionReceipt({ hash: transactionHash });
+    let output = 0n;
+    for (const entry of receipt.logs) {
+      if (entry.address.toLowerCase() !== position.quoteToken?.toLowerCase()) continue;
+      try {
+        const decoded = decodeEventLog({ abi: [erc20TransferEvent], data: entry.data, topics: entry.topics as [Hex, ...Hex[]] });
+        const args = decoded.args as { to?: Address; value?: bigint };
+        if (args.to?.toLowerCase() === this.config.executorAddress.toLowerCase() && args.value !== undefined) output += args.value;
+      } catch {
+        // Ignore non-standard token logs.
+      }
+    }
+    return output;
   }
 
   private async computeEthUsd(chainId: number, ethWei: bigint): Promise<bigint> {
