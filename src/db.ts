@@ -69,6 +69,8 @@ export class Database {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE(chain_id, protocol, position_key)
       );
+      ALTER TABLE positions ADD COLUMN IF NOT EXISTS settlement_lease_token TEXT;
+      ALTER TABLE positions ADD COLUMN IF NOT EXISTS settlement_lease_until TIMESTAMPTZ;
       CREATE TABLE IF NOT EXISTS cashflows (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         position_id UUID NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
@@ -336,6 +338,40 @@ export class Database {
     );
   }
 
+  async setPositionStatusUnlessSettled(positionId: string, status: PositionStatus, metadata?: Record<string, unknown>): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE positions
+       SET status = $2, metadata = metadata || $3::jsonb, updated_at = NOW()
+       WHERE id = $1 AND status <> 'settled'
+       RETURNING id`,
+      [positionId, status, JSON.stringify(metadata ?? {})],
+    );
+    return result.rowCount === 1;
+  }
+
+  async claimSettlementLease(positionId: string, token: string, ttlMs = 300_000): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE positions
+       SET settlement_lease_token = $2,
+           settlement_lease_until = NOW() + ($3 * INTERVAL '1 millisecond')
+       WHERE id = $1
+         AND status <> 'settled'
+         AND (settlement_lease_until IS NULL OR settlement_lease_until <= NOW())
+       RETURNING id`,
+      [positionId, token, ttlMs],
+    );
+    return result.rowCount === 1;
+  }
+
+  async releaseSettlementLease(positionId: string, token: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE positions
+       SET settlement_lease_token = NULL, settlement_lease_until = NULL
+       WHERE id = $1 AND settlement_lease_token = $2`,
+      [positionId, token],
+    );
+  }
+
   async markNeedsReviewIfNoPendingSettlement(positionId: string, metadata: Record<string, unknown>): Promise<boolean> {
     const result = await this.pool.query(
       `UPDATE positions
@@ -506,6 +542,20 @@ export class Database {
     const result = await this.pool.query<{ transaction_hash: string }>(
       "SELECT transaction_hash FROM execution_attempts WHERE position_id = $1 AND stage = 'swap_to_quote' AND status = 'submitted' AND transaction_hash IS NOT NULL ORDER BY created_at DESC LIMIT 1",
       [positionId],
+    );
+    return result.rowCount ? result.rows[0]!.transaction_hash : null;
+  }
+
+  async getLatestExecutionHash(positionId: string, stage: string): Promise<string | null> {
+    const result = await this.pool.query<{ transaction_hash: string }>(
+      `SELECT transaction_hash
+       FROM execution_attempts
+       WHERE position_id = $1 AND stage = $2
+         AND status IN ('submitted', 'confirmed')
+         AND transaction_hash IS NOT NULL
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [positionId, stage],
     );
     return result.rowCount ? result.rows[0]!.transaction_hash : null;
   }
@@ -724,6 +774,11 @@ export class Database {
     const metadataCloseTx = typeof meta.closeTransactionHash === "string" ? meta.closeTransactionHash : null;
     if (metadataCloseTx && metadataCloseTx.toLowerCase() !== closeTx.toLowerCase()) return;
     const swapTx = attempts.rows.find((attempt) => attempt.stage === "swap_to_quote")?.transaction_hash ?? null;
+    const closeSettlement = typeof meta.settlementQuoteFromClose === "string" ? BigInt(meta.settlementQuoteFromClose) : null;
+    if (swapTx && closeSettlement !== null && totalReceived <= closeSettlement) {
+      await this.pool.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);
+      return;
+    }
     const totals = await this.getCashflowTotals(positionId, [closeTx, swapTx].filter((hash): hash is string => hash !== null));
     if (totals.deposits === 0n) return;
     const finalPnl = totals.realized + totalReceived - totals.deposits;

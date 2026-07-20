@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { privateKeyToAccount } from "viem/accounts";
 import {
   createPublicClient,
@@ -53,6 +55,8 @@ interface PendingSwap {
 export class Executor {
   private readonly account;
   private readonly executorClientCache = new Map<string, PublicClient>();
+  private readonly settlementJobs = new Map<string, Promise<void>>();
+  private transactionTail: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly database: Database,
@@ -73,9 +77,13 @@ export class Executor {
   }
 
   async execute(position: PositionRecord, trigger?: ExitTrigger): Promise<void> {
+    return this.runSettlementExclusive(position.id, () => this.executeUnlocked(position, trigger));
+  }
+
+  private async executeUnlocked(position: PositionRecord, trigger?: ExitTrigger): Promise<void> {
     if (!position.quoteToken) throw new Error("Cannot execute a position without quote token");
     const quoteToken = position.quoteToken;
-    if (position.status === "closing") return this.resume(position);
+    if (position.status === "closing") return this.resumeUnlocked(position);
     if (position.protocol === "v4" && !(await this.canCloseV4(position))) return;
     const retryMetadata = position.metadata as Record<string, unknown>;
 
@@ -90,6 +98,7 @@ export class Executor {
       exitStartedAt: new Date().toISOString(),
       exitRetry: null,
       exitTrigger: trigger ?? "manual",
+      settlementPhase: "removing_liquidity",
       settlementQuoteFromClose: settlementQuoteFromClose.toString(),
       preCloseQuoteBalance: preCloseBalance.toString(),
       ...(!this.config.pnlIncludeGas && quoteToken.toLowerCase() === zeroAddress
@@ -139,8 +148,9 @@ export class Executor {
         closeTransactionHash: hash,
         settlementQuoteFromClose: closeAmounts.quoteAmount.toString(),
         closeReceiptAccounted: true,
+        settlementPhase: closeAmounts.nonQuoteAmount > 0n ? "pending_swap" : "accounting",
       });
-      await this.resume({
+      await this.resumeUnlocked({
         ...position,
         metadata: {
           ...position.metadata,
@@ -148,15 +158,17 @@ export class Executor {
           closeTransactionHash: hash,
           settlementQuoteFromClose: closeAmounts.quoteAmount.toString(),
           closeReceiptAccounted: true,
+          settlementPhase: closeAmounts.nonQuoteAmount > 0n ? "pending_swap" : "accounting",
         },
       });
     } catch (error) {
       if (!closeConfirmed) {
         const message = errorMessage(error);
         await this.database.recordExecution(position.id, "remove_liquidity", "failed", undefined, message);
-        await this.database.setPositionStatus(position.id, "armed", {
+        await this.database.setPositionStatusUnlessSettled(position.id, "armed", {
           lastExecutionError: message,
           exitRetry: nextExitRetry(retryMetadata, trigger),
+          settlementPhase: null,
         });
         await this.notifier.failure(position, message);
       }
@@ -165,10 +177,28 @@ export class Executor {
   }
 
   async resume(position: PositionRecord): Promise<void> {
+    return this.runSettlementExclusive(position.id, () => this.resumeUnlocked(position));
+  }
+
+  private async resumeUnlocked(position: PositionRecord): Promise<void> {
+    const durableMetadata = await this.database.getPositionMetadata(position.id);
+    if (durableMetadata) position = { ...position, metadata: durableMetadata };
+    if (position.metadata.settlementPhase === "removing_liquidity") {
+      const recovered = await this.recoverConfirmedClose(position);
+      if (!recovered) return;
+      position = recovered;
+    }
     const pending = parsePendingSwap(position.metadata.pendingSwap);
     if (!pending || pending.amount === 0n) {
+      if (position.metadata.settlementPhase === "pending_swap") {
+        await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
+          reason: "pending_swap_metadata_missing",
+          settlementRetryDisabled: true,
+        });
+        return;
+      }
       await this.saveSettlementBalance(position);
-      await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null });
+      await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, settlementPhase: "settled" });
       await this.notifier.settled(position);
       this.finalizeCloseHistory(position);
       return;
@@ -179,36 +209,41 @@ export class Executor {
     const quoteToken = recoveredPosition.quoteToken;
     if (!quoteToken) return;
 
-    const actualBalance = await this.tokenBalance(position.chainId, pending.token);
-    if (actualBalance < pending.amount) {
-      const submittedSwap = await this.database.getSubmittedSwapAttempt(position.id);
-      if (submittedSwap) {
-        try {
-          const { client } = this.chains.getById(position.chainId);
-          const receipt = await client.getTransactionReceipt({ hash: submittedSwap as Hex });
-          if (receipt && receipt.status === "success") {
-            await this.database.recordExecution(position.id, "swap_to_quote", "confirmed", submittedSwap);
-            log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "reconciled submitted swap receipt after restart");
-            await this.saveSettlementBalance(position, 0n, submittedSwap as Hex);
-            await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: submittedSwap });
-            await this.notifier.settled(position);
-            this.finalizeCloseHistory(position);
-            return;
-          }
-        } catch {
-          // Receipt not yet available — keep position closing and retry later.
+    const submittedSwap = await this.database.getSubmittedSwapAttempt(position.id);
+    if (submittedSwap) {
+      try {
+        const { client } = this.chains.getById(position.chainId);
+        const receipt = await client.getTransactionReceipt({ hash: submittedSwap as Hex });
+        if (receipt.status === "success") {
+          await this.database.recordExecution(position.id, "swap_to_quote", "confirmed", submittedSwap);
+          await this.saveSettlementBalance(position, 0n, submittedSwap as Hex);
+          await this.database.setPositionStatus(position.id, "settled", {
+            pendingSwap: null,
+            swapTransactionHash: submittedSwap,
+            settlementPhase: "settled",
+          });
+          log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "reconciled submitted swap receipt");
+          await this.notifier.settled(position);
+          this.finalizeCloseHistory(position);
+          return;
         }
-        log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "swap was broadcast but receipt not yet confirmed; retrying");
+        await this.database.recordExecution(position.id, "swap_to_quote", "failed", submittedSwap, "transaction reverted");
+      } catch {
+        log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "swap was broadcast but receipt is not yet available");
         return;
       }
+    }
 
+    const actualBalance = await this.tokenBalance(position.chainId, pending.token);
+    if (actualBalance < pending.amount) {
       const reason = actualBalance === 0n
         ? "pending swap token is no longer held — position externally settled"
         : `pending swap balance (${actualBalance}) is below expected (${pending.amount}) — externally settled`;
-      await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, reason });
-      log.info({ positionId: position.id, positionKey: position.positionKey, reason }, "skipping post-close settlement");
-      await this.notifier.settled(position);
-      this.finalizeCloseHistory(position);
+      await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
+        reason,
+        settlementRetryDisabled: true,
+      });
+      log.warn({ positionId: position.id, positionKey: position.positionKey, reason }, "external settlement requires transaction reconciliation");
       return;
     }
 
@@ -226,7 +261,7 @@ export class Executor {
           return;
         }
         await this.saveSettlementBalance(position, expectedOut, hash);
-        await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash });
+        await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash, settlementPhase: "settled" });
         await this.notifier.settled(position);
         this.finalizeCloseHistory(position);
         return;
@@ -263,15 +298,91 @@ export class Executor {
         return;
       }
       await this.saveSettlementBalance(position, plan.expectedOut, hash);
-      await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash });
+      await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash, settlementPhase: "settled" });
       await this.notifier.settled(position);
       this.finalizeCloseHistory(position);
     } catch (error) {
       await this.database.recordExecution(position.id, "swap_to_quote", "failed", undefined, errorMessage(error));
-      await this.database.setPositionStatus(position.id, "closing", { lastExecutionError: errorMessage(error) });
+      await this.database.setPositionStatusUnlessSettled(position.id, "closing", { lastExecutionError: errorMessage(error) });
       await this.notifier.failure(position, errorMessage(error));
       throw error;
     }
+  }
+
+  private runSettlementExclusive(positionId: string, work: () => Promise<void>): Promise<void> {
+    const existing = this.settlementJobs.get(positionId);
+    if (existing) return existing;
+    const leaseToken = randomUUID();
+    const run = (async () => {
+      const claimed = await this.database.claimSettlementLease(positionId, leaseToken);
+      if (!claimed) {
+        log.info({ positionId }, "settlement already claimed by another worker");
+        return;
+      }
+      try {
+        await work();
+      } finally {
+        try {
+          await this.database.releaseSettlementLease(positionId, leaseToken);
+        } catch (error) {
+          log.warn({ error: errorMessage(error), positionId }, "could not release settlement lease");
+        }
+      }
+    })();
+    const tracked = run.finally(() => {
+      if (this.settlementJobs.get(positionId) === tracked) this.settlementJobs.delete(positionId);
+    });
+    this.settlementJobs.set(positionId, tracked);
+    return tracked;
+  }
+
+  private async recoverConfirmedClose(position: PositionRecord): Promise<PositionRecord | null> {
+    const meta = position.metadata as Record<string, unknown>;
+    const storedHash = typeof meta.closeTransactionHash === "string" ? meta.closeTransactionHash : null;
+    const closeHash = storedHash ?? await this.database.getLatestExecutionHash(position.id, "remove_liquidity");
+    const trigger = typeof meta.exitTrigger === "string" ? meta.exitTrigger as ExitTrigger : undefined;
+    if (!closeHash) {
+      await this.database.setPositionStatusUnlessSettled(position.id, "armed", {
+        pendingSwap: null,
+        settlementPhase: null,
+        exitRetry: nextExitRetry(meta, trigger),
+        reason: "close_transaction_was_not_submitted",
+      });
+      return null;
+    }
+
+    const { client } = this.chains.getById(position.chainId);
+    let receipt: Awaited<ReturnType<typeof client.getTransactionReceipt>>;
+    try {
+      receipt = await client.getTransactionReceipt({ hash: closeHash as Hex });
+    } catch {
+      return null;
+    }
+    if (receipt.status !== "success") {
+      await this.database.recordExecution(position.id, "remove_liquidity", "failed", closeHash, "transaction reverted");
+      await this.database.setPositionStatusUnlessSettled(position.id, "armed", {
+        pendingSwap: null,
+        settlementPhase: null,
+        exitRetry: nextExitRetry(meta, trigger),
+        reason: "close_transaction_reverted",
+      });
+      return null;
+    }
+
+    const closeAmounts = await this.closeReceiptAmounts(position, closeHash as Hex);
+    const nonQuoteToken = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? position.token1 : position.token0;
+    const nextMetadata = {
+      ...meta,
+      pendingSwap: closeAmounts.nonQuoteAmount > 0n ? { token: nonQuoteToken, amount: closeAmounts.nonQuoteAmount.toString() } : null,
+      closeTransactionHash: closeHash,
+      settlementQuoteFromClose: closeAmounts.quoteAmount.toString(),
+      closeReceiptAccounted: true,
+      settlementPhase: closeAmounts.nonQuoteAmount > 0n ? "pending_swap" : "accounting",
+    };
+    await this.database.recordExecution(position.id, "remove_liquidity", "confirmed", closeHash);
+    await this.database.setPositionStatusUnlessSettled(position.id, "closing", nextMetadata);
+    log.info({ positionId: position.id, positionKey: position.positionKey, closeHash }, "recovered confirmed close receipt");
+    return { ...position, status: "closing", metadata: nextMetadata };
   }
 
   private async saveSettlementBalance(position: PositionRecord, swapExpectedOut = 0n, swapTransactionHash?: Hex): Promise<void> {
@@ -685,7 +796,13 @@ export class Executor {
     return alchemyClient;
   }
 
-  private async send(position: PositionRecord, stage: string, plan: TransactionPlan): Promise<Hex | null> {
+  private send(position: PositionRecord, stage: string, plan: TransactionPlan): Promise<Hex | null> {
+    const run = this.transactionTail.then(() => this.sendUnlocked(position, stage, plan));
+    this.transactionTail = run.catch(() => undefined);
+    return run;
+  }
+
+  private async sendUnlocked(position: PositionRecord, stage: string, plan: TransactionPlan): Promise<Hex | null> {
     const { registry } = this.chains.getById(plan.chainId);
     const client = this.executorClient(plan.chainId);
     await client.call({ account: position.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n });

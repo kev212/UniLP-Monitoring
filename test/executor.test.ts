@@ -230,7 +230,14 @@ describe("Executor pending settlement recovery", () => {
   });
 
   it("swaps only the amount received by the closing position", async () => {
-    const database = { recordExecution: vi.fn(), setPositionStatus: vi.fn() };
+    const database = {
+      claimSettlementLease: vi.fn().mockResolvedValue(true),
+      releaseSettlementLease: vi.fn(),
+      getPositionMetadata: vi.fn().mockResolvedValue({ pendingSwap: { token, amount: "5" } }),
+      getSubmittedSwapAttempt: vi.fn().mockResolvedValue(null),
+      recordExecution: vi.fn(),
+      setPositionStatusUnlessSettled: vi.fn(),
+    };
     const client = { readContract: vi.fn().mockResolvedValue(100n) };
     const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
     const routes = { quoteDirect: vi.fn().mockResolvedValue(null) };
@@ -244,6 +251,28 @@ describe("Executor pending settlement recovery", () => {
 
     await expect(executor.resume(position)).rejects.toThrow("No safe route");
     expect(routes.quoteDirect).toHaveBeenCalledWith(position, token, 5n, usdg);
+  });
+
+  it("runs only one settlement worker per position", async () => {
+    let releaseWork!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseWork = resolve; });
+    const database = {
+      claimSettlementLease: vi.fn().mockResolvedValue(true),
+      releaseSettlementLease: vi.fn(),
+    };
+    const executor = new Executor(database as never, {} as never, {} as never, {} as never, {} as never, config);
+    const work = vi.fn(async () => gate);
+    const run = (executor as unknown as { runSettlementExclusive(id: string, task: () => Promise<void>): Promise<void> }).runSettlementExclusive.bind(executor);
+
+    const first = run("position", work);
+    const second = run("position", work);
+    expect(second).toBe(first);
+    releaseWork();
+    await Promise.all([first, second]);
+
+    expect(work).toHaveBeenCalledTimes(1);
+    expect(database.claimSettlementLease).toHaveBeenCalledTimes(1);
+    expect(database.releaseSettlementLease).toHaveBeenCalledTimes(1);
   });
 
   it("rejects a confirmed swap without a measurable quote output", async () => {

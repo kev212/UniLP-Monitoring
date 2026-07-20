@@ -3,6 +3,28 @@ import { describe, expect, it, vi } from "vitest";
 import { Database } from "../src/db.js";
 
 describe("Database native USD backfill", () => {
+  it("claims settlement only when no active lease or settled status exists", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ id: "position" }] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.claimSettlementLease("position", "worker", 300_000)).resolves.toBe(true);
+
+    expect(query.mock.calls[0]![0]).toContain("status <> 'settled'");
+    expect(query.mock.calls[0]![0]).toContain("settlement_lease_until <= NOW()");
+    expect(query.mock.calls[0]![1]).toEqual(["position", "worker", 300_000]);
+  });
+
+  it("does not regress a settled position to a mutable status", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 0, rows: [] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.setPositionStatusUnlessSettled("position", "closing", { reason: "late worker" })).resolves.toBe(false);
+
+    expect(query.mock.calls[0]![0]).toContain("status <> 'settled'");
+  });
+
   it("aggregates calendar days in UTC without a history limit", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn().mockResolvedValue({ rows: [{ date: "2026-07-01", pnl_usd: "1250000", close_count: "2", win_count: "1" }] });
@@ -162,6 +184,28 @@ describe("Database native USD backfill", () => {
     await database.finalizeCloseHistory("position", "manual");
 
     expect(query).toHaveBeenCalledTimes(2);
+  });
+
+  it("removes history when a confirmed swap is missing from the settlement total", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{
+        chain_id: 4663, protocol: "v4", position_key: "position", status: "settled",
+        token0: "0x5fc5360d0400a0fd4f2af552add042d716f1d168", token1: "0xtoken",
+        quote_token: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        metadata: { totalReceived: "10000", settlementQuoteFromClose: "10000" }, opened_at_block: null,
+      }] })
+      .mockResolvedValueOnce({ rows: [
+        { stage: "remove_liquidity", transaction_hash: "0xclose" },
+        { stage: "swap_to_quote", transaction_hash: "0xswap" },
+      ] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await database.finalizeCloseHistory("position", "manual");
+
+    expect(query).toHaveBeenCalledTimes(3);
+    expect(query.mock.calls[2]![0]).toContain("DELETE FROM close_history");
   });
 
   it("does not send a closing position to review from stale burn detection", async () => {
