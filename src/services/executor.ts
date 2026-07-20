@@ -13,6 +13,7 @@ import {
   type Address,
   type Hex,
   type PublicClient,
+  type TransactionReceipt,
 } from "viem";
 
 import {
@@ -79,7 +80,6 @@ export class Executor {
     const retryMetadata = position.metadata as Record<string, unknown>;
 
     const value = await this.reader.read(position);
-    const before = await this.tokenBalances(position.chainId, position.owner, position.token0, position.token1);
     const quoteIsToken0 = value.token0.token.toLowerCase() === position.quoteToken.toLowerCase();
     const quotePrincipal = quoteIsToken0 ? value.token0.amount : value.token1.amount;
     const quoteFee = quoteIsToken0 ? value.unclaimedFees0 : value.unclaimedFees1;
@@ -119,21 +119,35 @@ export class Executor {
       }
       closeConfirmed = true;
 
-      const after = await this.tokenBalances(position.chainId, position.owner, position.token0, position.token1);
       const nonQuoteToken = quoteToken.toLowerCase() === position.token0.toLowerCase() ? position.token1 : position.token0;
-      const nonQuoteAmount = nonQuoteToken.toLowerCase() === position.token0.toLowerCase()
-        ? positiveDelta(before.token0, after.token0)
-        : positiveDelta(before.token1, after.token1);
+      let closeAmounts: { quoteAmount: bigint; nonQuoteAmount: bigint };
+      try {
+        closeAmounts = await this.closeReceiptAmounts(position, hash);
+      } catch (error) {
+        const reason = errorMessage(error);
+        await this.database.setPositionStatus(position.id, "needs_review", {
+          pendingSwap: null,
+          closeTransactionHash: hash,
+          reason: "close_receipt_accounting_failed",
+          lastExecutionError: reason,
+        });
+        await this.notifier.failure(position, reason);
+        return;
+      }
       await this.database.setPositionStatus(position.id, "closing", {
-        pendingSwap: nonQuoteAmount > 0n ? { token: nonQuoteToken, amount: nonQuoteAmount.toString() } satisfies PendingSwap : null,
+        pendingSwap: closeAmounts.nonQuoteAmount > 0n ? { token: nonQuoteToken, amount: closeAmounts.nonQuoteAmount.toString() } satisfies PendingSwap : null,
         closeTransactionHash: hash,
+        settlementQuoteFromClose: closeAmounts.quoteAmount.toString(),
+        closeReceiptAccounted: true,
       });
       await this.resume({
         ...position,
         metadata: {
           ...position.metadata,
-          pendingSwap: nonQuoteAmount > 0n ? { token: nonQuoteToken, amount: nonQuoteAmount.toString() } : null,
+          pendingSwap: closeAmounts.nonQuoteAmount > 0n ? { token: nonQuoteToken, amount: closeAmounts.nonQuoteAmount.toString() } : null,
           closeTransactionHash: hash,
+          settlementQuoteFromClose: closeAmounts.quoteAmount.toString(),
+          closeReceiptAccounted: true,
         },
       });
     } catch (error) {
@@ -202,7 +216,7 @@ export class Executor {
     const effectiveSlippageBps = Math.min(500, 100 * (1 + retryCount));
 
     try {
-      const apiResult = retryCount >= 2 ? undefined : await this.tradingApiSwapPlan(position, pending.token, actualBalance, quoteToken);
+      const apiResult = retryCount >= 2 ? undefined : await this.tradingApiSwapPlan(position, pending.token, pending.amount, quoteToken);
       if (apiResult === null) return;
       if (apiResult) {
         const { plan, expectedOut } = apiResult;
@@ -218,7 +232,7 @@ export class Executor {
         return;
       }
 
-      const route = await this.routes.quoteDirect(position, pending.token, actualBalance, quoteToken);
+      const route = await this.routes.quoteDirect(position, pending.token, pending.amount, quoteToken);
       if (!route) throw new Error("No safe route remains for post-close settlement");
       const plan = retryCount > 0
         ? { ...route, minimumOut: applySlippage(route.expectedOut, effectiveSlippageBps) }
@@ -226,18 +240,18 @@ export class Executor {
       log.info({ positionKey: position.positionKey, protocol: route.protocol, path: route.path, expectedOut: route.expectedOut.toString(), minimumOut: plan.minimumOut.toString(), slippageBps: effectiveSlippageBps }, "local swap route selected");
       if (route.protocol === "v4") {
         const { registry } = this.chains.getById(position.chainId);
-        const tokenApprovalChanged = await this.ensureExactApproval(position, pending.token, registry.contracts.v4.permit2, actualBalance, "approve_permit2");
+        const tokenApprovalChanged = await this.ensureExactApproval(position, pending.token, registry.contracts.v4.permit2, pending.amount, "approve_permit2");
         if (this.config.dryRun && tokenApprovalChanged) {
           await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve_permit2 then permit2_approve then swap_to_quote" });
           return;
         }
-        const permit2ApprovalChanged = await this.ensurePermit2Approval(position, pending.token, route.router, actualBalance);
+        const permit2ApprovalChanged = await this.ensurePermit2Approval(position, pending.token, route.router, pending.amount);
         if (this.config.dryRun && permit2ApprovalChanged) {
           await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "permit2_approve then swap_to_quote" });
           return;
         }
       } else {
-        const approvalChanged = await this.ensureExactApproval(position, pending.token, route.router, actualBalance, "approve_swap");
+        const approvalChanged = await this.ensureExactApproval(position, pending.token, route.router, pending.amount, "approve_swap");
         if (this.config.dryRun && approvalChanged) {
           await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve_swap then swap_to_quote" });
           return;
@@ -272,9 +286,10 @@ export class Executor {
       ? await this.quoteOutputFromReceipt(position, swapTransactionHash)
       : 0n;
     if (swapTransactionHash) {
-      const swapOutput = receiptSwapOutput || swapExpectedOut;
-      if (swapOutput === 0n) throw new Error("Confirmed swap receipt has no quote-token output");
-      totalReceived = closeSettlement + swapOutput;
+      if (receiptSwapOutput === 0n) throw new Error("Confirmed swap receipt has no quote-token output");
+      totalReceived = closeSettlement + receiptSwapOutput;
+    } else if (meta.closeReceiptAccounted === true) {
+      totalReceived = closeSettlement;
     } else if (preCloseStr) {
       const actualNow = await this.assetBalance(position.chainId, this.config.executorAddress, position.quoteToken);
       const preClose = BigInt(preCloseStr);
@@ -307,18 +322,45 @@ export class Executor {
   private async quoteOutputFromReceipt(position: PositionRecord, transactionHash: Hex): Promise<bigint> {
     const { client } = this.chains.getById(position.chainId);
     const receipt = await client.getTransactionReceipt({ hash: transactionHash });
-    let output = 0n;
-    for (const entry of receipt.logs) {
-      if (entry.address.toLowerCase() !== position.quoteToken?.toLowerCase()) continue;
-      try {
-        const decoded = decodeEventLog({ abi: [erc20TransferEvent], data: entry.data, topics: entry.topics as [Hex, ...Hex[]] });
-        const args = decoded.args as { to?: Address; value?: bigint };
-        if (args.to?.toLowerCase() === this.config.executorAddress.toLowerCase() && args.value !== undefined) output += args.value;
-      } catch {
-        // Ignore non-standard token logs.
-      }
+    if (!position.quoteToken) return 0n;
+    return this.assetReceivedFromReceipt(position.chainId, position.quoteToken, this.config.executorAddress, transactionHash, receipt);
+  }
+
+  private async closeReceiptAmounts(position: PositionRecord, transactionHash: Hex): Promise<{ quoteAmount: bigint; nonQuoteAmount: bigint }> {
+    if (!position.quoteToken) throw new Error("Cannot inspect close receipt without a quote token");
+    const { client } = this.chains.getById(position.chainId);
+    const receipt = await client.getTransactionReceipt({ hash: transactionHash });
+    if (receipt.status !== "success") throw new Error(`Close receipt is not successful: ${transactionHash}`);
+    const [amount0, amount1] = await Promise.all([
+      this.assetReceivedFromReceipt(position.chainId, position.token0, position.owner, transactionHash, receipt),
+      this.assetReceivedFromReceipt(position.chainId, position.token1, position.owner, transactionHash, receipt),
+    ]);
+    const quoteIsToken0 = position.quoteToken.toLowerCase() === position.token0.toLowerCase();
+    return quoteIsToken0
+      ? { quoteAmount: amount0, nonQuoteAmount: amount1 }
+      : { quoteAmount: amount1, nonQuoteAmount: amount0 };
+  }
+
+  private async assetReceivedFromReceipt(chainId: number, token: Address, owner: Address, transactionHash: Hex, receipt: TransactionReceipt): Promise<bigint> {
+    if (token.toLowerCase() !== zeroAddress) {
+      const transferred = receiptErc20NetReceived(receipt.logs, token, owner);
+      if (transferred > 0n) return transferred;
+      const [before, after] = await Promise.all([
+        this.assetBalanceAt(chainId, owner, token, receipt.blockNumber - 1n),
+        this.assetBalanceAt(chainId, owner, token, receipt.blockNumber),
+      ]);
+      return positiveDelta(before, after);
     }
-    return output;
+
+    const { client } = this.chains.getById(chainId);
+    const [before, after, transaction] = await Promise.all([
+      client.getBalance({ address: owner, blockNumber: receipt.blockNumber - 1n }),
+      client.getBalance({ address: owner, blockNumber: receipt.blockNumber }),
+      client.getTransaction({ hash: transactionHash }),
+    ]);
+    const l1Fee = (receipt as TransactionReceipt & { l1Fee?: bigint }).l1Fee ?? 0n;
+    const adjustedAfter = after + receipt.gasUsed * receipt.effectiveGasPrice + l1Fee + transaction.value;
+    return positiveDelta(before, adjustedAfter);
   }
 
   private async computeEthUsd(chainId: number, ethWei: bigint): Promise<bigint> {
@@ -674,14 +716,6 @@ export class Executor {
     await this.database.setPositionStatus(position.id, "closing", { settlementGasWei: totalGasWei.toString() });
   }
 
-  private async tokenBalances(chainId: number, owner: Address, token0: Address, token1: Address): Promise<{ token0: bigint; token1: bigint }> {
-    const [balance0, balance1] = await Promise.all([
-      this.assetBalance(chainId, owner, token0),
-      this.assetBalance(chainId, owner, token1),
-    ]);
-    return { token0: balance0, token1: balance1 };
-  }
-
   private async tokenBalance(chainId: number, token: Address): Promise<bigint> {
     return this.assetBalance(chainId, this.config.executorAddress, token);
   }
@@ -690,6 +724,12 @@ export class Executor {
     const { client } = this.chains.getById(chainId);
     if (token.toLowerCase() === zeroAddress) return client.getBalance({ address: owner });
     return client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
+  }
+
+  private async assetBalanceAt(chainId: number, owner: Address, token: Address, blockNumber: bigint): Promise<bigint> {
+    const { client } = this.chains.getById(chainId);
+    if (token.toLowerCase() === zeroAddress) return client.getBalance({ address: owner, blockNumber });
+    return client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner], blockNumber });
   }
 
   private closeTrigger(position: PositionRecord): string {
@@ -901,6 +941,28 @@ function parsePendingSwap(value: unknown): { token: Address; amount: bigint } | 
     return null;
   }
   return { token: candidate.token as Address, amount: BigInt(candidate.amount) };
+}
+
+export function receiptErc20NetReceived(
+  logs: readonly { address: Address; data: Hex; topics: readonly Hex[] }[],
+  token: Address,
+  owner: Address,
+): bigint {
+  let incoming = 0n;
+  let outgoing = 0n;
+  for (const entry of logs) {
+    if (entry.address.toLowerCase() !== token.toLowerCase()) continue;
+    try {
+      const decoded = decodeEventLog({ abi: [erc20TransferEvent], data: entry.data, topics: entry.topics as [Hex, ...Hex[]] });
+      const args = decoded.args as { from?: Address; to?: Address; value?: bigint };
+      if (args.value === undefined) continue;
+      if (args.to?.toLowerCase() === owner.toLowerCase()) incoming += args.value;
+      if (args.from?.toLowerCase() === owner.toLowerCase()) outgoing += args.value;
+    } catch {
+      // Ignore non-standard token logs.
+    }
+  }
+  return incoming > outgoing ? incoming - outgoing : 0n;
 }
 
 function positiveDelta(before: bigint, after: bigint): bigint {
