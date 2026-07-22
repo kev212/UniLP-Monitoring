@@ -244,8 +244,8 @@ export class Guardian {
         return true;
       }
       const nextAttemptAt = retryAt(position.metadata);
-      if (nextAttemptAt !== null && Date.now() < nextAttemptAt) {
-        log.info({ positionId: position.id, trigger: effectiveTrigger, nextAttemptAt: new Date(nextAttemptAt).toISOString() }, "exit retry waiting for backoff");
+      if (shouldWaitForExitRetry(effectiveTrigger, nextAttemptAt)) {
+        log.info({ positionId: position.id, trigger: effectiveTrigger, nextAttemptAt: new Date(nextAttemptAt!).toISOString() }, "exit retry waiting for backoff");
         return true;
       }
       if (this.queuedExitPositions.has(position.id)) return true;
@@ -319,10 +319,19 @@ export class Guardian {
         const latestMetadata = await this.database.getPositionMetadata(position.id);
         const latestPosition = latestMetadata ? { ...position, metadata: latestMetadata } : position;
         const latestBlock = await this.chains.getById(position.chainId).client.getBlockNumber();
-        const latestEstimate = await this.trailingExitEstimateAllowed(latestPosition, latestBlock);
-        if (!latestEstimate) return;
+        const latestValuation = await this.pnl.value(latestPosition, latestBlock, this.config.settlementSwapSlippageBps, false);
+        const quoteIsToken0 = latestPosition.quoteToken?.toLowerCase() === latestPosition.token0.toLowerCase();
+        const latestStaticTrigger = this.pnl.shouldTrigger(latestValuation.snapshot, latestValuation.range, quoteIsToken0);
+        if (latestStaticTrigger === "stop_loss") {
+          trigger = latestStaticTrigger;
+          triggerSnapshot = latestValuation.snapshot;
+          log.warn({ positionId: position.id, positionKey: position.positionKey }, "queued trailing exit upgraded to stop-loss");
+        } else {
+          const latestEstimate = await this.trailingExitEstimateAllowed(latestPosition, latestBlock, latestValuation);
+          if (!latestEstimate) return;
+          triggerSnapshot = latestEstimate;
+        }
         position = latestPosition;
-        triggerSnapshot = latestEstimate;
       }
       void this.notifier.trigger(position, triggerSnapshot, trigger);
       await this.executor.execute(position, trigger);
@@ -335,7 +344,7 @@ export class Guardian {
     }
   }
 
-  private async trailingExitEstimateAllowed(position: PositionRecord, blockNumber: bigint): Promise<PnlSnapshot | null> {
+  private async trailingExitEstimateAllowed(position: PositionRecord, blockNumber: bigint, valued?: Awaited<ReturnType<PnlService["value"]>>): Promise<PnlSnapshot | null> {
     const gateBps = this.pnl.trailingExitEstimateGateBps(position.metadata);
     if (gateBps === null) {
       await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
@@ -346,7 +355,7 @@ export class Guardian {
       return null;
     }
 
-    const exitEstimate = await this.pnl.value(
+    const exitEstimate = valued ?? await this.pnl.value(
       position,
       blockNumber,
       this.config.settlementSwapSlippageBps,
@@ -452,6 +461,10 @@ function retryAt(metadata: Record<string, unknown>): number | null {
   if (typeof nextAttemptAt !== "string") return null;
   const timestamp = Date.parse(nextAttemptAt);
   return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+export function shouldWaitForExitRetry(trigger: ExitTrigger, nextAttemptAt: number | null, now = Date.now()): boolean {
+  return trigger !== "stop_loss" && nextAttemptAt !== null && now < nextAttemptAt;
 }
 
 function parseExitRetry(metadata: Record<string, unknown>): { reason: ExitTrigger; nextAttemptAt: number } | null {

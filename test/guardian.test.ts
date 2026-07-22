@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { Guardian } from "../src/services/guardian.js";
+import { Guardian, shouldWaitForExitRetry } from "../src/services/guardian.js";
 import { quoteRangeState } from "../src/services/quote-range.js";
 import { sqrtRatioAtTick } from "../src/services/uniswap-math.js";
 import type { RuntimeConfig } from "../src/config.js";
@@ -114,6 +114,12 @@ describe("profit + OOR above timer", () => {
 
     const db = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
     expect(db.setPositionStatus).toHaveBeenCalledWith("position", "armed", expect.objectContaining({ profitOorAboveSeenAt: expect.any(Number) }));
+  });
+
+  it("keeps stop-loss eligible when a previous exit retry is still backing off", () => {
+    const now = Date.now();
+    expect(shouldWaitForExitRetry("trailing_take_profit", now + 60_000, now)).toBe(true);
+    expect(shouldWaitForExitRetry("stop_loss", now + 60_000, now)).toBe(false);
   });
 
   it("fires the trigger only after the configured duration elapses", () => {
