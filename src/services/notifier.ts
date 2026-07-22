@@ -703,7 +703,8 @@ export class Notifier {
     const bins = positionRangeBins(minimum, maximum, current);
     const prices = formatRangePrices(minimum, current, maximum, quoteSymbol);
     const scaleSuffix = prices.scale ? ` ${prices.scale}` : "";
-    return `\n   ${prices.low} ${bins.bar} ${prices.high}${scaleSuffix}\n   ${bins.marker} ${prices.cur}`;
+    const rangeStatus = formatDashboardRangeStatus(quoteRangeState(range, quoteIsToken0)?.status, position.metadata);
+    return `\n   ${prices.low} ${bins.bar} ${prices.high}${scaleSuffix}\n   ${bins.marker} ${prices.cur}${rangeStatus}`;
   }
 
   private lastScanAt = 0;
@@ -1563,6 +1564,18 @@ export function formatRangePrices(
     cur: ((current + halfDivisor) / divisor).toString(),
     high: ((maximum + halfDivisor) / divisor).toString(),
   };
+}
+
+export function formatDashboardRangeStatus(
+  status: import("../types.js").PositionRangeInfo["status"] | undefined,
+  metadata: Record<string, unknown>,
+  now = Date.now(),
+): string {
+  if (status === "below") return " | ⚠️ OOR BELOW";
+  if (status !== "above") return "";
+  const seenAt = typeof metadata.oorAboveSeenAt === "number" ? metadata.oorAboveSeenAt : undefined;
+  const elapsedMinutes = seenAt === undefined ? null : Math.max(0, Math.floor((now - seenAt) / 60_000));
+  return ` | ⚠️ OOR ABOVE${elapsedMinutes === null ? "" : ` ⏳${elapsedMinutes}m`}`;
 }
 
 function triggerDisplayShort(trigger: string): string {

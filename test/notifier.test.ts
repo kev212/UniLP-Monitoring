@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { canRequestManualClose, clampDashboardPage, formatRangePrices, isExpiredCallbackError, parseDashboardAction, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
+import { canRequestManualClose, clampDashboardPage, formatDashboardRangeStatus, formatRangePrices, isExpiredCallbackError, parseDashboardAction, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -85,6 +85,14 @@ describe("Telegram dashboard callbacks", () => {
   it("pins the marker to the edge when price is outside the range", () => {
     expect(positionRangeBins(100n, 200n, 50n)).toMatchObject({ marker: "◀", markerIndex: 0 });
     expect(positionRangeBins(100n, 200n, 250n)).toMatchObject({ marker: "▶", markerIndex: 9 });
+  });
+
+  it("shows textual range status only outside the range", () => {
+    const now = Date.now();
+    expect(formatDashboardRangeStatus("in_range", {})).toBe("");
+    expect(formatDashboardRangeStatus("below", {})).toBe(" | ⚠️ OOR BELOW");
+    expect(formatDashboardRangeStatus("above", { oorAboveSeenAt: now - 17 * 60_000 }, now)).toBe(" | ⚠️ OOR ABOVE ⏳17m");
+    expect(formatDashboardRangeStatus("above", {})).toBe(" | ⚠️ OOR ABOVE");
   });
 
   it("shows prices normally when all values are at least 0.001", () => {
