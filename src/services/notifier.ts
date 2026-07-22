@@ -709,8 +709,7 @@ export class Notifier {
     const bins = positionRangeBins(minimum, maximum, current);
     const nonQuoteSymbol = await this.tokenLabel(quoteIsToken0 ? position.token1 : position.token0, position.chainId);
     const legend = `${nonQuoteSymbol} 🟩   ${quoteSymbol} 🟦`;
-    const marker = `${" ".repeat(bins.markerIndex)}${bins.marker}`;
-    return `\n   ${legend}\n   ${marker}\n   ${bins.bar}\n   ${formatQuotePrice(minimum, quoteSymbol)}        ${formatQuotePrice(current, quoteSymbol)}        ${formatQuotePrice(maximum, quoteSymbol)}`;
+    return `\n   ${legend}\n   ${formatQuotePrice(minimum, quoteSymbol)} ${bins.bar} ${formatQuotePrice(maximum, quoteSymbol)}\n   ${bins.marker} ${formatQuotePrice(current, quoteSymbol)}`;
   }
 
   private lastScanAt = 0;
@@ -1514,20 +1513,20 @@ function quotePriceScaled(sqrtPriceX96: bigint, quoteIsToken0: boolean, token0De
   return (square * 10n ** BigInt(token0Decimals) * QUOTE_PRICE_SCALE) / (Q192 * 10n ** BigInt(token1Decimals));
 }
 
-const POSITION_BIN_COUNT = 28;
+const POSITION_BIN_COUNT = 10;
 
-export function positionRangeBins(minimum: bigint, maximum: bigint, current: bigint): { bar: string; marker: "◀" | "▲" | "▶"; markerIndex: number } {
+export function positionRangeBins(minimum: bigint, maximum: bigint, current: bigint): { bar: string; marker: "◀" | "🟨" | "▶"; markerIndex: number } {
   if (maximum <= minimum) {
-    return { bar: "█".repeat(POSITION_BIN_COUNT), marker: "▲", markerIndex: 0 };
+    return { bar: "🟨" + "🟦".repeat(POSITION_BIN_COUNT - 1), marker: "🟨", markerIndex: 0 };
   }
 
-  const marker = current < minimum ? "◀" : current > maximum ? "▶" : "▲";
+  const marker = current < minimum ? "◀" : current > maximum ? "▶" : "🟨";
   const markerIndex = current <= minimum
     ? 0
     : current >= maximum
       ? POSITION_BIN_COUNT - 1
       : Number(((current - minimum) * BigInt(POSITION_BIN_COUNT - 1)) / (maximum - minimum));
-  const bar = Array.from({ length: POSITION_BIN_COUNT }, (_, index) => index === markerIndex ? "│" : index < markerIndex ? "█" : "░").join("");
+  const bar = Array.from({ length: POSITION_BIN_COUNT }, (_, index) => index === markerIndex ? "🟨" : index < markerIndex ? "🟩" : "🟦").join("");
   return { bar, marker, markerIndex };
 }
 

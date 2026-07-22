@@ -75,14 +75,15 @@ describe("Telegram dashboard callbacks", () => {
 
   it("renders a centered bin marker for an in-range price", () => {
     const bins = positionRangeBins(0n, 100n, 50n);
-    expect(bins.marker).toBe("▲");
-    expect(bins.markerIndex).toBe(13);
-    expect(bins.bar).toHaveLength(28);
-    expect(bins.bar[13]).toBe("│");
+    expect(bins.marker).toBe("🟨");
+    expect(bins.markerIndex).toBe(4);
+    expect([...bins.bar].filter((value) => value === "🟨")).toHaveLength(1);
+    expect(bins.bar).toContain("🟩");
+    expect(bins.bar).toContain("🟦");
   });
 
   it("pins the marker to the edge when price is outside the range", () => {
     expect(positionRangeBins(100n, 200n, 50n)).toMatchObject({ marker: "◀", markerIndex: 0 });
-    expect(positionRangeBins(100n, 200n, 250n)).toMatchObject({ marker: "▶", markerIndex: 27 });
+    expect(positionRangeBins(100n, 200n, 250n)).toMatchObject({ marker: "▶", markerIndex: 9 });
   });
 });
