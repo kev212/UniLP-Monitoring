@@ -669,21 +669,11 @@ export class Notifier {
       const qtSymbol = this.quoteSymbol(position.quoteToken);
       const qtDec = await this.decimals(position.quoteToken, position.chainId);
       const cv = formatToken(valued.snapshot.liquidationQuote, qtDec, 2);
-      const pnlText = `PnL ${formatBps(valued.snapshot.pnlBps)}%`;
+      const pnlText = `${pnlEmoji(valued.snapshot.pnlBps)} ${formatBps(valued.snapshot.pnlBps)}%`;
       const trailingPeak = trailingPeakDisplay(position.metadata);
-      const valueLine = `   ${cv} ${qtSymbol} | ${pnlText}${trailingPeak}`;
-      let feeLine = `   Fees ${formatToken(valued.snapshot.feeQuote, qtDec, 2)} ${qtSymbol}`;
-      let feeValueLine = "";
-      if (valued.snapshot.feeNonQuote) {
-        const nqSymbol = await this.tokenLabel(valued.snapshot.feeNonQuote.token, position.chainId);
-        const nqDecimals = await this.decimals(valued.snapshot.feeNonQuote.token, position.chainId);
-        feeLine += ` + ${formatCompactToken(valued.snapshot.feeNonQuote.amount, nqDecimals)} ${nqSymbol}`;
-        feeValueLine = `\n   ≈ ${formatToken(valued.snapshot.feeQuoteUsdg, 6, 2)} USDG`;
-      } else {
-        feeLine = `   Fees ${formatToken(valued.snapshot.feeQuoteUsdg, 6, 2)} USDG`;
-      }
+      const valueLine = `   💰 ${cv} ${qtSymbol} ${pnlText} | 🪙 ≈$${formatToken(valued.snapshot.feeQuoteUsdg, 6, 2)}${trailingPeak}`;
       const bins = await this.formatPositionBins(position, valued.range);
-      return `${base}\n${valueLine}\n${feeLine}${feeValueLine}${bins}\n`;
+      return `${base}\n${valueLine}${bins}\n`;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const detail = message.includes("zero liquidity")
@@ -709,11 +699,9 @@ export class Notifier {
     const quoteSymbol = this.quoteSymbol(position.quoteToken);
     const current = quotePriceScaled(range.currentSqrtPrice, quoteIsToken0, token0Decimals, token1Decimals);
     const bins = positionRangeBins(minimum, maximum, current);
-    const nonQuoteSymbol = await this.tokenLabel(quoteIsToken0 ? position.token1 : position.token0, position.chainId);
-    const legend = `${nonQuoteSymbol} 🟩   ${quoteSymbol} 🟦`;
     const prices = formatRangePrices(minimum, current, maximum, quoteSymbol);
-    const scaleSuffix = prices.scale ? `  ${prices.scale}` : "";
-    return `\n   ${legend}${scaleSuffix}\n   ${prices.low} ${bins.bar} ${prices.high}\n   ${bins.marker} ${prices.cur}`;
+    const scaleSuffix = prices.scale ? ` ${prices.scale}` : "";
+    return `\n   ${prices.low} ${bins.bar} ${prices.high}${scaleSuffix}\n   ${bins.marker} ${prices.cur}`;
   }
 
   private lastScanAt = 0;
@@ -1573,22 +1561,6 @@ export function formatRangePrices(
     cur: ((current + halfDivisor) / divisor).toString(),
     high: ((maximum + halfDivisor) / divisor).toString(),
   };
-}
-
-export function formatCompactToken(value: bigint, decimals: number): string {
-  const raw = formatToken(value, decimals, 2);
-  const numeric = Number(raw);
-  if (!Number.isFinite(numeric) || Math.abs(numeric) < 1_000) return raw;
-
-  const absolute = Math.abs(numeric);
-  const suffix = absolute >= 1_000_000_000
-    ? { divisor: 1_000_000_000, label: "B" }
-    : absolute >= 1_000_000
-      ? { divisor: 1_000_000, label: "M" }
-      : { divisor: 1_000, label: "k" };
-  const compact = numeric / suffix.divisor;
-  const decimalsToShow = Math.abs(compact) >= 100 ? 0 : 2;
-  return `${compact.toFixed(decimalsToShow).replace(/\.0+$|(?<=\.[0-9])0+$/, "")}${suffix.label}`;
 }
 
 function triggerDisplayShort(trigger: string): string {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { canRequestManualClose, clampDashboardPage, formatCompactToken, formatRangePrices, isExpiredCallbackError, parseDashboardAction, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
+import { canRequestManualClose, clampDashboardPage, formatRangePrices, isExpiredCallbackError, parseDashboardAction, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -103,9 +103,4 @@ describe("Telegram dashboard callbacks", () => {
     expect(result.high).toBe("1690");
   });
 
-  it("shortens large fee amounts for mobile", () => {
-    expect(formatCompactToken(927_761_210_000_000_000_000_000n, 18)).toBe("928k");
-    expect(formatCompactToken(1_250_000n, 6)).toBe("1.25");
-    expect(formatCompactToken(1_250_000_000n, 6)).toBe("1.25k");
-  });
 });
