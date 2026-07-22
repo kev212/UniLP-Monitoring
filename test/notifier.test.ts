@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { canRequestManualClose, clampDashboardPage, isExpiredCallbackError, parseDashboardAction, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
+import { canRequestManualClose, clampDashboardPage, formatRangePrices, isExpiredCallbackError, parseDashboardAction, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -85,5 +85,21 @@ describe("Telegram dashboard callbacks", () => {
   it("pins the marker to the edge when price is outside the range", () => {
     expect(positionRangeBins(100n, 200n, 50n)).toMatchObject({ marker: "◀", markerIndex: 0 });
     expect(positionRangeBins(100n, 200n, 250n)).toMatchObject({ marker: "▶", markerIndex: 9 });
+  });
+
+  it("shows prices normally when all values are at least 0.001", () => {
+    const SCALE = 10n ** 18n;
+    const result = formatRangePrices(10n ** 15n, 1383n * 10n ** 15n, 2n * 10n ** 16n, "USDG");
+    expect(result.scale).toBe("");
+    expect(result.low).toBe("$0.001");
+    expect(result.high).toBe("$0.02");
+  });
+
+  it("uses shared integer scale for very small prices", () => {
+    const result = formatRangePrices(7758n * 10n ** 8n, 1383n * 10n ** 9n, 169n * 10n ** 10n, "ETH");
+    expect(result.scale).toContain("×10");
+    expect(result.low).toBe("776");
+    expect(result.cur).toBe("1383");
+    expect(result.high).toBe("1690");
   });
 });

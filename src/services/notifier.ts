@@ -709,7 +709,9 @@ export class Notifier {
     const bins = positionRangeBins(minimum, maximum, current);
     const nonQuoteSymbol = await this.tokenLabel(quoteIsToken0 ? position.token1 : position.token0, position.chainId);
     const legend = `${nonQuoteSymbol} 🟩   ${quoteSymbol} 🟦`;
-    return `\n   ${legend}\n   ${formatQuotePrice(minimum, quoteSymbol)} ${bins.bar} ${formatQuotePrice(maximum, quoteSymbol)}\n   ${bins.marker} ${formatQuotePrice(current, quoteSymbol)}`;
+    const prices = formatRangePrices(minimum, current, maximum, quoteSymbol);
+    const scaleSuffix = prices.scale ? `  ${prices.scale}` : "";
+    return `\n   ${legend}${scaleSuffix}\n   ${prices.low} ${bins.bar} ${prices.high}\n   ${bins.marker} ${prices.cur}`;
   }
 
   private lastScanAt = 0;
@@ -1530,15 +1532,45 @@ export function positionRangeBins(minimum: bigint, maximum: bigint, current: big
   return { bar, marker, markerIndex };
 }
 
-function formatQuotePrice(value: bigint, quoteSymbol: string): string {
+const SUPERSCRIPT_MAP: Record<string, string> = {
+  "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴",
+  "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹", "-": "⁻",
+};
+
+function toSuperscript(value: number): string {
+  return String(value).split("").map((c) => SUPERSCRIPT_MAP[c] ?? c).join("");
+}
+
+export function formatRangePrices(
+  minimum: bigint,
+  current: bigint,
+  maximum: bigint,
+  quoteSymbol: string,
+): { scale: string; low: string; cur: string; high: string } {
   const prefix = quoteSymbol === "USDG" || quoteSymbol === "USDC" ? "$" : "";
-  if (value === 0n) return `${prefix}0`;
-  const integer = value / QUOTE_PRICE_SCALE;
-  if (integer > 0n) return `${prefix}${formatToken(value, 18, integer >= 100n ? 2 : 4)}`;
-  const fraction = value.toString().padStart(18, "0");
-  const firstSignificant = fraction.search(/[1-9]/);
-  const decimals = Math.min(12, firstSignificant + 4);
-  return `${prefix}${formatToken(value, 18, decimals)}`;
+  const SMALL_THRESHOLD = 10n ** 15n;
+
+  if (minimum >= SMALL_THRESHOLD || minimum === 0n) {
+    return {
+      scale: "",
+      low: `${prefix}${formatToken(minimum, 18, 3)}`,
+      cur: `${prefix}${formatToken(current, 18, 3)}`,
+      high: `${prefix}${formatToken(maximum, 18, 3)}`,
+    };
+  }
+
+  const minDigits = minimum.toString().length;
+  const divisorExp = Math.max(0, minDigits - 3);
+  const divisor = 10n ** BigInt(divisorExp);
+  const halfDivisor = divisor / 2n;
+  const exponent = divisorExp - 18;
+
+  return {
+    scale: `×10${toSuperscript(exponent)}`,
+    low: ((minimum + halfDivisor) / divisor).toString(),
+    cur: ((current + halfDivisor) / divisor).toString(),
+    high: ((maximum + halfDivisor) / divisor).toString(),
+  };
 }
 
 function triggerDisplayShort(trigger: string): string {
