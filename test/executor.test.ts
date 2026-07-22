@@ -7,6 +7,7 @@ import type { PositionRecord } from "../src/types.js";
 
 const usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as const;
 const token = "0xd7321801caae694090694ff55a9323139f043b88" as const;
+const nvda = "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec" as const;
 const owner = "0xeE924367213Ae3764b57d5b9a6214c8188d34060" as const;
 const sender = "0x0000000000000000000000000000000000000002" as const;
 const hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
@@ -393,6 +394,57 @@ describe("Executor pending settlement recovery", () => {
       settlementUsd: "23",
     });
     expect(client.readContract).not.toHaveBeenCalled();
+  });
+
+  it("converts an arbitrary 18-decimal quote token to stablecoin settlement units", async () => {
+    const database = {
+      setPositionStatus: vi.fn(),
+      getPositionMetadata: vi.fn().mockResolvedValue({ closeReceiptAccounted: true, settlementQuoteFromClose: "1264138280810145126" }),
+    };
+    const chains = { getById: vi.fn(() => ({ registry: { name: "robinhood" } })) };
+    const routes = { quoteDirect: vi.fn().mockResolvedValue({ expectedOut: 266_760_835n }) };
+    const executor = new Executor(database as never, chains as never, {} as never, routes as never, {} as never, {
+      ...config,
+      quoteTokens: { ...config.quoteTokens, robinhood: [{ symbol: "USDG", address: usdg }, { symbol: "NVDA", address: nvda }] },
+    });
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "284857", owner, poolAddress: null,
+      token0: token, token1: nvda, quoteToken: nvda, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    await (executor as unknown as { saveSettlementBalance(value: PositionRecord): Promise<void> }).saveSettlementBalance(position);
+
+    expect(routes.quoteDirect).toHaveBeenCalledWith(position, nvda, 1_264_138_280_810_145_126n, usdg);
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "closing", {
+      totalReceived: "1264138280810145126",
+      settlementUsd: "266760835",
+    });
+  });
+
+  it("stores zero USD instead of raw token units when no conversion route exists", async () => {
+    const database = {
+      setPositionStatus: vi.fn(),
+      getPositionMetadata: vi.fn().mockResolvedValue({ closeReceiptAccounted: true, settlementQuoteFromClose: "1000000000000000000" }),
+    };
+    const chains = { getById: vi.fn(() => ({ registry: { name: "robinhood" } })) };
+    const routes = { quoteDirect: vi.fn().mockResolvedValue(null) };
+    const executor = new Executor(database as never, chains as never, {} as never, routes as never, {} as never, {
+      ...config,
+      quoteTokens: { ...config.quoteTokens, robinhood: [{ symbol: "USDG", address: usdg }, { symbol: "NVDA", address: nvda }] },
+    });
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
+      token0: token, token1: nvda, quoteToken: nvda, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    await (executor as unknown as { saveSettlementBalance(value: PositionRecord): Promise<void> }).saveSettlementBalance(position);
+
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "closing", {
+      totalReceived: "1000000000000000000",
+      settlementUsd: "0",
+    });
   });
 
   it("swaps only the amount received by the closing position", async () => {

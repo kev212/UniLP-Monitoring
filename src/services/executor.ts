@@ -538,15 +538,28 @@ export class Executor {
     }
     const qtLower = position.quoteToken.toLowerCase();
     const { registry } = this.chains.getById(position.chainId);
-    const weth = this.config.quoteTokens[registry.name]?.find(q => q.symbol === "WETH") ?? this.config.quoteTokens[registry.name]?.find(q => q.symbol === "ETH");
+    const quoteTokens = this.config.quoteTokens[registry.name] ?? [];
+    const stable = quoteTokens.find(q => q.symbol === "USDG" || q.symbol === "USDC");
+    const weth = quoteTokens.find(q => q.symbol === "WETH") ?? quoteTokens.find(q => q.symbol === "ETH");
     const isEth = qtLower === zeroAddress || (weth ? qtLower === weth.address.toLowerCase() : false);
-    let settlementUsd = totalReceived;
-    if (isEth) {
+    let settlementUsd = 0n;
+    if (stable && qtLower === stable.address.toLowerCase()) {
+      settlementUsd = totalReceived;
+    } else if (isEth) {
       try {
         settlementUsd = await this.computeEthUsd(position.chainId, totalReceived);
       } catch (error) {
         log.warn({ error: errorMessage(error), positionId: position.id, positionKey: position.positionKey }, "could not value settlement in USD");
-        settlementUsd = 0n;
+      }
+    } else if (stable && totalReceived > 0n) {
+      try {
+        const route = await this.routes.quoteDirect(position, position.quoteToken, totalReceived, stable.address);
+        settlementUsd = route?.expectedOut ?? 0n;
+        if (!route) {
+          log.warn({ positionId: position.id, positionKey: position.positionKey, quoteToken: position.quoteToken }, "no USD route for settlement quote token");
+        }
+      } catch (error) {
+        log.warn({ error: errorMessage(error), positionId: position.id, positionKey: position.positionKey, quoteToken: position.quoteToken }, "could not convert settlement quote token to USD");
       }
     }
     await this.database.setPositionStatus(position.id, "closing", {
