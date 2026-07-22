@@ -23,6 +23,7 @@ function environment(overrides: Record<string, string> = {}): NodeJS.ProcessEnv 
     DISCOVERY_INTERVAL_MS: "30000",
     POSITION_MONITOR_CONCURRENCY: "2",
     MAX_SWAP_SLIPPAGE_BPS: "100",
+    SWAP_GAS_LIMIT_MULTIPLIER_PERCENT: "300",
     MAX_TWAP_DEVIATION_BPS: "250",
     TWAP_WINDOW_SECONDS: "300",
     PNL_INCLUDE_GAS: "false",
@@ -61,6 +62,7 @@ describe("loadConfig", () => {
     expect(config.kyberswapClientId).toBe("UniLP-Monitoring-kev212");
     expect(config.settlementSwapSlippageBps).toBe(200);
     expect(config.settlementSwapMaxSlippageBps).toBe(500);
+    expect(config.swapGasLimitMultiplierPercent).toBe(300);
     expect(config.removeLiquiditySlippageBps).toBe(200);
     expect(config.removeLiquidityMaxSlippageBps).toBe(500);
     expect(config.swapApiTimeoutMs).toBe(2_500);

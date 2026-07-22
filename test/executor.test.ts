@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { encodeAbiParameters, keccak256, pad, stringToHex, zeroAddress, type Address, type Hex } from "viem";
 
 import type { RuntimeConfig } from "../src/config.js";
-import { Executor, effectiveRemoveSlippageBps, nextExitRetry, nextSwapRetry, receiptErc20NetReceived } from "../src/services/executor.js";
+import { bufferedGasLimit, Executor, effectiveRemoveSlippageBps, nextExitRetry, nextSwapRetry, receiptErc20NetReceived } from "../src/services/executor.js";
 import type { PositionRecord } from "../src/types.js";
 
 const usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as const;
@@ -33,6 +33,7 @@ const config = {
   quoteTokens: { base: [], robinhood: [{ symbol: "USDG", address: usdg }] },
   settlementSwapSlippageBps: 200,
   settlementSwapMaxSlippageBps: 500,
+  swapGasLimitMultiplierPercent: 300,
   removeLiquiditySlippageBps: 200,
   removeLiquidityMaxSlippageBps: 500,
   confirmations: 1,
@@ -142,13 +143,40 @@ describe("Executor pending settlement recovery", () => {
   });
 
   it("tracks mined swap reverts separately from planning failures", () => {
-    const planning = nextSwapRetry({}, "uniswap", false);
-    const reverted = nextSwapRetry({ swapRetry: planning }, "uniswap", true);
+    const now = Date.now();
+    const planning = nextSwapRetry({}, "uniswap", false, 2, now);
+    const reverted = nextSwapRetry({}, "uniswap", true, 2, now);
 
-    expect(planning).toMatchObject({ broadcastAttempts: 0, planningFailures: 1, lastProvider: "uniswap" });
-    expect(reverted).toMatchObject({ broadcastAttempts: 1, planningFailures: 0, lastProvider: "uniswap" });
-    expect(Date.parse(planning.nextAttemptAt!)).toBeGreaterThan(Date.now());
-    expect(Date.parse(reverted.nextAttemptAt!)).toBeLessThanOrEqual(Date.now());
+    expect(planning).toMatchObject({ broadcastAttempts: 0, planningFailures: 1, cycleBroadcastAttempts: 0, lastProvider: "uniswap" });
+    expect(reverted).toMatchObject({ broadcastAttempts: 1, planningFailures: 0, cycleBroadcastAttempts: 1, lastProvider: "uniswap" });
+    expect(Date.parse(planning.nextAttemptAt!)).toBe(now + 3_000);
+    expect(Date.parse(reverted.nextAttemptAt!)).toBe(now);
+  });
+
+  it("restarts a failed two-provider cycle after three seconds without a hard retry cap", () => {
+    const now = Date.now();
+    let retry = nextSwapRetry({}, "kyberswap", true, 2, now);
+    const first = retry;
+    retry = nextSwapRetry({ swapRetry: retry }, "uniswap", true, 2, now);
+    const second = retry;
+    retry = nextSwapRetry({ swapRetry: retry }, "kyberswap", true, 2, now + 3_000);
+    const third = retry;
+    for (let attempt = 4; attempt <= 10; attempt += 1) {
+      retry = nextSwapRetry({ swapRetry: retry }, attempt % 2 === 0 ? "uniswap" : "kyberswap", true, 2, now + 3_000);
+    }
+
+    expect(first.cycleBroadcastAttempts).toBe(1);
+    expect(second).toMatchObject({ broadcastAttempts: 2, cycleBroadcastAttempts: 0, lastProvider: "uniswap" });
+    expect(Date.parse(second.nextAttemptAt!)).toBe(now + 3_000);
+    expect(third).toMatchObject({ broadcastAttempts: 3, cycleBroadcastAttempts: 1, lastProvider: "kyberswap" });
+    expect(Date.parse(third.nextAttemptAt!)).toBe(now + 3_000);
+    expect(retry).toMatchObject({ broadcastAttempts: 10, cycleBroadcastAttempts: 0, lastProvider: "uniswap" });
+  });
+
+  it("buffers swap gas estimates without changing actual gas accounting", () => {
+    expect(bufferedGasLimit(172_217n, 300)).toBe(516_651n);
+    expect(bufferedGasLimit(1n, 250)).toBe(3n);
+    expect(() => bufferedGasLimit(100n, 99)).toThrow("between 100 and 500");
   });
 
   it("quotes providers in parallel and selects the best simulated output", async () => {
@@ -368,6 +396,7 @@ describe("Executor pending settlement recovery", () => {
   });
 
   it("swaps only the amount received by the closing position", async () => {
+    vi.useFakeTimers();
     const database = {
       claimSettlementLease: vi.fn().mockResolvedValue(true),
       releaseSettlementLease: vi.fn(),
@@ -387,8 +416,49 @@ describe("Executor pending settlement recovery", () => {
       openedAtBlock: null, metadata: { pendingSwap: { token, amount: "5" } },
     } as PositionRecord;
 
-    await expect(executor.resume(position)).rejects.toThrow("No executable settlement route");
-    expect(routes.quoteDirect).toHaveBeenCalledWith(position, token, 5n, usdg);
+    try {
+      await expect(executor.resume(position)).resolves.toBeUndefined();
+      expect(routes.quoteDirect).toHaveBeenCalledWith(position, token, 5n, usdg);
+      expect(database.setPositionStatusUnlessSettled).toHaveBeenCalledWith("position", "closing", expect.objectContaining({
+        settlementRetryDisabled: null,
+        swapRetry: expect.objectContaining({ planningFailures: 1, cycleBroadcastAttempts: 0 }),
+      }));
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops retrying when the pending token was moved externally after a failed cycle", async () => {
+    const metadata = {
+      pendingSwap: { token, amount: "5" },
+      closeReceiptAccounted: true,
+      swapRetry: { broadcastAttempts: 2, planningFailures: 0, cycleBroadcastAttempts: 0 },
+    };
+    const database = {
+      claimSettlementLease: vi.fn().mockResolvedValue(true),
+      releaseSettlementLease: vi.fn(),
+      getPositionMetadata: vi.fn().mockResolvedValue(metadata),
+      getSubmittedSwapAttempt: vi.fn().mockResolvedValue(null),
+      setPositionStatusUnlessSettled: vi.fn(),
+    };
+    const client = { readContract: vi.fn().mockResolvedValue(0n) };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const routes = { quoteDirect: vi.fn() };
+    const executor = new Executor(database as never, chains as never, {} as never, routes as never, {} as never, config);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata,
+    } as PositionRecord;
+
+    await executor.resume(position);
+
+    expect(database.setPositionStatusUnlessSettled).toHaveBeenCalledWith("position", "needs_review", {
+      reason: "pending swap token is no longer held — position externally settled",
+      settlementRetryDisabled: true,
+    });
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
   });
 
   it("runs only one settlement worker per position", async () => {

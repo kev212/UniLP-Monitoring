@@ -8,6 +8,7 @@ import type { DiscoveryService } from "./discovery.js";
 import type { Executor } from "./executor.js";
 import type { Notifier } from "./notifier.js";
 import type { PnlService } from "./pnl.js";
+import { hasPendingSettlement } from "./pending-settlement.js";
 import { quoteRangeState } from "./quote-range.js";
 
 export class Guardian {
@@ -96,7 +97,8 @@ export class Guardian {
     const { client, registry } = this.chains.get(name);
     const blockNumber = await client.getBlockNumber();
     const positions = (await this.database.listOpenPositions(registry.chain.id))
-      .filter((position) => position.status === "needs_review");
+      .filter((position) => position.status === "needs_review"
+        && !hasPendingSettlement(position.status, position.metadata));
 
     for (const position of positions) {
       let candidate = position;
@@ -145,6 +147,17 @@ export class Guardian {
   private async evaluatePosition(name: ChainName, position: PositionRecord, blockNumber: bigint): Promise<boolean> {
     const startedAt = Date.now();
     try {
+      if (hasPendingSettlement(position.status, position.metadata)) {
+        if (position.metadata.settlementRetryDisabled === true) {
+          await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
+            reason: typeof position.metadata.reason === "string" ? position.metadata.reason : "settlement_retry_disabled",
+          });
+          return true;
+        }
+        await this.database.setPositionStatusUnlessSettled(position.id, "closing", { reason: null });
+        await this.executor.resume({ ...position, status: "closing" });
+        return true;
+      }
       if (position.protocol === "v4" && position.status === "syncing") {
         try {
           const totals = await this.database.getCashflowTotals(position.id);

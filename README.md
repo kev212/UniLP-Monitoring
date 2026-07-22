@@ -41,6 +41,7 @@ Mulai dengan `DRY_RUN=true`. Ubah ke `false` hanya setelah cashflow, PnL, dan si
 | `TRAILING_STOP_DRAWDOWN_PERCENT` | Drawdown dari peak trailing stop. |
 | `TRAILING_EXIT_ESTIMATE_BUFFER_PERCENT` | Buffer estimasi sebelum close trailing; default 10% di bawah trailing floor. |
 | `PROFIT_OOR_ABOVE_THRESHOLD_PERCENT` | PnL minimum untuk memulai timer profit + OOR above. Default 3%. |
+| `SWAP_GAS_LIMIT_MULTIPLIER_PERCENT` | Multiplier gas limit swap untuk menghindari RPC underestimation. Default 300%. |
 | `OOR_AUTO_CLOSE_ENABLED` | Aktifkan auto-exit saat quote token cukup jauh above range. |
 | `BASE_RPC_HTTP`, `ROBINHOOD_RPC_HTTP` | Endpoint RPC untuk monitoring dan discovery. |
 | `ALCHEMY_BASE_HTTP`, `ALCHEMY_ROBINHOOD_HTTP` | Endpoint archive/bootstrap opsional. |

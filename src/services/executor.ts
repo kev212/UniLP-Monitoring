@@ -74,9 +74,12 @@ interface PreparedSwap {
 export interface SwapRetryState {
   broadcastAttempts: number;
   planningFailures: number;
+  cycleBroadcastAttempts: number;
   lastProvider?: string;
   nextAttemptAt?: string;
 }
+
+const SWAP_RETRY_CYCLE_DELAY_MS = 3_000;
 
 class PendingExecutionError extends Error {
   constructor(readonly stage: string, readonly transactionHash: Hex, cause: unknown) {
@@ -92,6 +95,7 @@ export class Executor {
   private readonly executorClientCache = new Map<string, PublicClient>();
   private readonly confirmedReceipts = new Map<Hex, TransactionReceipt>();
   private readonly settlementJobs = new Map<string, Promise<void>>();
+  private readonly settlementRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly activeSettlementLeases = new Map<string, string>();
   private transactionTail: Promise<unknown> = Promise.resolve();
 
@@ -293,24 +297,31 @@ export class Executor {
         return;
       }
       await this.database.recordExecution(position.id, "swap_to_quote", "failed", submittedSwap, "transaction reverted");
-      retry = nextSwapRetry(position.metadata, typeof position.metadata.swapProvider === "string" ? position.metadata.swapProvider : undefined, true);
+      retry = nextSwapRetry(
+        position.metadata,
+        typeof position.metadata.swapProvider === "string" ? position.metadata.swapProvider : undefined,
+        true,
+        this.swapRetryCycleSize(),
+      );
       position = { ...position, metadata: { ...position.metadata, swapRetry: retry } };
-      if (retry.broadcastAttempts >= 2) {
-        await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
-          reason: "swap_reverted_twice",
-          settlementRetryDisabled: true,
-          swapRetry: retry,
-          pendingRawTransaction: null,
-        });
-        await this.notifier.failure(position, "Swap reverted twice after fresh quotes and simulations");
+      await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+        reason: null,
+        settlementRetryDisabled: null,
+        lastExecutionError: `swap_to_quote transaction reverted: ${submittedSwap}`,
+        swapRetry: retry,
+        pendingRawTransaction: null,
+      });
+      if (retry.cycleBroadcastAttempts === 0) {
+        this.scheduleSettlementRetry(position, retry);
         return;
       }
-      await this.database.setPositionStatusUnlessSettled(position.id, "closing", { swapRetry: retry, pendingRawTransaction: null });
     }
 
     const actualBalance = await this.tokenBalance(position.chainId, pending.token);
     if (actualBalance < pending.amount) {
       const closeReceiptTrusted = position.metadata.closeReceiptAccounted === true
+        && retry.broadcastAttempts === 0
+        && retry.planningFailures === 0
         && !(await this.database.getSubmittedSwapAttempt(position.id));
       if (!closeReceiptTrusted) {
         const reason = actualBalance === 0n
@@ -356,38 +367,62 @@ export class Executor {
       if (error instanceof PendingExecutionError) return;
       if (error instanceof RevertedExecutionError) {
         const failedProvider = typeof position.metadata.swapProvider === "string" ? position.metadata.swapProvider : retry.lastProvider;
-        const revertedRetry = nextSwapRetry(position.metadata, failedProvider, true);
+        const revertedRetry = nextSwapRetry(position.metadata, failedProvider, true, this.swapRetryCycleSize());
         position = { ...position, metadata: { ...position.metadata, swapRetry: revertedRetry } };
-        if (revertedRetry.broadcastAttempts >= 2) {
-          await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
-            reason: "swap_reverted_twice",
-            settlementRetryDisabled: true,
-            swapRetry: revertedRetry,
-            pendingRawTransaction: null,
-          });
-          await this.notifier.failure(position, "Swap reverted twice after fresh quotes and simulations");
-          return;
-        }
         await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+          reason: null,
+          settlementRetryDisabled: null,
           lastExecutionError: error.message,
           swapRetry: revertedRetry,
           pendingRawTransaction: null,
         });
+        if (revertedRetry.cycleBroadcastAttempts === 0) {
+          this.scheduleSettlementRetry(position, revertedRetry);
+          return;
+        }
         return this.resumeUnlocked(position);
       }
       const message = errorMessage(error);
       const currentProvider = typeof position.metadata.swapProvider === "string" ? position.metadata.swapProvider : retry.lastProvider;
-      const nextRetry = nextSwapRetry(position.metadata, currentProvider, false);
+      const nextRetry = nextSwapRetry(position.metadata, currentProvider, false, this.swapRetryCycleSize());
       await this.database.recordExecution(position.id, "swap_to_quote", "failed", undefined, message);
-      await this.database.setPositionStatusUnlessSettled(position.id, "closing", { lastExecutionError: message, swapRetry: nextRetry });
-      await this.notifier.failure(position, message);
-      throw error;
+      await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+        reason: null,
+        settlementRetryDisabled: null,
+        lastExecutionError: message,
+        swapRetry: nextRetry,
+      });
+      log.warn({ positionId: position.id, positionKey: position.positionKey, reason: message }, "settlement swap cycle failed; retry scheduled");
+      this.scheduleSettlementRetry({ ...position, metadata: { ...position.metadata, swapRetry: nextRetry } }, nextRetry);
+      return;
     }
+  }
+
+  private swapRetryCycleSize(): number {
+    return Math.max(1, Number(Boolean(this.tradingApi)) + Number(Boolean(this.kyberswapApi)));
+  }
+
+  private scheduleSettlementRetry(position: PositionRecord, retry: SwapRetryState): void {
+    const retryAt = retry.nextAttemptAt ? Date.parse(retry.nextAttemptAt) : Date.now() + SWAP_RETRY_CYCLE_DELAY_MS;
+    const existing = this.settlementRetryTimers.get(position.id);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.settlementRetryTimers.delete(position.id);
+      void this.resume({ ...position, status: "closing", metadata: { ...position.metadata, swapRetry: retry } }).catch((error) => {
+        log.warn({ err: error, positionId: position.id, positionKey: position.positionKey }, "scheduled settlement retry deferred");
+      });
+    }, Math.max(0, retryAt - Date.now()));
+    this.settlementRetryTimers.set(position.id, timer);
   }
 
   private runSettlementExclusive(positionId: string, work: () => Promise<void>): Promise<void> {
     const existing = this.settlementJobs.get(positionId);
     if (existing) return existing;
+    const scheduled = this.settlementRetryTimers.get(positionId);
+    if (scheduled) {
+      clearTimeout(scheduled);
+      this.settlementRetryTimers.delete(positionId);
+    }
     const leaseToken = randomUUID();
     const run = (async () => {
       const claimed = await this.database.claimSettlementLease(positionId, leaseToken);
@@ -1104,7 +1139,14 @@ export class Executor {
     const alchemyUrl = this.config.alchemyHttp[registry.name];
     const transport = alchemyUrl ? http(alchemyUrl) : http(this.config.rpcHttp[registry.name]);
     const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport });
-    const request = await wallet.prepareTransactionRequest({ account: this.account, to: plan.to, data: plan.data, value: plan.value ?? 0n });
+    const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account, to: plan.to, data: plan.data, value: plan.value ?? 0n });
+    const request = stage === "swap_to_quote"
+      ? { ...preparedRequest, gas: bufferedGasLimit(preparedRequest.gas, this.config.swapGasLimitMultiplierPercent) }
+      : preparedRequest;
+    if (stage === "swap_to_quote") {
+      await client.call({ account: position.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n, gas: request.gas });
+      log.info({ positionId: position.id, positionKey: position.positionKey, estimatedGas: preparedRequest.gas, gasLimit: request.gas }, "swap gas limit buffered");
+    }
     const serializedTransaction = await wallet.signTransaction(request);
     const hash = keccak256(serializedTransaction);
     try {
@@ -1526,26 +1568,44 @@ function parsePendingRawTransaction(value: unknown): PendingRawTransaction | nul
 
 function swapRetryState(metadata: Record<string, unknown>): SwapRetryState {
   const value = metadata.swapRetry;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return { broadcastAttempts: 0, planningFailures: 0 };
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { broadcastAttempts: 0, planningFailures: 0, cycleBroadcastAttempts: 0 };
   const retry = value as Record<string, unknown>;
   const broadcastAttempts = safeAttemptCount(retry.broadcastAttempts);
   const planningFailures = safeAttemptCount(retry.planningFailures);
+  const cycleBroadcastAttempts = safeAttemptCount(retry.cycleBroadcastAttempts);
   return {
     broadcastAttempts,
     planningFailures,
+    cycleBroadcastAttempts,
     ...(typeof retry.lastProvider === "string" ? { lastProvider: retry.lastProvider } : {}),
     ...(typeof retry.nextAttemptAt === "string" ? { nextAttemptAt: retry.nextAttemptAt } : {}),
   };
 }
 
-export function nextSwapRetry(metadata: Record<string, unknown>, lastProvider: string | undefined, broadcastFailed: boolean): SwapRetryState {
+export function nextSwapRetry(
+  metadata: Record<string, unknown>,
+  lastProvider: string | undefined,
+  broadcastFailed: boolean,
+  cycleSize = 2,
+  now = Date.now(),
+): SwapRetryState {
   const previous = swapRetryState(metadata);
+  const nextCycleAttempts = broadcastFailed ? previous.cycleBroadcastAttempts + 1 : 0;
+  const cycleComplete = !broadcastFailed || nextCycleAttempts >= Math.max(1, cycleSize);
   return {
     broadcastAttempts: previous.broadcastAttempts + (broadcastFailed ? 1 : 0),
     planningFailures: broadcastFailed ? 0 : previous.planningFailures + 1,
+    cycleBroadcastAttempts: cycleComplete ? 0 : nextCycleAttempts,
     ...(lastProvider ? { lastProvider } : {}),
-    nextAttemptAt: new Date(Date.now() + (broadcastFailed ? 0 : 1_000)).toISOString(),
+    nextAttemptAt: new Date(now + (cycleComplete ? SWAP_RETRY_CYCLE_DELAY_MS : 0)).toISOString(),
   };
+}
+
+export function bufferedGasLimit(estimatedGas: bigint, multiplierPercent: number): bigint {
+  if (!Number.isSafeInteger(multiplierPercent) || multiplierPercent < 100 || multiplierPercent > 500) {
+    throw new Error("Swap gas multiplier must be between 100 and 500 percent");
+  }
+  return (estimatedGas * BigInt(multiplierPercent) + 99n) / 100n;
 }
 
 function safeAttemptCount(value: unknown): number {

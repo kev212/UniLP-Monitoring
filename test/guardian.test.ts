@@ -125,3 +125,38 @@ describe("profit + OOR above timer", () => {
     expect(check({})).toBeNull();
   });
 });
+
+describe("pending settlement status recovery", () => {
+  const pendingPosition = {
+    id: "pending-position",
+    chainId: 4663,
+    protocol: "v3" as const,
+    positionKey: "305936",
+    owner: "0x0000000000000000000000000000000000000001",
+    poolAddress: "0x0000000000000000000000000000000000000003",
+    token0: "0x0000000000000000000000000000000000000002",
+    token1: "0x0000000000000000000000000000000000000004",
+    quoteToken: "0x0000000000000000000000000000000000000002",
+    status: "syncing" as const,
+    liquidity: null,
+    openedAtBlock: 1n,
+    metadata: {
+      pendingSwap: { token: "0x0000000000000000000000000000000000000004", amount: "5" },
+      settlementRetryDisabled: true,
+    },
+  } satisfies PositionRecord;
+
+  it("returns a disabled pending settlement to needs review without reading the burned NFT", async () => {
+    const database = { setPositionStatusUnlessSettled: vi.fn().mockResolvedValue(true) };
+    const guardian = new Guardian({} as RuntimeConfig, database as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never);
+
+    const result = await (guardian as unknown as {
+      evaluatePosition(name: "robinhood", position: PositionRecord, blockNumber: bigint): Promise<boolean>;
+    }).evaluatePosition("robinhood", pendingPosition, 10n);
+
+    expect(result).toBe(true);
+    expect(database.setPositionStatusUnlessSettled).toHaveBeenCalledWith("pending-position", "needs_review", {
+      reason: "settlement_retry_disabled",
+    });
+  });
+});
