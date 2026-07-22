@@ -669,19 +669,21 @@ export class Notifier {
       const qtSymbol = this.quoteSymbol(position.quoteToken);
       const qtDec = await this.decimals(position.quoteToken, position.chainId);
       const cv = formatToken(valued.snapshot.liquidationQuote, qtDec, 2);
-      let feeStr = formatToken(valued.snapshot.feeQuote, qtDec, 2);
-      if (valued.snapshot.feeNonQuote) {
-        const nqSymbol = await this.tokenLabel(valued.snapshot.feeNonQuote.token, position.chainId);
-        feeStr += ` + ${formatToken(valued.snapshot.feeNonQuote.amount, await this.decimals(valued.snapshot.feeNonQuote.token, position.chainId), 2)} ${nqSymbol}`;
-      }
-      const usdgDec = 6;
-      const feeDisplay = valued.snapshot.feeNonQuote
-        ? `${feeStr} (≈ ${formatToken(valued.snapshot.feeQuoteUsdg, usdgDec, 4)} USDG)`
-        : `${formatToken(valued.snapshot.feeQuoteUsdg, usdgDec, 4)} USDG`;
       const pnlText = `PnL ${formatBps(valued.snapshot.pnlBps)}%`;
       const trailingPeak = trailingPeakDisplay(position.metadata);
+      const valueLine = `   ${cv} ${qtSymbol} | ${pnlText}${trailingPeak}`;
+      let feeLine = `   Fees ${formatToken(valued.snapshot.feeQuote, qtDec, 2)} ${qtSymbol}`;
+      let feeValueLine = "";
+      if (valued.snapshot.feeNonQuote) {
+        const nqSymbol = await this.tokenLabel(valued.snapshot.feeNonQuote.token, position.chainId);
+        const nqDecimals = await this.decimals(valued.snapshot.feeNonQuote.token, position.chainId);
+        feeLine += ` + ${formatCompactToken(valued.snapshot.feeNonQuote.amount, nqDecimals)} ${nqSymbol}`;
+        feeValueLine = `\n   ≈ ${formatToken(valued.snapshot.feeQuoteUsdg, 6, 2)} USDG`;
+      } else {
+        feeLine = `   Fees ${formatToken(valued.snapshot.feeQuoteUsdg, 6, 2)} USDG`;
+      }
       const bins = await this.formatPositionBins(position, valued.range);
-      return `${base}\n   💰 ${cv} ${qtSymbol} | 🪙 Fees ${feeDisplay} | 📊 ${pnlText}${trailingPeak}${bins}\n`;
+      return `${base}\n${valueLine}\n${feeLine}${feeValueLine}${bins}\n`;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const detail = message.includes("zero liquidity")
@@ -1571,6 +1573,22 @@ export function formatRangePrices(
     cur: ((current + halfDivisor) / divisor).toString(),
     high: ((maximum + halfDivisor) / divisor).toString(),
   };
+}
+
+export function formatCompactToken(value: bigint, decimals: number): string {
+  const raw = formatToken(value, decimals, 2);
+  const numeric = Number(raw);
+  if (!Number.isFinite(numeric) || Math.abs(numeric) < 1_000) return raw;
+
+  const absolute = Math.abs(numeric);
+  const suffix = absolute >= 1_000_000_000
+    ? { divisor: 1_000_000_000, label: "B" }
+    : absolute >= 1_000_000
+      ? { divisor: 1_000_000, label: "M" }
+      : { divisor: 1_000, label: "k" };
+  const compact = numeric / suffix.divisor;
+  const decimalsToShow = Math.abs(compact) >= 100 ? 0 : 2;
+  return `${compact.toFixed(decimalsToShow).replace(/\.0+$|(?<=\.[0-9])0+$/, "")}${suffix.label}`;
 }
 
 function triggerDisplayShort(trigger: string): string {
