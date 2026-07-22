@@ -17,6 +17,7 @@ const config: RuntimeConfig = {
   takeProfitPercent: 20,
   trailingStopActivationPercent: 5,
   trailingStopDrawdownPercent: 1.5,
+  trailingExitEstimateBufferPercent: 10,
   positionMonitorIntervalMs: 5_000,
   discoveryIntervalMs: 30_000,
   positionMonitorConcurrency: 2,
@@ -121,6 +122,12 @@ describe("trailing stop", () => {
     const metadata = { trailingStop: { peakPnlBps: "500", activatedAtBlock: "10" } };
 
     expect(pnl.evaluateTrailingStop(metadata, snapshot(-1n))).toEqual({ action: "reset" });
+  });
+
+  it("derives the conservative trailing exit gate from peak and drawdown", () => {
+    const pnl = new PnlService({} as never, {} as never, {} as never, config);
+    expect(pnl.trailingExitEstimateGateBps({ trailingStop: { peakPnlBps: "500", activatedAtBlock: "10" } })).toBe(315n);
+    expect(pnl.trailingExitEstimateGateBps({ trailingStop: { peakPnlBps: "900", activatedAtBlock: "10" } })).toBe(675n);
   });
 });
 

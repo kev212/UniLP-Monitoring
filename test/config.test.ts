@@ -17,6 +17,7 @@ function environment(overrides: Record<string, string> = {}): NodeJS.ProcessEnv 
     TAKE_PROFIT_PERCENT: "20",
     TRAILING_STOP_ACTIVATION_PERCENT: "5",
     TRAILING_STOP_DRAWDOWN_PERCENT: "1.5",
+    TRAILING_EXIT_ESTIMATE_BUFFER_PERCENT: "10",
     PROFIT_OOR_ABOVE_THRESHOLD_PERCENT: "3",
     POSITION_MONITOR_INTERVAL_MS: "5000",
     DISCOVERY_INTERVAL_MS: "30000",
@@ -47,6 +48,7 @@ describe("loadConfig", () => {
     expect(config.pnlIncludeGas).toBe(false);
     expect(config.trailingStopActivationPercent).toBe(5);
     expect(config.trailingStopDrawdownPercent).toBe(1.5);
+    expect(config.trailingExitEstimateBufferPercent).toBe(10);
     expect(config.profitOorAboveThresholdPercent).toBe(3);
     expect(config.positionMonitorIntervalMs).toBe(5_000);
     expect(config.discoveryIntervalMs).toBe(30_000);

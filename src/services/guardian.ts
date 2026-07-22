@@ -235,6 +235,21 @@ export class Guardian {
         log.info({ positionId: position.id, trigger: effectiveTrigger, nextAttemptAt: new Date(nextAttemptAt).toISOString() }, "exit retry waiting for backoff");
         return true;
       }
+      if (effectiveTrigger === "trailing_take_profit") {
+        const gateBps = this.pnl.trailingExitEstimateGateBps(position.metadata);
+        if (gateBps !== null) {
+          const exitEstimate = await this.pnl.value(position, blockNumber, this.config.settlementSwapSlippageBps);
+          if (exitEstimate.snapshot.pnlBps < gateBps) {
+            log.info({
+              positionId: position.id,
+              positionKey: position.positionKey,
+              estimatePnlBps: exitEstimate.snapshot.pnlBps,
+              gateBps,
+            }, "trailing exit deferred below conservative estimate gate");
+            return true;
+          }
+        }
+      }
       if (this.queuedExitPositions.has(position.id)) return true;
       void this.notifier.trigger(position, valued.snapshot, effectiveTrigger);
       try {

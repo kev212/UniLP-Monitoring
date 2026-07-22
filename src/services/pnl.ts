@@ -9,6 +9,7 @@ import type { PositionReader } from "./position-reader.js";
 import type { RoutePlanner } from "./route-planner.js";
 import type { UniswapTradingApi } from "./uniswap-trading-api.js";
 import { quoteRangeState } from "./quote-range.js";
+import { applySlippage } from "./uniswap-math.js";
 
 export interface ValuedPosition {
   snapshot: PnlSnapshot;
@@ -38,7 +39,7 @@ export class PnlService {
     private readonly tradingApi?: UniswapTradingApi,
   ) {}
 
-  async value(position: PositionRecord, blockNumber: bigint): Promise<ValuedPosition> {
+  async value(position: PositionRecord, blockNumber: bigint, quoteSlippageBps = this.config.maxSwapSlippageBps): Promise<ValuedPosition> {
     if (!position.quoteToken) throw new Error("Position has no eligible quote token");
     const value = await this.reader.read(position, blockNumber);
     await this.database.recordPositionObservation(
@@ -57,8 +58,8 @@ export class PnlService {
     const quoteSideFee = quoteIsToken0 ? value.unclaimedFees0 : value.unclaimedFees1;
     const nonQuoteFee = quoteIsToken0 ? value.unclaimedFees1 : value.unclaimedFees0;
     const [route, feeRoute] = await Promise.all([
-      this.quoteFresh(position, nonQuote.token, nonQuote.amount, position.quoteToken),
-      this.quoteFresh(position, nonQuote.token, nonQuoteFee, position.quoteToken),
+       this.quoteFresh(position, nonQuote.token, nonQuote.amount, position.quoteToken, quoteSlippageBps),
+       this.quoteFresh(position, nonQuote.token, nonQuoteFee, position.quoteToken, quoteSlippageBps),
     ]);
     if (nonQuote.amount > 0n && !route) throw new Error("No safe direct Uniswap route from LP asset to quote token");
 
@@ -77,7 +78,7 @@ export class PnlService {
     if (chainName) {
       const stable = this.config.quoteTokens[chainName]?.[0]?.address;
       if (stable && position.quoteToken.toLowerCase() !== stable.toLowerCase() && feeQuote > 0n) {
-        const stableRoute = await this.quoteFresh(position, position.quoteToken, feeQuote, stable);
+        const stableRoute = await this.quoteFresh(position, position.quoteToken, feeQuote, stable, quoteSlippageBps);
         feeQuoteUsdg = stableRoute?.minimumOut ?? 0n;
       }
     }
@@ -141,11 +142,22 @@ export class PnlService {
     return { action: "none" };
   }
 
-  private async quoteFresh(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address): Promise<ValuationRoute | null> {
+  trailingExitEstimateGateBps(metadata: Record<string, unknown>): bigint | null {
+    const state = parseTrailingStopState(metadata);
+    if (!state) return null;
+    const trailingFloor = state.peakPnlBps - percentToBps(this.config.trailingStopDrawdownPercent);
+    if (trailingFloor <= 0n) return 0n;
+    const bufferBps = BigInt(Math.round(this.config.trailingExitEstimateBufferPercent * 100));
+    return (trailingFloor * (10_000n - bufferBps)) / 10_000n;
+  }
+
+  private async quoteFresh(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address, slippageBps = this.config.maxSwapSlippageBps): Promise<ValuationRoute | null> {
     if (amountIn === 0n || tokenIn.toLowerCase() === tokenOut.toLowerCase()) return null;
     if (this.tradingApi) {
       try {
-        const quote = await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut);
+        const quote = slippageBps === this.config.maxSwapSlippageBps
+          ? await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut)
+          : await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
         if (quote) {
           return { expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, path: [tokenIn, tokenOut] };
         }
@@ -156,7 +168,7 @@ export class PnlService {
 
     const route = await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
     return route
-      ? { expectedOut: route.expectedOut, minimumOut: route.minimumOut, path: route.path }
+      ? { expectedOut: route.expectedOut, minimumOut: applySlippage(route.expectedOut, slippageBps), path: route.path }
       : null;
   }
 

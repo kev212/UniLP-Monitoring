@@ -26,6 +26,7 @@ const envSchema = z.object({
   TAKE_PROFIT_PERCENT: z.coerce.number().positive(),
   TRAILING_STOP_ACTIVATION_PERCENT: z.coerce.number().positive().default(5),
   TRAILING_STOP_DRAWDOWN_PERCENT: z.coerce.number().positive().default(1.5),
+  TRAILING_EXIT_ESTIMATE_BUFFER_PERCENT: z.coerce.number().nonnegative().max(50).default(10),
   PROFIT_OOR_ABOVE_THRESHOLD_PERCENT: z.coerce.number().positive().default(3),
   POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).default(5_000),
   BASE_POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).optional(),
@@ -87,6 +88,7 @@ export interface RuntimeConfig {
   takeProfitPercent: number;
   trailingStopActivationPercent: number;
   trailingStopDrawdownPercent: number;
+  trailingExitEstimateBufferPercent: number;
   profitOorAboveThresholdPercent: number;
   positionMonitorIntervalMs: number;
   discoveryIntervalMs: number;
@@ -235,6 +237,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     takeProfitPercent: env.TAKE_PROFIT_PERCENT,
     trailingStopActivationPercent: env.TRAILING_STOP_ACTIVATION_PERCENT,
     trailingStopDrawdownPercent: env.TRAILING_STOP_DRAWDOWN_PERCENT,
+    trailingExitEstimateBufferPercent: env.TRAILING_EXIT_ESTIMATE_BUFFER_PERCENT,
     profitOorAboveThresholdPercent: env.PROFIT_OOR_ABOVE_THRESHOLD_PERCENT,
     positionMonitorIntervalMs: env.POSITION_MONITOR_INTERVAL_MS,
     discoveryIntervalMs: env.DISCOVERY_INTERVAL_MS,
