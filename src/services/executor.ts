@@ -125,8 +125,15 @@ export class Executor {
     if (position.status === "closing") return this.resumeUnlocked(position);
     if (position.protocol === "v4" && !(await this.canCloseV4(position))) return;
     const retryMetadata = position.metadata as Record<string, unknown>;
+    const exitAttempts = exitRetryAttempts(retryMetadata);
+    const removeSlippageBps = effectiveRemoveSlippageBps(
+      this.config.removeLiquiditySlippageBps,
+      this.config.removeLiquidityMaxSlippageBps,
+      exitAttempts,
+    );
 
-    const value = await this.reader.read(position);
+    const value = await this.reader.read(position, undefined, removeSlippageBps);
+    log.info({ positionKey: position.positionKey, exitAttempts, removeSlippageBps }, "close attempt with adaptive slippage");
     const quoteIsToken0 = value.token0.token.toLowerCase() === position.quoteToken.toLowerCase();
     const quotePrincipal = quoteIsToken0 ? value.token0.amount : value.token1.amount;
     const quoteFee = quoteIsToken0 ? value.unclaimedFees0 : value.unclaimedFees1;
@@ -140,6 +147,7 @@ export class Executor {
       settlementPhase: "removing_liquidity",
       settlementQuoteFromClose: settlementQuoteFromClose.toString(),
       preCloseQuoteBalance: preCloseBalance.toString(),
+      removeSlippageBps,
       ...(!this.config.pnlIncludeGas && quoteToken.toLowerCase() === zeroAddress
         ? { settlementGasWei: "0" }
         : {}),
@@ -302,15 +310,20 @@ export class Executor {
 
     const actualBalance = await this.tokenBalance(position.chainId, pending.token);
     if (actualBalance < pending.amount) {
-      const reason = actualBalance === 0n
-        ? "pending swap token is no longer held — position externally settled"
-        : `pending swap balance (${actualBalance}) is below expected (${pending.amount}) — externally settled`;
-      await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
-        reason,
-        settlementRetryDisabled: true,
-      });
-      log.warn({ positionId: position.id, positionKey: position.positionKey, reason }, "external settlement requires transaction reconciliation");
-      return;
+      const closeReceiptTrusted = position.metadata.closeReceiptAccounted === true
+        && !(await this.database.getSubmittedSwapAttempt(position.id));
+      if (!closeReceiptTrusted) {
+        const reason = actualBalance === 0n
+          ? "pending swap token is no longer held — position externally settled"
+          : `pending swap balance (${actualBalance}) is below expected (${pending.amount}) — externally settled`;
+        await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
+          reason,
+          settlementRetryDisabled: true,
+        });
+        log.warn({ positionId: position.id, positionKey: position.positionKey, reason }, "external settlement requires transaction reconciliation");
+        return;
+      }
+      log.info({ positionId: position.id, positionKey: position.positionKey, pendingAmount: pending.amount }, "trusting receipt-accounted pending amount despite balance check");
     }
 
     if (retry.nextAttemptAt && Date.parse(retry.nextAttemptAt) > Date.now()) return;
@@ -1183,9 +1196,17 @@ export class Executor {
   }
 
   private async assetBalance(chainId: number, owner: Address, token: Address): Promise<bigint> {
-    const { client } = this.chains.getById(chainId);
-    if (token.toLowerCase() === zeroAddress) return client.getBalance({ address: owner });
-    return client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
+    const nativeClient = this.chains.getById(chainId).client;
+    const executorClient = this.executorClient(chainId);
+    const read = (client: PublicClient) => token.toLowerCase() === zeroAddress
+      ? client.getBalance({ address: owner })
+      : client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
+    try {
+      return await read(executorClient);
+    } catch (error) {
+      if (executorClient === nativeClient) throw error;
+      return read(nativeClient);
+    }
   }
 
   private async assetBalanceAt(chainId: number, owner: Address, token: Address, blockNumber: bigint): Promise<bigint> {
@@ -1476,6 +1497,18 @@ export function nextExitRetry(metadata: Record<string, unknown>, trigger?: ExitT
     lastFailedAt: new Date().toISOString(),
     nextAttemptAt: new Date(Date.now() + delaySeconds * 1_000).toISOString(),
   };
+}
+
+function exitRetryAttempts(metadata: Record<string, unknown>): number {
+  const retry = metadata.exitRetry;
+  if (!retry || typeof retry !== "object" || Array.isArray(retry)) return 0;
+  const attempts = (retry as Record<string, unknown>).attempts;
+  if (typeof attempts !== "number" || !Number.isSafeInteger(attempts) || attempts < 0) return 0;
+  return attempts;
+}
+
+export function effectiveRemoveSlippageBps(base: number, max: number, attempts: number): number {
+  return Math.min(max, base + attempts * 100);
 }
 
 function addressFromMetadata(value: unknown): Address | null {

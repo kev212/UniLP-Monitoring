@@ -47,4 +47,27 @@ describe("PositionReader block consistency", () => {
     expect(calls).toHaveLength(3);
     expect(calls.every((call) => call.blockNumber === 777n)).toBe(true);
   });
+
+  it("applies custom remove-liquidity slippage instead of the default", async () => {
+    const client = {
+      readContract: async (request: { functionName: string }) => {
+        if (request.functionName === "balanceOf") return 10n;
+        if (request.functionName === "totalSupply") return 100n;
+        if (request.functionName === "getReserves") return [1_000n, 2_000n, 123n] as const;
+        throw new Error();
+      },
+    };
+    const chains = { getById: () => ({ client }) } as never;
+    const reader = new PositionReader(chains, 100);
+    const position: PositionRecord = {
+      id: "position", chainId: 8453, protocol: "v2", positionKey: pair, owner,
+      poolAddress: pair, token0, token1, quoteToken: token0, status: "armed",
+      liquidity: 10n, openedAtBlock: 1n, metadata: {},
+    };
+
+    const value = await reader.read(position, 777n, 500);
+
+    expect(value.minAmount0).toBe(95n);
+    expect(value.minAmount1).toBe(190n);
+  });
 });

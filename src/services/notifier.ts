@@ -211,6 +211,8 @@ export class Notifier {
         ? "take profit"
       : reason === "trailing_take_profit"
         ? "trailing take profit"
+      : reason === "profit_oor_above"
+        ? "PROFIT + OOR ABOVE"
       : reason === "out_of_range_above"
         ? "OUT OF RANGE ABOVE"
         : "manual";
@@ -654,12 +656,12 @@ export class Notifier {
     const t0 = await this.tokenLabel(position.token0, position.chainId);
     const t1 = await this.tokenLabel(position.token1, position.chainId);
     const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
-    const statusLabel = statusDisplay(position.status);
     const reviewReason = position.status === "needs_review"
       ? ` | ${reviewReasonDisplay(position.metadata)}`
       : "";
     const autoExitDisabled = position.metadata.autoExitDisabled === true ? " | ⚠️ AUTO EXIT DISABLED" : "";
-    const base = `${index}. ${statusLabel.split(" ")[0]} ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${reviewReason}${autoExitDisabled}`;
+    const operationalStatus = position.status === "armed" ? "" : ` | ${statusDisplay(position.status)}`;
+    const base = `${index}. ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${operationalStatus}${reviewReason}${autoExitDisabled}`;
 
     if (!position.quoteToken || !blockNumber) return `${base}\n`;
     try {
@@ -678,8 +680,8 @@ export class Notifier {
         : `${formatToken(valued.snapshot.feeQuoteUsdg, usdgDec, 4)} USDG`;
       const pnlText = `PnL ${formatBps(valued.snapshot.pnlBps)}%`;
       const trailingPeak = trailingPeakDisplay(position.metadata);
-      const range = await this.formatPositionRange(position, valued.range);
-      return `${base} | 💰 ${cv} ${qtSymbol} | 🪙 ${feeDisplay} | 📊 ${pnlText}${trailingPeak}${range}\n`;
+      const bins = await this.formatPositionBins(position, valued.range);
+      return `${base}\n   💰 ${cv} ${qtSymbol} | 🪙 Fees ${feeDisplay} | 📊 ${pnlText}${trailingPeak}${bins}\n`;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const detail = message.includes("zero liquidity")
@@ -689,8 +691,8 @@ export class Notifier {
     }
   }
 
-  private async formatPositionRange(position: PositionRecord, range: import("../types.js").PositionRangeInfo | undefined): Promise<string> {
-    if (position.protocol === "v2") return "\n   Range: Full range (V2)";
+  private async formatPositionBins(position: PositionRecord, range: import("../types.js").PositionRangeInfo | undefined): Promise<string> {
+    if (position.protocol === "v2") return "\n   ████████████████████████████  FULL RANGE";
     if (!range || !position.quoteToken) return "";
 
     const quoteIsToken0 = position.quoteToken.toLowerCase() === position.token0.toLowerCase();
@@ -703,8 +705,12 @@ export class Notifier {
     const minimum = lower < upper ? lower : upper;
     const maximum = lower > upper ? lower : upper;
     const quoteSymbol = this.quoteSymbol(position.quoteToken);
-    const status = formatQuoteRangeStatus(quoteRangeState(range, quoteIsToken0)?.status ?? "in_range", position.metadata);
-    return `\n   ${status} | ${formatQuotePrice(minimum, quoteSymbol)} - ${formatQuotePrice(maximum, quoteSymbol)} ${quoteSymbol}`;
+    const current = quotePriceScaled(range.currentSqrtPrice, quoteIsToken0, token0Decimals, token1Decimals);
+    const bins = positionRangeBins(minimum, maximum, current);
+    const nonQuoteSymbol = await this.tokenLabel(quoteIsToken0 ? position.token1 : position.token0, position.chainId);
+    const legend = `${nonQuoteSymbol} 🟩   ${quoteSymbol} 🟦`;
+    const marker = `${" ".repeat(bins.markerIndex)}${bins.marker}`;
+    return `\n   ${legend}\n   ${marker}\n   ${bins.bar}\n   ${formatQuotePrice(minimum, quoteSymbol)}        ${formatQuotePrice(current, quoteSymbol)}        ${formatQuotePrice(maximum, quoteSymbol)}`;
   }
 
   private lastScanAt = 0;
@@ -1508,6 +1514,23 @@ function quotePriceScaled(sqrtPriceX96: bigint, quoteIsToken0: boolean, token0De
   return (square * 10n ** BigInt(token0Decimals) * QUOTE_PRICE_SCALE) / (Q192 * 10n ** BigInt(token1Decimals));
 }
 
+const POSITION_BIN_COUNT = 28;
+
+export function positionRangeBins(minimum: bigint, maximum: bigint, current: bigint): { bar: string; marker: "◀" | "▲" | "▶"; markerIndex: number } {
+  if (maximum <= minimum) {
+    return { bar: "█".repeat(POSITION_BIN_COUNT), marker: "▲", markerIndex: 0 };
+  }
+
+  const marker = current < minimum ? "◀" : current > maximum ? "▶" : "▲";
+  const markerIndex = current <= minimum
+    ? 0
+    : current >= maximum
+      ? POSITION_BIN_COUNT - 1
+      : Number(((current - minimum) * BigInt(POSITION_BIN_COUNT - 1)) / (maximum - minimum));
+  const bar = Array.from({ length: POSITION_BIN_COUNT }, (_, index) => index === markerIndex ? "│" : index < markerIndex ? "█" : "░").join("");
+  return { bar, marker, markerIndex };
+}
+
 function formatQuotePrice(value: bigint, quoteSymbol: string): string {
   const prefix = quoteSymbol === "USDG" || quoteSymbol === "USDC" ? "$" : "";
   if (value === 0n) return `${prefix}0`;
@@ -1519,19 +1542,12 @@ function formatQuotePrice(value: bigint, quoteSymbol: string): string {
   return `${prefix}${formatToken(value, 18, decimals)}`;
 }
 
-function formatQuoteRangeStatus(status: import("../types.js").PositionRangeInfo["status"], metadata: Record<string, unknown>): string {
-  if (status === "in_range") return "🟢 IN RANGE";
-  if (status === "below") return "⚠️ BELOW RANGE";
-  const seenAt = typeof metadata.oorAboveSeenAt === "number" ? metadata.oorAboveSeenAt : undefined;
-  const timer = seenAt ? ` ⏳${Math.floor((Date.now() - seenAt) / 60_000)}m` : "";
-  return `⚠️ ABOVE RANGE${timer}`;
-}
-
 function triggerDisplayShort(trigger: string): string {
   switch (trigger) {
     case "stop_loss": return "SL";
     case "take_profit": return "TP";
     case "trailing_take_profit": return "Trail";
+    case "profit_oor_above": return "P+OOR";
     case "out_of_range_above": return "OOR";
     case "manual": return "Manual";
     default: return trigger;

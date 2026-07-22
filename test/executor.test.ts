@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { encodeAbiParameters, keccak256, pad, stringToHex, zeroAddress, type Address, type Hex } from "viem";
 
 import type { RuntimeConfig } from "../src/config.js";
-import { Executor, nextExitRetry, nextSwapRetry, receiptErc20NetReceived } from "../src/services/executor.js";
+import { Executor, effectiveRemoveSlippageBps, nextExitRetry, nextSwapRetry, receiptErc20NetReceived } from "../src/services/executor.js";
 import type { PositionRecord } from "../src/types.js";
 
 const usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as const;
@@ -33,6 +33,8 @@ const config = {
   quoteTokens: { base: [], robinhood: [{ symbol: "USDG", address: usdg }] },
   settlementSwapSlippageBps: 200,
   settlementSwapMaxSlippageBps: 500,
+  removeLiquiditySlippageBps: 200,
+  removeLiquidityMaxSlippageBps: 500,
   confirmations: 1,
 } as RuntimeConfig;
 
@@ -130,6 +132,13 @@ describe("Executor pending settlement recovery", () => {
   it("increments retry attempts after a failed exit", () => {
     const retry = nextExitRetry({ exitRetry: { reason: "stop_loss", attempts: 2 } }, "stop_loss");
     expect(retry).toMatchObject({ reason: "stop_loss", attempts: 3 });
+  });
+
+  it("escalates remove-liquidity slippage on repeated close failures", () => {
+    expect(effectiveRemoveSlippageBps(200, 500, 0)).toBe(200);
+    expect(effectiveRemoveSlippageBps(200, 500, 1)).toBe(300);
+    expect(effectiveRemoveSlippageBps(200, 500, 3)).toBe(500);
+    expect(effectiveRemoveSlippageBps(200, 500, 5)).toBe(500);
   });
 
   it("tracks mined swap reverts separately from planning failures", () => {
@@ -245,7 +254,7 @@ describe("Executor pending settlement recovery", () => {
 
   it("reads native ETH with getBalance instead of ERC-20 balanceOf", async () => {
     const client = { getBalance: vi.fn().mockResolvedValue(123n), readContract: vi.fn() };
-    const chains = { getById: vi.fn(() => ({ client })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
     const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
 
     const balance = await (executor as unknown as {

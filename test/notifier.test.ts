@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { canRequestManualClose, clampDashboardPage, isExpiredCallbackError, parseDashboardAction, parseScanInput, parseScanV2Input } from "../src/services/notifier.js";
+import { canRequestManualClose, clampDashboardPage, isExpiredCallbackError, parseDashboardAction, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -71,5 +71,18 @@ describe("Telegram dashboard callbacks", () => {
     expect(isExpiredCallbackError(new Error("400: Bad Request: query is too old and response timeout expired"))).toBe(true);
     expect(isExpiredCallbackError(new Error("400: Bad Request: query ID is invalid"))).toBe(true);
     expect(isExpiredCallbackError(new Error("400: Bad Request: message is not modified"))).toBe(false);
+  });
+
+  it("renders a centered bin marker for an in-range price", () => {
+    const bins = positionRangeBins(0n, 100n, 50n);
+    expect(bins.marker).toBe("▲");
+    expect(bins.markerIndex).toBe(13);
+    expect(bins.bar).toHaveLength(28);
+    expect(bins.bar[13]).toBe("│");
+  });
+
+  it("pins the marker to the edge when price is outside the range", () => {
+    expect(positionRangeBins(100n, 200n, 50n)).toMatchObject({ marker: "◀", markerIndex: 0 });
+    expect(positionRangeBins(100n, 200n, 250n)).toMatchObject({ marker: "▶", markerIndex: 27 });
   });
 });

@@ -12,7 +12,7 @@ export type PositionStatus =
   | "failed"
   | "paused";
 
-export type ExitTrigger = "stop_loss" | "take_profit" | "trailing_take_profit" | "out_of_range_above" | "manual";
+export type ExitTrigger = "stop_loss" | "take_profit" | "trailing_take_profit" | "profit_oor_above" | "out_of_range_above" | "manual";
 
 export interface PositionRangeInfo {
   tickLower: number;

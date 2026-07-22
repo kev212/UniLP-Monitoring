@@ -1,7 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import { Guardian } from "../src/services/guardian.js";
 import { quoteRangeState } from "../src/services/quote-range.js";
 import { sqrtRatioAtTick } from "../src/services/uniswap-math.js";
+import type { RuntimeConfig } from "../src/config.js";
+import type { PositionRecord } from "../src/types.js";
 
 describe("quote-oriented range triggers", () => {
   const range = (status: "in_range" | "above" | "below", currentTick: number) => ({
@@ -41,5 +44,84 @@ describe("quote-oriented range triggers", () => {
     const state = quoteRangeState(value, true)!;
     expect(state.status).toBe("above");
     expect(state.aboveDistanceBps).toBeGreaterThan(0n);
+  });
+});
+
+describe("profit + OOR above timer", () => {
+  const config = {
+    trailingStopActivationPercent: 5,
+    profitOorAboveThresholdPercent: 3,
+    oorAboveProfitDurationMs: 300_000,
+  } as RuntimeConfig;
+
+  function makeGuardian(): Guardian {
+    const database = {
+      setPositionStatus: vi.fn().mockResolvedValue(undefined),
+    };
+    return new Guardian(config, database as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never);
+  }
+
+  const position = {
+    id: "position",
+    chainId: 4663,
+    protocol: "v4" as const,
+    positionKey: "1",
+    owner: "0x0000000000000000000000000000000000000001",
+    poolAddress: null,
+    token0: "0x0000000000000000000000000000000000000000",
+    token1: "0x0000000000000000000000000000000000000002",
+    quoteToken: "0x0000000000000000000000000000000000000002",
+    status: "armed" as const,
+    liquidity: null,
+    openedAtBlock: null,
+    metadata: {},
+  } satisfies PositionRecord;
+
+  const aboveRange = {
+    tickLower: 0,
+    tickUpper: 100,
+    currentTick: 200,
+    currentSqrtPrice: sqrtRatioAtTick(200),
+    status: "above" as const,
+    aboveDistanceBps: 500n,
+  };
+
+  it("starts the timer when above range and PnL reaches the dedicated 3% threshold", async () => {
+    const guardian = makeGuardian();
+    await (guardian as unknown as {
+      updateProfitOorAboveTimer(position: PositionRecord, range: unknown, pnlBps: bigint): Promise<void>;
+    }).updateProfitOorAboveTimer(position, aboveRange, 600n);
+
+    const db = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
+    expect(db.setPositionStatus).toHaveBeenCalledWith("position", "armed", expect.objectContaining({ profitOorAboveSeenAt: expect.any(Number) }));
+  });
+
+  it("resets the timer when PnL drops below the dedicated threshold", async () => {
+    const guardian = makeGuardian();
+    await (guardian as unknown as {
+      updateProfitOorAboveTimer(position: PositionRecord, range: unknown, pnlBps: bigint): Promise<void>;
+    }).updateProfitOorAboveTimer({ ...position, metadata: { profitOorAboveSeenAt: Date.now() - 10_000 } }, aboveRange, 299n);
+
+    const db = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
+    expect(db.setPositionStatus).toHaveBeenCalledWith("position", "armed", expect.objectContaining({ profitOorAboveSeenAt: null }));
+  });
+
+  it("does not use the trailing-stop activation threshold", async () => {
+    const guardian = makeGuardian();
+    await (guardian as unknown as {
+      updateProfitOorAboveTimer(position: PositionRecord, range: unknown, pnlBps: bigint): Promise<void>;
+    }).updateProfitOorAboveTimer(position, aboveRange, 300n);
+
+    const db = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
+    expect(db.setPositionStatus).toHaveBeenCalledWith("position", "armed", expect.objectContaining({ profitOorAboveSeenAt: expect.any(Number) }));
+  });
+
+  it("fires the trigger only after the configured duration elapses", () => {
+    const guardian = makeGuardian();
+    const check = (guardian as unknown as { checkProfitOorAboveTrigger(metadata: Record<string, unknown>): string | null }).checkProfitOorAboveTrigger.bind(guardian);
+
+    expect(check({ profitOorAboveSeenAt: Date.now() - 60_000 })).toBeNull();
+    expect(check({ profitOorAboveSeenAt: Date.now() - 300_000 })).toBe("profit_oor_above");
+    expect(check({})).toBeNull();
   });
 });

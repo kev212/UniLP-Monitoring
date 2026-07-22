@@ -42,14 +42,15 @@ export interface PositionValue {
 export class PositionReader {
   constructor(private readonly chains: ChainClients, private readonly slippageBps: number) {}
 
-  async read(position: PositionRecord, blockNumber?: bigint): Promise<PositionValue> {
+  async read(position: PositionRecord, blockNumber?: bigint, removeSlippageBps?: number): Promise<PositionValue> {
     const observedBlock = blockNumber ?? await this.chains.getById(position.chainId).client.getBlockNumber();
-    if (position.protocol === "v2") return this.readV2(position, observedBlock);
-    if (position.protocol === "v3") return this.readV3(position, observedBlock);
-    return this.readV4(position, observedBlock);
+    const effective = removeSlippageBps ?? this.slippageBps;
+    if (position.protocol === "v2") return this.readV2(position, observedBlock, effective);
+    if (position.protocol === "v3") return this.readV3(position, observedBlock, effective);
+    return this.readV4(position, observedBlock, effective);
   }
 
-  private async readV2(position: PositionRecord, blockNumber: bigint): Promise<PositionValue> {
+  private async readV2(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number): Promise<PositionValue> {
     if (!position.poolAddress) throw new Error("V2 position has no pair address");
     const { client } = this.chains.getById(position.chainId);
     const [balance, totalSupply, reserves] = await Promise.all([
@@ -62,7 +63,7 @@ export class PositionReader {
     const token0Amount = (reserves[0] * balance) / totalSupply;
     const token1Amount = (reserves[1] * balance) / totalSupply;
     const priceMarker = reserves[0] === 0n ? 0n : (reserves[1] << 96n) / reserves[0];
-    const minFactor = 10_000n - BigInt(this.slippageBps);
+    const minFactor = 10_000n - BigInt(removeSlippageBps);
 
     return {
       protocol: "v2",
@@ -80,7 +81,7 @@ export class PositionReader {
     };
   }
 
-  private async readV3(position: PositionRecord, blockNumber: bigint): Promise<PositionValue> {
+  private async readV3(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number): Promise<PositionValue> {
     const { client, registry } = this.chains.getById(position.chainId);
     const details = (await client.readContract({
       address: registry.contracts.v3.positionManager,
@@ -125,8 +126,8 @@ export class PositionReader {
       liquidity,
       priceMarker: (slot0[0] * slot0[0]) >> 96n,
       v3Fee: fee,
-      minAmount0: applySlippage(principal.amount0, this.slippageBps),
-      minAmount1: applySlippage(principal.amount1, this.slippageBps),
+      minAmount0: applySlippage(principal.amount0, removeSlippageBps),
+      minAmount1: applySlippage(principal.amount1, removeSlippageBps),
       unclaimedFees0: fee0,
       unclaimedFees1: fee1,
       range: rangeInfo(currentTick, tickLower, tickUpper, slot0[0]),
@@ -134,7 +135,7 @@ export class PositionReader {
     };
   }
 
-  private async readV4(position: PositionRecord, blockNumber: bigint): Promise<PositionValue> {
+  private async readV4(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number): Promise<PositionValue> {
     const { client, registry } = this.chains.getById(position.chainId);
     const tokenId = BigInt(position.positionKey);
     const metadata = position.metadata as Record<string, unknown>;
@@ -179,8 +180,8 @@ export class PositionReader {
       token1: { token: poolKey.currency1, amount: principal.amount1 },
       liquidity,
       priceMarker: (slot0[0] * slot0[0]) >> 96n,
-      minAmount0: applySlippage(principal.amount0, this.slippageBps),
-      minAmount1: applySlippage(principal.amount1, this.slippageBps),
+      minAmount0: applySlippage(principal.amount0, removeSlippageBps),
+      minAmount1: applySlippage(principal.amount1, removeSlippageBps),
       v4PoolKey: poolKey,
       unclaimedFees0: fee0,
       unclaimedFees1: fee1,

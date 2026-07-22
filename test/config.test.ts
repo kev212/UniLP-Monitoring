@@ -17,6 +17,7 @@ function environment(overrides: Record<string, string> = {}): NodeJS.ProcessEnv 
     TAKE_PROFIT_PERCENT: "20",
     TRAILING_STOP_ACTIVATION_PERCENT: "5",
     TRAILING_STOP_DRAWDOWN_PERCENT: "1.5",
+    PROFIT_OOR_ABOVE_THRESHOLD_PERCENT: "3",
     POSITION_MONITOR_INTERVAL_MS: "5000",
     DISCOVERY_INTERVAL_MS: "30000",
     POSITION_MONITOR_CONCURRENCY: "2",
@@ -46,16 +47,20 @@ describe("loadConfig", () => {
     expect(config.pnlIncludeGas).toBe(false);
     expect(config.trailingStopActivationPercent).toBe(5);
     expect(config.trailingStopDrawdownPercent).toBe(1.5);
+    expect(config.profitOorAboveThresholdPercent).toBe(3);
     expect(config.positionMonitorIntervalMs).toBe(5_000);
     expect(config.discoveryIntervalMs).toBe(30_000);
     expect(config.oorAboveMinDistancePercent).toBe(10);
     expect(config.oorAboveMinDurationMs).toBe(3_600_000);
+    expect(config.oorAboveProfitDurationMs).toBe(300_000);
     expect(config.positionMonitorConcurrency).toBe(2);
     expect(config.uniswapApiKey).toBeUndefined();
     expect(config.kyberswapEnabled).toBe(true);
     expect(config.kyberswapClientId).toBe("UniLP-Monitoring-kev212");
     expect(config.settlementSwapSlippageBps).toBe(200);
     expect(config.settlementSwapMaxSlippageBps).toBe(500);
+    expect(config.removeLiquiditySlippageBps).toBe(200);
+    expect(config.removeLiquidityMaxSlippageBps).toBe(500);
     expect(config.swapApiTimeoutMs).toBe(2_500);
     expect(config.poolScanDefaults).toEqual({
       minMarketCapUsd: 500_000,
@@ -125,5 +130,12 @@ describe("loadConfig", () => {
     expect(config.rpcHttp.robinhood).toBe("https://rpc.mainnet.chain.robinhood.com");
     expect(config.alchemyHttp.base).toContain("alchemy.com");
     expect(config.alchemyHttp.robinhood).toContain("alchemy.com");
+  });
+
+  it("rejects remove-liquidity max slippage below base", () => {
+    expect(() => loadConfig(environment({
+      REMOVE_LIQUIDITY_SLIPPAGE_BPS: "500",
+      REMOVE_LIQUIDITY_MAX_SLIPPAGE_BPS: "200",
+    }))).toThrow("REMOVE_LIQUIDITY_MAX_SLIPPAGE_BPS must be at least");
   });
 });

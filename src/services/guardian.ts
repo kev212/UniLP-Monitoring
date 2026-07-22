@@ -172,6 +172,7 @@ export class Guardian {
       }
       const trailing = this.pnl.evaluateTrailingStop(position.metadata, valued.snapshot);
       await this.updateOorAboveTimer(position, valued.range);
+      await this.updateProfitOorAboveTimer(position, valued.range, valued.snapshot.pnlBps);
 
       if (position.status === "discovered" || position.status === "syncing") {
         if (trailing.action === "activate" || trailing.action === "raise_peak") {
@@ -211,6 +212,7 @@ export class Guardian {
 
       const trigger = staticTrigger
         ?? (trailing.action === "trigger" ? "trailing_take_profit" : null)
+        ?? this.checkProfitOorAboveTrigger(position.metadata)
         ?? this.checkOorAboveTrigger(position.metadata);
       const pendingRetry = !trigger ? parseExitRetry(position.metadata) : null;
       const effectiveTrigger: ExitTrigger | null = trigger ?? pendingRetry?.reason ?? null;
@@ -337,6 +339,36 @@ export class Guardian {
     if (typeof seenAt !== "number") return null;
     if (Date.now() - seenAt < this.config.oorAboveMinDurationMs) return null;
     return "out_of_range_above";
+  }
+
+  private async updateProfitOorAboveTimer(position: PositionRecord, range: import("../types.js").PositionRangeInfo | undefined, pnlBps: bigint): Promise<void> {
+    const meta = position.metadata as Record<string, unknown>;
+    const quoteIsToken0 = position.quoteToken?.toLowerCase() === position.token0.toLowerCase();
+    const state = quoteRangeState(range, quoteIsToken0 === true);
+    if (!state) return;
+    const thresholdBps = BigInt(Math.round(this.config.profitOorAboveThresholdPercent * 100));
+    const active = state.status === "above" && pnlBps >= thresholdBps;
+    if (active && typeof meta.profitOorAboveSeenAt !== "number") {
+      const now = Date.now();
+      await this.database.setPositionStatus(position.id, position.status, {
+        profitOorAboveSeenAt: now,
+        profitOorAbovePnlBps: Number(pnlBps),
+      });
+      log.info({ positionId: position.id, positionKey: position.positionKey, pnlBps, quoteRangeStatus: state.status, quoteIsToken0 }, "profit + OOR above timer started");
+    } else if (!active && typeof meta.profitOorAboveSeenAt === "number") {
+      await this.database.setPositionStatus(position.id, position.status, {
+        profitOorAboveSeenAt: null,
+        profitOorAbovePnlBps: null,
+      });
+      log.info({ positionId: position.id, positionKey: position.positionKey, pnlBps, quoteRangeStatus: state?.status, quoteIsToken0 }, "profit + OOR above timer reset");
+    }
+  }
+
+  private checkProfitOorAboveTrigger(metadata: Record<string, unknown>): ExitTrigger | null {
+    const seenAt = (metadata as Record<string, unknown>).profitOorAboveSeenAt;
+    if (typeof seenAt !== "number") return null;
+    if (Date.now() - seenAt < this.config.oorAboveProfitDurationMs) return null;
+    return "profit_oor_above";
   }
 
 }

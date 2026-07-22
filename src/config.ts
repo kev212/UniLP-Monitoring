@@ -26,6 +26,7 @@ const envSchema = z.object({
   TAKE_PROFIT_PERCENT: z.coerce.number().positive(),
   TRAILING_STOP_ACTIVATION_PERCENT: z.coerce.number().positive().default(5),
   TRAILING_STOP_DRAWDOWN_PERCENT: z.coerce.number().positive().default(1.5),
+  PROFIT_OOR_ABOVE_THRESHOLD_PERCENT: z.coerce.number().positive().default(3),
   POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).default(5_000),
   BASE_POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).optional(),
   ROBINHOOD_POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).optional(),
@@ -34,6 +35,8 @@ const envSchema = z.object({
   MAX_SWAP_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(100),
   SETTLEMENT_SWAP_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(200),
   SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(500),
+  REMOVE_LIQUIDITY_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(200),
+  REMOVE_LIQUIDITY_MAX_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(500),
   SWAP_API_TIMEOUT_MS: z.coerce.number().int().min(500).max(10_000).default(2_500),
   MAX_TWAP_DEVIATION_BPS: z.coerce.number().int().min(1).max(5_000).default(250),
   TWAP_WINDOW_SECONDS: z.coerce.number().int().min(10).max(3_600).default(300),
@@ -41,6 +44,7 @@ const envSchema = z.object({
   OOR_AUTO_CLOSE_ENABLED: z.string().default("true"),
   OOR_ABOVE_MIN_DISTANCE_PERCENT: z.coerce.number().positive().default(10),
   OOR_ABOVE_MIN_DURATION_MS: z.coerce.number().int().min(5_000).max(86_400_000).default(3_600_000),
+  OOR_ABOVE_PROFIT_DURATION_MS: z.coerce.number().int().min(5_000).max(86_400_000).default(300_000),
   APPROVAL_MODE: z.literal("exact").default("exact"),
   DRY_RUN: z.string().default("true"),
   POOL_SCAN_MIN_MARKET_CAP_USD: z.coerce.number().nonnegative().default(500_000),
@@ -83,6 +87,7 @@ export interface RuntimeConfig {
   takeProfitPercent: number;
   trailingStopActivationPercent: number;
   trailingStopDrawdownPercent: number;
+  profitOorAboveThresholdPercent: number;
   positionMonitorIntervalMs: number;
   discoveryIntervalMs: number;
   chainMonitorIntervalMs: Partial<Record<ChainName, number>>;
@@ -90,6 +95,8 @@ export interface RuntimeConfig {
   maxSwapSlippageBps: number;
   settlementSwapSlippageBps: number;
   settlementSwapMaxSlippageBps: number;
+  removeLiquiditySlippageBps: number;
+  removeLiquidityMaxSlippageBps: number;
   swapApiTimeoutMs: number;
   maxTwapDeviationBps: number;
   twapWindowSeconds: number;
@@ -97,6 +104,7 @@ export interface RuntimeConfig {
   oorAutoCloseEnabled: boolean;
   oorAboveMinDistancePercent: number;
   oorAboveMinDurationMs: number;
+  oorAboveProfitDurationMs: number;
   dryRun: boolean;
   poolScanDefaults: PoolScanSettings;
   poolScanCandidatePages: number;
@@ -191,6 +199,9 @@ export function loadConfig(environment = process.env): RuntimeConfig {
   if (env.SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS < env.SETTLEMENT_SWAP_SLIPPAGE_BPS) {
     throw new Error("SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS must be at least SETTLEMENT_SWAP_SLIPPAGE_BPS");
   }
+  if (env.REMOVE_LIQUIDITY_MAX_SLIPPAGE_BPS < env.REMOVE_LIQUIDITY_SLIPPAGE_BPS) {
+    throw new Error("REMOVE_LIQUIDITY_MAX_SLIPPAGE_BPS must be at least REMOVE_LIQUIDITY_SLIPPAGE_BPS");
+  }
   if (env.KYBERSWAP_MAX_ROUTE_AGE_MS < env.SWAP_API_TIMEOUT_MS + 1_000) {
     throw new Error("KYBERSWAP_MAX_ROUTE_AGE_MS must exceed SWAP_API_TIMEOUT_MS by at least 1000ms");
   }
@@ -224,6 +235,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     takeProfitPercent: env.TAKE_PROFIT_PERCENT,
     trailingStopActivationPercent: env.TRAILING_STOP_ACTIVATION_PERCENT,
     trailingStopDrawdownPercent: env.TRAILING_STOP_DRAWDOWN_PERCENT,
+    profitOorAboveThresholdPercent: env.PROFIT_OOR_ABOVE_THRESHOLD_PERCENT,
     positionMonitorIntervalMs: env.POSITION_MONITOR_INTERVAL_MS,
     discoveryIntervalMs: env.DISCOVERY_INTERVAL_MS,
     chainMonitorIntervalMs: {
@@ -234,6 +246,8 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     maxSwapSlippageBps: env.MAX_SWAP_SLIPPAGE_BPS,
     settlementSwapSlippageBps: env.SETTLEMENT_SWAP_SLIPPAGE_BPS,
     settlementSwapMaxSlippageBps: env.SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS,
+    removeLiquiditySlippageBps: env.REMOVE_LIQUIDITY_SLIPPAGE_BPS,
+    removeLiquidityMaxSlippageBps: env.REMOVE_LIQUIDITY_MAX_SLIPPAGE_BPS,
     swapApiTimeoutMs: env.SWAP_API_TIMEOUT_MS,
     maxTwapDeviationBps: env.MAX_TWAP_DEVIATION_BPS,
     twapWindowSeconds: env.TWAP_WINDOW_SECONDS,
@@ -241,6 +255,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     oorAutoCloseEnabled: parseBoolean(env.OOR_AUTO_CLOSE_ENABLED, "OOR_AUTO_CLOSE_ENABLED"),
     oorAboveMinDistancePercent: env.OOR_ABOVE_MIN_DISTANCE_PERCENT,
     oorAboveMinDurationMs: env.OOR_ABOVE_MIN_DURATION_MS,
+    oorAboveProfitDurationMs: env.OOR_ABOVE_PROFIT_DURATION_MS,
     dryRun: parseBoolean(env.DRY_RUN, "DRY_RUN"),
     poolScanDefaults: {
       minMarketCapUsd: env.POOL_SCAN_MIN_MARKET_CAP_USD,
