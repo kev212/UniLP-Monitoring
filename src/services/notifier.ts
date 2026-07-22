@@ -87,7 +87,9 @@ export class Notifier {
       { command: "scan_pools", description: "Cari pool V3/V4 dengan estimasi yield 1 jam tertinggi" },
       { command: "history", description: "Tampilkan riwayat posisi close >= ±0.5% PnL" },
       { command: "calendar", description: "Tampilkan kalender realized PnL UTC" },
-    ]);
+    ]).catch((error) => {
+      log.warn({ err: error }, "Telegram command registration failed; bot will continue without updated commands");
+    });
     this.bot.command("status", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleStatus(ctx, database, pnl);
