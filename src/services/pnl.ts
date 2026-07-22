@@ -39,19 +39,26 @@ export class PnlService {
     private readonly tradingApi?: UniswapTradingApi,
   ) {}
 
-  async value(position: PositionRecord, blockNumber: bigint, quoteSlippageBps = this.config.maxSwapSlippageBps): Promise<ValuedPosition> {
+  async value(
+    position: PositionRecord,
+    blockNumber: bigint,
+    quoteSlippageBps = this.config.maxSwapSlippageBps,
+    recordObservations = true,
+  ): Promise<ValuedPosition> {
     if (!position.quoteToken) throw new Error("Position has no eligible quote token");
     const value = await this.reader.read(position, blockNumber);
-    await this.database.recordPositionObservation(
-      position.id,
-      value.protocol,
-      value.liquidity,
-      value.token0.token,
-      value.token0.amount,
-      value.token1.token,
-      value.token1.amount,
-      value.observedBlock,
-    );
+    if (recordObservations) {
+      await this.database.recordPositionObservation(
+        position.id,
+        value.protocol,
+        value.liquidity,
+        value.token0.token,
+        value.token0.amount,
+        value.token1.token,
+        value.token1.amount,
+        value.observedBlock,
+      );
+    }
     const quoteIsToken0 = value.token0.token.toLowerCase() === position.quoteToken.toLowerCase();
     const quoteAmount = quoteIsToken0 ? value.token0.amount : value.token1.amount;
     const nonQuote = quoteIsToken0 ? value.token1 : value.token0;
@@ -84,7 +91,9 @@ export class PnlService {
     }
     const pnlQuote = totals.realized + feeQuote + liquidationQuote - totals.deposits;
     const pnlBps = (pnlQuote * 10_000n) / totals.deposits;
-    const twapGuard = await this.recordAndCheckPrice(position, value.poolKey, value.priceMarker, value.observedBlock);
+    const twapGuard = recordObservations
+      ? await this.recordAndCheckPrice(position, value.poolKey, value.priceMarker, value.observedBlock)
+      : { ready: true };
 
     return {
       snapshot: {

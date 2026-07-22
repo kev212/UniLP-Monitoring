@@ -1,7 +1,7 @@
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, ExitTrigger, PositionRecord } from "../types.js";
+import type { ChainName, ExitTrigger, PnlSnapshot, PositionRecord } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { AlchemyBootstrapper } from "./alchemy-bootstrap.js";
 import type { DiscoveryService } from "./discovery.js";
@@ -236,22 +236,9 @@ export class Guardian {
         return true;
       }
       if (effectiveTrigger === "trailing_take_profit") {
-        const gateBps = this.pnl.trailingExitEstimateGateBps(position.metadata);
-        if (gateBps !== null) {
-          const exitEstimate = await this.pnl.value(position, blockNumber, this.config.settlementSwapSlippageBps);
-          if (exitEstimate.snapshot.pnlBps < gateBps) {
-            log.info({
-              positionId: position.id,
-              positionKey: position.positionKey,
-              estimatePnlBps: exitEstimate.snapshot.pnlBps,
-              gateBps,
-            }, "trailing exit deferred below conservative estimate gate");
-            return true;
-          }
-        }
+        if (!(await this.trailingExitEstimateAllowed(position, blockNumber))) return true;
       }
       if (this.queuedExitPositions.has(position.id)) return true;
-      void this.notifier.trigger(position, valued.snapshot, effectiveTrigger);
       try {
         await this.database.setPositionStatus(position.id, position.status, {
           exitSnapshot: {
@@ -260,7 +247,7 @@ export class Guardian {
             blockNumber: valued.snapshot.blockNumber.toString(),
           },
         });
-        await this.executeExit(position, effectiveTrigger);
+        await this.executeExit(position, effectiveTrigger, valued.snapshot);
         return true;
       } catch (error) {
         log.warn({ err: error, positionId: position.id, trigger: effectiveTrigger }, "exit attempt failed; waiting for fresh PnL before retry");
@@ -311,16 +298,55 @@ export class Guardian {
     }
   }
 
-  private async executeExit(position: PositionRecord, trigger: ExitTrigger): Promise<void> {
+  private async executeExit(position: PositionRecord, trigger: ExitTrigger, triggerSnapshot: PnlSnapshot): Promise<void> {
     if (this.queuedExitPositions.has(position.id)) return;
     this.queuedExitPositions.add(position.id);
-    const attempt = this.exitQueue.then(() => this.executor.execute(position, trigger));
+    const attempt = this.exitQueue.then(async () => {
+      if (trigger === "trailing_take_profit") {
+        const latestMetadata = await this.database.getPositionMetadata(position.id);
+        const latestPosition = latestMetadata ? { ...position, metadata: latestMetadata } : position;
+        const latestBlock = await this.chains.getById(position.chainId).client.getBlockNumber();
+        const latestEstimate = await this.trailingExitEstimateAllowed(latestPosition, latestBlock);
+        if (!latestEstimate) return;
+        position = latestPosition;
+        triggerSnapshot = latestEstimate;
+      }
+      void this.notifier.trigger(position, triggerSnapshot, trigger);
+      await this.executor.execute(position, trigger);
+    });
     this.exitQueue = attempt.catch(() => undefined);
     try {
       await attempt;
     } finally {
       this.queuedExitPositions.delete(position.id);
     }
+  }
+
+  private async trailingExitEstimateAllowed(position: PositionRecord, blockNumber: bigint): Promise<PnlSnapshot | null> {
+    const gateBps = this.pnl.trailingExitEstimateGateBps(position.metadata);
+    if (gateBps === null) {
+      await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
+        reason: "trailing_exit_state_missing",
+        settlementRetryDisabled: true,
+      });
+      log.error({ positionId: position.id, positionKey: position.positionKey }, "trailing exit blocked because peak state is missing");
+      return null;
+    }
+
+    const exitEstimate = await this.pnl.value(
+      position,
+      blockNumber,
+      this.config.settlementSwapSlippageBps,
+      false,
+    );
+    if (exitEstimate.snapshot.pnlBps >= gateBps) return exitEstimate.snapshot;
+    log.info({
+      positionId: position.id,
+      positionKey: position.positionKey,
+      estimatePnlBps: exitEstimate.snapshot.pnlBps,
+      gateBps,
+    }, "trailing exit deferred below conservative estimate gate");
+    return null;
   }
 
   private async updateOorAboveTimer(position: PositionRecord, range?: import("../types.js").PositionRangeInfo): Promise<void> {
