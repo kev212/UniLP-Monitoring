@@ -235,10 +235,10 @@ export class Guardian {
         log.info({ positionId: position.id, trigger: effectiveTrigger, nextAttemptAt: new Date(nextAttemptAt).toISOString() }, "exit retry waiting for backoff");
         return true;
       }
+      if (this.queuedExitPositions.has(position.id)) return true;
       if (effectiveTrigger === "trailing_take_profit") {
         if (!(await this.trailingExitEstimateAllowed(position, blockNumber))) return true;
       }
-      if (this.queuedExitPositions.has(position.id)) return true;
       try {
         await this.database.setPositionStatus(position.id, position.status, {
           exitSnapshot: {
