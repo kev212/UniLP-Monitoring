@@ -230,18 +230,48 @@ export class Guardian {
       const pendingRetry = !trigger ? parseExitRetry(position.metadata) : null;
       const effectiveTrigger: ExitTrigger | null = trigger ?? pendingRetry?.reason ?? null;
       if (!effectiveTrigger) {
+        if (position.metadata.slTwapWaitStartedAt !== undefined) {
+          await this.database.setPositionStatus(position.id, position.status, { slTwapWaitStartedAt: null });
+        }
         return true;
       }
-      if (effectiveTrigger !== "stop_loss" && !valued.twapGuard.ready) {
-        log.warn({
-          positionId: position.id,
-          trigger: effectiveTrigger,
-          rawRangeStatus: valued.range?.status,
-          quoteRangeStatus: quoteRange?.status,
-          quoteIsToken0,
-          deviationBps: valued.twapGuard.deviationBps,
-        }, "threshold reached but price guard is not ready");
-        return true;
+      if (!valued.twapGuard.ready) {
+        if (effectiveTrigger === "stop_loss") {
+          const slWaitStartedAt = typeof position.metadata.slTwapWaitStartedAt === "number"
+            ? position.metadata.slTwapWaitStartedAt : null;
+          if (slWaitStartedAt === null) {
+            await this.database.setPositionStatus(position.id, position.status, { slTwapWaitStartedAt: Date.now() });
+            log.warn({
+              positionId: position.id,
+              trigger: effectiveTrigger,
+              deviationBps: valued.twapGuard.deviationBps,
+            }, "SL threshold reached but TWAP not ready; starting guard wait");
+            return true;
+          }
+          if (Date.now() - slWaitStartedAt < this.config.slTwapGuardMaxWaitMs) {
+            log.info({
+              positionId: position.id,
+              trigger: effectiveTrigger,
+              elapsed: Date.now() - slWaitStartedAt,
+            }, "SL waiting for TWAP guard to stabilize");
+            return true;
+          }
+          log.warn({
+            positionId: position.id,
+            trigger: effectiveTrigger,
+            elapsed: Date.now() - slWaitStartedAt,
+          }, "SL executing after TWAP guard max wait override");
+        } else {
+          log.warn({
+            positionId: position.id,
+            trigger: effectiveTrigger,
+            rawRangeStatus: valued.range?.status,
+            quoteRangeStatus: quoteRange?.status,
+            quoteIsToken0,
+            deviationBps: valued.twapGuard.deviationBps,
+          }, "threshold reached but price guard is not ready");
+          return true;
+        }
       }
       const nextAttemptAt = retryAt(position.metadata);
       if (shouldWaitForExitRetry(effectiveTrigger, nextAttemptAt)) {
@@ -254,6 +284,7 @@ export class Guardian {
       }
       try {
         await this.database.setPositionStatus(position.id, position.status, {
+          slTwapWaitStartedAt: null,
           exitSnapshot: {
             pnlBps: valued.snapshot.pnlBps.toString(),
             pnlQuote: valued.snapshot.pnlQuote.toString(),

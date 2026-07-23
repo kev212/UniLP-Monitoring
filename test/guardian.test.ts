@@ -51,6 +51,7 @@ describe("profit + OOR above timer", () => {
   const config = {
     trailingStopActivationPercent: 5,
     profitOorAboveThresholdPercent: 3,
+    slTwapGuardMaxWaitMs: 15_000,
     oorAboveProfitDurationMs: 300_000,
   } as RuntimeConfig;
 

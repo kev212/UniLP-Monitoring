@@ -126,7 +126,7 @@ export class PnlService {
   shouldTrigger(snapshot: PnlSnapshot, range: PositionRangeInfo | undefined, quoteIsToken0: boolean): ExitTrigger | null {
     const stopLossBps = percentToBps(this.config.stopLossPercent);
     const takeProfitBps = percentToBps(this.config.takeProfitPercent);
-    if (snapshot.pnlBps <= stopLossBps && quoteRangeState(range, quoteIsToken0)?.status === "below") return "stop_loss";
+    if (snapshot.pnlBps <= stopLossBps) return "stop_loss";
     if (snapshot.pnlBps >= takeProfitBps) return "take_profit";
     return null;
   }

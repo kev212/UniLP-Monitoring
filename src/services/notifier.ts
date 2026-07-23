@@ -543,7 +543,7 @@ export class Notifier {
     }
 
     lines.push("");
-    lines.push(`SL: ${this.config.stopLossPercent}% (OOR Below only) | TP: +${this.config.takeProfitPercent}% | Trail: +${this.config.trailingStopActivationPercent}% / -${this.config.trailingStopDrawdownPercent}%`);
+    lines.push(`SL: ${this.config.stopLossPercent}% | TP: +${this.config.takeProfitPercent}% | Trail: +${this.config.trailingStopActivationPercent}% / -${this.config.trailingStopDrawdownPercent}%`);
     if (pageCount > 1) lines.push(`Page ${page + 1}/${pageCount} | ${active.length} posisi aktif`);
     return { text: lines.join("\n"), positions: active, page, pageCount };
   }

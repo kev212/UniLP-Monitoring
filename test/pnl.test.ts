@@ -18,6 +18,8 @@ const config: RuntimeConfig = {
   trailingStopActivationPercent: 5,
   trailingStopDrawdownPercent: 1.5,
   trailingExitEstimateBufferPercent: 10,
+  profitOorAboveThresholdPercent: 3,
+  slTwapGuardMaxWaitMs: 15_000,
   positionMonitorIntervalMs: 5_000,
   discoveryIntervalMs: 30_000,
   positionMonitorConcurrency: 2,
@@ -61,10 +63,11 @@ describe("PnL thresholds", () => {
     currentSqrtPrice: 1n,
   });
 
-  it("triggers stop-loss only for quote OOR Below", () => {
+  it("triggers stop-loss purely on PnL regardless of range state", () => {
+    expect(pnl.shouldTrigger(snapshot(-1_000n), range("in_range"), false)).toBe("stop_loss");
     expect(pnl.shouldTrigger(snapshot(-1_000n), range("below"), false)).toBe("stop_loss");
     expect(pnl.shouldTrigger(snapshot(-1_000n), range("above"), true)).toBe("stop_loss");
-    expect(pnl.shouldTrigger(snapshot(-1_000n), range("in_range"), false)).toBeNull();
+    expect(pnl.shouldTrigger(snapshot(-1_000n), undefined, false)).toBe("stop_loss");
     expect(pnl.shouldTrigger(snapshot(-999n), range("below"), false)).toBeNull();
   });
 
