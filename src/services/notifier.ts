@@ -5,7 +5,7 @@ import sharp from "sharp";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol } from "../types.js";
+import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol, RiskSettings } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
@@ -32,6 +32,9 @@ type DashboardAction =
   | { type: "config_reset"; page: number }
   | { type: "config_edit"; key: PoolSettingKey }
   | { type: "config_quote"; quote: string }
+  | { type: "risk"; page: number }
+  | { type: "risk_reset"; page: number }
+  | { type: "risk_edit"; key: RiskSettingKey }
   | { type: "history"; page: number }
   | { type: "pnl_card"; page: number }
   | { type: "pnl_card_select"; page: number; historyIndex: number }
@@ -43,7 +46,11 @@ type DashboardAction =
   | { type: "select" | "confirm"; page: number; chainId: number; protocol: Protocol; positionKey: string };
 
 type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "max_results";
-type PendingInput = { kind: "scan_token"; chain: ChainName } | { kind: "config"; key: PoolSettingKey; dashboardMessageId: number };
+type RiskSettingKey = "stop_loss" | "take_profit" | "trailing_activation" | "trailing_drawdown";
+type PendingInput =
+  | { kind: "scan_token"; chain: ChainName }
+  | { kind: "config"; key: PoolSettingKey; dashboardMessageId: number }
+  | { kind: "risk"; key: RiskSettingKey; dashboardMessageId: number };
 
 interface DashboardView {
   text: string;
@@ -59,6 +66,7 @@ export class Notifier {
   private readonly dashboardCloseInFlight = new Set<string>();
   private readonly pendingInput = new Map<string, PendingInput>();
   private readonly pendingBgUpload = new Set<string>();
+  private readonly riskDefaults: RiskSettings;
   private poolScanRunning = false;
   private tokenScanRunning = false;
   private scanV2Running = false;
@@ -70,6 +78,7 @@ export class Notifier {
     database?: Database,
   ) {
     this.database = database;
+    this.riskDefaults = this.riskSettings();
     if (!config.telegram) return;
     this.bot = new Bot(config.telegram.token);
     this.bot.catch((error) => {
@@ -425,6 +434,21 @@ export class Notifier {
         await this.showPoolScanConfig(database, chatId, message.message_id);
         return;
       }
+      if (action.type === "risk") {
+        await this.showRiskConfig(chatId, message.message_id, action.page);
+        return;
+      }
+      if (action.type === "risk_reset") {
+        await database.clearGlobalRiskSettings();
+        this.applyRiskSettings(this.riskDefaults);
+        await this.showRiskConfig(chatId, message.message_id, action.page, "Risk settings dikembalikan ke default ENV.");
+        return;
+      }
+      if (action.type === "risk_edit") {
+        this.pendingInput.set(chatId, { kind: "risk", key: action.key, dashboardMessageId: message.message_id });
+        await this.replyTemp(ctx, riskInputPrompt(action.key), { reply_markup: { force_reply: true } as any });
+        return;
+      }
       if (action.type === "history") {
         await this.showHistory(ctx, database, chatId, action.page);
         return;
@@ -580,7 +604,9 @@ export class Notifier {
     keyboard.row()
       .text("🖼 Background card", dashboardAction("bg_upload", 0))
       .text("⬛ Reset BG", dashboardAction("bg_reset", 0));
-    keyboard.row().text("⚙️ Pool scan config", dashboardAction("config", page));
+    keyboard.row()
+      .text("⚙️ Risk settings", dashboardAction("risk", page))
+      .text("⚙️ Pool scan config", dashboardAction("config", page));
     if (pageCount > 1) {
       keyboard.row();
       if (page > 0) keyboard.text("← Prev", dashboardAction("status", page - 1));
@@ -901,18 +927,71 @@ export class Notifier {
       return;
     }
     try {
+      if (pending.kind === "risk") {
+        const next = { ...this.riskSettings(), ...parseRiskSettingInput(pending.key, text) };
+        await database.setGlobalRiskSettings(next);
+        this.applyRiskSettings(next);
+        await this.replyTemp(ctx, "✅ Risk settings diperbarui.");
+        await this.showRiskConfig(chatId, pending.dashboardMessageId, 0);
+        return;
+      }
       const settings = await this.poolScanSettings(database, chatId);
       const next = { ...settings, ...parsePoolScanInput(pending.key, text) };
       await database.setPoolScanSettings(chatId, next);
       await this.replyTemp(ctx, "✅ Pool scan config diperbarui.");
       await this.showPoolScanConfig(database, chatId, pending.dashboardMessageId);
     } catch (error) {
-      await this.replyTemp(ctx, "Config tidak valid.");
+      if (pending.kind === "risk") {
+        this.pendingInput.set(chatId, pending);
+        await this.replyTemp(ctx, "Risk settings tidak valid. Kirim nilai lagi atau pilih tombol lain.");
+      } else {
+        await this.replyTemp(ctx, "Config tidak valid.");
+      }
     }
   }
 
   private async poolScanSettings(database: Database, chatId: string): Promise<PoolScanSettings> {
     return { ...this.config.poolScanDefaults, ...(await database.getPoolScanSettings(chatId)) };
+  }
+
+  private riskSettings(): RiskSettings {
+    return {
+      stopLossPercent: this.config.stopLossPercent,
+      takeProfitPercent: this.config.takeProfitPercent,
+      trailingStopActivationPercent: this.config.trailingStopActivationPercent,
+      trailingStopDrawdownPercent: this.config.trailingStopDrawdownPercent,
+    };
+  }
+
+  private applyRiskSettings(settings: RiskSettings): void {
+    this.config.stopLossPercent = settings.stopLossPercent;
+    this.config.takeProfitPercent = settings.takeProfitPercent;
+    this.config.trailingStopActivationPercent = settings.trailingStopActivationPercent;
+    this.config.trailingStopDrawdownPercent = settings.trailingStopDrawdownPercent;
+  }
+
+  private async showRiskConfig(chatId: string, messageId: number, page: number, notice?: string): Promise<void> {
+    const settings = this.riskSettings();
+    const keyboard = new InlineKeyboard()
+      .text("SL", "lp:riskcfg:stop_loss")
+      .text("TP", "lp:riskcfg:take_profit")
+      .row()
+      .text("Trailing activation", "lp:riskcfg:trailing_activation")
+      .text("Trailing drawdown", "lp:riskcfg:trailing_drawdown")
+      .row()
+      .text("Reset ENV", dashboardAction("risk_reset", page))
+      .text("← Back", dashboardAction("status", page));
+    const lines = [
+      "⚙️ GLOBAL RISK SETTINGS",
+      `Stop loss: ${settings.stopLossPercent}%`,
+      `Take profit: +${settings.takeProfitPercent}%`,
+      `Trailing activation: +${settings.trailingStopActivationPercent}%`,
+      `Trailing drawdown: -${settings.trailingStopDrawdownPercent}%`,
+      "",
+      "Berlaku untuk semua posisi pada siklus monitor berikutnya.",
+    ];
+    if (notice) lines.push("", notice);
+    await this.editDashboardMessage(chatId, messageId, lines.join("\n"), keyboard);
   }
 
   private async poolScanFilters(database: Database, chatId: string): Promise<PoolScanFilters> {
@@ -1286,7 +1365,7 @@ export class Notifier {
   }
 }
 
-function dashboardAction(type: "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset", page: number): string {
+function dashboardAction(type: "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "risk" | "risk_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset", page: number): string {
   return `lp:${type}:${page}`;
 }
 
@@ -1342,6 +1421,9 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
   if (parts.length === 3 && parts[0] === "lp" && parts[1] === "cfg" && isPoolSettingKey(parts[2])) {
     return { type: "config_edit", key: parts[2] };
   }
+  if (parts.length === 3 && parts[0] === "lp" && parts[1] === "riskcfg" && isRiskSettingKey(parts[2])) {
+    return { type: "risk_edit", key: parts[2] };
+  }
   if (parts.length === 3 && parts[0] === "lp" && parts[1] === "cfgquote" && ["USDG", "WETH", "ETH"].includes(parts[2] ?? "")) {
     return { type: "config_quote", quote: parts[2]! };
   }
@@ -1368,8 +1450,8 @@ function parseDashboardPage(value: string | undefined): number | null {
   return Number.isSafeInteger(page) ? page : null;
 }
 
-function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset" {
-  return value === "refresh" || value === "close" || value === "status" || value === "scan" || value === "scan_pools" || value === "config" || value === "config_reset" || value === "history" || value === "pnl_card" || value === "bg_upload" || value === "bg_reset";
+function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "risk" | "risk_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset" {
+  return value === "refresh" || value === "close" || value === "status" || value === "scan" || value === "scan_pools" || value === "config" || value === "config_reset" || value === "risk" || value === "risk_reset" || value === "history" || value === "pnl_card" || value === "bg_upload" || value === "bg_reset";
 }
 
 function monthLabel(year: number, month: number): string {
@@ -1386,6 +1468,10 @@ function isProtocol(value: string | undefined): value is Protocol {
 
 function isPoolSettingKey(value: string | undefined): value is PoolSettingKey {
   return value === "market_cap" || value === "pool_tvl" || value === "total_tvl" || value === "age" || value === "yield" || value === "max_results";
+}
+
+function isRiskSettingKey(value: string | undefined): value is RiskSettingKey {
+  return value === "stop_loss" || value === "take_profit" || value === "trailing_activation" || value === "trailing_drawdown";
 }
 
 export function isExpiredCallbackError(error: unknown): boolean {
@@ -1625,6 +1711,26 @@ function configInputPrompt(key: PoolSettingKey): string {
   if (key === "age") return "Kirim Min usia pool tertua, contoh: 30m, 1h, atau 2d.";
   if (key === "yield") return "Kirim Min gross yield per jam, contoh: 1 atau 1%.";
   return "Kirim jumlah hasil top, dari 1 sampai 20.";
+}
+
+export function parseRiskSettingInput(key: RiskSettingKey, value: string): Partial<RiskSettings> {
+  const number = Number(value.trim().replace(/[%\s,]/g, ""));
+  if (!Number.isFinite(number)) throw new Error("nilai harus angka");
+  if (key === "stop_loss") {
+    if (number >= 0 || number < -100) throw new Error("SL harus antara -100 dan kurang dari 0");
+    return { stopLossPercent: number };
+  }
+  if (number <= 0 || number > 1_000) throw new Error("nilai harus lebih dari 0 dan maksimal 1000");
+  if (key === "take_profit") return { takeProfitPercent: number };
+  if (key === "trailing_activation") return { trailingStopActivationPercent: number };
+  return { trailingStopDrawdownPercent: number };
+}
+
+function riskInputPrompt(key: RiskSettingKey): string {
+  if (key === "stop_loss") return "Kirim Stop Loss dalam persen negatif, contoh: -24.";
+  if (key === "take_profit") return "Kirim Take Profit dalam persen positif, contoh: 20.";
+  if (key === "trailing_activation") return "Kirim Trailing activation dalam persen positif, contoh: 5.";
+  return "Kirim Trailing drawdown dalam persen positif, contoh: 1.5.";
 }
 
 function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters): string {

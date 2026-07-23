@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { canRequestManualClose, clampDashboardPage, formatDashboardRangeStatus, formatRangePrices, isExpiredCallbackError, parseDashboardAction, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
+import { canRequestManualClose, clampDashboardPage, formatDashboardRangeStatus, formatRangePrices, isExpiredCallbackError, parseDashboardAction, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -37,6 +37,21 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseDashboardAction("lp:scan_pools:0")).toEqual({ type: "scan_pools", page: 0 });
     expect(parseDashboardAction("lp:cfg:yield")).toEqual({ type: "config_edit", key: "yield" });
     expect(parseDashboardAction("lp:cfgquote:WETH")).toEqual({ type: "config_quote", quote: "WETH" });
+  });
+
+  it("parses global risk-settings callbacks", () => {
+    expect(parseDashboardAction("lp:risk:0")).toEqual({ type: "risk", page: 0 });
+    expect(parseDashboardAction("lp:riskcfg:stop_loss")).toEqual({ type: "risk_edit", key: "stop_loss" });
+    expect(parseDashboardAction("lp:riskcfg:trailing_drawdown")).toEqual({ type: "risk_edit", key: "trailing_drawdown" });
+  });
+
+  it("validates global risk-setting values", () => {
+    expect(parseRiskSettingInput("stop_loss", "-24%")).toEqual({ stopLossPercent: -24 });
+    expect(parseRiskSettingInput("take_profit", "20")).toEqual({ takeProfitPercent: 20 });
+    expect(parseRiskSettingInput("trailing_activation", "5")).toEqual({ trailingStopActivationPercent: 5 });
+    expect(parseRiskSettingInput("trailing_drawdown", "1.5")).toEqual({ trailingStopDrawdownPercent: 1.5 });
+    expect(() => parseRiskSettingInput("stop_loss", "0")).toThrow();
+    expect(() => parseRiskSettingInput("take_profit", "-1")).toThrow();
   });
 
   it("parses UTC calendar callbacks", () => {

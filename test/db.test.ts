@@ -1,8 +1,59 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { Database } from "../src/db.js";
+import { isRiskSettings } from "../src/types.js";
 
 describe("Database native USD backfill", () => {
+  it("rejects malformed persisted risk settings", () => {
+    expect(isRiskSettings({
+      stopLossPercent: -24,
+      takeProfitPercent: 20,
+      trailingStopActivationPercent: 5,
+      trailingStopDrawdownPercent: 1.5,
+    })).toBe(true);
+    expect(isRiskSettings({ stopLossPercent: -24 })).toBe(false);
+    expect(isRiskSettings({
+      stopLossPercent: 0,
+      takeProfitPercent: 20,
+      trailingStopActivationPercent: 5,
+      trailingStopDrawdownPercent: 1.5,
+    })).toBe(false);
+  });
+
+  it("persists one global risk-settings override", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [] });
+    Object.defineProperty(database, "pool", { value: { query } });
+    const settings = {
+      stopLossPercent: -24,
+      takeProfitPercent: 20,
+      trailingStopActivationPercent: 5,
+      trailingStopDrawdownPercent: 1.5,
+    };
+
+    await database.setGlobalRiskSettings(settings);
+    await database.clearGlobalRiskSettings();
+
+    expect(query.mock.calls[0]![0]).toContain("INSERT INTO global_risk_settings");
+    expect(query.mock.calls[0]![1]).toEqual([JSON.stringify(settings)]);
+    expect(query.mock.calls[1]![0]).toContain("DELETE FROM global_risk_settings");
+  });
+
+  it("loads the global risk-settings override when present", async () => {
+    const database = new Database("postgres://unused");
+    const settings = {
+      stopLossPercent: -24,
+      takeProfitPercent: 20,
+      trailingStopActivationPercent: 5,
+      trailingStopDrawdownPercent: 1.5,
+    };
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ settings }] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.getGlobalRiskSettings()).resolves.toEqual(settings);
+    expect(query.mock.calls[0]![0]).toContain("SELECT settings FROM global_risk_settings");
+  });
+
   it("claims settlement only when no active lease or settled status exists", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ id: "position" }] });

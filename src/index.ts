@@ -14,6 +14,7 @@ import { RoutePlanner } from "./services/route-planner.js";
 import { UniswapTradingApi } from "./services/uniswap-trading-api.js";
 import { PoolScanner } from "./services/pool-scanner.js";
 import { KyberSwapAggregatorApi } from "./services/kyberswap-aggregator-api.js";
+import { isRiskSettings, type RiskSettings } from "./types.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -42,6 +43,12 @@ async function main(): Promise<void> {
 
   await database.connect();
   await database.migrate();
+  const storedRiskSettings = await database.getGlobalRiskSettings();
+  if (isRiskSettings(storedRiskSettings)) {
+    applyRiskSettings(config, storedRiskSettings);
+  } else if (storedRiskSettings !== null) {
+    log.warn("invalid global risk settings ignored; using ENV defaults");
+  }
   await guardian.validateNetworks();
   scanner.startCandidateRefresh([...config.quoteTokens.robinhood.map(({ address }) => address), zeroAddress], config.poolScanCandidatePages);
   void executor.backfillStaleCloseHistoryUsd().catch(() => {});
@@ -61,6 +68,13 @@ async function main(): Promise<void> {
     guardian.runForever(),
     notifier.startBot().then(() => { botRunning = true; }),
   ]);
+}
+
+function applyRiskSettings(config: ReturnType<typeof loadConfig>, settings: RiskSettings): void {
+  config.stopLossPercent = settings.stopLossPercent;
+  config.takeProfitPercent = settings.takeProfitPercent;
+  config.trailingStopActivationPercent = settings.trailingStopActivationPercent;
+  config.trailingStopDrawdownPercent = settings.trailingStopDrawdownPercent;
 }
 
 main().catch((error: unknown) => {

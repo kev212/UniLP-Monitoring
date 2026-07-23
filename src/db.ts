@@ -1,7 +1,7 @@
 import { Pool, type PoolClient } from "pg";
 import type { Address } from "viem";
 
-import type { CloseHistoryRecord, PnlCalendarMonth, PnlCardDetail, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol, TrailingStopState } from "./types.js";
+import type { CloseHistoryRecord, PnlCalendarMonth, PnlCardDetail, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol, RiskSettings, TrailingStopState } from "./types.js";
 
 const HISTORY_MIN_PNL_BPS = 50n;
 
@@ -130,6 +130,11 @@ export class Database {
       CREATE INDEX IF NOT EXISTS pool_observations_lookup_idx ON pool_observations(chain_id, protocol, pool_key, observed_at DESC);
       CREATE TABLE IF NOT EXISTS telegram_pool_scan_settings (
         chat_id TEXT PRIMARY KEY,
+        settings JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS global_risk_settings (
+        id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
         settings JSONB NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
@@ -333,6 +338,26 @@ export class Database {
 
   async clearPoolScanSettings(chatId: string): Promise<void> {
     await this.pool.query("DELETE FROM telegram_pool_scan_settings WHERE chat_id = $1", [chatId]);
+  }
+
+  async getGlobalRiskSettings(): Promise<unknown | null> {
+    const result = await this.pool.query<{ settings: unknown }>(
+      "SELECT settings FROM global_risk_settings WHERE id = TRUE",
+    );
+    return result.rowCount ? result.rows[0]!.settings : null;
+  }
+
+  async setGlobalRiskSettings(settings: RiskSettings): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO global_risk_settings (id, settings)
+       VALUES (TRUE, $1)
+       ON CONFLICT (id) DO UPDATE SET settings = EXCLUDED.settings, updated_at = NOW()`,
+      [JSON.stringify(settings)],
+    );
+  }
+
+  async clearGlobalRiskSettings(): Promise<void> {
+    await this.pool.query("DELETE FROM global_risk_settings WHERE id = TRUE");
   }
 
   async findPositionByKey(chainId: number, protocol: string, positionKey: string): Promise<PositionRecord | null> {

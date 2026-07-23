@@ -43,6 +43,26 @@ export interface PoolScanSettings {
   allowedQuotes: string[];
 }
 
+export interface RiskSettings {
+  stopLossPercent: number;
+  takeProfitPercent: number;
+  trailingStopActivationPercent: number;
+  trailingStopDrawdownPercent: number;
+}
+
+export function isRiskSettings(value: unknown): value is RiskSettings {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const settings = value as Record<string, unknown>;
+  const stopLoss = settings.stopLossPercent;
+  const takeProfit = settings.takeProfitPercent;
+  const activation = settings.trailingStopActivationPercent;
+  const drawdown = settings.trailingStopDrawdownPercent;
+  return typeof stopLoss === "number" && Number.isFinite(stopLoss) && stopLoss < 0 && stopLoss >= -100
+    && typeof takeProfit === "number" && Number.isFinite(takeProfit) && takeProfit > 0 && takeProfit <= 1_000
+    && typeof activation === "number" && Number.isFinite(activation) && activation > 0 && activation <= 1_000
+    && typeof drawdown === "number" && Number.isFinite(drawdown) && drawdown > 0 && drawdown <= 1_000;
+}
+
 export interface PositionRecord {
   id: string;
   chainId: number;
