@@ -135,8 +135,9 @@ export class PoolScanner {
       return { active: [], watchlist: [] };
     }
 
+    const dexTvlMap = await this.buildDexScreenerTvlMap(normalized);
     const scored = (await mapWithConcurrency(pools, TOKEN_SCAN_VERIFY_CONCURRENCY, (raw) =>
-      this.toScoredPool(raw, normalized, true, chain),
+      this.toScoredPool(raw, normalized, true, chain, dexTvlMap),
     )).filter((pool): pool is ScoredPool => pool !== null);
     const result = rankPools(scored);
     log.info({ token: normalized, rawPools: pools.length, scoredPools: scored.length, active: result.active.length, watchlist: result.watchlist.length, durationMs: Date.now() - startedAt }, "token pool scan completed");
@@ -146,7 +147,8 @@ export class PoolScanner {
   async scanV2(tokenAddress: Address, chain: ChainName = "robinhood", downsidePercent = 35, onProgress?: (completed: number, total: number) => void): Promise<PoolScan> {
     const normalized = tokenAddress.toLowerCase();
     const rawPools = await this.fetchUniswapPools(normalized, chain, "interactive");
-    const verified = (await mapWithConcurrency(rawPools, TOKEN_SCAN_VERIFY_CONCURRENCY, (raw) => this.toScoredPool(raw, normalized, false, chain)))
+    const dexTvlMap = await this.buildDexScreenerTvlMap(normalized);
+    const verified = (await mapWithConcurrency(rawPools, TOKEN_SCAN_VERIFY_CONCURRENCY, (raw) => this.toScoredPool(raw, normalized, false, chain, dexTvlMap)))
       .filter((pool): pool is ScoredPool => pool !== null && pool.activeLiquidity)
       .sort((a, b) => b.volume6hUsd - a.volume6hUsd)
       .slice(0, 3);
@@ -387,7 +389,19 @@ export class PoolScanner {
     return pools;
   }
 
-  private async toScoredPool(raw: GeckoPool, token: string, requireMinimumVolume6h: boolean, chain: ChainName): Promise<ScoredPool | null> {
+  private async buildDexScreenerTvlMap(token: string): Promise<Map<string, number>> {
+    const pairs = await this.fetchDexScreenerPairs(token);
+    const map = new Map<string, number>();
+    for (const pair of pairs) {
+      const usd = Number(pair.liquidity?.usd ?? 0);
+      if (Number.isFinite(usd) && usd > 0) {
+        map.set(pair.pairAddress.toLowerCase(), usd);
+      }
+    }
+    return map;
+  }
+
+  private async toScoredPool(raw: GeckoPool, token: string, requireMinimumVolume6h: boolean, chain: ChainName, dexScreenerTvls?: Map<string, number>): Promise<ScoredPool | null> {
     const dexId = raw.relationships.dex.data.id;
     const protocol = dexId.startsWith("uniswap-v4") ? "v4" : "v3";
     const poolAddress = raw.attributes.address;
@@ -396,7 +410,9 @@ export class PoolScanner {
       return null;
     }
 
-    const tvlUsd = Number(raw.attributes.reserve_in_usd || "0");
+    const geckoTvl = Number(raw.attributes.reserve_in_usd || "0");
+    const dexTvl = dexScreenerTvls?.get(poolAddress.toLowerCase());
+    const tvlUsd = dexTvl ?? geckoTvl;
     if (!Number.isFinite(tvlUsd) || tvlUsd <= 0) return null;
 
     const volume6hUsd = Number(raw.attributes.volume_usd?.h6 || "0");
