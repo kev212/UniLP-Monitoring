@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { Guardian, shouldWaitForExitRetry } from "../src/services/guardian.js";
+import { Guardian, shouldResumeExitRetry, shouldWaitForExitRetry } from "../src/services/guardian.js";
 import { quoteRangeState } from "../src/services/quote-range.js";
 import { sqrtRatioAtTick } from "../src/services/uniswap-math.js";
 import type { RuntimeConfig } from "../src/config.js";
@@ -53,6 +53,9 @@ describe("profit + OOR above timer", () => {
     profitOorAboveThresholdPercent: 3,
     slTwapGuardMaxWaitMs: 15_000,
     oorAboveProfitDurationMs: 300_000,
+    oorAutoCloseEnabled: true,
+    oorAboveMinDistancePercent: 10,
+    oorAboveMinDurationMs: 300_000,
   } as RuntimeConfig;
 
   function makeGuardian(): Guardian {
@@ -123,13 +126,35 @@ describe("profit + OOR above timer", () => {
     expect(shouldWaitForExitRetry("stop_loss", now + 60_000, now)).toBe(false);
   });
 
-  it("fires the trigger only after the configured duration elapses", () => {
+  it("fires the trigger only while live range and PnL remain eligible after the duration", async () => {
     const guardian = makeGuardian();
-    const check = (guardian as unknown as { checkProfitOorAboveTrigger(metadata: Record<string, unknown>): string | null }).checkProfitOorAboveTrigger.bind(guardian);
+    const update = (guardian as unknown as {
+      updateProfitOorAboveTimer(position: PositionRecord, range: unknown, pnlBps: bigint): Promise<string | null>;
+    }).updateProfitOorAboveTimer.bind(guardian);
 
-    expect(check({ profitOorAboveSeenAt: Date.now() - 60_000 })).toBeNull();
-    expect(check({ profitOorAboveSeenAt: Date.now() - 300_000 })).toBe("profit_oor_above");
-    expect(check({})).toBeNull();
+    await expect(update({ ...position, metadata: { profitOorAboveSeenAt: Date.now() - 60_000 } }, aboveRange, 600n)).resolves.toBeNull();
+    await expect(update({ ...position, metadata: { profitOorAboveSeenAt: Date.now() - 300_000 } }, aboveRange, 600n)).resolves.toBe("profit_oor_above");
+  });
+
+  it("resets stale OOR metadata without returning a trigger when live price is in range", async () => {
+    const guardian = makeGuardian();
+    const update = (guardian as unknown as {
+      updateOorAboveTimer(position: PositionRecord, range: unknown): Promise<string | null>;
+    }).updateOorAboveTimer.bind(guardian);
+    const inRange = { ...aboveRange, status: "in_range" as const, currentTick: 50, currentSqrtPrice: sqrtRatioAtTick(50), aboveDistanceBps: 0n };
+
+    await expect(update({ ...position, metadata: { oorAboveSeenAt: Date.now() - 1_000_000 } }, inRange)).resolves.toBeNull();
+    const db = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
+    expect(db.setPositionStatus).toHaveBeenCalledWith("position", "armed", expect.objectContaining({ oorAboveSeenAt: null }));
+  });
+
+  it("does not resume dynamic retries after their live trigger disappears", () => {
+    expect(shouldResumeExitRetry("out_of_range_above")).toBe(false);
+    expect(shouldResumeExitRetry("profit_oor_above")).toBe(false);
+    expect(shouldResumeExitRetry("trailing_take_profit")).toBe(false);
+    expect(shouldResumeExitRetry("stop_loss")).toBe(true);
+    expect(shouldResumeExitRetry("take_profit")).toBe(true);
+    expect(shouldResumeExitRetry("manual")).toBe(true);
   });
 });
 

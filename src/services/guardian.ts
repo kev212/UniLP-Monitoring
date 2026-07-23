@@ -205,8 +205,8 @@ export class Guardian {
         return true;
       }
       const trailing = this.pnl.evaluateTrailingStop(position.metadata, valued.snapshot);
-      await this.updateOorAboveTimer(position, valued.range);
-      await this.updateProfitOorAboveTimer(position, valued.range, valued.snapshot.pnlBps);
+      const oorTrigger = await this.updateOorAboveTimer(position, valued.range);
+      const profitOorTrigger = await this.updateProfitOorAboveTimer(position, valued.range, valued.snapshot.pnlBps);
 
       if (position.status === "discovered" || position.status === "syncing") {
         if (trailing.action === "activate" || trailing.action === "raise_peak") {
@@ -246,13 +246,18 @@ export class Guardian {
 
       const trigger = staticTrigger
         ?? (trailing.action === "trigger" ? "trailing_take_profit" : null)
-        ?? this.checkProfitOorAboveTrigger(position.metadata)
-        ?? this.checkOorAboveTrigger(position.metadata);
+        ?? profitOorTrigger
+        ?? oorTrigger;
       const pendingRetry = !trigger ? parseExitRetry(position.metadata) : null;
-      const effectiveTrigger: ExitTrigger | null = trigger ?? pendingRetry?.reason ?? null;
+      const retryTrigger = pendingRetry && shouldResumeExitRetry(pendingRetry.reason) ? pendingRetry.reason : null;
+      const effectiveTrigger: ExitTrigger | null = trigger ?? retryTrigger;
       if (!effectiveTrigger) {
-        if (position.metadata.slTwapWaitStartedAt !== undefined) {
-          await this.database.setPositionStatus(position.id, position.status, { slTwapWaitStartedAt: null });
+        const staleDynamicRetry = pendingRetry && !shouldResumeExitRetry(pendingRetry.reason);
+        if (position.metadata.slTwapWaitStartedAt !== undefined || staleDynamicRetry) {
+          await this.database.setPositionStatus(position.id, position.status, {
+            slTwapWaitStartedAt: null,
+            ...(staleDynamicRetry ? { exitRetry: null } : {}),
+          });
         }
         return true;
       }
@@ -423,11 +428,11 @@ export class Guardian {
     return null;
   }
 
-  private async updateOorAboveTimer(position: PositionRecord, range?: import("../types.js").PositionRangeInfo): Promise<void> {
+  private async updateOorAboveTimer(position: PositionRecord, range?: import("../types.js").PositionRangeInfo): Promise<ExitTrigger | null> {
     const meta = position.metadata as Record<string, unknown>;
     const quoteIsToken0 = position.quoteToken?.toLowerCase() === position.token0.toLowerCase();
     const state = quoteRangeState(range, quoteIsToken0 === true);
-    if (!state || !this.config.oorAutoCloseEnabled) return;
+    if (!state || !this.config.oorAutoCloseEnabled) return null;
     const thresholdBps = BigInt(Math.round(this.config.oorAboveMinDistancePercent * 100));
     const active = state.status === "above" && state.aboveDistanceBps >= thresholdBps;
     if (active && typeof meta.oorAboveSeenAt !== "number") {
@@ -438,6 +443,7 @@ export class Guardian {
         oorStatus: state.status,
       });
       log.info({ positionId: position.id, rawRangeStatus: range?.status, quoteRangeStatus: state.status, quoteIsToken0, distanceBps: state.aboveDistanceBps }, "OOR above timer started");
+      return null;
     } else if (!active && typeof meta.oorAboveSeenAt === "number") {
       await this.database.setPositionStatus(position.id, position.status, {
         oorAboveSeenAt: null,
@@ -445,22 +451,19 @@ export class Guardian {
         oorStatus: state.status,
       });
       log.info({ positionId: position.id, rawRangeStatus: range?.status, quoteRangeStatus: state.status, quoteIsToken0 }, "OOR above timer reset");
+      return null;
     }
-  }
-
-  private checkOorAboveTrigger(metadata: Record<string, unknown>): ExitTrigger | null {
-    if (!this.config.oorAutoCloseEnabled) return null;
-    const seenAt = (metadata as Record<string, unknown>).oorAboveSeenAt;
+    const seenAt = meta.oorAboveSeenAt;
     if (typeof seenAt !== "number") return null;
     if (Date.now() - seenAt < this.config.oorAboveMinDurationMs) return null;
     return "out_of_range_above";
   }
 
-  private async updateProfitOorAboveTimer(position: PositionRecord, range: import("../types.js").PositionRangeInfo | undefined, pnlBps: bigint): Promise<void> {
+  private async updateProfitOorAboveTimer(position: PositionRecord, range: import("../types.js").PositionRangeInfo | undefined, pnlBps: bigint): Promise<ExitTrigger | null> {
     const meta = position.metadata as Record<string, unknown>;
     const quoteIsToken0 = position.quoteToken?.toLowerCase() === position.token0.toLowerCase();
     const state = quoteRangeState(range, quoteIsToken0 === true);
-    if (!state) return;
+    if (!state) return null;
     const thresholdBps = BigInt(Math.round(this.config.profitOorAboveThresholdPercent * 100));
     const active = state.status === "above" && pnlBps >= thresholdBps;
     if (active && typeof meta.profitOorAboveSeenAt !== "number") {
@@ -470,17 +473,16 @@ export class Guardian {
         profitOorAbovePnlBps: Number(pnlBps),
       });
       log.info({ positionId: position.id, positionKey: position.positionKey, pnlBps, quoteRangeStatus: state.status, quoteIsToken0 }, "profit + OOR above timer started");
+      return null;
     } else if (!active && typeof meta.profitOorAboveSeenAt === "number") {
       await this.database.setPositionStatus(position.id, position.status, {
         profitOorAboveSeenAt: null,
         profitOorAbovePnlBps: null,
       });
       log.info({ positionId: position.id, positionKey: position.positionKey, pnlBps, quoteRangeStatus: state?.status, quoteIsToken0 }, "profit + OOR above timer reset");
+      return null;
     }
-  }
-
-  private checkProfitOorAboveTrigger(metadata: Record<string, unknown>): ExitTrigger | null {
-    const seenAt = (metadata as Record<string, unknown>).profitOorAboveSeenAt;
+    const seenAt = meta.profitOorAboveSeenAt;
     if (typeof seenAt !== "number") return null;
     if (Date.now() - seenAt < this.config.oorAboveProfitDurationMs) return null;
     return "profit_oor_above";
@@ -531,6 +533,10 @@ function retryAt(metadata: Record<string, unknown>): number | null {
 
 export function shouldWaitForExitRetry(trigger: ExitTrigger, nextAttemptAt: number | null, now = Date.now()): boolean {
   return trigger !== "stop_loss" && nextAttemptAt !== null && now < nextAttemptAt;
+}
+
+export function shouldResumeExitRetry(trigger: ExitTrigger): boolean {
+  return trigger === "stop_loss" || trigger === "take_profit" || trigger === "manual";
 }
 
 function parseExitRetry(metadata: Record<string, unknown>): { reason: ExitTrigger; nextAttemptAt: number } | null {
