@@ -5,7 +5,7 @@ import sharp from "sharp";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol, RiskSettings } from "../types.js";
+import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionRangeInfo, PositionRecord, PositionStatus, Protocol, RiskSettings } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
@@ -550,7 +550,7 @@ export class Notifier {
   }
 
   private async buildDashboard(database: Database, pnl: PnlService, requestedPage: number, notice?: string): Promise<DashboardView> {
-    const { active, blocks } = await this.activePositions(database, true);
+    const { active } = await this.activePositions(database, false);
     const pageCount = Math.max(1, Math.ceil(active.length / DASHBOARD_PAGE_SIZE));
     const page = clampDashboardPage(requestedPage, pageCount);
     const first = page * DASHBOARD_PAGE_SIZE;
@@ -560,9 +560,14 @@ export class Notifier {
       lines.push("Tidak ada posisi aktif.");
     } else {
       const pagePositions = active.slice(first, first + DASHBOARD_PAGE_SIZE);
-      const statusLines = await mapWithConcurrency(pagePositions, DASHBOARD_VALUE_CONCURRENCY, (position, index) =>
-        this.formatStatusLine(position, pnl, blocks[position.chainId], first + index + 1),
-      );
+      const positionIds = pagePositions.map((p) => p.id);
+      const [snapshotMap, observationMap] = await Promise.all([
+        database.getLatestSnapshots(positionIds),
+        database.getLatestObservations(positionIds),
+      ]);
+      const statusLines = await Promise.all(pagePositions.map((position, index) =>
+        this.formatStatusLineFromSnapshot(position, snapshotMap.get(position.id), observationMap.get(position.id), pnl, first + index + 1),
+      ));
       lines.push(...statusLines.map((line) => line.trimEnd()));
     }
 
@@ -678,6 +683,51 @@ export class Notifier {
       if (message.includes("message is not modified")) return;
       throw error;
     }
+  }
+
+  private async formatStatusLineFromSnapshot(
+    position: PositionRecord,
+    snapshot: { pnlBps: bigint; liquidationQuote: bigint; realizedQuote: bigint; depositsQuote: bigint; feeQuoteUsdg: bigint; blockNumber: bigint; createdAt: Date } | undefined,
+    observation: { liquidity: bigint; token0Amount: bigint; token1Amount: bigint; blockNumber: bigint; rangeStatus: string | null; rangeTickLower: number | null; rangeTickUpper: number | null; rangeCurrentTick: number | null; rangeSqrtPrice: bigint | null } | undefined,
+    pnl: PnlService,
+    index: number,
+  ): Promise<string> {
+    const t0 = await this.tokenLabel(position.token0, position.chainId);
+    const t1 = await this.tokenLabel(position.token1, position.chainId);
+    const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
+    const reviewReason = position.status === "needs_review"
+      ? ` | ${reviewReasonDisplay(position.metadata)}`
+      : "";
+    const autoExitDisabled = position.metadata.autoExitDisabled === true ? " | ⚠️ AUTO EXIT DISABLED" : "";
+    const operationalStatus = position.status === "armed" ? "" : ` | ${statusDisplay(position.status)}`;
+    const base = `${index}. ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${operationalStatus}${reviewReason}${autoExitDisabled}`;
+
+    if (!snapshot || !position.quoteToken) {
+      if (!position.quoteToken) return `${base}\n`;
+      const blockNumber = observation?.blockNumber;
+      if (!blockNumber) return `${base} | ⏳ LOADING\n`;
+      return this.formatStatusLine(position, pnl, blockNumber, index);
+    }
+
+    const qtSymbol = this.quoteSymbol(position.quoteToken);
+    const qtDec = await this.decimals(position.quoteToken, position.chainId);
+    const cv = formatToken(snapshot.liquidationQuote, qtDec, 2);
+    const pnlText = `${pnlEmoji(snapshot.pnlBps)} ${formatBps(snapshot.pnlBps)}%`;
+    const trailingPeak = trailingPeakDisplay(position.metadata);
+    const feeUsdg = snapshot.feeQuoteUsdg ?? 0n;
+    const valueLine = `   💰 ${cv} ${qtSymbol} ${pnlText} | 🪙 ≈$${formatToken(feeUsdg, 6, 2)}${trailingPeak}`;
+
+    const rangeInfo = observation?.rangeStatus && observation.rangeTickLower !== null && observation.rangeTickUpper !== null && observation.rangeCurrentTick !== null && observation.rangeSqrtPrice !== null
+      ? {
+          status: observation.rangeStatus as PositionRangeInfo["status"],
+          tickLower: observation.rangeTickLower,
+          tickUpper: observation.rangeTickUpper,
+          currentTick: observation.rangeCurrentTick,
+          currentSqrtPrice: observation.rangeSqrtPrice,
+        } as PositionRangeInfo
+      : undefined;
+    const bins = await this.formatPositionBins(position, rangeInfo);
+    return `${base}\n${valueLine}${bins}\n`;
   }
 
   private async formatStatusLine(position: PositionRecord, pnl: PnlService, blockNumber: bigint | undefined, index: number): Promise<string> {

@@ -64,6 +64,13 @@ export class PnlService {
         value.token1.token,
         value.token1.amount,
         value.observedBlock,
+        value.range ? {
+          status: value.range.status,
+          tickLower: value.range.tickLower,
+          tickUpper: value.range.tickUpper,
+          currentTick: value.range.currentTick,
+          currentSqrtPrice: value.range.currentSqrtPrice,
+        } : undefined,
       );
     }
     const quoteIsToken0 = value.token0.token.toLowerCase() === position.quoteToken.toLowerCase();

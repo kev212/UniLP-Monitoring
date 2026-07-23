@@ -94,6 +94,7 @@ export class Database {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS pnl_snapshots_position_created_idx ON pnl_snapshots(position_id, created_at DESC);
+      ALTER TABLE pnl_snapshots ADD COLUMN IF NOT EXISTS fee_quote_usdg NUMERIC(78, 0) DEFAULT 0;
       CREATE TABLE IF NOT EXISTS position_observations (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         position_id UUID NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
@@ -108,6 +109,11 @@ export class Database {
         UNIQUE(position_id, block_number)
       );
       CREATE INDEX IF NOT EXISTS position_observations_lookup_idx ON position_observations(position_id, observed_at DESC);
+      ALTER TABLE position_observations ADD COLUMN IF NOT EXISTS range_status TEXT;
+      ALTER TABLE position_observations ADD COLUMN IF NOT EXISTS range_tick_lower INTEGER;
+      ALTER TABLE position_observations ADD COLUMN IF NOT EXISTS range_tick_upper INTEGER;
+      ALTER TABLE position_observations ADD COLUMN IF NOT EXISTS range_current_tick INTEGER;
+      ALTER TABLE position_observations ADD COLUMN IF NOT EXISTS range_sqrt_price NUMERIC(78, 0);
       CREATE TABLE IF NOT EXISTS execution_attempts (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         position_id UUID NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
@@ -534,8 +540,8 @@ export class Database {
 
   async addPnlSnapshot(snapshot: PnlSnapshot): Promise<void> {
     await this.pool.query(
-      `INSERT INTO pnl_snapshots (position_id, quote_token, deposits_quote, realized_quote, liquidation_quote, pnl_quote, pnl_bps, block_number)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      `INSERT INTO pnl_snapshots (position_id, quote_token, deposits_quote, realized_quote, liquidation_quote, pnl_quote, pnl_bps, block_number, fee_quote_usdg)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
         snapshot.positionId,
         snapshot.quoteToken.toLowerCase(),
@@ -545,6 +551,7 @@ export class Database {
         snapshot.pnlQuote.toString(),
         snapshot.pnlBps.toString(),
         snapshot.blockNumber.toString(),
+        snapshot.feeQuoteUsdg.toString(),
       ],
     );
   }
@@ -558,18 +565,25 @@ export class Database {
     token1: Address,
     token1Amount: bigint,
     blockNumber: bigint,
+    range?: { status: string; tickLower: number; tickUpper: number; currentTick: number; currentSqrtPrice: bigint },
   ): Promise<void> {
     await this.transaction(async (client) => {
       await client.query(
         `INSERT INTO position_observations
-          (position_id, protocol, liquidity, token0, token0_amount, token1, token1_amount, block_number)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          (position_id, protocol, liquidity, token0, token0_amount, token1, token1_amount, block_number,
+           range_status, range_tick_lower, range_tick_upper, range_current_tick, range_sqrt_price)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          ON CONFLICT (position_id, block_number) DO UPDATE SET
            liquidity = EXCLUDED.liquidity,
            token0 = EXCLUDED.token0,
            token0_amount = EXCLUDED.token0_amount,
            token1 = EXCLUDED.token1,
            token1_amount = EXCLUDED.token1_amount,
+           range_status = EXCLUDED.range_status,
+           range_tick_lower = EXCLUDED.range_tick_lower,
+           range_tick_upper = EXCLUDED.range_tick_upper,
+           range_current_tick = EXCLUDED.range_current_tick,
+           range_sqrt_price = EXCLUDED.range_sqrt_price,
            observed_at = NOW()`,
         [
           positionId,
@@ -580,6 +594,11 @@ export class Database {
           token1.toLowerCase(),
           token1Amount.toString(),
           blockNumber.toString(),
+          range?.status ?? null,
+          range?.tickLower ?? null,
+          range?.tickUpper ?? null,
+          range?.currentTick ?? null,
+          range?.currentSqrtPrice?.toString() ?? null,
         ],
       );
       await client.query(
@@ -587,6 +606,79 @@ export class Database {
         [positionId, liquidity.toString()],
       );
     });
+  }
+
+  async getLatestSnapshots(positionIds: string[]): Promise<Map<string, { pnlBps: bigint; liquidationQuote: bigint; realizedQuote: bigint; depositsQuote: bigint; blockNumber: bigint; feeQuoteUsdg: bigint; createdAt: Date }>> {
+    if (positionIds.length === 0) return new Map();
+    const result = await this.pool.query(
+      `SELECT DISTINCT ON (position_id)
+          position_id, pnl_bps, liquidation_quote, realized_quote, deposits_quote, block_number, fee_quote_usdg, created_at
+       FROM pnl_snapshots
+       WHERE position_id = ANY($1::uuid[])
+       ORDER BY position_id, created_at DESC`,
+      [positionIds],
+    );
+    const map = new Map<string, { pnlBps: bigint; liquidationQuote: bigint; realizedQuote: bigint; depositsQuote: bigint; blockNumber: bigint; feeQuoteUsdg: bigint; createdAt: Date }>();
+    for (const row of result.rows) {
+      map.set(row.position_id, {
+        pnlBps: BigInt(row.pnl_bps),
+        liquidationQuote: BigInt(row.liquidation_quote),
+        realizedQuote: BigInt(row.realized_quote),
+        depositsQuote: BigInt(row.deposits_quote),
+        blockNumber: BigInt(row.block_number),
+        feeQuoteUsdg: BigInt(row.fee_quote_usdg ?? 0),
+        createdAt: row.created_at,
+      });
+    }
+    return map;
+  }
+
+  async getLatestObservations(positionIds: string[]): Promise<Map<string, {
+    liquidity: bigint;
+    token0Amount: bigint;
+    token1Amount: bigint;
+    blockNumber: bigint;
+    rangeStatus: string | null;
+    rangeTickLower: number | null;
+    rangeTickUpper: number | null;
+    rangeCurrentTick: number | null;
+    rangeSqrtPrice: bigint | null;
+  }>> {
+    if (positionIds.length === 0) return new Map();
+    const result = await this.pool.query(
+      `SELECT DISTINCT ON (position_id)
+          position_id, liquidity, token0_amount, token1_amount, block_number,
+          range_status, range_tick_lower, range_tick_upper, range_current_tick, range_sqrt_price
+       FROM position_observations
+       WHERE position_id = ANY($1::uuid[])
+       ORDER BY position_id, observed_at DESC`,
+      [positionIds],
+    );
+    const map = new Map<string, {
+      liquidity: bigint;
+      token0Amount: bigint;
+      token1Amount: bigint;
+      blockNumber: bigint;
+      rangeStatus: string | null;
+      rangeTickLower: number | null;
+      rangeTickUpper: number | null;
+      rangeCurrentTick: number | null;
+      rangeSqrtPrice: bigint | null;
+    }>();
+    for (const row of result.rows) {
+      map.set(row.position_id, {
+        liquidity: BigInt(row.liquidity),
+        token0Amount: BigInt(row.token0_amount),
+        token1Amount: BigInt(row.token1_amount),
+        blockNumber: BigInt(row.block_number),
+        rangeStatus: row.range_status ?? null,
+        rangeTickLower: row.range_tick_lower !== null ? Number(row.range_tick_lower) : null,
+        rangeTickUpper: row.range_tick_upper !== null ? Number(row.range_tick_upper) : null,
+        rangeCurrentTick: row.range_current_tick !== null ? Number(row.range_current_tick) : null,
+        rangeSqrtPrice: row.range_sqrt_price ? BigInt(row.range_sqrt_price) : null,
+      });
+    }
+    return map;
   }
 
   async recordExecution(positionId: string, stage: string, status: "planned" | "submitted" | "confirmed" | "failed", transactionHash?: string, error?: string): Promise<void> {
