@@ -944,8 +944,20 @@ export class DiscoveryService {
 
   private findQuoteToken(name: ChainName, token0: Address, token1: Address): Address | null {
     const tokens = this.config.quoteTokens[name];
-    const matches = [token0, token1].filter((token) => tokens.some((quote) => quote.address.toLowerCase() === token.toLowerCase()));
-    return matches.length === 1 ? matches[0]! : null;
+    const match = (addr: Address) => tokens.find((quote) => quote.address.toLowerCase() === addr.toLowerCase());
+    const m0 = match(token0);
+    const m1 = match(token1);
+    if (m0 && m1) {
+      const priority = ["USDG", "USDC", "WETH", "ETH"];
+      for (const sym of priority) {
+        if (m0.symbol === sym) return m0.address;
+        if (m1.symbol === sym) return m1.address;
+      }
+      return m0.address;
+    }
+    if (m0) return m0.address;
+    if (m1) return m1.address;
+    return null;
   }
 
   private initialStatus(quoteToken: Address | null): PositionStatus {
