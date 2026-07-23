@@ -122,7 +122,11 @@ export class Guardian {
           continue;
         }
       }
-      if (!candidate.quoteToken) continue;
+      if (!candidate.quoteToken) {
+        const repaired = await this.discovery.tryAssignQuoteToken(name, candidate);
+        if (!repaired) continue;
+        candidate = repaired;
+      }
 
       await this.database.setPositionStatus(candidate.id, "syncing", { needsReviewRetriedAt: new Date().toISOString(), reason: null });
       await this.evaluatePosition(name, { ...candidate, status: "syncing" }, blockNumber);

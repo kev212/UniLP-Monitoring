@@ -963,6 +963,14 @@ export class DiscoveryService {
   private initialStatus(quoteToken: Address | null): PositionStatus {
     return quoteToken ? "syncing" : "needs_review";
   }
+
+  async tryAssignQuoteToken(name: ChainName, position: PositionRecord): Promise<PositionRecord | null> {
+    const quoteToken = this.findQuoteToken(name, position.token0, position.token1);
+    if (!quoteToken) return null;
+    await this.database.repairPositionAssets(position.id, position.token0, position.token1, quoteToken);
+    log.info({ positionId: position.id, positionKey: position.positionKey, quoteToken }, "quote token assigned on retry");
+    return { ...position, quoteToken };
+  }
 }
 
 function quoteValueFromPairAmounts(position: PositionRecord, amount0: bigint, amount1: bigint): bigint {
