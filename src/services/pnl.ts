@@ -174,6 +174,12 @@ export class PnlService {
     return (trailingFloor * (10_000n - bufferBps)) / 10_000n;
   }
 
+  trailingFloorBps(metadata: Record<string, unknown>): bigint | null {
+    const state = parseTrailingStopState(metadata);
+    if (!state) return null;
+    return state.peakPnlBps - percentToBps(this.config.trailingStopDrawdownPercent);
+  }
+
   private async quoteFresh(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address, slippageBps = this.config.maxSwapSlippageBps): Promise<ValuationRoute | null> {
     if (amountIn === 0n || tokenIn.toLowerCase() === tokenOut.toLowerCase()) return null;
     if (this.tradingApi) {

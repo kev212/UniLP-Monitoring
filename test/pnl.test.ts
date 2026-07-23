@@ -132,6 +132,12 @@ describe("trailing stop", () => {
     expect(pnl.trailingExitEstimateGateBps({ trailingStop: { peakPnlBps: "500", activatedAtBlock: "10" } })).toBe(315n);
     expect(pnl.trailingExitEstimateGateBps({ trailingStop: { peakPnlBps: "900", activatedAtBlock: "10" } })).toBe(675n);
   });
+
+  it("exposes the raw trailing floor for hard-floor enforcement", () => {
+    const pnl = new PnlService({} as never, {} as never, {} as never, config);
+    expect(pnl.trailingFloorBps({ trailingStop: { peakPnlBps: "1000", activatedAtBlock: "10" } })).toBe(850n);
+    expect(pnl.trailingFloorBps({})).toBeNull();
+  });
 });
 
 describe("fresh valuation quotes", () => {

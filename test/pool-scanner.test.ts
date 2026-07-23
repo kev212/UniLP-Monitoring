@@ -119,7 +119,7 @@ describe("concentrated yield range math", () => {
 });
 
 describe("scan pool eligibility", () => {
-  it("keeps at most the two best qualified pools for one token", () => {
+  it("keeps only the best qualified pool for one token", () => {
     const pool = (pair: string, quoteToken: string, estimatedPoolYield1hPercent: number, tvlUsd: number) => ({ pair, quoteToken, estimatedPoolYield1hPercent, tvlUsd }) as ScoredPool;
 
     expect(limitQualifiedPoolsPerToken([
@@ -127,7 +127,7 @@ describe("scan pool eligibility", () => {
       pool("TOKEN/ETH 2%", "0x0000000000000000000000000000000000000000", 8, 50_000),
       pool("TOKEN/USDG 3%", "0x5fc5360d0400a0fd4f2af552add042d716f1d168", 8, 200_000),
       pool("TOKEN/USDG 4%", "0x5fc5360d0400a0fd4f2af552add042d716f1d168", 4, 300_000),
-    ]).map((item) => item.pair)).toEqual(["TOKEN/USDG 3%", "TOKEN/ETH 2%"]);
+    ]).map((item) => item.pair)).toEqual(["TOKEN/USDG 3%"]);
   });
 
   it("excludes pools with less than $100 of cumulative 6h volume", () => {

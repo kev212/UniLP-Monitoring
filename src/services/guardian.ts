@@ -12,6 +12,7 @@ import { hasPendingSettlement } from "./pending-settlement.js";
 import { quoteRangeState } from "./quote-range.js";
 
 const POSITION_EVALUATION_TIMEOUT_MS = 60_000;
+const TRAILING_HARD_FLOOR_DROP_BPS = 200n;
 
 export class Guardian {
   private readonly lastEvaluatedBlock = new Map<number, bigint>();
@@ -422,6 +423,19 @@ export class Guardian {
       this.config.settlementSwapSlippageBps,
       false,
     );
+
+    const trailingFloorBps = this.pnl.trailingFloorBps(position.metadata);
+    if (trailingFloorBps !== null && exitEstimate.snapshot.pnlBps <= trailingFloorBps - TRAILING_HARD_FLOOR_DROP_BPS) {
+      log.warn({
+        positionId: position.id,
+        positionKey: position.positionKey,
+        estimatePnlBps: exitEstimate.snapshot.pnlBps,
+        trailingFloorBps,
+        hardFloorBps: trailingFloorBps - TRAILING_HARD_FLOOR_DROP_BPS,
+      }, "trailing exit forced below hard floor");
+      return exitEstimate.snapshot;
+    }
+
     if (exitEstimate.snapshot.pnlBps >= gateBps) return exitEstimate.snapshot;
     log.info({
       positionId: position.id,
