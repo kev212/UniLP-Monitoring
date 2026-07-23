@@ -11,12 +11,15 @@ import type { PnlService } from "./pnl.js";
 import { hasPendingSettlement } from "./pending-settlement.js";
 import { quoteRangeState } from "./quote-range.js";
 
+const POSITION_EVALUATION_TIMEOUT_MS = 60_000;
+
 export class Guardian {
   private readonly lastEvaluatedBlock = new Map<number, bigint>();
   private exitQueue: Promise<void> = Promise.resolve();
   private readonly queuedExitPositions = new Set<string>();
   private monitorRunning = false;
   private readonly chainMonitorRunning = new Set<string>();
+  private readonly positionEvaluations = new Set<string>();
   private discoveryRunning = false;
 
   constructor(
@@ -140,8 +143,26 @@ export class Guardian {
     if (this.lastEvaluatedBlock.get(registry.chain.id) === blockNumber) return;
     const positions = (await this.database.listOpenPositions(registry.chain.id))
       .filter((position) => position.status !== "needs_review" && position.status !== "failed" && position.status !== "paused");
-    const results = await mapWithConcurrency(positions, this.config.positionMonitorConcurrency, (position) => this.evaluatePosition(name, position, blockNumber));
+    const results = await mapWithConcurrency(
+      positions,
+      this.config.positionMonitorConcurrency,
+      (position) => this.evaluatePositionWithTimeout(name, position, blockNumber),
+    );
     if (results.every(Boolean)) this.lastEvaluatedBlock.set(registry.chain.id, blockNumber);
+  }
+
+  private async evaluatePositionWithTimeout(name: ChainName, position: PositionRecord, blockNumber: bigint): Promise<boolean> {
+    if (this.positionEvaluations.has(position.id)) return true;
+
+    this.positionEvaluations.add(position.id);
+    const evaluation = this.evaluatePosition(name, position, blockNumber);
+    void evaluation.finally(() => this.positionEvaluations.delete(position.id)).catch(() => {});
+    try {
+      return await withTimeout(evaluation, POSITION_EVALUATION_TIMEOUT_MS);
+    } catch (error) {
+      log.warn({ err: error, positionId: position.id, positionKey: position.positionKey, timeoutMs: POSITION_EVALUATION_TIMEOUT_MS }, "position valuation timed out; continuing monitor cycle");
+      return true;
+    }
   }
 
   private async evaluatePosition(name: ChainName, position: PositionRecord, blockNumber: bigint): Promise<boolean> {
@@ -468,6 +489,20 @@ export class Guardian {
 }
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`position evaluation timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number, work: (item: T) => Promise<R>): Promise<R[]> {

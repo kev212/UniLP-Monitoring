@@ -11,6 +11,9 @@ import type { UniswapTradingApi } from "./uniswap-trading-api.js";
 import { quoteRangeState } from "./quote-range.js";
 import { applySlippage } from "./uniswap-math.js";
 
+const POSITION_READ_TIMEOUT_MS = 15_000;
+const ROUTE_QUOTE_TIMEOUT_MS = 15_000;
+
 export interface ValuedPosition {
   snapshot: PnlSnapshot;
   liquidation: LiquidationQuote;
@@ -46,7 +49,11 @@ export class PnlService {
     recordObservations = true,
   ): Promise<ValuedPosition> {
     if (!position.quoteToken) throw new Error("Position has no eligible quote token");
-    const value = await this.reader.read(position, blockNumber);
+    const value = await withTimeout(
+      this.reader.read(position, blockNumber),
+      POSITION_READ_TIMEOUT_MS,
+      "position read",
+    );
     if (recordObservations) {
       await this.database.recordPositionObservation(
         position.id,
@@ -175,7 +182,11 @@ export class PnlService {
       }
     }
 
-    const route = await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
+    const route = await withTimeout(
+      this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut),
+      ROUTE_QUOTE_TIMEOUT_MS,
+      "local route quote",
+    );
     return route
       ? { expectedOut: route.expectedOut, minimumOut: applySlippage(route.expectedOut, slippageBps), path: route.path }
       : null;
@@ -198,6 +209,20 @@ export class PnlService {
 
 function percentToBps(percent: number): bigint {
   return BigInt(Math.round(percent * 100));
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${operation} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function parseTrailingStopState(metadata: Record<string, unknown>): TrailingStopState | null {

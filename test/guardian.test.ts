@@ -167,3 +167,41 @@ describe("pending settlement status recovery", () => {
     });
   });
 });
+
+describe("position monitor timeouts", () => {
+  const position = {
+    id: "stuck-position",
+    chainId: 4663,
+    protocol: "v4" as const,
+    positionKey: "123",
+    owner: "0x0000000000000000000000000000000000000001",
+    poolAddress: null,
+    token0: "0x0000000000000000000000000000000000000000",
+    token1: "0x0000000000000000000000000000000000000002",
+    quoteToken: "0x0000000000000000000000000000000000000002",
+    status: "armed" as const,
+    liquidity: null,
+    openedAtBlock: null,
+    metadata: {},
+  } satisfies PositionRecord;
+
+  it("releases the monitor cycle and avoids duplicate valuation when a position hangs", async () => {
+    vi.useFakeTimers();
+    try {
+      const pnl = { value: vi.fn(() => new Promise(() => {})) };
+      const guardian = new Guardian({} as RuntimeConfig, {} as never, {} as never, {} as never, {} as never, pnl as never, {} as never, {} as never);
+      const evaluate = (guardian as unknown as {
+        evaluatePositionWithTimeout(name: "robinhood", position: PositionRecord, blockNumber: bigint): Promise<boolean>;
+      }).evaluatePositionWithTimeout.bind(guardian);
+
+      const first = evaluate("robinhood", position, 10n);
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      await expect(first).resolves.toBe(true);
+      await expect(evaluate("robinhood", position, 11n)).resolves.toBe(true);
+      expect(pnl.value).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

@@ -135,6 +135,38 @@ describe("trailing stop", () => {
 });
 
 describe("fresh valuation quotes", () => {
+  it("bounds a stuck position read so monitoring can retry", async () => {
+    vi.useFakeTimers();
+    try {
+      const reader = { read: vi.fn(() => new Promise(() => {})) };
+      const pnl = new PnlService({} as never, reader as never, {} as never, config);
+      const position = {
+        id: "position",
+        chainId: 8453,
+        protocol: "v4",
+        positionKey: "1",
+        owner: "0x0000000000000000000000000000000000000003",
+        poolAddress: null,
+        token0: "0x0000000000000000000000000000000000000001",
+        token1: "0x0000000000000000000000000000000000000002",
+        quoteToken: "0x0000000000000000000000000000000000000001",
+        status: "armed",
+        liquidity: 1n,
+        openedAtBlock: 1n,
+        metadata: {},
+      } as const;
+      const value = pnl.value(position, 1n);
+      const rejection = expect(value).rejects.toThrow("position read timed out after 15000ms");
+
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      await rejection;
+      expect(reader.read).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("uses a fresh Trading API quote before the local route planner", async () => {
     const usdg = "0x0000000000000000000000000000000000000001" as Address;
     const token = "0x0000000000000000000000000000000000000002" as Address;
