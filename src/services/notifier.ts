@@ -9,6 +9,7 @@ import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanS
 import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
+import type { PositionOpener, OpenPositionPreview } from "./position-opener.js";
 import { fmtUtc, renderPnlCard } from "./pnl-card.js";
 import { renderPnlCalendarCard } from "./pnl-calendar-card.js";
 import type { PoolMarketScan, PoolScanFilters, PoolScanner, ScoredPool } from "./pool-scanner.js";
@@ -43,6 +44,10 @@ type DashboardAction =
   | { type: "calendar"; year: number; month: number }
   | { type: "calendar_page"; year: number; month: number }
   | { type: "history_page"; page: number }
+  | { type: "open"; page: number }
+  | { type: "open_pool_input"; page: number }
+  | { type: "open_confirm"; requestId: string }
+  | { type: "open_cancel"; page: number }
   | { type: "select" | "confirm"; page: number; chainId: number; protocol: Protocol; positionKey: string };
 
 type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "max_results";
@@ -50,7 +55,10 @@ type RiskSettingKey = "stop_loss" | "take_profit" | "trailing_activation" | "tra
 type PendingInput =
   | { kind: "scan_token"; chain: ChainName }
   | { kind: "config"; key: PoolSettingKey; dashboardMessageId: number }
-  | { kind: "risk"; key: RiskSettingKey; dashboardMessageId: number };
+  | { kind: "risk"; key: RiskSettingKey; dashboardMessageId: number }
+  | { kind: "open_pool"; chain: ChainName; dashboardMessageId: number }
+  | { kind: "open_range"; chain: ChainName; poolAddress: string; dashboardMessageId: number }
+  | { kind: "open_amount"; chain: ChainName; poolAddress: string; dropPercent: number; dashboardMessageId: number };
 
 interface DashboardView {
   text: string;
@@ -71,6 +79,8 @@ export class Notifier {
   private tokenScanRunning = false;
   private scanV2Running = false;
   private deletionTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly openConfirmations = new Map<string, OpenPositionPreview>();
+  private positionOpener?: PositionOpener;
 
   constructor(
     private readonly config: RuntimeConfig,
@@ -84,6 +94,10 @@ export class Notifier {
     this.bot.catch((error) => {
       log.error({ updateId: error.ctx.update.update_id }, "Telegram update failed");
     });
+  }
+
+  setPositionOpener(opener: PositionOpener): void {
+    this.positionOpener = opener;
   }
 
   registerCommands(database: Database, pnl: PnlService, executor: Executor, scanner: PoolScanner): void {
@@ -485,6 +499,33 @@ export class Notifier {
         await this.replyTemp(ctx, "✅ Background PnL card dikembalikan ke default.");
         return;
       }
+      if (action.type === "open") {
+        this.pendingInput.set(chatId, { kind: "open_pool", chain: "robinhood", dashboardMessageId: message.message_id });
+        await this.replyTemp(ctx, "🟢 Open Position\nKirim pool address (V3 contract) atau V4 pool ID.", { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
+        return;
+      }
+      if (action.type === "open_confirm") {
+        const preview = this.openConfirmations.get(action.requestId);
+        if (!preview) {
+          await this.replyTemp(ctx, "❌ Konfirmasi open position sudah kadaluarsa. Ulangi dari awal.");
+          return;
+        }
+        this.openConfirmations.delete(action.requestId);
+        await this.replyTemp(ctx, "⏳ Membuka posisi...");
+        try {
+          if (!this.positionOpener) throw new Error("Position opener is not configured");
+          const result = await this.positionOpener.executeOpen(preview);
+          const hashLabel = result.hash ? `\ntx: ${result.hash.slice(0, 18)}...` : "";
+          await this.replyTemp(ctx, `🟢 LP OPENED\n${preview.protocol.toUpperCase()} ${preview.pair} | ${preview.feeLabel}\nRange: ${preview.lowerPrice} → ${preview.upperPrice}\nDeposit: ${(Number(preview.depositAmount) / 10 ** (preview.quoteTokenSymbol === "USDG" ? 6 : 18)).toFixed(2)} ${preview.quoteTokenSymbol}${hashLabel}`);
+        } catch (error) {
+          await this.replyTemp(ctx, `❌ Open position gagal: ${errorMessage(error).slice(0, 200)}`);
+        }
+        return;
+      }
+      if (action.type === "open_cancel") {
+        await this.replyTemp(ctx, "❌ Open position dibatalkan.");
+        return;
+      }
       if (action.type !== "select" && action.type !== "confirm") {
         await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
         return;
@@ -601,6 +642,8 @@ export class Notifier {
     keyboard.row()
       .text("🔍 Scan token", dashboardAction("scan", page))
       .text("🏆 Scan pools", dashboardAction("scan_pools", page));
+    keyboard.row()
+      .text("🟢 Open position", dashboardAction("open", page));
     keyboard.row()
       .text("📚 History ±0.5%", dashboardAction("history", 0))
       .text("🖼 PnL card", dashboardAction("pnl_card", 0));
@@ -977,6 +1020,36 @@ export class Notifier {
       return;
     }
     try {
+      if (pending.kind === "open_pool") {
+        if (!isAddress(text) && !(text.startsWith("0x") && text.length === 66)) {
+          await this.replyTemp(ctx, "Address tidak valid. Kirim V3 pool address atau V4 pool ID.");
+          return;
+        }
+        this.pendingInput.set(chatId, { kind: "open_range", chain: pending.chain, poolAddress: text.toLowerCase(), dashboardMessageId: pending.dashboardMessageId });
+        await this.replyTemp(ctx, "Kirim range drop % (contoh: -60 untuk 60% di bawah harga sekarang).", { reply_markup: { force_reply: true } as any });
+        return;
+      }
+      if (pending.kind === "open_range") {
+        const dropPercent = Number(text.replace(/[%\s,]/g, ""));
+        if (!Number.isFinite(dropPercent) || dropPercent <= 0 || dropPercent >= 100) {
+          this.pendingInput.set(chatId, pending);
+          await this.replyTemp(ctx, "Range tidak valid. Kirim angka 1-99, contoh: -60.");
+          return;
+        }
+        this.pendingInput.set(chatId, { kind: "open_amount", chain: pending.chain, poolAddress: pending.poolAddress, dropPercent, dashboardMessageId: pending.dashboardMessageId });
+        await this.replyTemp(ctx, "Kirim jumlah deposit (contoh: 200 untuk 200 USDG).", { reply_markup: { force_reply: true } as any });
+        return;
+      }
+      if (pending.kind === "open_amount") {
+        const amount = Number(text.replace(/[$,%\s]/g, ""));
+        if (!Number.isFinite(amount) || amount <= 0) {
+          this.pendingInput.set(chatId, pending);
+          await this.replyTemp(ctx, "Jumlah tidak valid. Kirim angka positif.");
+          return;
+        }
+        await this.handleOpenPreview(ctx, pending.chain, pending.poolAddress, pending.dropPercent, amount);
+        return;
+      }
       if (pending.kind === "risk") {
         const next = { ...this.riskSettings(), ...parseRiskSettingInput(pending.key, text) };
         await database.setGlobalRiskSettings(next);
@@ -998,6 +1071,58 @@ export class Notifier {
         await this.replyTemp(ctx, "Config tidak valid.");
       }
     }
+  }
+
+  private async handleOpenPreview(ctx: Context, chain: ChainName, poolAddress: string, dropPercent: number, amount: number): Promise<void> {
+    if (!this.positionOpener) {
+      await this.replyTemp(ctx, "❌ Position opener belum dikonfigurasi.");
+      return;
+    }
+    const quoteTokens = this.config.quoteTokens[chain] ?? [];
+    if (quoteTokens.length === 0) {
+      await this.replyTemp(ctx, "❌ Tidak ada quote token yang terkonfigurasi.");
+      return;
+    }
+    const chatId = ctx.chat!.id.toString();
+
+    let preview: OpenPositionPreview | null = null;
+    let lastError = "";
+    for (const qt of quoteTokens) {
+      const decimals = qt.symbol === "USDG" || qt.symbol === "USDC" ? 6 : 18;
+      const depositAmount = BigInt(Math.round(amount * 10 ** decimals));
+      try {
+        preview = await this.positionOpener.prepareOpen(poolAddress, chain, dropPercent, depositAmount, qt);
+        break;
+      } catch (error) {
+        lastError = errorMessage(error);
+      }
+    }
+    if (!preview) {
+      await this.replyTemp(ctx, `❌ Gagal membaca pool: ${lastError.slice(0, 200)}`);
+      return;
+    }
+
+    const requestId = `${chatId}-${Date.now()}`;
+    this.openConfirmations.set(requestId, preview);
+
+    const depositFormatted = (amount).toFixed(2);
+    const lines = [
+      "🟢 OPEN POSITION — REVIEW",
+      "",
+      `${preview.protocol.toUpperCase()} ${preview.pair} | ${preview.feeLabel}`,
+      `Current price: ${preview.currentPrice}`,
+      `Range: ${preview.lowerPrice} → ${preview.upperPrice}`,
+      `Drop: -${dropPercent}%`,
+      `Deposit: ${depositFormatted} ${preview.quoteTokenSymbol}`,
+      `Quote side: single-side ${preview.quoteTokenSymbol}`,
+      "",
+      `${this.config.dryRun ? "⚠️ DRY_RUN — simulasi tanpa broadcast" : "Konfirmasi untuk eksekusi."}`,
+    ];
+
+    const keyboard = new InlineKeyboard()
+      .text("✅ Confirm", `lp:open_confirm:${requestId}`)
+      .text("❌ Cancel", `lp:open_cancel:0`);
+    await this.replyTemp(ctx, lines.join("\n"), { reply_markup: keyboard as any }, 120_000);
   }
 
   private async poolScanSettings(database: Database, chatId: string): Promise<PoolScanSettings> {
@@ -1415,7 +1540,7 @@ export class Notifier {
   }
 }
 
-function dashboardAction(type: "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "risk" | "risk_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset", page: number): string {
+function dashboardAction(type: "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "risk" | "risk_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset" | "open", page: number): string {
   return `lp:${type}:${page}`;
 }
 
@@ -1483,6 +1608,12 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
     if (page === null || !Number.isSafeInteger(historyIndex) || historyIndex < 0) return null;
     return { type: "pnl_card_select", page, historyIndex };
   }
+  if (parts.length === 3 && parts[0] === "lp" && parts[1] === "open_confirm") {
+    return { type: "open_confirm", requestId: parts[2]! };
+  }
+  if (parts.length === 3 && parts[0] === "lp" && parts[1] === "open_cancel") {
+    return { type: "open_cancel", page: parseDashboardPage(parts[2]) ?? 0 };
+  }
   return null;
 }
 
@@ -1500,8 +1631,8 @@ function parseDashboardPage(value: string | undefined): number | null {
   return Number.isSafeInteger(page) ? page : null;
 }
 
-function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "risk" | "risk_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset" {
-  return value === "refresh" || value === "close" || value === "status" || value === "scan" || value === "scan_pools" || value === "config" || value === "config_reset" || value === "risk" || value === "risk_reset" || value === "history" || value === "pnl_card" || value === "bg_upload" || value === "bg_reset";
+function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "risk" | "risk_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset" | "open" {
+  return value === "refresh" || value === "close" || value === "status" || value === "scan" || value === "scan_pools" || value === "config" || value === "config_reset" || value === "risk" || value === "risk_reset" || value === "history" || value === "pnl_card" || value === "bg_upload" || value === "bg_reset" || value === "open";
 }
 
 function monthLabel(year: number, month: number): string {

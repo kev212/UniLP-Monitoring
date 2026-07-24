@@ -65,3 +65,25 @@ function amount0Delta(sqrtA: bigint, sqrtB: bigint, liquidity: bigint): bigint {
 function amount1Delta(sqrtA: bigint, sqrtB: bigint, liquidity: bigint): bigint {
   return (liquidity * (sqrtB - sqrtA)) / Q96;
 }
+
+export function liquidityForAmount0(sqrtLower: bigint, sqrtUpper: bigint, amount0: bigint): bigint {
+  const intermediate = (amount0 * sqrtUpper * sqrtLower) / (sqrtUpper - sqrtLower);
+  return intermediate / Q96;
+}
+
+export function liquidityForAmount1(sqrtLower: bigint, sqrtUpper: bigint, amount1: bigint): bigint {
+  return (amount1 * Q96) / (sqrtUpper - sqrtLower);
+}
+
+export function tickToFloorSpacing(tick: number, tickSpacing: number): number {
+  return Math.floor(tick / tickSpacing) * tickSpacing;
+}
+
+export function tickToCeilSpacing(tick: number, tickSpacing: number): number {
+  return Math.ceil(tick / tickSpacing) * tickSpacing;
+}
+
+export function ticksForDropPercent(dropPercent: number): number {
+  const ratio = 1 / (1 - dropPercent / 100);
+  return Math.round(Math.log(ratio) / Math.log(1.0001));
+}

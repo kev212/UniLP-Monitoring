@@ -13,6 +13,7 @@ import { PositionReader } from "./services/position-reader.js";
 import { RoutePlanner } from "./services/route-planner.js";
 import { UniswapTradingApi } from "./services/uniswap-trading-api.js";
 import { PoolScanner } from "./services/pool-scanner.js";
+import { PositionOpener } from "./services/position-opener.js";
 import { KyberSwapAggregatorApi } from "./services/kyberswap-aggregator-api.js";
 import { isRiskSettings, type RiskSettings } from "./types.js";
 
@@ -38,6 +39,8 @@ async function main(): Promise<void> {
   const executor = new Executor(database, chains, reader, routes, notifier, config, tradingApi, kyberswapApi);
   const guardian = new Guardian(config, database, chains, alchemyBootstrapper, discovery, pnl, executor, notifier);
   const scanner = new PoolScanner(chains, database);
+  const positionOpener = new PositionOpener(config, chains);
+  notifier.setPositionOpener(positionOpener);
 
   notifier.registerCommands(database, pnl, executor, scanner);
 
