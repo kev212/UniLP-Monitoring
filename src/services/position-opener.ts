@@ -32,6 +32,45 @@ export interface OpenPositionPreview {
 
 const Q192 = 1n << 192n;
 
+type V4PoolKey = {
+  currency0: Address;
+  currency1: Address;
+  fee: number;
+  tickSpacing: number;
+  hooks: Address;
+};
+
+export function encodeV4MintParams(
+  poolKey: V4PoolKey,
+  tickLower: number,
+  tickUpper: number,
+  liquidity: bigint,
+  amount0Min: bigint,
+  amount1Min: bigint,
+): Hex {
+  return encodeAbiParameters(
+    [
+      {
+        type: "tuple",
+        components: [
+          { name: "currency0", type: "address" },
+          { name: "currency1", type: "address" },
+          { name: "fee", type: "uint24" },
+          { name: "tickSpacing", type: "int24" },
+          { name: "hooks", type: "address" },
+        ],
+      },
+      { type: "int24" },
+      { type: "int24" },
+      { type: "uint256" },
+      { type: "uint128" },
+      { type: "uint128" },
+      { type: "bytes" },
+    ],
+    [poolKey, tickLower, tickUpper, liquidity, amount0Min, amount1Min, "0x"],
+  );
+}
+
 export class PositionOpener {
   private readonly account;
 
@@ -89,7 +128,7 @@ export class PositionOpener {
       client.readContract({ address: registry.contracts.v4.positionManager, abi: v4PoolKeysAbi, functionName: "poolKeys", args: [bytes25] }),
     ]);
 
-    const poolKey = poolKeyResult as unknown as { currency0: Address; currency1: Address; fee: number; tickSpacing: number; hooks: Address };
+    const poolKey = poolKeyResult as unknown as V4PoolKey;
     const lpFee = slot0[3];
 
     return this.buildPreview("v4", chain, poolId, poolKey.currency0, poolKey.currency1, Number(lpFee), poolKey.tickSpacing, slot0[1], slot0[0], poolKey.hooks, dropPercent, depositAmount, quoteToken);
@@ -213,21 +252,13 @@ export class PositionOpener {
     const amount0Min = preview.quoteIsToken0 ? amountMin : 0n;
     const amount1Min = preview.quoteIsToken0 ? 0n : amountMin;
 
-    const mintParams = encodeAbiParameters(
-      [
-        { type: "(address,address,uint24,int24,address)" },
-        { type: "int24" }, { type: "int24" },
-        { type: "uint256" },
-        { type: "uint128" }, { type: "uint128" },
-        { type: "bytes" },
-      ],
-      [
-        [poolKey.currency0, poolKey.currency1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks],
-        preview.tickLower, preview.tickUpper,
-        preview.liquidity,
-        amount0Min, amount1Min,
-        "0x",
-      ],
+    const mintParams = encodeV4MintParams(
+      poolKey,
+      preview.tickLower,
+      preview.tickUpper,
+      preview.liquidity,
+      amount0Min,
+      amount1Min,
     );
 
     const settleParams = encodeAbiParameters(
