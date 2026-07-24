@@ -91,6 +91,39 @@ export class PositionOpener {
     return this.prepareV4(normalized, chain, dropPercent, depositAmount, quoteToken);
   }
 
+  async detectQuoteToken(poolAddress: string, chain: ChainName): Promise<QuoteToken> {
+    const normalized = poolAddress.toLowerCase() as Hex;
+    const isV4 = normalized.length === 66 && normalized.startsWith("0x");
+    const client = this.client(chain);
+    let token0: Address;
+    let token1: Address;
+    if (isV4) {
+      const { registry } = this.chains.get(chain);
+      const bytes25 = normalized.slice(0, 2 + 25 * 2) as Hex;
+      const poolKey = await client.readContract({ address: registry.contracts.v4.positionManager, abi: v4PoolKeysAbi, functionName: "poolKeys", args: [bytes25] }) as unknown as V4PoolKey;
+      token0 = poolKey.currency0;
+      token1 = poolKey.currency1;
+    } else {
+      [token0, token1] = await Promise.all([
+        client.readContract({ address: normalized, abi: v3PoolAbi, functionName: "token0" }) as Promise<Address>,
+        client.readContract({ address: normalized, abi: v3PoolAbi, functionName: "token1" }) as Promise<Address>,
+      ]);
+    }
+    const allowed = this.config.quoteTokens[chain] ?? [];
+    const matches = allowed.filter(({ address }) => address.toLowerCase() === token0.toLowerCase() || address.toLowerCase() === token1.toLowerCase());
+    const priority = ["USDG", "USDC", "WETH", "ETH"];
+    const quote = matches.sort((a, b) => priority.indexOf(a.symbol) - priority.indexOf(b.symbol))[0];
+    if (quote) return quote;
+    if ((token0.toLowerCase() === zeroAddress || token1.toLowerCase() === zeroAddress) && allowed.some(({ symbol }) => symbol === "ETH")) {
+      return { symbol: "ETH", address: zeroAddress };
+    }
+    throw new Error("Pool tidak memiliki quote token dari allowlist");
+  }
+
+  async quoteTokenDecimals(chain: ChainName, token: Address): Promise<number> {
+    return this.tokenDecimals(this.client(chain), token);
+  }
+
   private async prepareV3(pool: Hex, chain: ChainName, dropPercent: number, depositAmount: bigint, quoteToken: QuoteToken): Promise<OpenPositionPreview> {
     const client = this.client(chain);
     const [token0, token1, fee, slot0, tickSpacing, liquidity] = await Promise.all([

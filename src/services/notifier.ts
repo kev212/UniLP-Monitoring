@@ -5,7 +5,7 @@ import sharp from "sharp";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionRangeInfo, PositionRecord, PositionStatus, Protocol, RiskSettings } from "../types.js";
+import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionRangeInfo, PositionRecord, PositionStatus, Protocol, QuoteToken, RiskSettings } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
@@ -58,7 +58,7 @@ type PendingInput =
   | { kind: "risk"; key: RiskSettingKey; dashboardMessageId: number }
   | { kind: "open_pool"; chain: ChainName; dashboardMessageId: number }
   | { kind: "open_range"; chain: ChainName; poolAddress: string; dashboardMessageId: number }
-  | { kind: "open_amount"; chain: ChainName; poolAddress: string; dropPercent: number; dashboardMessageId: number };
+  | { kind: "open_amount"; chain: ChainName; poolAddress: string; dropPercent: number; quoteToken: QuoteToken; dashboardMessageId: number };
 
 interface DashboardView {
   text: string;
@@ -1052,8 +1052,11 @@ export class Notifier {
           await this.replyTemp(ctx, "Range tidak valid. Kirim angka 1-99, contoh: -60.");
           return;
         }
-        this.pendingInput.set(chatId, { kind: "open_amount", chain: pending.chain, poolAddress: pending.poolAddress, dropPercent, dashboardMessageId: pending.dashboardMessageId });
-        await this.replyTemp(ctx, "Kirim jumlah deposit (contoh: 200 untuk 200 USDG).", { reply_markup: { force_reply: true } as any });
+        if (!this.positionOpener) throw new Error("Position opener is not configured");
+        const quoteToken = await this.positionOpener.detectQuoteToken(pending.poolAddress, pending.chain);
+        this.pendingInput.set(chatId, { kind: "open_amount", chain: pending.chain, poolAddress: pending.poolAddress, dropPercent, quoteToken, dashboardMessageId: pending.dashboardMessageId });
+        const example = quoteToken.symbol === "USDG" || quoteToken.symbol === "USDC" ? "200" : "0.01";
+        await this.replyTemp(ctx, `Kirim jumlah deposit dalam ${quoteToken.symbol} (contoh: ${example}).`, { reply_markup: { force_reply: true } as any });
         return;
       }
       if (pending.kind === "open_amount") {
@@ -1063,7 +1066,7 @@ export class Notifier {
           await this.replyTemp(ctx, "Jumlah tidak valid. Kirim angka positif.");
           return;
         }
-        await this.handleOpenPreview(ctx, pending.chain, pending.poolAddress, pending.dropPercent, amount);
+        await this.handleOpenPreview(ctx, pending.chain, pending.poolAddress, pending.dropPercent, amount, pending.quoteToken);
         return;
       }
       if (pending.kind === "risk") {
@@ -1089,32 +1092,19 @@ export class Notifier {
     }
   }
 
-  private async handleOpenPreview(ctx: Context, chain: ChainName, poolAddress: string, dropPercent: number, amount: string): Promise<void> {
+  private async handleOpenPreview(ctx: Context, chain: ChainName, poolAddress: string, dropPercent: number, amount: string, quoteToken: QuoteToken): Promise<void> {
     if (!this.positionOpener) {
       await this.replyTemp(ctx, "❌ Position opener belum dikonfigurasi.");
       return;
     }
-    const quoteTokens = this.config.quoteTokens[chain] ?? [];
-    if (quoteTokens.length === 0) {
-      await this.replyTemp(ctx, "❌ Tidak ada quote token yang terkonfigurasi.");
-      return;
-    }
     const chatId = ctx.chat!.id.toString();
 
-    let preview: OpenPositionPreview | null = null;
-    let lastError = "";
-    for (const qt of quoteTokens) {
-      const decimals = qt.symbol === "USDG" || qt.symbol === "USDC" ? 6 : 18;
-      const depositAmount = parseUnits(amount, decimals);
-      try {
-        preview = await this.positionOpener.prepareOpen(poolAddress, chain, dropPercent, depositAmount, qt);
-        break;
-      } catch (error) {
-        lastError = errorMessage(error);
-      }
-    }
-    if (!preview) {
-      await this.replyTemp(ctx, `❌ Gagal membaca pool: ${lastError.slice(0, 200)}`);
+    let preview: OpenPositionPreview;
+    try {
+      const decimals = await this.positionOpener.quoteTokenDecimals(chain, quoteToken.address);
+      preview = await this.positionOpener.prepareOpen(poolAddress, chain, dropPercent, parseUnits(amount, decimals), quoteToken);
+    } catch (error) {
+      await this.replyTemp(ctx, `❌ Gagal membaca pool: ${errorMessage(error).slice(0, 200)}`);
       return;
     }
 
