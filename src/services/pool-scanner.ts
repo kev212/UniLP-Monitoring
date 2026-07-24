@@ -66,7 +66,7 @@ export interface PoolMarketScan {
   warming?: boolean;
 }
 
-interface VerifiedPool {
+export interface VerifiedPool {
   feeTier?: number;
   currentLpFee?: number;
   activeLiquidity: boolean;
@@ -559,7 +559,7 @@ export class PoolScanner {
     this.geckoRequestRunning = false;
   }
 
-  private async verifyPool(
+  async verifyPool(
     protocol: "v3" | "v4",
     poolAddress: Address,
     searchToken: string,
@@ -569,7 +569,7 @@ export class PoolScanner {
     return this.verifyV4Pool(poolAddress, searchToken, chain);
   }
 
-  private async verifyV3Pool(pool: Address, searchToken: string, chain: ChainName): Promise<VerifiedPool | null> {
+  async verifyV3Pool(pool: Address, searchToken: string, chain: ChainName): Promise<VerifiedPool | null> {
     const { client, registry } = this.chains.getForScan(chain);
     try {
       const [token0, token1, fee, liquidity] = await Promise.all([
@@ -612,7 +612,7 @@ export class PoolScanner {
     }
   }
 
-  private async verifyV4Pool(
+  async verifyV4Pool(
     poolId: Address,
     searchToken: string,
     chain: ChainName,

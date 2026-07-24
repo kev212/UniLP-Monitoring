@@ -13,6 +13,8 @@ import type { PositionOpener, OpenPositionPreview } from "./position-opener.js";
 import { fmtUtc, renderPnlCard } from "./pnl-card.js";
 import { renderPnlCalendarCard } from "./pnl-calendar-card.js";
 import type { PoolMarketScan, PoolScanFilters, PoolScanner, ScoredPool } from "./pool-scanner.js";
+import type { GemScanner, GemScanResult } from "./gem-scanner.js";
+import type { GemCandidate } from "./gem-score.js";
 import { quoteRangeState } from "./quote-range.js";
 import { sqrtRatioAtTick } from "./uniswap-math.js";
 
@@ -78,9 +80,11 @@ export class Notifier {
   private poolScanRunning = false;
   private tokenScanRunning = false;
   private scanV2Running = false;
+  private gemScanRunning = false;
   private deletionTimer: ReturnType<typeof setInterval> | null = null;
   private readonly openConfirmations = new Map<string, OpenPositionPreview>();
   private positionOpener?: PositionOpener;
+  private gemScanner?: GemScanner;
 
   constructor(
     private readonly config: RuntimeConfig,
@@ -100,6 +104,10 @@ export class Notifier {
     this.positionOpener = opener;
   }
 
+  setGemScanner(scanner: GemScanner): void {
+    this.gemScanner = scanner;
+  }
+
   registerCommands(database: Database, pnl: PnlService, executor: Executor, scanner: PoolScanner): void {
     if (!this.bot) return;
     void this.bot.api.setMyCommands([
@@ -108,6 +116,7 @@ export class Notifier {
       { command: "scan", description: "Scan token — /scan [base|robinhood] <contract>" },
       ...(this.config.scanV2Enabled ? [{ command: "scanv2", description: "Scan concentrated yield — /scanv2 [chain] <contract> [range%]" }] : []),
       { command: "scan_pools", description: "Cari pool V3/V4 dengan estimasi yield 1 jam tertinggi" },
+      { command: "gem", description: "💎 Hidden gem radar — yield gacor V3/V4" },
       { command: "history", description: "Tampilkan riwayat posisi close >= ±0.5% PnL" },
       { command: "calendar", description: "Tampilkan kalender realized PnL UTC" },
     ]).catch((error) => {
@@ -132,6 +141,10 @@ export class Notifier {
     this.bot.command("scan_pools", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleScanPools(ctx, database, scanner);
+    });
+    this.bot.command("gem", async (ctx: ChatContext) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
+      await this.handleGem(ctx);
     });
     this.bot.command("history", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
@@ -1015,6 +1028,40 @@ export class Notifier {
       await this.queueTemp(chatId, messageId, 120_000);
     } catch {
       // Final result is sent as a new message if this progress message disappears.
+    }
+  }
+
+  private async handleGem(ctx: Context): Promise<void> {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId || !this.authorized(chatId, ctx.from?.id.toString())) return;
+    if (!this.gemScanner) {
+      await this.replyTemp(ctx, "💎 Gem scanner belum dikonfigurasi.");
+      return;
+    }
+    if (this.gemScanRunning) {
+      await this.replyTemp(ctx, "💎 Gem radar masih berjalan. Tunggu hasil sebelumnya.");
+      return;
+    }
+    this.gemScanRunning = true;
+    const progress = await ctx.reply("💎 GEM RADAR — Mencari hidden gem yield gacor di Robinhood... (±60s)");
+    const messageId = progress.message_id;
+    void this.queueTemp(chatId, messageId, 120_000);
+    void this.executeGemScan(chatId, messageId).catch((error) =>
+      log.error({ error: errorMessage(error) }, "gem scan background job failed"),
+    );
+  }
+
+  private async executeGemScan(chatId: string, messageId: number): Promise<void> {
+    try {
+      const result = await this.gemScanner!.scan();
+      const text = formatGemResult(result);
+      if (!this.bot) return;
+      const sent = await this.bot.api.sendMessage(chatId, text);
+      await this.queueTemp(chatId, sent.message_id, 180_000);
+    } catch {
+      await this.sendTemp(["💎 Gem scan gagal. Coba lagi nanti."], chatId, 120_000);
+    } finally {
+      this.gemScanRunning = false;
     }
   }
 
@@ -2018,4 +2065,52 @@ function fmtDuration(seconds: number): string {
   if (seconds >= 86_400) return `${(seconds / 86_400).toFixed(seconds % 86_400 === 0 ? 0 : 1)}d`;
   if (seconds >= 3_600) return `${(seconds / 3_600).toFixed(seconds % 3_600 === 0 ? 0 : 1)}h`;
   return `${Math.floor(seconds / 60)}m`;
+}
+
+function formatGemResult(result: GemScanResult): string {
+  const lines: string[] = [
+    "💎 GEM RADAR — ROBINHOOD",
+    "",
+    `Filter: MC ≥ $${fmtUsd(150_000)} | Uni Vol1h ≥ $${fmtUsd(30_000)} | Yield ≥ 2%/h`,
+    "",
+  ];
+
+  if (result.warming) {
+    lines.push("⏳ Cache kandidat sedang diprosas. Coba lagi dalam 1-2 menit.");
+    return lines.join("\n");
+  }
+
+  if (result.candidates.length === 0) {
+    lines.push("Tidak ada gem yang lolos filter saat ini.");
+    lines.push("", `Token dievaluasi: ${result.evaluatedTokens} | Lolos: ${result.qualifiedTokens}`);
+    return lines.join("\n");
+  }
+
+  const medals = ["🥇", "🥈", "🥉", "4.", "5.", "6.", "7.", "8."];
+  for (let i = 0; i < result.candidates.length; i++) {
+    const gem = result.candidates[i]!;
+    const label = medals[i] ?? `${i + 1}.`;
+    const categoryEmoji = gem.category === "STRONG" ? "💎 STRONG" : gem.category === "EARLY" ? "🚀 EARLY" : "⚠️ DEGEN";
+
+    lines.push(...[
+      `${label} ${gem.pair} · ${gem.protocol.toUpperCase()}`,
+      `MC: $${fmtUsd(gem.tokenMarketCapUsd)}${gem.tokenValuationSource === "fdv" ? " (FDV)" : ""}`,
+      `Token Uni Vol1h: $${fmtUsd(gem.tokenVolume1hUsd)}`,
+      `Pool TVL: $${fmtUsd(gem.tvlUsd)} | Vol1h: $${fmtUsd(gem.volume1hUsd)}`,
+      `Fee: ${((gem.currentLpFee ?? gem.feeTier) / 10_000).toFixed(2)}%${gem.dynamicFee ? " dynamic" : ""}`,
+      `Spot yield: ${gem.spotYield1hPercent.toFixed(2)}%/h | Persistent: ${(gem.persistence.hourlyRate * (gem.feeTier > 0 ? (gem.currentLpFee ?? gem.feeTier) / 1_000_000 : 0) * 100 / Math.max(1, gem.tvlUsd)).toFixed(2)}%/h`,
+      `Confidence: ${gem.confidence}/100 | Score: ${gem.gemScore.toFixed(2)} | ${categoryEmoji}`,
+      `Tx 1h: ${gem.txns1h.buys}B/${gem.txns1h.sells}S | Persistence: ${(gem.persistence.persistence * 100).toFixed(0)}%`,
+    ]);
+
+    if (gem.warnings.length > 0) {
+      lines.push(`⚠️ ${gem.warnings.join(" · ")}`);
+    }
+    lines.push(gem.uniswapUrl);
+    lines.push("");
+  }
+
+  lines.push(`Token dievaluasi: ${result.evaluatedTokens} | Lolos: ${result.qualifiedTokens}`);
+  lines.push("", "Spot yield: vol1h × fee / TVL. Persistent: harmonic mean window 1h/6h/24h. Bukan jaminan return.");
+  return lines.join("\n");
 }
