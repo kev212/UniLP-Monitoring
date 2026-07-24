@@ -1,7 +1,7 @@
 import { createPublicClient, createWalletClient, encodeAbiParameters, encodeFunctionData, http, type Address, type Hex, type PublicClient, zeroAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
-import { erc20Abi, v3PoolAbi, v3PositionManagerAbi, v4PositionManagerAbi, v4PoolKeysAbi, v4StateViewAbi } from "../abi.js";
+import { erc20Abi, permit2Abi, v3PoolAbi, v3PositionManagerAbi, v4PositionManagerAbi, v4PoolKeysAbi, v4StateViewAbi } from "../abi.js";
 import { chainRegistry, type ChainRegistry } from "../chains.js";
 import type { RuntimeConfig } from "../config.js";
 import { log } from "../log.js";
@@ -217,7 +217,7 @@ export class PositionOpener {
     const amount0Min = preview.quoteIsToken0 ? amountMin : 0n;
     const amount1Min = preview.quoteIsToken0 ? 0n : amountMin;
 
-    await this.ensureApproval(client, preview.quoteToken, positionManager, preview.depositAmount, executor);
+    await this.ensureApproval(client, preview.quoteToken, positionManager, preview.depositAmount, executor, preview.chain);
 
     const mintData = encodeFunctionData({
       abi: v3PositionManagerAbi, functionName: "mint",
@@ -249,7 +249,8 @@ export class PositionOpener {
     ]);
     const poolKey = poolKeyResult as unknown as { currency0: Address; currency1: Address; fee: number; tickSpacing: number; hooks: Address };
 
-    await this.ensureApproval(client, preview.quoteToken, registry.contracts.v4.permit2, preview.depositAmount, executor);
+    await this.ensureApproval(client, preview.quoteToken, registry.contracts.v4.permit2, preview.depositAmount, executor, preview.chain);
+    await this.ensurePermit2Approval(client, preview.quoteToken, positionManager, preview.depositAmount, executor, preview.chain);
 
     const amount0Max = preview.quoteIsToken0 ? preview.depositAmount : 0n;
     const amount1Max = preview.quoteIsToken0 ? 0n : preview.depositAmount;
@@ -276,14 +277,15 @@ export class PositionOpener {
     );
 
     const data = encodeFunctionData({ abi: v4PositionManagerAbi, functionName: "modifyLiquidities", args: [unlockData, deadline] });
-    return this.broadcast(preview.chain, positionManager, data);
+    const value = preview.quoteToken.toLowerCase() === zeroAddress ? preview.depositAmount : 0n;
+    return this.broadcast(preview.chain, positionManager, data, value);
   }
 
-  private async broadcast(chain: ChainName, to: Address, data: Hex): Promise<{ hash: Hex | null }> {
+  private async broadcast(chain: ChainName, to: Address, data: Hex, value = 0n): Promise<{ hash: Hex | null }> {
     const client = this.client(chain);
     const executor = this.config.executorAddress;
 
-    await client.call({ account: executor, to, data });
+    await client.call({ account: executor, to, data, value });
 
     if (this.config.dryRun) {
       log.info({ to, data: data.slice(0, 100) }, "dry-run open position simulated");
@@ -291,13 +293,15 @@ export class PositionOpener {
     }
 
     const wallet = this.walletClient(chain);
-    const hash = await wallet.sendTransaction({ to, data, account: this.account!, chain: this.chains.get(chain).registry.chain });
+    const hash = await wallet.sendTransaction({ to, data, value, account: this.account!, chain: this.chains.get(chain).registry.chain });
     log.info({ hash, to }, "open position transaction broadcast");
     return { hash };
   }
 
-  private async ensureApproval(client: PublicClient, token: Address, spender: Address, amount: bigint, owner: Address): Promise<void> {
+  private async ensureApproval(client: PublicClient, token: Address, spender: Address, amount: bigint, owner: Address, chain: ChainName): Promise<void> {
     if (token.toLowerCase() === zeroAddress) return;
+    const balance = await client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
+    if (balance < amount) throw new Error(`Insufficient ${token} balance for open position`);
     const allowance = await client.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [owner, spender] });
     if (allowance >= amount) return;
 
@@ -306,10 +310,48 @@ export class PositionOpener {
       return;
     }
 
-    const wallet = this.walletClient(this.config.chains[0] as ChainName);
+    const wallet = this.walletClient(chain);
     const approveData = encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [spender, amount] });
-    const hash = await wallet.sendTransaction({ to: token, data: approveData, account: this.account! });
+    const hash = await wallet.sendTransaction({ to: token, data: approveData, account: this.account!, chain: this.chains.get(chain).registry.chain });
+    const receipt = await client.waitForTransactionReceipt({ hash });
+    if (receipt.status !== "success") throw new Error(`ERC-20 approval reverted for ${token}`);
     log.info({ hash, token, spender }, "approval submitted");
+  }
+
+  private async ensurePermit2Approval(client: PublicClient, token: Address, spender: Address, amount: bigint, owner: Address, chain: ChainName): Promise<void> {
+    if (token.toLowerCase() === zeroAddress) {
+      const balance = await client.getBalance({ address: owner });
+      if (balance < amount) throw new Error("Insufficient native ETH balance for open position");
+      return;
+    }
+    if (amount > (1n << 160n) - 1n) throw new Error("Permit2 approval amount overflows uint160");
+
+    const { registry } = this.chains.get(chain);
+    const permit2 = registry.contracts.v4.permit2;
+    const allowance = await client.readContract({
+      address: permit2,
+      abi: permit2Abi,
+      functionName: "allowance",
+      args: [owner, token, spender],
+    });
+    const expiration = Math.floor(Date.now() / 1_000) + 600;
+    if (allowance[0] >= amount && BigInt(allowance[1]) >= BigInt(expiration)) return;
+
+    if (this.config.dryRun) {
+      log.info({ token, spender, amount: amount.toString() }, "dry-run: Permit2 approval needed");
+      return;
+    }
+
+    const wallet = this.walletClient(chain);
+    const approvalData = encodeFunctionData({
+      abi: permit2Abi,
+      functionName: "approve",
+      args: [token, spender, amount, expiration],
+    });
+    const hash = await wallet.sendTransaction({ to: permit2, data: approvalData, account: this.account!, chain: this.chains.get(chain).registry.chain });
+    const receipt = await client.waitForTransactionReceipt({ hash });
+    if (receipt.status !== "success") throw new Error(`Permit2 approval reverted for ${token}`);
+    log.info({ hash, token, spender }, "Permit2 approval submitted");
   }
 
   private async tokenDecimals(client: PublicClient, token: Address): Promise<number> {
