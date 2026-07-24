@@ -1036,11 +1036,12 @@ export class Notifier {
     }
     try {
       if (pending.kind === "open_pool") {
-        if (!isAddress(text) && !(text.startsWith("0x") && text.length === 66)) {
-          await this.replyTemp(ctx, "Address tidak valid. Kirim V3 pool address atau V4 pool ID.");
+        const poolAddress = parseOpenPoolInput(text);
+        if (!poolAddress) {
+          await this.replyTemp(ctx, "Address atau link pool Uniswap Robinhood tidak valid.");
           return;
         }
-        this.pendingInput.set(chatId, { kind: "open_range", chain: pending.chain, poolAddress: text.toLowerCase(), dashboardMessageId: pending.dashboardMessageId });
+        this.pendingInput.set(chatId, { kind: "open_range", chain: pending.chain, poolAddress, dashboardMessageId: pending.dashboardMessageId });
         await this.replyTemp(ctx, "Kirim range drop % (contoh: -60 untuk 60% di bawah harga sekarang).", { reply_markup: { force_reply: true } as any });
         return;
       }
@@ -1734,6 +1735,26 @@ export function parseScanInput(raw: string): { chain: ChainName; token: Address 
   const token = parts.length === 2 ? parts[1] : parts[0];
   if ((chain !== "base" && chain !== "robinhood") || !token || !isAddress(token, { strict: false })) return null;
   return { chain, token: token as Address };
+}
+
+export function parseOpenPoolInput(raw: string): string | null {
+  const value = raw.trim();
+  if (isAddress(value, { strict: false })) return value.toLowerCase();
+  if (/^0x[0-9a-fA-F]{64}$/.test(value)) return value.toLowerCase();
+
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" || url.hostname !== "app.uniswap.org") return null;
+
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts.length !== 4 || parts[0] !== "explore" || parts[1] !== "pools" || parts[2] !== "robinhood") return null;
+  const identifier = parts[3]!;
+  if (isAddress(identifier, { strict: false }) || /^0x[0-9a-fA-F]{64}$/.test(identifier)) return identifier.toLowerCase();
+  return null;
 }
 
 export function parseScanV2Input(raw: string): { chain: ChainName; token: Address; range: number } | null {

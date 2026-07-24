@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { canRequestManualClose, clampDashboardPage, formatDashboardRangeStatus, formatRangePrices, isExpiredCallbackError, parseDashboardAction, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
+import { canRequestManualClose, clampDashboardPage, formatDashboardRangeStatus, formatRangePrices, isExpiredCallbackError, parseDashboardAction, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -15,6 +15,14 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseScanV2Input(token)).toEqual({ chain: "robinhood", token, range: 35 });
     expect(parseScanV2Input(`base ${token} 40%`)).toEqual({ chain: "base", token, range: 40 });
     expect(parseScanV2Input(`base ${token} 4`)).toBeNull();
+  });
+
+  it("parses Robinhood Uniswap pool URLs for opening positions", () => {
+    const poolId = "0x6dbc403a0afed02fe5d180476257ed9b88c3a50d0ba48435af9fde2a4bcb018a";
+    expect(parseOpenPoolInput(poolId)).toBe(poolId);
+    expect(parseOpenPoolInput(`https://app.uniswap.org/explore/pools/robinhood/${poolId}?foo=bar#pool`)).toBe(poolId);
+    expect(parseOpenPoolInput(`https://app.uniswap.org/explore/pools/base/${poolId}`)).toBeNull();
+    expect(parseOpenPoolInput(`https://example.com/explore/pools/robinhood/${poolId}`)).toBeNull();
   });
 
   it("parses dashboard navigation callbacks", () => {
