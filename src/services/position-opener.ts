@@ -112,7 +112,10 @@ export class PositionOpener {
     }
     const allowed = this.config.quoteTokens[chain] ?? [];
     const quote = selectOpenQuoteToken(allowed, token0, token1);
-    if (quote) return quote;
+    // Uniswap V3 stores native ETH pools as WETH, but its PositionManager can
+    // wrap native ETH in the mint multicall. Keep the pool address as WETH while
+    // exposing ETH as the funding currency to the user.
+    if (quote) return !isV4 && quote.symbol === "WETH" ? { ...quote, symbol: "ETH" } : quote;
     if ((token0.toLowerCase() === zeroAddress || token1.toLowerCase() === zeroAddress) && allowed.some(({ symbol }) => symbol === "ETH")) {
       return { symbol: "ETH", address: zeroAddress };
     }
@@ -236,13 +239,16 @@ export class PositionOpener {
     const positionManager = registry.contracts.v3.positionManager;
     const executor = this.config.executorAddress;
 
-    await this.ensureApproval(client, preview.quoteToken, positionManager, preview.depositAmount, executor, preview.chain);
+    const useNative = preview.quoteTokenSymbol === "ETH";
+    if (useNative) await this.ensureNativeBalance(client, executor, preview.depositAmount);
+    else await this.ensureApproval(client, preview.quoteToken, positionManager, preview.depositAmount, executor, preview.chain);
     const position = this.v3PositionFromPreview(preview);
     this.assertSingleSideSpend(position, preview.quoteIsToken0, preview.depositAmount);
     const parameters = NonfungiblePositionManager.addCallParameters(position, {
       recipient: executor,
       deadline: deadline.toString(),
       slippageTolerance: new Percent(0, 10_000),
+      ...(useNative ? { useNative: Ether.onChain(this.chains.get(preview.chain).registry.chain.id) } : {}),
     });
     return this.broadcast(preview.chain, positionManager, parameters.calldata as Hex, BigInt(parameters.value));
   }
@@ -405,6 +411,11 @@ export class PositionOpener {
     const receipt = await client.waitForTransactionReceipt({ hash });
     if (receipt.status !== "success") throw new Error(`ERC-20 approval reverted for ${token}`);
     log.info({ hash, token, spender }, "approval submitted");
+  }
+
+  private async ensureNativeBalance(client: PublicClient, owner: Address, amount: bigint): Promise<void> {
+    const balance = await client.getBalance({ address: owner });
+    if (balance < amount) throw new Error("Insufficient native ETH balance for open position");
   }
 
   private async ensurePermit2Approval(client: PublicClient, token: Address, spender: Address, amount: bigint, owner: Address, chain: ChainName): Promise<void> {
