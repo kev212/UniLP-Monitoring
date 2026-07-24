@@ -337,6 +337,18 @@ export class Notifier {
     await this.database.queueMessageDeletion(chatId, messageId, new Date(Date.now() + ttlMs));
   }
 
+  private async dismissOpenReview(ctx: Context, chatId: string, messageId: number): Promise<void> {
+    try {
+      await ctx.api.deleteMessage(chatId, messageId);
+    } catch (error) {
+      try {
+        await ctx.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: { inline_keyboard: [] } });
+      } catch {
+        log.warn({ error: errorMessage(error), chatId, messageId }, "could not dismiss open position review");
+      }
+    }
+  }
+
   private async replyTemp(ctx: Context | ChatContext, text: string, other?: Record<string, unknown>, ttlMs?: number): Promise<void> {
     const sent = await ctx.reply(text, other as any);
     if (sent && "message_id" in sent) {
@@ -507,10 +519,12 @@ export class Notifier {
       if (action.type === "open_confirm") {
         const preview = this.openConfirmations.get(action.requestId);
         if (!preview) {
+          await this.dismissOpenReview(ctx, chatId, message.message_id);
           await this.replyTemp(ctx, "❌ Konfirmasi open position sudah kadaluarsa. Ulangi dari awal.");
           return;
         }
         this.openConfirmations.delete(action.requestId);
+        await this.dismissOpenReview(ctx, chatId, message.message_id);
         await this.replyTemp(ctx, "⏳ Membuka posisi...");
         try {
           if (!this.positionOpener) throw new Error("Position opener is not configured");
@@ -523,6 +537,7 @@ export class Notifier {
         return;
       }
       if (action.type === "open_cancel") {
+        await this.dismissOpenReview(ctx, chatId, message.message_id);
         await this.replyTemp(ctx, "❌ Open position dibatalkan.");
         return;
       }
