@@ -1,13 +1,15 @@
-import { createPublicClient, createWalletClient, encodeAbiParameters, encodeFunctionData, http, type Address, type Hex, type PublicClient, zeroAddress } from "viem";
+import { Ether, Percent, Token } from "@uniswap/sdk-core";
+import { FeeAmount, NonfungiblePositionManager, Pool as V3SdkPool, Position as V3SdkPosition } from "@uniswap/v3-sdk";
+import { Pool as V4SdkPool, Position as V4SdkPosition, V4PositionManager } from "@uniswap/v4-sdk";
+import { createPublicClient, createWalletClient, encodeFunctionData, http, type Address, type Hex, type PublicClient, zeroAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
-import { erc20Abi, permit2Abi, v3PoolAbi, v3PositionManagerAbi, v4PositionManagerAbi, v4PoolKeysAbi, v4StateViewAbi } from "../abi.js";
-import { chainRegistry, type ChainRegistry } from "../chains.js";
+import { erc20Abi, permit2Abi, v3PoolAbi, v4PoolKeysAbi, v4StateViewAbi } from "../abi.js";
 import type { RuntimeConfig } from "../config.js";
 import { log } from "../log.js";
 import type { ChainName, QuoteToken } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
-import { applySlippage, liquidityForAmount0, liquidityForAmount1, sqrtRatioAtTick, tickToCeilSpacing, tickToFloorSpacing, ticksForDropPercent } from "./uniswap-math.js";
+import { sqrtRatioAtTick, tickToCeilSpacing, tickToFloorSpacing, ticksForDropPercent } from "./uniswap-math.js";
 
 export interface OpenPositionPreview {
   protocol: "v3" | "v4";
@@ -19,9 +21,17 @@ export interface OpenPositionPreview {
   quoteToken: Address;
   quoteTokenSymbol: string;
   quoteIsToken0: boolean;
+  token0: Address;
+  token1: Address;
+  token0Decimals: number;
+  token1Decimals: number;
   currentTick: number;
+  tickSpacing: number;
   tickLower: number;
   tickUpper: number;
+  sqrtPriceX96: bigint;
+  poolLiquidity: bigint;
+  hooks: Address;
   liquidity: bigint;
   depositAmount: bigint;
   lowerPrice: string;
@@ -31,6 +41,7 @@ export interface OpenPositionPreview {
 }
 
 const Q192 = 1n << 192n;
+const V3_SUPPORTED_FEES = new Set<number>([FeeAmount.LOWEST, FeeAmount.LOW, FeeAmount.MEDIUM, FeeAmount.HIGH]);
 
 type V4PoolKey = {
   currency0: Address;
@@ -39,39 +50,6 @@ type V4PoolKey = {
   tickSpacing: number;
   hooks: Address;
 };
-
-export function encodeV4MintParams(
-  poolKey: V4PoolKey,
-  tickLower: number,
-  tickUpper: number,
-  liquidity: bigint,
-  amount0Max: bigint,
-  amount1Max: bigint,
-  owner: Address,
-): Hex {
-  return encodeAbiParameters(
-    [
-      {
-        type: "tuple",
-        components: [
-          { name: "currency0", type: "address" },
-          { name: "currency1", type: "address" },
-          { name: "fee", type: "uint24" },
-          { name: "tickSpacing", type: "int24" },
-          { name: "hooks", type: "address" },
-        ],
-      },
-      { type: "int24" },
-      { type: "int24" },
-      { type: "uint256" },
-      { type: "uint128" },
-      { type: "uint128" },
-      { type: "address" },
-      { type: "bytes" },
-    ],
-    [poolKey, tickLower, tickUpper, liquidity, amount0Max, amount1Max, owner, "0x"],
-  );
-}
 
 export class PositionOpener {
   private readonly account;
@@ -109,15 +87,17 @@ export class PositionOpener {
 
   private async prepareV3(pool: Hex, chain: ChainName, dropPercent: number, depositAmount: bigint, quoteToken: QuoteToken): Promise<OpenPositionPreview> {
     const client = this.client(chain);
-    const [token0, token1, fee, slot0, tickSpacing] = await Promise.all([
+    const [token0, token1, fee, slot0, tickSpacing, liquidity] = await Promise.all([
       client.readContract({ address: pool, abi: v3PoolAbi, functionName: "token0" }) as Promise<Address>,
       client.readContract({ address: pool, abi: v3PoolAbi, functionName: "token1" }) as Promise<Address>,
       client.readContract({ address: pool, abi: v3PoolAbi, functionName: "fee" }) as Promise<number>,
       client.readContract({ address: pool, abi: v3PoolAbi, functionName: "slot0" }),
       client.readContract({ address: pool, abi: v3PoolAbi, functionName: "tickSpacing" }) as Promise<number>,
+      client.readContract({ address: pool, abi: v3PoolAbi, functionName: "liquidity" }) as Promise<bigint>,
     ]);
 
-    return this.buildPreview("v3", chain, pool, token0, token1, Number(fee), Number(tickSpacing), slot0[1], slot0[0], zeroAddress, dropPercent, depositAmount, quoteToken);
+    if (!V3_SUPPORTED_FEES.has(Number(fee))) throw new Error(`V3 fee tier ${fee} is unsupported by the official SDK`);
+    return this.buildPreview("v3", chain, pool, token0, token1, Number(fee), Number(tickSpacing), slot0[1], slot0[0], liquidity, zeroAddress, dropPercent, depositAmount, quoteToken);
   }
 
   private async prepareV4(poolId: Hex, chain: ChainName, dropPercent: number, depositAmount: bigint, quoteToken: QuoteToken): Promise<OpenPositionPreview> {
@@ -125,15 +105,15 @@ export class PositionOpener {
     const { registry } = this.chains.get(chain);
     const bytes25 = poolId.slice(0, 2 + 25 * 2) as Hex;
 
-    const [slot0, poolKeyResult] = await Promise.all([
+    const [slot0, liquidity, poolKeyResult] = await Promise.all([
       client.readContract({ address: registry.contracts.v4.stateView, abi: v4StateViewAbi, functionName: "getSlot0", args: [poolId] }),
+      client.readContract({ address: registry.contracts.v4.stateView, abi: v4StateViewAbi, functionName: "getLiquidity", args: [poolId] }) as Promise<bigint>,
       client.readContract({ address: registry.contracts.v4.positionManager, abi: v4PoolKeysAbi, functionName: "poolKeys", args: [bytes25] }),
     ]);
 
     const poolKey = poolKeyResult as unknown as V4PoolKey;
-    const lpFee = slot0[3];
 
-    return this.buildPreview("v4", chain, poolId, poolKey.currency0, poolKey.currency1, Number(lpFee), poolKey.tickSpacing, slot0[1], slot0[0], poolKey.hooks, dropPercent, depositAmount, quoteToken);
+    return this.buildPreview("v4", chain, poolId, poolKey.currency0, poolKey.currency1, Number(poolKey.fee), poolKey.tickSpacing, slot0[1], slot0[0], liquidity, poolKey.hooks, dropPercent, depositAmount, quoteToken);
   }
 
   private async buildPreview(
@@ -146,6 +126,7 @@ export class PositionOpener {
     tickSpacing: number,
     currentTick: number,
     sqrtPriceX96: bigint,
+    poolLiquidity: bigint,
     hooks: Address,
     dropPercent: number,
     depositAmount: bigint,
@@ -154,7 +135,7 @@ export class PositionOpener {
     const client = this.client(chain);
     const quoteAddr = quoteToken.address.toLowerCase() as Address;
     const quoteIsToken0 = quoteAddr === token0.toLowerCase();
-    if (quoteIsToken0 !== (quoteAddr < token1.toLowerCase())) {
+    if (!quoteIsToken0 && quoteAddr !== token1.toLowerCase()) {
       throw new Error("Quote token is neither token0 nor token1 of this pool");
     }
 
@@ -162,123 +143,191 @@ export class PositionOpener {
     let tickUpper: number;
 
     if (quoteIsToken0) {
-      tickUpper = tickToFloorSpacing(currentTick - tickSpacing, tickSpacing);
-      tickLower = tickToFloorSpacing(tickUpper - ticksForDropPercent(dropPercent), tickSpacing);
-    } else {
       tickLower = tickToCeilSpacing(currentTick + tickSpacing, tickSpacing);
       tickUpper = tickToCeilSpacing(tickLower + ticksForDropPercent(dropPercent), tickSpacing);
+    } else {
+      tickUpper = tickToFloorSpacing(currentTick - tickSpacing, tickSpacing);
+      tickLower = tickToFloorSpacing(tickUpper - ticksForDropPercent(dropPercent), tickSpacing);
     }
+
+    const [token0Decimals, token1Decimals] = await Promise.all([this.tokenDecimals(client, token0), this.tokenDecimals(client, token1)]);
+    const position = protocol === "v3"
+      ? this.v3Position(chain, token0, token1, token0Decimals, token1Decimals, fee, sqrtPriceX96, poolLiquidity, currentTick, tickLower, tickUpper, depositAmount, quoteIsToken0)
+      : this.v4Position(chain, token0, token1, token0Decimals, token1Decimals, fee, tickSpacing, hooks, sqrtPriceX96, poolLiquidity, currentTick, tickLower, tickUpper, depositAmount, quoteIsToken0);
+    const liquidity = BigInt(position.liquidity.toString());
+    if (liquidity === 0n) throw new Error("Deposit amount is too small for this pool range");
+    this.assertSingleSideSpend(position, quoteIsToken0, depositAmount);
 
     const sqrtLower = sqrtRatioAtTick(tickLower);
     const sqrtUpper = sqrtRatioAtTick(tickUpper);
-    const liquidity = quoteIsToken0
-      ? liquidityForAmount0(sqrtLower, sqrtUpper, depositAmount)
-      : liquidityForAmount1(sqrtLower, sqrtUpper, depositAmount);
 
     const baseToken = quoteIsToken0 ? token1 : token0;
-    const baseDecimals = await this.tokenDecimals(client, baseToken);
-    const lowerPrice = this.formatPrice(sqrtLower, quoteIsToken0, baseDecimals, quoteToken.symbol === "USDG" || quoteToken.symbol === "USDC" ? 6 : 18);
-    const upperPrice = this.formatPrice(sqrtUpper, quoteIsToken0, baseDecimals, quoteToken.symbol === "USDG" || quoteToken.symbol === "USDC" ? 6 : 18);
-    const currentPrice = this.formatPrice(sqrtPriceX96, quoteIsToken0, baseDecimals, quoteToken.symbol === "USDG" || quoteToken.symbol === "USDC" ? 6 : 18);
+    const baseDecimals = quoteIsToken0 ? token1Decimals : token0Decimals;
+    const quoteDecimals = quoteIsToken0 ? token0Decimals : token1Decimals;
+    const currentPrice = this.formatPrice(sqrtPriceX96, quoteIsToken0, baseDecimals, quoteDecimals);
 
     const baseSymbol = await this.tokenSymbol(client, baseToken);
     const pair = quoteIsToken0 ? `${baseSymbol}/${quoteToken.symbol}` : `${quoteToken.symbol}/${baseSymbol}`;
+
+    const [lowerPrice, upperPrice] = this.sortPrices(
+      this.formatPrice(sqrtLower, quoteIsToken0, baseDecimals, quoteDecimals),
+      this.formatPrice(sqrtUpper, quoteIsToken0, baseDecimals, quoteDecimals),
+    );
 
     return {
       protocol, chain, poolAddress: pool, pair, feeTier: fee,
       feeLabel: hooks !== zeroAddress ? `${(fee / 10_000).toFixed(2)}% dynamic` : `${(fee / 10_000).toFixed(2)}%`,
       quoteToken: quoteToken.address, quoteTokenSymbol: quoteToken.symbol,
-      quoteIsToken0, currentTick, tickLower, tickUpper, liquidity, depositAmount,
+      quoteIsToken0, token0, token1, token0Decimals, token1Decimals, currentTick, tickSpacing, tickLower, tickUpper, sqrtPriceX96, poolLiquidity, hooks, liquidity, depositAmount,
       lowerPrice, upperPrice, currentPrice, dropPercent,
     };
   }
 
   async executeOpen(preview: OpenPositionPreview): Promise<{ hash: Hex | null }> {
-    const amountMin = applySlippage(preview.depositAmount, this.config.removeLiquiditySlippageBps);
     const deadline = BigInt(Math.floor(Date.now() / 1_000) + 600);
+    const refreshed = await this.prepareOpen(preview.poolAddress, preview.chain, preview.dropPercent, preview.depositAmount, { address: preview.quoteToken, symbol: preview.quoteTokenSymbol });
+    if (!this.isStillSingleSided(preview, refreshed.currentTick)) throw new Error("Pool price moved into the requested range; review and confirm again");
 
-    if (preview.protocol === "v3") return this.executeV3(preview, deadline, amountMin);
-    return this.executeV4(preview, deadline);
+    if (preview.protocol === "v3") return this.executeV3({ ...preview, ...refreshed, tickLower: preview.tickLower, tickUpper: preview.tickUpper }, deadline);
+    return this.executeV4({ ...preview, ...refreshed, tickLower: preview.tickLower, tickUpper: preview.tickUpper }, deadline);
   }
 
-  private async executeV3(preview: OpenPositionPreview, deadline: bigint, amountMin: bigint): Promise<{ hash: Hex | null }> {
+  private async executeV3(preview: OpenPositionPreview, deadline: bigint): Promise<{ hash: Hex | null }> {
     const client = this.client(preview.chain);
     const { registry } = this.chains.get(preview.chain);
     const positionManager = registry.contracts.v3.positionManager;
     const executor = this.config.executorAddress;
 
-    const [token0, token1] = await Promise.all([
-      client.readContract({ address: preview.poolAddress, abi: v3PoolAbi, functionName: "token0" }) as Promise<Address>,
-      client.readContract({ address: preview.poolAddress, abi: v3PoolAbi, functionName: "token1" }) as Promise<Address>,
-    ]);
-
-    const amount0Desired = preview.quoteIsToken0 ? preview.depositAmount : 0n;
-    const amount1Desired = preview.quoteIsToken0 ? 0n : preview.depositAmount;
-    const amount0Min = preview.quoteIsToken0 ? amountMin : 0n;
-    const amount1Min = preview.quoteIsToken0 ? 0n : amountMin;
-
     await this.ensureApproval(client, preview.quoteToken, positionManager, preview.depositAmount, executor, preview.chain);
-
-    const mintData = encodeFunctionData({
-      abi: v3PositionManagerAbi, functionName: "mint",
-      args: [{
-        token0, token1, fee: preview.feeTier,
-        tickLower: preview.tickLower, tickUpper: preview.tickUpper,
-        amount0Desired, amount1Desired, amount0Min, amount1Min,
-        recipient: executor, deadline,
-      }],
+    const position = this.v3PositionFromPreview(preview);
+    this.assertSingleSideSpend(position, preview.quoteIsToken0, preview.depositAmount);
+    const parameters = NonfungiblePositionManager.addCallParameters(position, {
+      recipient: executor,
+      deadline: deadline.toString(),
+      slippageTolerance: new Percent(0, 10_000),
     });
-    const data = encodeFunctionData({ abi: v3PositionManagerAbi, functionName: "multicall", args: [[mintData]] });
-
-    return this.broadcast(preview.chain, positionManager, data);
+    return this.broadcast(preview.chain, positionManager, parameters.calldata as Hex, BigInt(parameters.value));
   }
 
   private async executeV4(preview: OpenPositionPreview, deadline: bigint): Promise<{ hash: Hex | null }> {
     const client = this.client(preview.chain);
     const { registry } = this.chains.get(preview.chain);
     const positionManager = registry.contracts.v4.positionManager;
-    const stateView = registry.contracts.v4.stateView;
     const executor = this.config.executorAddress;
-
-    const poolId = preview.poolAddress;
-    const bytes25 = poolId.slice(0, 2 + 25 * 2) as Hex;
-
-    const [poolKeyResult, slot0] = await Promise.all([
-      client.readContract({ address: positionManager, abi: v4PoolKeysAbi, functionName: "poolKeys", args: [bytes25] }),
-      client.readContract({ address: stateView, abi: v4StateViewAbi, functionName: "getSlot0", args: [poolId] }),
-    ]);
-    const poolKey = poolKeyResult as unknown as { currency0: Address; currency1: Address; fee: number; tickSpacing: number; hooks: Address };
 
     await this.ensureApproval(client, preview.quoteToken, registry.contracts.v4.permit2, preview.depositAmount, executor, preview.chain);
     await this.ensurePermit2Approval(client, preview.quoteToken, positionManager, preview.depositAmount, executor, preview.chain);
+    const position = this.v4PositionFromPreview(preview);
+    this.assertSingleSideSpend(position, preview.quoteIsToken0, preview.depositAmount);
+    const parameters = V4PositionManager.addCallParameters(position, {
+      recipient: executor,
+      deadline: deadline.toString(),
+      slippageTolerance: new Percent(0, 10_000),
+      hookData: "0x",
+      ...(preview.token0.toLowerCase() === zeroAddress ? { useNative: Ether.onChain(this.chains.get(preview.chain).registry.chain.id) } : {}),
+    });
+    return this.broadcast(preview.chain, positionManager, parameters.calldata as Hex, BigInt(parameters.value));
+  }
 
-    const amount0Max = preview.quoteIsToken0 ? preview.depositAmount : 0n;
-    const amount1Max = preview.quoteIsToken0 ? 0n : preview.depositAmount;
-
-    const mintParams = encodeV4MintParams(
-      poolKey,
-      preview.tickLower,
-      preview.tickUpper,
-      preview.liquidity,
-      amount0Max,
-      amount1Max,
-      executor,
+  private v3Position(
+    chain: ChainName,
+    token0: Address,
+    token1: Address,
+    token0Decimals: number,
+    token1Decimals: number,
+    fee: number,
+    sqrtPriceX96: bigint,
+    poolLiquidity: bigint,
+    currentTick: number,
+    tickLower: number,
+    tickUpper: number,
+    depositAmount: bigint,
+    quoteIsToken0: boolean,
+  ): V3SdkPosition {
+    const chainId = this.chains.get(chain).registry.chain.id;
+    const pool = new V3SdkPool(
+      new Token(chainId, token0, token0Decimals),
+      new Token(chainId, token1, token1Decimals),
+      fee as FeeAmount,
+      sqrtPriceX96.toString(),
+      poolLiquidity.toString(),
+      currentTick,
     );
+    return V3SdkPosition.fromAmounts({
+      pool,
+      tickLower,
+      tickUpper,
+      amount0: quoteIsToken0 ? depositAmount.toString() : "0",
+      amount1: quoteIsToken0 ? "0" : depositAmount.toString(),
+      useFullPrecision: true,
+    });
+  }
 
-    const settleParams = encodeAbiParameters(
-      [{ type: "address" }, { type: "address" }],
-      [poolKey.currency0, poolKey.currency1],
+  private v3PositionFromPreview(preview: OpenPositionPreview): V3SdkPosition {
+    return this.v3Position(
+      preview.chain, preview.token0, preview.token1, preview.token0Decimals, preview.token1Decimals,
+      preview.feeTier, preview.sqrtPriceX96, preview.poolLiquidity, preview.currentTick,
+      preview.tickLower, preview.tickUpper, preview.depositAmount, preview.quoteIsToken0,
     );
+  }
 
-    const actions = "0x020d";
-    const unlockData = encodeAbiParameters(
-      [{ type: "bytes" }, { type: "bytes[]" }],
-      [actions, [mintParams, settleParams]],
+  private v4Position(
+    chain: ChainName,
+    token0: Address,
+    token1: Address,
+    token0Decimals: number,
+    token1Decimals: number,
+    fee: number,
+    tickSpacing: number,
+    hooks: Address,
+    sqrtPriceX96: bigint,
+    poolLiquidity: bigint,
+    currentTick: number,
+    tickLower: number,
+    tickUpper: number,
+    depositAmount: bigint,
+    quoteIsToken0: boolean,
+  ): V4SdkPosition {
+    const chainId = this.chains.get(chain).registry.chain.id;
+    const currency0 = token0.toLowerCase() === zeroAddress ? Ether.onChain(chainId) : new Token(chainId, token0, token0Decimals);
+    const currency1 = new Token(chainId, token1, token1Decimals);
+    const pool = new V4SdkPool(currency0, currency1, fee, tickSpacing, hooks, sqrtPriceX96.toString(), poolLiquidity.toString(), currentTick);
+    return V4SdkPosition.fromAmounts({
+      pool,
+      tickLower,
+      tickUpper,
+      amount0: quoteIsToken0 ? depositAmount.toString() : "0",
+      amount1: quoteIsToken0 ? "0" : depositAmount.toString(),
+      useFullPrecision: true,
+    });
+  }
+
+  private v4PositionFromPreview(preview: OpenPositionPreview): V4SdkPosition {
+    return this.v4Position(
+      preview.chain, preview.token0, preview.token1, preview.token0Decimals, preview.token1Decimals,
+      preview.feeTier, preview.tickSpacing, preview.hooks, preview.sqrtPriceX96, preview.poolLiquidity,
+      preview.currentTick, preview.tickLower, preview.tickUpper, preview.depositAmount, preview.quoteIsToken0,
     );
+  }
 
-    const data = encodeFunctionData({ abi: v4PositionManagerAbi, functionName: "modifyLiquidities", args: [unlockData, deadline] });
-    const value = preview.quoteToken.toLowerCase() === zeroAddress ? preview.depositAmount : 0n;
-    return this.broadcast(preview.chain, positionManager, data, value);
+  private isStillSingleSided(preview: OpenPositionPreview, currentTick: number): boolean {
+    return preview.quoteIsToken0 ? currentTick < preview.tickLower : currentTick >= preview.tickUpper;
+  }
+
+  private assertSingleSideSpend(position: V3SdkPosition | V4SdkPosition, quoteIsToken0: boolean, depositAmount: bigint): void {
+    const { amount0, amount1 } = position.mintAmounts;
+    const quoteAmount = BigInt((quoteIsToken0 ? amount0 : amount1).toString());
+    const nonQuoteAmount = BigInt((quoteIsToken0 ? amount1 : amount0).toString());
+    if (nonQuoteAmount !== 0n) throw new Error("Requested range is not single-side quote liquidity");
+    if (quoteAmount > depositAmount) throw new Error("SDK quote spend exceeds the requested deposit cap");
+  }
+
+  private sortPrices(a: string, b: string): [string, string] {
+    const asUnits = (value: string) => {
+      const [whole, fraction = ""] = value.split(".");
+      return BigInt(whole!) * 10_000n + BigInt(fraction.padEnd(4, "0"));
+    };
+    return asUnits(a) <= asUnits(b) ? [a, b] : [b, a];
   }
 
   private async broadcast(chain: ChainName, to: Address, data: Hex, value = 0n): Promise<{ hash: Hex | null }> {
@@ -294,6 +343,8 @@ export class PositionOpener {
 
     const wallet = this.walletClient(chain);
     const hash = await wallet.sendTransaction({ to, data, value, account: this.account!, chain: this.chains.get(chain).registry.chain });
+    const receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
+    if (receipt.status !== "success") throw new Error(`Open position transaction reverted: ${hash}`);
     log.info({ hash, to }, "open position transaction broadcast");
     return { hash };
   }

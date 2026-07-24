@@ -1,48 +1,40 @@
+import { Token } from "@uniswap/sdk-core";
+import { FeeAmount, Pool as V3Pool, Position as V3Position } from "@uniswap/v3-sdk";
+import { Pool as V4Pool, Position as V4Position } from "@uniswap/v4-sdk";
 import { describe, expect, it } from "vitest";
-import { decodeAbiParameters, type Address } from "viem";
+import { zeroAddress } from "viem";
 
-import { encodeV4MintParams } from "../src/services/position-opener.js";
+const chainId = 4663;
+const token0 = new Token(chainId, "0x0000000000000000000000000000000000000001", 6, "USDG");
+const token1 = new Token(chainId, "0x0000000000000000000000000000000000000002", 18, "VLAD");
+const sqrtPriceX96 = (1n << 96n).toString();
 
-describe("V4 position mint encoding", () => {
-  it("encodes the pool key as a structured tuple accepted by viem", () => {
-    const currency0 = "0x0000000000000000000000000000000000000001" as Address;
-    const currency1 = "0x0000000000000000000000000000000000000002" as Address;
-    const hooks = "0x0000000000000000000000000000000000000003" as Address;
-    const owner = "0x0000000000000000000000000000000000000004" as Address;
-    const encoded = encodeV4MintParams(
-      { currency0, currency1, fee: 3000, tickSpacing: 60, hooks },
-      -120,
-      120,
-      123456n,
-      100n,
-      0n,
-      owner,
-    );
+describe("SDK single-side liquidity", () => {
+  it("keeps token0 deposits above the current tick for V3 and V4", () => {
+    const v3Pool = new V3Pool(token0, token1, FeeAmount.MEDIUM, sqrtPriceX96, "1000000", 0);
+    const v4Pool = new V4Pool(token0, token1, FeeAmount.MEDIUM, 60, zeroAddress, sqrtPriceX96, "1000000", 0);
+    const options = { tickLower: 60, tickUpper: 120, amount0: "20000000", amount1: "0", useFullPrecision: true } as const;
 
-    const [poolKey, tickLower, tickUpper, liquidity, amount0Max, amount1Max, decodedOwner, hookData] = decodeAbiParameters(
-      [
-        {
-          type: "tuple",
-          components: [
-            { name: "currency0", type: "address" },
-            { name: "currency1", type: "address" },
-            { name: "fee", type: "uint24" },
-            { name: "tickSpacing", type: "int24" },
-            { name: "hooks", type: "address" },
-          ],
-        },
-        { type: "int24" },
-        { type: "int24" },
-        { type: "uint256" },
-        { type: "uint128" },
-        { type: "uint128" },
-        { type: "address" },
-        { type: "bytes" },
-      ],
-      encoded,
-    );
+    const v3 = V3Position.fromAmounts({ pool: v3Pool, ...options });
+    const v4 = V4Position.fromAmounts({ pool: v4Pool, ...options });
 
-    expect(poolKey).toEqual({ currency0, currency1, fee: 3000, tickSpacing: 60, hooks });
-    expect([tickLower, tickUpper, liquidity, amount0Max, amount1Max, decodedOwner, hookData]).toEqual([-120, 120, 123456n, 100n, 0n, owner, "0x"]);
+    expect(v3.mintAmounts.amount0.toString()).toBe("20000000");
+    expect(v3.mintAmounts.amount1.toString()).toBe("0");
+    expect(v4.mintAmounts.amount0.toString()).toBe("20000000");
+    expect(v4.mintAmounts.amount1.toString()).toBe("0");
+  });
+
+  it("keeps token1 deposits below the current tick for V3 and V4", () => {
+    const v3Pool = new V3Pool(token0, token1, FeeAmount.MEDIUM, sqrtPriceX96, "1000000", 0);
+    const v4Pool = new V4Pool(token0, token1, FeeAmount.MEDIUM, 60, zeroAddress, sqrtPriceX96, "1000000", 0);
+    const options = { tickLower: -120, tickUpper: -60, amount0: "0", amount1: "20000000000000000000", useFullPrecision: true } as const;
+
+    const v3 = V3Position.fromAmounts({ pool: v3Pool, ...options });
+    const v4 = V4Position.fromAmounts({ pool: v4Pool, ...options });
+
+    expect(v3.mintAmounts.amount0.toString()).toBe("0");
+    expect(v3.mintAmounts.amount1.toString()).toBe("20000000000000000000");
+    expect(v4.mintAmounts.amount0.toString()).toBe("0");
+    expect(v4.mintAmounts.amount1.toString()).toBe("20000000000000000000");
   });
 });

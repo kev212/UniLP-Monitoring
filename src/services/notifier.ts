@@ -1,5 +1,5 @@
 import { Bot, Context, InlineKeyboard, InputFile, type CommandContext } from "grammy";
-import { isAddress, zeroAddress, type Address } from "viem";
+import { isAddress, parseUnits, zeroAddress, type Address } from "viem";
 import sharp from "sharp";
 
 import type { RuntimeConfig } from "../config.js";
@@ -1041,8 +1041,8 @@ export class Notifier {
         return;
       }
       if (pending.kind === "open_amount") {
-        const amount = Number(text.replace(/[$,%\s]/g, ""));
-        if (!Number.isFinite(amount) || amount <= 0) {
+        const amount = text.replace(/[$,\s]/g, "");
+        if (!/^\d+(?:\.\d+)?$/.test(amount) || Number(amount) <= 0) {
           this.pendingInput.set(chatId, pending);
           await this.replyTemp(ctx, "Jumlah tidak valid. Kirim angka positif.");
           return;
@@ -1073,7 +1073,7 @@ export class Notifier {
     }
   }
 
-  private async handleOpenPreview(ctx: Context, chain: ChainName, poolAddress: string, dropPercent: number, amount: number): Promise<void> {
+  private async handleOpenPreview(ctx: Context, chain: ChainName, poolAddress: string, dropPercent: number, amount: string): Promise<void> {
     if (!this.positionOpener) {
       await this.replyTemp(ctx, "❌ Position opener belum dikonfigurasi.");
       return;
@@ -1089,7 +1089,7 @@ export class Notifier {
     let lastError = "";
     for (const qt of quoteTokens) {
       const decimals = qt.symbol === "USDG" || qt.symbol === "USDC" ? 6 : 18;
-      const depositAmount = BigInt(Math.round(amount * 10 ** decimals));
+      const depositAmount = parseUnits(amount, decimals);
       try {
         preview = await this.positionOpener.prepareOpen(poolAddress, chain, dropPercent, depositAmount, qt);
         break;
@@ -1105,13 +1105,14 @@ export class Notifier {
     const requestId = `${chatId}-${Date.now()}`;
     this.openConfirmations.set(requestId, preview);
 
-    const depositFormatted = (amount).toFixed(2);
+    const depositFormatted = amount;
     const lines = [
       "🟢 OPEN POSITION — REVIEW",
       "",
       `${preview.protocol.toUpperCase()} ${preview.pair} | ${preview.feeLabel}`,
       `Current price: ${preview.currentPrice}`,
       `Range: ${preview.lowerPrice} → ${preview.upperPrice}`,
+      `Ticks: ${preview.tickLower} → ${preview.tickUpper} | current ${preview.currentTick}`,
       `Drop: -${dropPercent}%`,
       `Deposit: ${depositFormatted} ${preview.quoteTokenSymbol}`,
       `Quote side: single-side ${preview.quoteTokenSymbol}`,
