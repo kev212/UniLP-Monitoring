@@ -1,6 +1,4 @@
-import { Ether, Percent, Token } from "@uniswap/sdk-core";
-import { FeeAmount, NonfungiblePositionManager, Pool as V3SdkPool, Position as V3SdkPosition } from "@uniswap/v3-sdk";
-import { Pool as V4SdkPool, Position as V4SdkPosition, V4PositionManager } from "@uniswap/v4-sdk";
+import { createRequire } from "node:module";
 import { createPublicClient, createWalletClient, encodeFunctionData, http, type Address, type Hex, type PublicClient, zeroAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
@@ -10,6 +8,14 @@ import { log } from "../log.js";
 import type { ChainName, QuoteToken } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import { sqrtRatioAtTick, tickToCeilSpacing, tickToFloorSpacing, ticksForDropPercent } from "./uniswap-math.js";
+
+const require = createRequire(import.meta.url);
+const { Ether, Percent, Token } = require("@uniswap/sdk-core") as typeof import("@uniswap/sdk-core");
+const { FeeAmount, NonfungiblePositionManager, Pool: V3SdkPool, Position: V3SdkPosition } = require("@uniswap/v3-sdk") as typeof import("@uniswap/v3-sdk");
+const { Pool: V4SdkPool, Position: V4SdkPosition, V4PositionManager } = require("@uniswap/v4-sdk") as typeof import("@uniswap/v4-sdk");
+type V3Position = import("@uniswap/v3-sdk").Position;
+type V4Position = import("@uniswap/v4-sdk").Position;
+type V3FeeAmount = import("@uniswap/v3-sdk").FeeAmount;
 
 export interface OpenPositionPreview {
   protocol: "v3" | "v4";
@@ -243,12 +249,12 @@ export class PositionOpener {
     tickUpper: number,
     depositAmount: bigint,
     quoteIsToken0: boolean,
-  ): V3SdkPosition {
+  ): V3Position {
     const chainId = this.chains.get(chain).registry.chain.id;
     const pool = new V3SdkPool(
       new Token(chainId, token0, token0Decimals),
       new Token(chainId, token1, token1Decimals),
-      fee as FeeAmount,
+      fee as V3FeeAmount,
       sqrtPriceX96.toString(),
       poolLiquidity.toString(),
       currentTick,
@@ -263,7 +269,7 @@ export class PositionOpener {
     });
   }
 
-  private v3PositionFromPreview(preview: OpenPositionPreview): V3SdkPosition {
+  private v3PositionFromPreview(preview: OpenPositionPreview): V3Position {
     return this.v3Position(
       preview.chain, preview.token0, preview.token1, preview.token0Decimals, preview.token1Decimals,
       preview.feeTier, preview.sqrtPriceX96, preview.poolLiquidity, preview.currentTick,
@@ -287,7 +293,7 @@ export class PositionOpener {
     tickUpper: number,
     depositAmount: bigint,
     quoteIsToken0: boolean,
-  ): V4SdkPosition {
+  ): V4Position {
     const chainId = this.chains.get(chain).registry.chain.id;
     const currency0 = token0.toLowerCase() === zeroAddress ? Ether.onChain(chainId) : new Token(chainId, token0, token0Decimals);
     const currency1 = new Token(chainId, token1, token1Decimals);
@@ -302,7 +308,7 @@ export class PositionOpener {
     });
   }
 
-  private v4PositionFromPreview(preview: OpenPositionPreview): V4SdkPosition {
+  private v4PositionFromPreview(preview: OpenPositionPreview): V4Position {
     return this.v4Position(
       preview.chain, preview.token0, preview.token1, preview.token0Decimals, preview.token1Decimals,
       preview.feeTier, preview.tickSpacing, preview.hooks, preview.sqrtPriceX96, preview.poolLiquidity,
@@ -314,7 +320,7 @@ export class PositionOpener {
     return preview.quoteIsToken0 ? currentTick < preview.tickLower : currentTick >= preview.tickUpper;
   }
 
-  private assertSingleSideSpend(position: V3SdkPosition | V4SdkPosition, quoteIsToken0: boolean, depositAmount: bigint): void {
+  private assertSingleSideSpend(position: V3Position | V4Position, quoteIsToken0: boolean, depositAmount: bigint): void {
     const { amount0, amount1 } = position.mintAmounts;
     const quoteAmount = BigInt((quoteIsToken0 ? amount0 : amount1).toString());
     const nonQuoteAmount = BigInt((quoteIsToken0 ? amount1 : amount0).toString());
