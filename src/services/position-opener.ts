@@ -45,8 +45,9 @@ export function encodeV4MintParams(
   tickLower: number,
   tickUpper: number,
   liquidity: bigint,
-  amount0Min: bigint,
-  amount1Min: bigint,
+  amount0Max: bigint,
+  amount1Max: bigint,
+  owner: Address,
 ): Hex {
   return encodeAbiParameters(
     [
@@ -65,9 +66,10 @@ export function encodeV4MintParams(
       { type: "uint256" },
       { type: "uint128" },
       { type: "uint128" },
+      { type: "address" },
       { type: "bytes" },
     ],
-    [poolKey, tickLower, tickUpper, liquidity, amount0Min, amount1Min, "0x"],
+    [poolKey, tickLower, tickUpper, liquidity, amount0Max, amount1Max, owner, "0x"],
   );
 }
 
@@ -196,7 +198,7 @@ export class PositionOpener {
     const deadline = BigInt(Math.floor(Date.now() / 1_000) + 600);
 
     if (preview.protocol === "v3") return this.executeV3(preview, deadline, amountMin);
-    return this.executeV4(preview, deadline, amountMin);
+    return this.executeV4(preview, deadline);
   }
 
   private async executeV3(preview: OpenPositionPreview, deadline: bigint, amountMin: bigint): Promise<{ hash: Hex | null }> {
@@ -231,7 +233,7 @@ export class PositionOpener {
     return this.broadcast(preview.chain, positionManager, data);
   }
 
-  private async executeV4(preview: OpenPositionPreview, deadline: bigint, amountMin: bigint): Promise<{ hash: Hex | null }> {
+  private async executeV4(preview: OpenPositionPreview, deadline: bigint): Promise<{ hash: Hex | null }> {
     const client = this.client(preview.chain);
     const { registry } = this.chains.get(preview.chain);
     const positionManager = registry.contracts.v4.positionManager;
@@ -249,16 +251,17 @@ export class PositionOpener {
 
     await this.ensureApproval(client, preview.quoteToken, registry.contracts.v4.permit2, preview.depositAmount, executor);
 
-    const amount0Min = preview.quoteIsToken0 ? amountMin : 0n;
-    const amount1Min = preview.quoteIsToken0 ? 0n : amountMin;
+    const amount0Max = preview.quoteIsToken0 ? preview.depositAmount : 0n;
+    const amount1Max = preview.quoteIsToken0 ? 0n : preview.depositAmount;
 
     const mintParams = encodeV4MintParams(
       poolKey,
       preview.tickLower,
       preview.tickUpper,
       preview.liquidity,
-      amount0Min,
-      amount1Min,
+      amount0Max,
+      amount1Max,
+      executor,
     );
 
     const settleParams = encodeAbiParameters(
@@ -266,7 +269,7 @@ export class PositionOpener {
       [poolKey.currency0, poolKey.currency1],
     );
 
-    const actions = "0x0510";
+    const actions = "0x020d";
     const unlockData = encodeAbiParameters(
       [{ type: "bytes" }, { type: "bytes[]" }],
       [actions, [mintParams, settleParams]],
