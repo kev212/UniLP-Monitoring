@@ -16,6 +16,7 @@ const { Pool: V4SdkPool, Position: V4SdkPosition, V4PositionManager } = require(
 type V3Position = import("@uniswap/v3-sdk").Position;
 type V4Position = import("@uniswap/v4-sdk").Position;
 type V3FeeAmount = import("@uniswap/v3-sdk").FeeAmount;
+const OPEN_QUOTE_PRIORITY = ["USDG", "USDC", "WETH", "ETH"];
 
 export interface OpenPositionPreview {
   protocol: "v3" | "v4";
@@ -110,9 +111,7 @@ export class PositionOpener {
       ]);
     }
     const allowed = this.config.quoteTokens[chain] ?? [];
-    const matches = allowed.filter(({ address }) => address.toLowerCase() === token0.toLowerCase() || address.toLowerCase() === token1.toLowerCase());
-    const priority = ["USDG", "USDC", "WETH", "ETH"];
-    const quote = matches.sort((a, b) => priority.indexOf(a.symbol) - priority.indexOf(b.symbol))[0];
+    const quote = selectOpenQuoteToken(allowed, token0, token1);
     if (quote) return quote;
     if ((token0.toLowerCase() === zeroAddress || token1.toLowerCase() === zeroAddress) && allowed.some(({ symbol }) => symbol === "ETH")) {
       return { symbol: "ETH", address: zeroAddress };
@@ -466,4 +465,11 @@ export class PositionOpener {
     const frac = (raw % scale).toString().padStart(18, "0").slice(0, 4);
     return `${whole}.${frac}`;
   }
+}
+
+export function selectOpenQuoteToken(allowed: readonly QuoteToken[], token0: Address, token1: Address): QuoteToken | null {
+  const matches = allowed.filter(({ symbol, address }) =>
+    OPEN_QUOTE_PRIORITY.includes(symbol) && (address.toLowerCase() === token0.toLowerCase() || address.toLowerCase() === token1.toLowerCase()),
+  );
+  return matches.sort((a, b) => OPEN_QUOTE_PRIORITY.indexOf(a.symbol) - OPEN_QUOTE_PRIORITY.indexOf(b.symbol))[0] ?? null;
 }
