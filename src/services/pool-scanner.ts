@@ -72,6 +72,49 @@ export interface VerifiedPool {
   activeLiquidity: boolean;
 }
 
+export interface InvestigateResult {
+  protocol: "v3" | "v4";
+  pairAddress: string;
+  pair: string;
+  baseToken: { address: string; symbol: string };
+  quoteToken: { address: string; symbol: string };
+  feeTier: number;
+  currentLpFee?: number;
+  dynamicFee: boolean;
+  activeLiquidity: boolean;
+  tvlUsd: number;
+  volume1hUsd: number;
+  volume6hUsd: number;
+  volume24hUsd: number;
+  marketCapUsd: number | null;
+  fdvUsd: number | null;
+  pairCreatedAt: number | null;
+  txns1h: { buys: number; sells: number };
+  priceChange1h: number;
+  priceChange6h: number;
+  priceChange24h: number;
+  priceUsd: string | null;
+  dexScreenerFound: boolean;
+}
+
+interface DexScreenerPairDetail {
+  chainId: string;
+  dexId: string;
+  pairAddress: string;
+  labels?: string[];
+  baseToken: { address: string; name?: string; symbol: string };
+  quoteToken: { address: string; name?: string; symbol: string };
+  priceNative?: string;
+  priceUsd?: string | null;
+  txns?: Record<string, { buys?: number; sells?: number }>;
+  volume?: Record<string, number>;
+  priceChange?: Record<string, number> | null;
+  liquidity?: { usd?: number | null; base?: number; quote?: number } | null;
+  fdv?: number | null;
+  marketCap?: number | null;
+  pairCreatedAt?: number | null;
+}
+
 interface GeckoPool {
   id: string;
   type: string;
@@ -674,6 +717,180 @@ export class PoolScanner {
       return null;
     }
   }
+
+  async investigatePool(poolAddress: string, chain: ChainName = "robinhood"): Promise<InvestigateResult> {
+    const normalized = poolAddress.toLowerCase();
+    const isV4 = isHex(normalized) && normalized.length === 66;
+    const protocol: "v3" | "v4" = isV4 ? "v4" : "v3";
+
+    const [dexData, onChain] = await Promise.all([
+      this.fetchDexScreenerPair(normalized),
+      isV4 ? this.readV4PoolOnChain(normalized as Address, chain) : this.readV3PoolOnChain(normalized as Address, chain),
+    ]);
+
+    if (!onChain) throw new Error("Pool tidak ditemukan on-chain atau bukan pool Uniswap valid");
+
+    const feeTier = onChain.feeTier ?? 0;
+    const currentLpFee = onChain.currentLpFee;
+    const dynamicFee = protocol === "v4" && currentLpFee !== undefined && currentLpFee !== feeTier;
+
+    if (!dexData) {
+      const symbol = protocol === "v3" ? shortAddr(normalized as Address) : "V4";
+      return {
+        protocol,
+        pairAddress: normalized,
+        pair: symbol,
+        baseToken: { address: "", symbol: "?" },
+        quoteToken: { address: "", symbol: "?" },
+        feeTier,
+        currentLpFee,
+        dynamicFee,
+        activeLiquidity: onChain.activeLiquidity,
+        tvlUsd: 0,
+        volume1hUsd: 0,
+        volume6hUsd: 0,
+        volume24hUsd: 0,
+        marketCapUsd: null,
+        fdvUsd: null,
+        pairCreatedAt: null,
+        txns1h: { buys: 0, sells: 0 },
+        priceChange1h: 0,
+        priceChange6h: 0,
+        priceChange24h: 0,
+        priceUsd: null,
+        dexScreenerFound: false,
+      };
+    }
+
+    return {
+      protocol,
+      pairAddress: normalized,
+      pair: `${dexData.baseToken.symbol}/${dexData.quoteToken.symbol}`,
+      baseToken: dexData.baseToken,
+      quoteToken: dexData.quoteToken,
+      feeTier,
+      currentLpFee,
+      dynamicFee,
+      activeLiquidity: onChain.activeLiquidity,
+      tvlUsd: Number(dexData.liquidity?.usd ?? 0),
+      volume1hUsd: Number(dexData.volume?.h1 ?? 0),
+      volume6hUsd: Number(dexData.volume?.h6 ?? 0),
+      volume24hUsd: Number(dexData.volume?.h24 ?? 0),
+      marketCapUsd: dexData.marketCap ?? null,
+      fdvUsd: dexData.fdv ?? null,
+      pairCreatedAt: dexData.pairCreatedAt ?? null,
+      txns1h: { buys: dexData.txns?.h1?.buys ?? 0, sells: dexData.txns?.h1?.sells ?? 0 },
+      priceChange1h: dexData.priceChange?.h1 ?? 0,
+      priceChange6h: dexData.priceChange?.h6 ?? 0,
+      priceChange24h: dexData.priceChange?.h24 ?? 0,
+      priceUsd: dexData.priceUsd ?? null,
+      dexScreenerFound: true,
+    };
+  }
+
+  private async fetchDexScreenerPair(pairAddress: string): Promise<DexScreenerPairDetail | null> {
+    try {
+      const response = await fetch(`${DEXSCREENER_BASE}/latest/dex/pairs/robinhood/${pairAddress}`, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) return null;
+      const body = await response.json();
+      const pairs = (body as { pairs?: unknown })?.pairs ?? (Array.isArray(body) ? body : []);
+      return Array.isArray(pairs) && pairs.length > 0 ? (pairs[0] as DexScreenerPairDetail) : null;
+    } catch (error) {
+      log.warn({ error: error instanceof Error ? error.message : String(error), pairAddress }, "DexScreener pair lookup failed");
+      return null;
+    }
+  }
+
+  private async readV3PoolOnChain(pool: Address, chain: ChainName): Promise<VerifiedPool | null> {
+    const { client, registry } = this.chains.getForScan(chain);
+    try {
+      const [token0, token1, fee, liquidity] = await Promise.all([
+        client.readContract({
+          address: pool, abi: [{ name: "token0", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] }],
+          functionName: "token0",
+        }),
+        client.readContract({
+          address: pool, abi: [{ name: "token1", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] }],
+          functionName: "token1",
+        }),
+        client.readContract({
+          address: pool, abi: [{ name: "fee", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "uint24" }] }],
+          functionName: "fee",
+        }),
+        client.readContract({
+          address: pool, abi: [{ name: "liquidity", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "uint128" }] }],
+          functionName: "liquidity",
+        }),
+      ]);
+
+      const factoryPool = await client.readContract({
+        address: registry.contracts.v3.factory,
+        abi: [{ name: "getPool", type: "function", stateMutability: "view", inputs: [
+          { name: "tokenA", type: "address" }, { name: "tokenB", type: "address" }, { name: "fee", type: "uint24" },
+        ], outputs: [{ type: "address" }] }],
+        functionName: "getPool",
+        args: [token0 as Address, token1 as Address, fee as number],
+      });
+
+      if ((factoryPool as string).toLowerCase() !== pool.toLowerCase()) return null;
+
+      return { feeTier: Number(fee), activeLiquidity: liquidity > 0n };
+    } catch {
+      return null;
+    }
+  }
+
+  private async readV4PoolOnChain(poolId: Address, chain: ChainName): Promise<VerifiedPool | null> {
+    if (!isHex(poolId) || poolId.length !== 66) return null;
+
+    const { client, registry } = this.chains.getForScan(chain);
+    const { stateView, positionManager } = registry.contracts.v4;
+
+    try {
+      const [slot0, liquidity] = await Promise.all([
+        client.readContract({
+          address: stateView,
+          abi: [{ name: "getSlot0", type: "function", stateMutability: "view", inputs: [{ type: "bytes32" }], outputs: [
+            { type: "uint160" }, { type: "int24" }, { type: "uint24" }, { type: "uint24" },
+          ] }],
+          functionName: "getSlot0",
+          args: [poolId as Hex],
+        }),
+        client.readContract({
+          address: stateView,
+          abi: [{ name: "getLiquidity", type: "function", stateMutability: "view", inputs: [{ type: "bytes32" }], outputs: [{ type: "uint128" }] }],
+          functionName: "getLiquidity",
+          args: [poolId as Hex],
+        }),
+      ]);
+
+      const bytes25 = (poolId as Hex).slice(0, 2 + 25 * 2) as Hex;
+      const poolKeyResult = await client.readContract({
+        address: positionManager,
+        abi: [{ name: "poolKeys", type: "function", stateMutability: "view", inputs: [{ type: "bytes25" }], outputs: [
+          { name: "poolKey", type: "tuple", components: [
+            { name: "currency0", type: "address" }, { name: "currency1", type: "address" },
+            { name: "fee", type: "uint24" }, { name: "tickSpacing", type: "int24" },
+            { name: "hooks", type: "address" },
+          ] },
+        ] }],
+        functionName: "poolKeys",
+        args: [bytes25],
+      });
+      const poolKey = poolKeyResult as { fee: number };
+
+      return {
+        feeTier: Number(poolKey.fee),
+        currentLpFee: Number(slot0[3]),
+        activeLiquidity: liquidity > 0n,
+      };
+    } catch {
+      return null;
+    }
+  }
 }
 
 export function hasMinimumScanVolume6h(volume6hUsd: number): boolean {
@@ -764,6 +981,10 @@ function feeRateFromName(name: string): number | null {
   if (!match?.[1]) return null;
   const percent = Number(match[1]);
   return Number.isFinite(percent) && percent >= 0 ? percent / 100 : null;
+}
+
+function shortAddr(address: Address): string {
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
 async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number, work: (item: T) => Promise<R>): Promise<R[]> {

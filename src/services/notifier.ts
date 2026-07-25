@@ -12,7 +12,7 @@ import type { PnlService } from "./pnl.js";
 import type { PositionOpener, OpenPositionPreview } from "./position-opener.js";
 import { fmtUtc, renderPnlCard } from "./pnl-card.js";
 import { renderPnlCalendarCard } from "./pnl-calendar-card.js";
-import type { PoolMarketScan, PoolScanFilters, PoolScanner, ScoredPool } from "./pool-scanner.js";
+import type { PoolMarketScan, PoolScanFilters, PoolScanner, ScoredPool, InvestigateResult } from "./pool-scanner.js";
 import type { GemScanner, GemScanResult } from "./gem-scanner.js";
 import type { GemCandidate } from "./gem-score.js";
 import { quoteRangeState } from "./quote-range.js";
@@ -116,6 +116,7 @@ export class Notifier {
       { command: "scan", description: "Scan token — /scan [base|robinhood] <contract>" },
       ...(this.config.scanV2Enabled ? [{ command: "scanv2", description: "Scan concentrated yield — /scanv2 [chain] <contract> [range%]" }] : []),
       { command: "scan_pools", description: "Cari pool V3/V4 dengan estimasi yield 1 jam tertinggi" },
+      { command: "investigate", description: "Cek yield/h pool — /investigate <address atau link Uniswap>" },
       { command: "gem", description: "💎 Hidden gem radar — yield gacor V3/V4" },
       { command: "history", description: "Tampilkan riwayat posisi close >= ±0.5% PnL" },
       { command: "calendar", description: "Tampilkan kalender realized PnL UTC" },
@@ -141,6 +142,10 @@ export class Notifier {
     this.bot.command("scan_pools", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleScanPools(ctx, database, scanner);
+    });
+    this.bot.command("investigate", async (ctx: ChatContext) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
+      await this.handleInvestigate(ctx, scanner);
     });
     this.bot.command("gem", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
@@ -1062,6 +1067,30 @@ export class Notifier {
       await this.sendTemp(["💎 Gem scan gagal. Coba lagi nanti."], chatId, 120_000);
     } finally {
       this.gemScanRunning = false;
+    }
+  }
+
+  private async handleInvestigate(ctx: ChatContext, scanner: PoolScanner): Promise<void> {
+    const chatId = ctx.chat.id.toString();
+    if (!this.authorized(chatId, ctx.from?.id.toString())) return;
+
+    const raw = ctx.match.trim();
+    if (!raw) {
+      await this.replyTemp(ctx, "Gunakan /investigate <pool address atau link Uniswap>.");
+      return;
+    }
+    const poolAddress = parseOpenPoolInput(raw);
+    if (!poolAddress) {
+      await this.replyTemp(ctx, "Address atau link pool Uniswap Robinhood tidak valid.");
+      return;
+    }
+
+    await this.replyTemp(ctx, `🔍 Investigating ${shortAddress(poolAddress as Address)}...`, undefined, 60_000);
+    try {
+      const result = await scanner.investigatePool(poolAddress, "robinhood");
+      await this.replyTemp(ctx, formatInvestigateResult(result), undefined, 180_000);
+    } catch (error) {
+      await this.replyTemp(ctx, `❌ ${errorMessage(error).slice(0, 200)}`);
     }
   }
 
@@ -2112,5 +2141,62 @@ function formatGemResult(result: GemScanResult): string {
 
   lines.push(`Token dievaluasi: ${result.evaluatedTokens} | Lolos: ${result.qualifiedTokens}`);
   lines.push("", "Spot yield: vol1h × fee / TVL. Persistent: harmonic mean window 1h/6h/24h. Bukan jaminan return.");
+  return lines.join("\n");
+}
+
+function formatInvestigateResult(r: InvestigateResult): string {
+  const effectiveFee = r.currentLpFee ?? r.feeTier;
+  const feeRate = effectiveFee / 1_000_000;
+  const feePct = (effectiveFee / 10_000).toFixed(2);
+  const lines: string[] = [
+    "🔍 INVESTIGATE POOL",
+    `${r.protocol.toUpperCase()} ${r.pair} | Fee: ${feePct}%${r.dynamicFee ? " dynamic" : ""} | Robinhood`,
+    "",
+  ];
+
+  if (!r.dexScreenerFound) {
+    lines.push("⚠️ Pool tidak ditemukan di DexScreener — tidak ada data volume/TVL.");
+    lines.push(`Active liquidity: ${r.activeLiquidity ? "YES" : "NO (zero)"}`);
+    return lines.join("\n");
+  }
+
+  if (r.tvlUsd > 0) {
+    const fees1h = r.volume1hUsd * feeRate;
+    const fees6h = r.volume6hUsd * feeRate;
+    const yield1h = r.tvlUsd > 0 ? (r.volume1hUsd * feeRate / r.tvlUsd) * 100 : 0;
+    const yield6h = r.tvlUsd > 0 ? (r.volume6hUsd * feeRate / r.tvlUsd / 6) * 100 : 0;
+    lines.push("📊 YIELD/HOUR (gross pool-wide)");
+    lines.push(`   1h spot:  ${yield1h.toFixed(2)}%/h  | Vol: $${fmtUsd(r.volume1hUsd)}  | Est fees: $${fmtUsd(fees1h)}`);
+    lines.push(`   6h avg:   ${yield6h.toFixed(2)}%/h  | Vol: $${fmtUsd(r.volume6hUsd)}  | Est fees: $${fmtUsd(fees6h)}`);
+    lines.push("");
+  } else {
+    lines.push("📊 TVL tidak tersedia — yield tidak dapat dihitung.");
+    lines.push("");
+  }
+
+  const mc = r.marketCapUsd ?? r.fdvUsd;
+  const mcLabel = r.marketCapUsd !== null ? "MC" : r.fdvUsd !== null ? "FDV" : null;
+  lines.push(`💰 TVL: $${fmtUsd(r.tvlUsd)}${mc !== null && mcLabel !== null ? ` | ${mcLabel}: $${fmtUsd(mc)}` : ""}`);
+
+  if (r.priceUsd) {
+    lines.push(`📈 Price: $${Number(r.priceUsd).toFixed(Number(r.priceUsd) < 0.01 ? 8 : 4)}`);
+  }
+  const changes: string[] = [];
+  if (r.priceChange1h !== 0) changes.push(`1h: ${r.priceChange1h > 0 ? "+" : ""}${r.priceChange1h.toFixed(1)}%`);
+  if (r.priceChange6h !== 0) changes.push(`6h: ${r.priceChange6h > 0 ? "+" : ""}${r.priceChange6h.toFixed(1)}%`);
+  if (r.priceChange24h !== 0) changes.push(`24h: ${r.priceChange24h > 0 ? "+" : ""}${r.priceChange24h.toFixed(1)}%`);
+  if (changes.length > 0) lines.push(`   ${changes.join(" | ")}`);
+
+  const txns: string[] = [];
+  if (r.txns1h.buys > 0 || r.txns1h.sells > 0) txns.push(`Txns 1h: ${r.txns1h.buys}B/${r.txns1h.sells}S`);
+  if (r.pairCreatedAt && r.pairCreatedAt > 0) {
+    const ageSeconds = Math.max(0, Math.floor((Date.now() - r.pairCreatedAt) / 1_000));
+    txns.push(`Age: ${fmtDuration(ageSeconds)}`);
+  }
+  if (txns.length > 0) lines.push(`🔄 ${txns.join(" | ")}`);
+
+  if (!r.activeLiquidity) lines.push("⚠️ Zero active liquidity on-chain");
+
+  lines.push("", "Gross pool yield = volume × fee / TVL. Bukan jaminan return personal LP.");
   return lines.join("\n");
 }
