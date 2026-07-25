@@ -19,6 +19,25 @@ const DEXSCREENER_BASE = "https://api.dexscreener.com";
 const USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168" as Address;
 const WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73" as Address;
 export const MIN_VOLUME_6H_USD = 100;
+const STOCK_MIN_YIELD_1H_PERCENT = 0.1;
+const STOCK_MAX_RESULTS = 10;
+const STOCK_VERIFY_CONCURRENCY = 3;
+
+export const ROBINHOOD_STOCK_TOKENS: readonly { address: Address; symbol: string }[] = [
+  { address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC", symbol: "NVDA" },
+  { address: "0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9", symbol: "AAPL" },
+  { address: "0x1b0E319c6A659F002271B69dB8A7df2F911c153E", symbol: "GME" },
+  { address: "0x322F0929c4625eD5bAd873c95208D54E1c003b2d", symbol: "TSLA" },
+  { address: "0xe93237C50D904957Cf27E7B1133b510C669c2e74", symbol: "MSFT" },
+  { address: "0x2e0847E8910a9732eB3fb1bb4b70a580ADAD4FE3", symbol: "GOOGL" },
+  { address: "0xfF080c8ce2E5feadaCa0Da81314Ae59D232d4afD", symbol: "MU" },
+  { address: "0x117cc2133c37B721F49dE2A7a74833232B3B4C0C", symbol: "SPY" },
+  { address: "0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa", symbol: "SPCX" },
+  { address: "0x894E1EC2D74FFE5AEF8Dc8A9e84686acCB964F2A", symbol: "PLTR" },
+  { address: "0xc72b96e0E48ecd4DC75E1e45396e26300BC39681", symbol: "INTC" },
+  { address: "0x12f190a9F9d7D37a250758b26824B97CE941bF54", symbol: "AMZN" },
+  { address: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC", symbol: "AMD" },
+];
 
 export interface ScoredPool {
   protocol: "v3" | "v4";
@@ -716,6 +735,45 @@ export class PoolScanner {
     } catch {
       return null;
     }
+  }
+
+  async scanStocks(onProgress?: (stage: string) => void): Promise<PoolMarketScan> {
+    onProgress?.(`Menganalisis ${ROBINHOOD_STOCK_TOKENS.length} tokenized stocks via DexScreener...`);
+    const enriched = await mapWithConcurrency(ROBINHOOD_STOCK_TOKENS, STOCK_VERIFY_CONCURRENCY, (stock) =>
+      this.enrichStockPairs(stock).catch(() => null),
+    );
+    onProgress?.("Memverifikasi pool on-chain dan menghitung yield...");
+    const pools = enriched
+      .flatMap((result) => result ?? [])
+      .filter((pool) => pool.estimatedPoolYield1hPercent > STOCK_MIN_YIELD_1H_PERCENT)
+      .sort((a, b) => b.estimatedPoolYield1hPercent - a.estimatedPoolYield1hPercent || b.tvlUsd - a.tvlUsd)
+      .slice(0, STOCK_MAX_RESULTS);
+    return {
+      pools,
+      candidateTokens: ROBINHOOD_STOCK_TOKENS.length,
+      qualifiedTokens: enriched.filter((result) => result && result.length > 0).length,
+      evaluatedTokens: ROBINHOOD_STOCK_TOKENS.length,
+    };
+  }
+
+  private async enrichStockPairs(stock: { address: Address; symbol: string }): Promise<ScoredPool[] | null> {
+    const token = stock.address.toLowerCase();
+    const pairs = await this.fetchDexScreenerPairs(token);
+    const relevant = pairs.filter((pair) => {
+      if (pair.chainId !== "robinhood" || pair.dexId !== "uniswap") return false;
+      return pair.labels?.includes("v3") || pair.labels?.includes("v4");
+    });
+    if (relevant.length === 0) return null;
+
+    const top = [...relevant]
+      .sort((a, b) => Number(b.volume?.h1 ?? 0) - Number(a.volume?.h1 ?? 0) || Number(b.liquidity?.usd ?? 0) - Number(a.liquidity?.usd ?? 0))
+      .slice(0, MAX_DEXSCREENER_POOL_VERIFICATIONS);
+
+    const scored = (await mapWithConcurrency(top, STOCK_VERIFY_CONCURRENCY, (pair) =>
+      this.toDexScreenerPool(pair, token),
+    )).filter((pool): pool is ScoredPool => pool !== null && pool.activeLiquidity);
+
+    return scored.map((pool) => ({ ...pool, pair: `${pool.pair} [${stock.symbol}]` }));
   }
 
   async investigatePool(poolAddress: string, chain: ChainName = "robinhood"): Promise<InvestigateResult> {

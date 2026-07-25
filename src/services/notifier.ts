@@ -81,6 +81,7 @@ export class Notifier {
   private tokenScanRunning = false;
   private scanV2Running = false;
   private gemScanRunning = false;
+  private stockScanRunning = false;
   private deletionTimer: ReturnType<typeof setInterval> | null = null;
   private readonly openConfirmations = new Map<string, OpenPositionPreview>();
   private positionOpener?: PositionOpener;
@@ -116,6 +117,7 @@ export class Notifier {
       { command: "scan", description: "Scan token — /scan [base|robinhood] <contract>" },
       ...(this.config.scanV2Enabled ? [{ command: "scanv2", description: "Scan concentrated yield — /scanv2 [chain] <contract> [range%]" }] : []),
       { command: "scan_pools", description: "Cari pool V3/V4 dengan estimasi yield 1 jam tertinggi" },
+      { command: "scan_stocks", description: "Scan pool tokenized stock (NVDA AAPL TSLA dll) by yield" },
       { command: "investigate", description: "Cek yield/h pool — /investigate <address atau link Uniswap>" },
       { command: "gem", description: "💎 Hidden gem radar — yield gacor V3/V4" },
       { command: "history", description: "Tampilkan riwayat posisi close >= ±0.5% PnL" },
@@ -142,6 +144,10 @@ export class Notifier {
     this.bot.command("scan_pools", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleScanPools(ctx, database, scanner);
+    });
+    this.bot.command("scan_stocks", async (ctx: ChatContext) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
+      await this.handleScanStocks(ctx, scanner);
     });
     this.bot.command("investigate", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
@@ -1030,6 +1036,68 @@ export class Notifier {
     if (!this.bot) return;
     try {
       await this.bot.api.editMessageText(chatId, messageId, `🏆 SCAN POOLS BERJALAN\n${stage}`);
+      await this.queueTemp(chatId, messageId, 120_000);
+    } catch {
+      // Final result is sent as a new message if this progress message disappears.
+    }
+  }
+
+  private async handleScanStocks(ctx: Context, scanner: PoolScanner): Promise<void> {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId || !this.authorized(chatId, ctx.from?.id.toString())) return;
+    if (this.stockScanRunning) {
+      await this.replyTemp(ctx, "📊 Stock scan masih berjalan. Tunggu hasil sebelumnya.");
+      return;
+    }
+    this.stockScanRunning = true;
+    const progress = await ctx.reply("📊 Memeriksa pool tokenized stock (NVDA AAPL GME TSLA MSFT GOOGL MU SPY SPCX PLTR INTC AMZN AMD) berdasarkan yield 1h...");
+    const messageId = progress.message_id;
+    void this.queueTemp(chatId, messageId, 120_000);
+    void this.executeStockScan(scanner, chatId, messageId).catch((error) =>
+      log.error({ error: errorMessage(error) }, "stock scan background job failed"),
+    );
+  }
+
+  private async executeStockScan(scanner: PoolScanner, chatId: string, messageId: number): Promise<void> {
+    let stage = "Memuat data tokenized stocks...";
+    const startedAt = Date.now();
+    const heartbeat = setInterval(() => {
+      void this.refreshStockScanProgress(chatId, messageId, `${stage}\nElapsed: ${Math.floor((Date.now() - startedAt) / 1_000)}s`);
+    }, 20_000);
+    try {
+      const scan = await scanner.scanStocks((nextStage) => { stage = nextStage; });
+      const text = formatStockScan(scan);
+      if (!this.bot) return;
+      try {
+        await this.bot.api.editMessageText(chatId, messageId, text);
+      } catch (editError) {
+        const details = errorMessage(editError);
+        if (!details.includes("message is not modified")) {
+          await this.sendTemp([text], chatId, 300_000);
+          return;
+        }
+      }
+      await this.queueTemp(chatId, messageId, 300_000);
+    } catch (error) {
+      const text = "Stock scan gagal. Coba lagi nanti.";
+      if (this.bot) {
+        try {
+          await this.bot.api.editMessageText(chatId, messageId, text);
+          await this.queueTemp(chatId, messageId, 300_000);
+        } catch {
+          await this.sendTemp([text], chatId, 300_000);
+        }
+      }
+    } finally {
+      clearInterval(heartbeat);
+      this.stockScanRunning = false;
+    }
+  }
+
+  private async refreshStockScanProgress(chatId: string, messageId: number, stage: string): Promise<void> {
+    if (!this.bot) return;
+    try {
+      await this.bot.api.editMessageText(chatId, messageId, `📊 STOCK SCAN BERJALAN\n${stage}`);
       await this.queueTemp(chatId, messageId, 120_000);
     } catch {
       // Final result is sent as a new message if this progress message disappears.
@@ -2044,6 +2112,30 @@ function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters): s
     lines.push(`   Pool TVL: $${fmtUsd(pool.tvlUsd)} | Uniswap: ${pool.uniswapUrl}`);
   }
   lines.push("", "Yield adalah estimasi gross pool, bukan hasil personal LP.");
+  return lines.join("\n");
+}
+
+function formatStockScan(scan: PoolMarketScan): string {
+  const lines = [
+    "📊 STOCK POOL YIELD 1H",
+    "Chain: Robinhood | Uniswap V3/V4",
+    `Stocks: NVDA AAPL GME TSLA MSFT GOOGL MU SPY SPCX PLTR INTC AMZN AMD`,
+    `Dievaluasi: ${scan.evaluatedTokens} stocks | Lolos: ${scan.qualifiedTokens}`,
+    `Filter: yield/h > 0.1%`,
+    "",
+  ];
+  if (scan.pools.length === 0) {
+    lines.push("Tidak ada stock pool dengan yield > 0.1%/h saat ini.");
+    return lines.join("\n");
+  }
+  for (let index = 0; index < scan.pools.length; index++) {
+    const pool = scan.pools[index]!;
+    const effectiveFee = pool.currentLpFee ?? pool.feeTier;
+    lines.push(`${index + 1}. ${pool.protocol.toUpperCase()} ${pool.pair} | ${(effectiveFee / 10_000).toFixed(2)}%${pool.dynamicFee ? " dynamic" : ""}`);
+    lines.push(`   Yield/h: ${fmtPercent(pool.estimatedPoolYield1hPercent)} | Vol 1h: $${fmtUsd(pool.volume1hUsd)} | Est. fees 1h: $${fmtUsd(pool.estimatedPoolFees1hUsd)}`);
+    lines.push(`   Pool TVL: $${fmtUsd(pool.tvlUsd)} | 6h avg: ${fmtPercent(pool.estimatedPoolYieldHourlyPercent)}/h${pool.warnings.length > 0 ? ` | ${pool.warnings.join(", ")}` : ""}`);
+  }
+  lines.push("", "Yield = vol1h × fee / TVL. Bukan jaminan return personal LP.");
   return lines.join("\n");
 }
 
