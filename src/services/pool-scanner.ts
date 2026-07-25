@@ -313,7 +313,9 @@ export class PoolScanner {
     const highestActivity = [...relevant]
       .sort((left, right) => Number(right.volume?.h1 ?? 0) - Number(left.volume?.h1 ?? 0) || Number(right.liquidity?.usd ?? 0) - Number(left.liquidity?.usd ?? 0))
       .slice(0, MAX_DEXSCREENER_POOL_VERIFICATIONS);
-    const scored = (await mapWithConcurrency(highestActivity, 3, (pair) => this.toDexScreenerPool(pair, token))).filter((pool): pool is ScoredPool => pool !== null);
+    const hasMissingTvl = highestActivity.some((pair) => !Number(pair.liquidity?.usd ?? 0));
+    const geckoTvlFallback = hasMissingTvl ? await this.buildGeckoTvlMap(token) : undefined;
+    const scored = (await mapWithConcurrency(highestActivity, 3, (pair) => this.toDexScreenerPool(pair, token, geckoTvlFallback))).filter((pool): pool is ScoredPool => pool !== null);
     const active = scored.filter((pool) => pool.activeLiquidity);
     const totalActiveTvlUsd = active.reduce((total, pool) => total + pool.tvlUsd, 0);
     if (totalActiveTvlUsd <= filters.minTotalActiveTvlUsd) return null;
@@ -341,10 +343,11 @@ export class PoolScanner {
     }
   }
 
-  private async toDexScreenerPool(pair: DexScreenerPair, token: string): Promise<ScoredPool | null> {
+  private async toDexScreenerPool(pair: DexScreenerPair, token: string, geckoTvlFallback?: Map<string, number>): Promise<ScoredPool | null> {
     const protocol = pair.labels?.includes("v4") ? "v4" : pair.labels?.includes("v3") ? "v3" : null;
     if (!protocol) return null;
-    const tvlUsd = Number(pair.liquidity?.usd ?? 0);
+    const dexTvl = Number(pair.liquidity?.usd ?? 0);
+    const tvlUsd = dexTvl > 0 ? dexTvl : (geckoTvlFallback?.get(pair.pairAddress.toLowerCase()) ?? 0);
     const volume1hUsd = Number(pair.volume?.h1 ?? 0);
     const volume6hUsd = Number(pair.volume?.h6 ?? 0);
     if (!Number.isFinite(tvlUsd) || tvlUsd <= 0 || !Number.isFinite(volume1hUsd) || volume1hUsd < 0 || !Number.isFinite(volume6hUsd) || volume6hUsd < 0) return null;
@@ -458,6 +461,23 @@ export class PoolScanner {
       const usd = Number(pair.liquidity?.usd ?? 0);
       if (Number.isFinite(usd) && usd > 0) {
         map.set(pair.pairAddress.toLowerCase(), usd);
+      }
+    }
+    return map;
+  }
+
+  async buildGeckoTvlMap(token: string): Promise<Map<string, number>> {
+    const map = new Map<string, number>();
+    let pools: GeckoPool[];
+    try {
+      pools = await this.fetchUniswapPools(token, "robinhood", "background");
+    } catch {
+      return map;
+    }
+    for (const pool of pools) {
+      const usd = Number(pool.attributes.reserve_in_usd || "0");
+      if (Number.isFinite(usd) && usd > 0) {
+        map.set(pool.attributes.address.toLowerCase(), usd);
       }
     }
     return map;
@@ -769,8 +789,10 @@ export class PoolScanner {
       .sort((a, b) => Number(b.volume?.h1 ?? 0) - Number(a.volume?.h1 ?? 0) || Number(b.liquidity?.usd ?? 0) - Number(a.liquidity?.usd ?? 0))
       .slice(0, MAX_DEXSCREENER_POOL_VERIFICATIONS);
 
+    const hasMissingTvl = top.some((pair) => !Number(pair.liquidity?.usd ?? 0));
+    const geckoTvlFallback = hasMissingTvl ? await this.buildGeckoTvlMap(token) : undefined;
     const scored = (await mapWithConcurrency(top, STOCK_VERIFY_CONCURRENCY, (pair) =>
-      this.toDexScreenerPool(pair, token),
+      this.toDexScreenerPool(pair, token, geckoTvlFallback),
     )).filter((pool): pool is ScoredPool => pool !== null && pool.activeLiquidity);
 
     return scored.map((pool) => ({ ...pool, pair: `${pool.pair} [${stock.symbol}]` }));
@@ -791,6 +813,12 @@ export class PoolScanner {
     const feeTier = onChain.feeTier ?? 0;
     const currentLpFee = onChain.currentLpFee;
     const dynamicFee = protocol === "v4" && currentLpFee !== undefined && currentLpFee !== feeTier;
+
+    let resolvedTvlUsd = Number(dexData?.liquidity?.usd ?? 0);
+    if (resolvedTvlUsd <= 0 && dexData) {
+      const geckoTvlMap = await this.buildGeckoTvlMap(dexData.baseToken.address.toLowerCase());
+      resolvedTvlUsd = geckoTvlMap.get(normalized) ?? 0;
+    }
 
     if (!dexData) {
       const symbol = protocol === "v3" ? shortAddr(normalized as Address) : "V4";
@@ -830,7 +858,7 @@ export class PoolScanner {
       currentLpFee,
       dynamicFee,
       activeLiquidity: onChain.activeLiquidity,
-      tvlUsd: Number(dexData.liquidity?.usd ?? 0),
+      tvlUsd: resolvedTvlUsd,
       volume1hUsd: Number(dexData.volume?.h1 ?? 0),
       volume6hUsd: Number(dexData.volume?.h6 ?? 0),
       volume24hUsd: Number(dexData.volume?.h24 ?? 0),

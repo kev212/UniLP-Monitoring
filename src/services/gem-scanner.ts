@@ -116,8 +116,10 @@ export class GemScanner {
       : 0;
 
     const results: GemCandidate[] = [];
+    const hasMissingTvl = lpPairs.some((p) => !Number(p.liquidity?.usd ?? 0));
+    const geckoTvlFallback = hasMissingTvl ? await this.poolScanner.buildGeckoTvlMap(token) : undefined;
     for (const pair of lpPairs) {
-      const candidate = await this.evaluatePair(pair, token, tokenVolume1hUsd, valuation, tokenOldestPoolAgeSeconds);
+      const candidate = await this.evaluatePair(pair, token, tokenVolume1hUsd, valuation, tokenOldestPoolAgeSeconds, geckoTvlFallback);
       if (candidate) results.push(candidate);
     }
 
@@ -133,9 +135,11 @@ export class GemScanner {
     tokenVolume1hUsd: number,
     valuation: { value: number; source: "market_cap" | "fdv" },
     tokenOldestPoolAgeSeconds: number,
+    geckoTvlFallback?: Map<string, number>,
   ): Promise<GemCandidate | null> {
     const protocol = pair.labels?.includes("v4") ? "v4" : "v3";
-    const tvlUsd = Number(pair.liquidity?.usd ?? 0);
+    const dexTvl = Number(pair.liquidity?.usd ?? 0);
+    const tvlUsd = dexTvl > 0 ? dexTvl : (geckoTvlFallback?.get(pair.pairAddress.toLowerCase()) ?? 0);
     if (!Number.isFinite(tvlUsd) || tvlUsd <= 0) return null;
 
     const volume1hUsd = Number(pair.volume?.h1 ?? 0);
