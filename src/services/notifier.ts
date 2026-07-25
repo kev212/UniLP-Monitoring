@@ -2134,6 +2134,7 @@ function formatStockScan(scan: PoolMarketScan): string {
     lines.push(`${index + 1}. ${pool.protocol.toUpperCase()} ${pool.pair} | ${(effectiveFee / 10_000).toFixed(2)}%${pool.dynamicFee ? " dynamic" : ""}`);
     lines.push(`   Yield/h: ${fmtPercent(pool.estimatedPoolYield1hPercent)} | Vol 1h: $${fmtUsd(pool.volume1hUsd)} | Est. fees 1h: $${fmtUsd(pool.estimatedPoolFees1hUsd)}`);
     lines.push(`   Pool TVL: $${fmtUsd(pool.tvlUsd)} | 6h avg: ${fmtPercent(pool.estimatedPoolYieldHourlyPercent)}/h${pool.warnings.length > 0 ? ` | ${pool.warnings.join(", ")}` : ""}`);
+    lines.push(`   ${pool.uniswapUrl}`);
   }
   lines.push("", "Yield = vol1h × fee / TVL. Bukan jaminan return personal LP.");
   return lines.join("\n");
