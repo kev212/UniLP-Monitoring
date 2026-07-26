@@ -3,18 +3,17 @@ import { zeroAddress, type Address } from "viem";
 import { erc20Abi } from "../abi.js";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
-import type { ChainName, PositionRecord } from "../types.js";
+import type { ChainName } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
-import type { PnlService } from "./pnl.js";
 
 const REFRESH_INTERVAL_MS = 3 * 60_000;
 const DEXSCREENER_BASE = "https://api.dexscreener.com";
+const PORTFOLIO_CHAIN: ChainName = "robinhood";
 
 export interface PortfolioSnapshot {
   totalUsd: number;
   walletUsd: number;
   activeLpUsd: number;
-  unpricedTokens: number;
   updatedAt: Date;
   calculating: boolean;
 }
@@ -37,7 +36,6 @@ export class PortfolioService {
     totalUsd: 0,
     walletUsd: 0,
     activeLpUsd: 0,
-    unpricedTokens: 0,
     updatedAt: new Date(0),
     calculating: true,
   };
@@ -48,7 +46,6 @@ export class PortfolioService {
     private readonly config: RuntimeConfig,
     private readonly chains: ChainClients,
     private readonly database: Database,
-    private readonly pnl: PnlService,
   ) {}
 
   getSnapshot(): PortfolioSnapshot {
@@ -69,15 +66,11 @@ export class PortfolioService {
     if (this.refreshRunning) return;
     this.refreshRunning = true;
     try {
-      const results = await Promise.all(this.config.chains.map((chain) => this.refreshChain(chain)));
-      const walletUsd = results.reduce((sum, result) => sum + result.walletUsd, 0);
-      const activeLpUsd = results.reduce((sum, result) => sum + result.activeLpUsd, 0);
-      const unpricedTokens = results.reduce((sum, result) => sum + result.unpricedTokens, 0);
+      const { walletUsd, activeLpUsd } = await this.refreshChain(PORTFOLIO_CHAIN);
       this.snapshot = {
         totalUsd: walletUsd + activeLpUsd,
         walletUsd,
         activeLpUsd,
-        unpricedTokens,
         updatedAt: new Date(),
         calculating: false,
       };
@@ -88,8 +81,7 @@ export class PortfolioService {
     }
   }
 
-  private async refreshChain(chain: ChainName): Promise<{ walletUsd: number; activeLpUsd: number; unpricedTokens: number }> {
-    const { client } = this.chains.getForScan(chain);
+  private async refreshChain(chain: ChainName): Promise<{ walletUsd: number; activeLpUsd: number }> {
     const positions = (await this.database.listActivePositions(this.chains.get(chain).registry.chain.id))
       .filter((position) => position.status === "armed" && position.owner.toLowerCase() === this.config.executorAddress.toLowerCase());
     const excludedWalletTokens = new Set(
@@ -98,18 +90,19 @@ export class PortfolioService {
         .map((position) => position.poolAddress!.toLowerCase()),
     );
     const balances = await this.walletBalances(chain, excludedWalletTokens);
+    const snapshots = await this.database.getLatestSnapshots(positions.map((position) => position.id));
     const addresses = [...new Set([
       ...balances.map((balance) => balance.address.toLowerCase()),
-      ...positions.flatMap((position) => [position.token0, position.token1]),
+      ...positions.flatMap((position) => position.quoteToken ? [position.quoteToken] : []),
       ...this.config.quoteTokens[chain].map((token) => token.address),
     ])] as Address[];
     const prices = await this.tokenPrices(chain, addresses);
-    let unpricedTokens = 0;
+    const stable = this.config.quoteTokens[chain].find((token) => token.symbol === "USDG");
+    const stableDecimals = stable ? await this.tokenDecimals(chain, stable.address) : 6;
     let walletUsd = 0;
     for (const balance of balances) {
       const price = this.usdPrice(chain, balance.address, prices);
       if (price === null) {
-        unpricedTokens += 1;
         continue;
       }
       walletUsd += Number(balance.amount) / 10 ** balance.decimals * price;
@@ -117,20 +110,16 @@ export class PortfolioService {
 
     let activeLpUsd = 0;
     for (const position of positions) {
-      try {
-        if (!position.quoteToken) continue;
-        const valued = await this.pnl.value(position, await client.getBlockNumber(), this.config.maxSwapSlippageBps, false);
-        const quotePrice = this.usdPrice(chain, position.quoteToken, prices);
-        if (quotePrice !== null) {
-          const decimals = await this.tokenDecimals(chain, position.quoteToken);
-          const totalQuote = valued.snapshot.liquidationQuote + valued.snapshot.feeQuote;
-          activeLpUsd += Number(totalQuote) / 10 ** decimals * quotePrice;
-        }
-      } catch {
-        unpricedTokens += 1;
-      }
+      if (!position.quoteToken) continue;
+      const snapshot = snapshots.get(position.id);
+      if (!snapshot) continue;
+      const quotePrice = this.usdPrice(chain, position.quoteToken, prices);
+      if (quotePrice === null) continue;
+      const decimals = await this.tokenDecimals(chain, position.quoteToken);
+      activeLpUsd += Number(snapshot.liquidationQuote) / 10 ** decimals * quotePrice;
+      activeLpUsd += Number(snapshot.feeQuoteUsdg) / 10 ** stableDecimals;
     }
-    return { walletUsd, activeLpUsd, unpricedTokens };
+    return { walletUsd, activeLpUsd };
   }
 
   private async walletBalances(chain: ChainName, excluded: Set<string>): Promise<TokenBalance[]> {
@@ -188,12 +177,10 @@ export class PortfolioService {
           const price = Number(pair.priceUsd);
           const base = pair.baseToken?.address?.toLowerCase();
           if (base && Number.isFinite(price) && price > 0 && !prices.has(base)) prices.set(base, price);
-          const quote = pair.quoteToken?.address?.toLowerCase();
-          if (quote && Number.isFinite(price) && price > 0 && !prices.has(quote)) prices.set(quote, price);
         }
-      } catch {
-        // Individual unpriced tokens are reported through unpricedTokens.
-      }
+        } catch {
+          // Tokens without a DexScreener USD price are excluded from the total.
+        }
     }
     const nativePrice = prices.get(this.config.quoteTokens[chain].find((token) => token.symbol === "WETH")?.address.toLowerCase() ?? "");
     if (nativePrice !== undefined) prices.set(zeroAddress, nativePrice);

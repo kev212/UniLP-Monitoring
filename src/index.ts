@@ -43,7 +43,7 @@ async function main(): Promise<void> {
   const scanner = new PoolScanner(chains, database);
   const positionOpener = new PositionOpener(config, chains);
   const gemScanner = new GemScanner(chains, database, scanner, config.quoteTokens.robinhood);
-  const portfolio = new PortfolioService(config, chains, database, pnl);
+  const portfolio = new PortfolioService(config, chains, database);
   notifier.setPositionOpener(positionOpener);
   notifier.setGemScanner(gemScanner);
   notifier.setPortfolioService(portfolio);

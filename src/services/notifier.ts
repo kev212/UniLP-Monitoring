@@ -645,7 +645,6 @@ export class Notifier {
       const portfolio = this.portfolioService.getSnapshot();
       const age = portfolio.updatedAt.getTime() > 0 ? ` · updated ${formatAge(Date.now() - portfolio.updatedAt.getTime())} ago` : "";
       lines.push(`💰 Total balance: ${portfolio.calculating ? "calculating..." : `$${formatUsdValue(portfolio.totalUsd)}${age}`}`);
-      if (portfolio.unpricedTokens > 0) lines.push(`⚠️ ${portfolio.unpricedTokens} token belum memiliki harga`);
       lines.push("");
     }
 
