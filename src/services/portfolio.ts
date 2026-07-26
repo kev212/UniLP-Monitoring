@@ -9,6 +9,7 @@ import type { ChainClients } from "./chain-client.js";
 const REFRESH_INTERVAL_MS = 3 * 60_000;
 const DEXSCREENER_BASE = "https://api.dexscreener.com";
 const PORTFOLIO_CHAIN: ChainName = "robinhood";
+const ROBINHOOD_USDG_WETH_PAIR = "0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca";
 
 export interface PortfolioSnapshot {
   totalUsd: number;
@@ -32,6 +33,10 @@ interface DexTokenPair {
   liquidity?: { usd?: number | null };
 }
 
+interface DexPairResponse {
+  pairs?: DexTokenPair[] | null;
+}
+
 export class PortfolioService {
   private snapshot: PortfolioSnapshot = {
     totalUsd: 0,
@@ -42,6 +47,7 @@ export class PortfolioService {
   };
   private refreshRunning = false;
   private refreshTimer?: ReturnType<typeof setInterval>;
+  private lastWethUsd?: number;
 
   constructor(
     private readonly config: RuntimeConfig,
@@ -173,8 +179,14 @@ export class PortfolioService {
       }
     }
     const wethAddress = this.config.quoteTokens[chain].find((token) => token.symbol === "WETH")?.address.toLowerCase();
-    let wethUsd: number | undefined;
-    let wethLiquidity = -1;
+    if (wethAddress) {
+      const wethUsd = await this.canonicalWethPrice(chain, wethAddress, stableAddresses);
+      if (wethUsd !== null) this.lastWethUsd = wethUsd;
+      if (this.lastWethUsd !== undefined) {
+        prices.set(wethAddress, this.lastWethUsd);
+        prices.set(zeroAddress, this.lastWethUsd);
+      }
+    }
     const nonStable = addresses.filter((address) => !prices.has(address.toLowerCase()) && address.toLowerCase() !== zeroAddress);
     for (let offset = 0; offset < nonStable.length; offset += 25) {
       const batch = nonStable.slice(offset, offset + 25);
@@ -186,28 +198,34 @@ export class PortfolioService {
           const price = Number(pair.priceUsd);
           const base = pair.baseToken?.address?.toLowerCase();
           if (base && Number.isFinite(price) && price > 0 && !prices.has(base)) prices.set(base, price);
-          const quote = pair.quoteToken?.address?.toLowerCase();
-          const nativePrice = Number(pair.priceNative);
-          const liquidity = pair.liquidity?.usd ?? 0;
-          if (wethAddress && quote === wethAddress && base && stableAddresses.has(base)
-            && Number.isFinite(price) && price > 0 && Number.isFinite(nativePrice) && nativePrice > 0 && liquidity > wethLiquidity) {
-            wethUsd = price / nativePrice;
-            wethLiquidity = liquidity;
-          }
-          if (wethAddress && base === wethAddress && Number.isFinite(price) && price > 0 && liquidity > wethLiquidity) {
-            wethUsd = price;
-            wethLiquidity = liquidity;
-          }
         }
         } catch {
           // Tokens without a DexScreener USD price are excluded from the total.
         }
     }
-    if (wethAddress && wethUsd !== undefined) {
-      prices.set(wethAddress, wethUsd);
-      prices.set(zeroAddress, wethUsd);
-    }
     return prices;
+  }
+
+  private async canonicalWethPrice(chain: ChainName, wethAddress: string, stableAddresses: Set<string>): Promise<number | null> {
+    if (chain !== "robinhood") return null;
+    try {
+      const response = await fetch(`${DEXSCREENER_BASE}/latest/dex/pairs/robinhood/${ROBINHOOD_USDG_WETH_PAIR}`, { signal: AbortSignal.timeout(15_000) });
+      if (!response.ok) return null;
+      const payload = await response.json() as DexPairResponse;
+      for (const pair of payload.pairs ?? []) {
+        const base = pair.baseToken?.address?.toLowerCase();
+        const quote = pair.quoteToken?.address?.toLowerCase();
+        const price = Number(pair.priceUsd);
+        const nativePrice = Number(pair.priceNative);
+        if (quote === wethAddress && base && stableAddresses.has(base)
+          && Number.isFinite(price) && price > 0 && Number.isFinite(nativePrice) && nativePrice > 0) {
+          return price / nativePrice;
+        }
+      }
+    } catch {
+      // Preserve the most recent valid WETH price when DexScreener is temporarily unavailable.
+    }
+    return null;
   }
 
   private usdPrice(chain: ChainName, address: Address | null, prices: Map<string, number>): number | null {

@@ -13,25 +13,21 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe("PortfolioService", () => {
   it("derives WETH and native ETH USD prices from the most liquid USDG/WETH pair", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => [
-        {
-          baseToken: { address: USDG },
-          quoteToken: { address: WETH },
-          priceUsd: "1",
-          priceNative: "0.0005",
-          liquidity: { usd: 100 },
-        },
-        {
-          baseToken: { address: USDG },
-          quoteToken: { address: WETH },
-          priceUsd: "1.00089",
-          priceNative: "0.0005317",
-          liquidity: { usd: 5_872_334 },
-        },
-      ],
-    }));
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          pairs: [{
+            baseToken: { address: USDG },
+            quoteToken: { address: WETH },
+            priceUsd: "1.00089",
+            priceNative: "0.0005317",
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+      }));
     const service = new PortfolioService({
       quoteTokens: {
         robinhood: [{ address: USDG, symbol: "USDG" }, { address: WETH, symbol: "WETH" }],
@@ -43,5 +39,9 @@ describe("PortfolioService", () => {
 
     expect(prices.get(WETH.toLowerCase())).toBeCloseTo(1.00089 / 0.0005317, 8);
     expect(prices.get(zeroAddress)).toBeCloseTo(1.00089 / 0.0005317, 8);
+
+    const cachedPrices = await (service as unknown as { tokenPrices(chain: "robinhood", addresses: Address[]): Promise<Map<string, number>> })
+      .tokenPrices("robinhood", [WETH]);
+    expect(cachedPrices.get(WETH.toLowerCase())).toBeCloseTo(1.00089 / 0.0005317, 8);
   });
 });
