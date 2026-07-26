@@ -868,11 +868,11 @@ export class Notifier {
     const oorStatus = formatDashboardRangeStatus(rangeStatus, position.metadata);
 
     if (rangeStatus === "below" || rangeStatus === "above") {
-      return `\n   ${line.bar}  ${oorStatus.replace(" | ⚠️ ", "")}\n   Range ${formatCompactPrice(minimum, quoteSymbol)} – ${formatCompactPrice(maximum, quoteSymbol)} · now ${formatCompactPrice(current, quoteSymbol)}`;
+      return `\n   ${line.bar}  ${oorStatus.replace(" | ⚠️ ", "")}\n   ${formatCompactPrice(minimum, quoteSymbol)} – ${formatCompactPrice(maximum, quoteSymbol)} · ${formatCompactPrice(current, quoteSymbol)}`;
     }
 
     const pctLabel = line.percent !== null ? ` ${line.percent}%` : "";
-    return `\n   ${line.bar}${pctLabel}\n   Range ${formatCompactPrice(minimum, quoteSymbol)} – ${formatCompactPrice(maximum, quoteSymbol)} · now ${formatCompactPrice(current, quoteSymbol)}`;
+    return `\n   ${line.bar}${pctLabel}\n   ${formatCompactPrice(minimum, quoteSymbol)} – ${formatCompactPrice(maximum, quoteSymbol)} · ${formatCompactPrice(current, quoteSymbol)}`;
   }
 
   private lastScanAt = 0;
@@ -1984,15 +1984,16 @@ export function formatCompactPrice(scaledValue: bigint, quoteSymbol: string): st
 
 export function positionRangeLine(minimum: bigint, maximum: bigint, current: bigint): { bar: string; percent: number | null } {
   const LEN = 10;
-  if (maximum <= minimum) return { bar: "🟢" + "━".repeat(LEN - 1), percent: null };
-  if (current <= minimum) return { bar: "🟢" + "━".repeat(LEN - 1), percent: 0 };
-  if (current >= maximum) return { bar: "━".repeat(LEN - 1) + "🟢", percent: 100 };
+  if (maximum <= minimum) return { bar: "│" + "━".repeat(LEN - 1), percent: null };
+  if (current <= minimum) return { bar: "│" + "━".repeat(LEN - 1), percent: 0 };
+  if (current >= maximum) return { bar: "━".repeat(LEN - 1) + "│", percent: 100 };
   const pct = Math.round(Number(((current - minimum) * 100n) / (maximum - minimum)));
   const idx = Math.max(0, Math.min(LEN - 1, Math.floor((pct / 100) * LEN)));
-  return { bar: "━".repeat(idx) + "🟢" + "━".repeat(LEN - 1 - idx), percent: pct };
+  return { bar: "━".repeat(idx) + "│" + "━".repeat(LEN - 1 - idx), percent: pct };
 }
 
 export function formatFeeTier(fee: number): string {
+  if (fee === 0x800000) return "dynamic";
   const pct = fee / 10_000;
   return `${Number.isInteger(pct) ? pct : pct.toFixed(2)}%`;
 }
