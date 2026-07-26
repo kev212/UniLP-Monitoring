@@ -22,6 +22,7 @@ import {
   erc20Abi,
   erc20TransferEvent,
   permit2Abi,
+  wethAbi,
   v2RouterAbi,
   v3FactoryAbi,
   v3PoolAbi,
@@ -244,6 +245,7 @@ export class Executor {
     const durableMetadata = await this.database.getPositionMetadata(position.id);
     if (durableMetadata) position = { ...position, metadata: durableMetadata };
     if (await this.recoverPendingApproval(position)) return;
+    if (await this.recoverPendingUnwrap(position)) return;
     if (position.metadata.settlementPhase === "removing_liquidity") {
       const recovered = await this.recoverConfirmedClose(position);
       if (!recovered) return;
@@ -258,10 +260,7 @@ export class Executor {
         });
         return;
       }
-      await this.saveSettlementBalance(position);
-      await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, settlementPhase: "settled" });
-      await this.notifier.settled(position);
-      this.finalizeCloseHistory(position);
+      await this.completeSettlement(position);
       return;
     }
     const recoveredPosition = await this.recoverSettlementPosition(position);
@@ -283,17 +282,8 @@ export class Executor {
       }
       if (receipt.status === "success") {
         await this.database.recordExecution(position.id, "swap_to_quote", "confirmed", submittedSwap);
-        await this.saveSettlementBalance(position, 0n, submittedSwap as Hex);
-        await this.database.setPositionStatus(position.id, "settled", {
-          pendingSwap: null,
-          swapTransactionHash: submittedSwap,
-          settlementPhase: "settled",
-          swapRetry: null,
-          pendingRawTransaction: null,
-        });
+        await this.completeSettlement(position, 0n, submittedSwap as Hex, submittedSwap);
         log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "reconciled submitted swap receipt");
-        await this.notifier.settled(position);
-        this.finalizeCloseHistory(position);
         return;
       }
       await this.database.recordExecution(position.id, "swap_to_quote", "failed", submittedSwap, "transaction reverted");
@@ -359,10 +349,7 @@ export class Executor {
         await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "swap_to_quote" });
         return;
       }
-      await this.saveSettlementBalance(position, prepared.expectedOut, hash);
-      await this.database.setPositionStatus(position.id, "settled", { pendingSwap: null, swapTransactionHash: hash, settlementPhase: "settled", swapRetry: null });
-      await this.notifier.settled(position);
-      this.finalizeCloseHistory(position);
+      await this.completeSettlement(position, prepared.expectedOut, hash, hash);
     } catch (error) {
       if (error instanceof PendingExecutionError) return;
       if (error instanceof RevertedExecutionError) {
@@ -510,7 +497,58 @@ export class Executor {
     return { ...position, status: "closing", metadata: nextMetadata };
   }
 
-  private async saveSettlementBalance(position: PositionRecord, swapExpectedOut = 0n, swapTransactionHash?: Hex): Promise<void> {
+  private async completeSettlement(position: PositionRecord, swapExpectedOut = 0n, swapTransactionHash?: Hex, swapHash?: string): Promise<void> {
+    const totalReceived = await this.saveSettlementBalance(position, swapExpectedOut, swapTransactionHash);
+    if (!(await this.unwrapWethQuote(position, totalReceived))) return;
+    await this.database.setPositionStatus(position.id, "settled", {
+      pendingSwap: null,
+      ...(swapHash ? { swapTransactionHash: swapHash } : {}),
+      settlementPhase: "settled",
+      swapRetry: null,
+      pendingRawTransaction: null,
+    });
+    await this.notifier.settled(position);
+    this.finalizeCloseHistory(position);
+  }
+
+  private async unwrapWethQuote(position: PositionRecord, amount: bigint): Promise<boolean> {
+    const weth = this.wethQuoteToken(position);
+    if (!weth || amount === 0n) return true;
+
+    const metadata = (await this.database.getPositionMetadata(position.id)) ?? position.metadata as Record<string, unknown>;
+    if (metadata.unwrapQuoteConfirmed === true && metadata.unwrapQuoteAmount === amount.toString()) return true;
+
+    await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+      settlementPhase: "unwrapping_quote",
+      unwrapQuoteAmount: amount.toString(),
+    });
+    const hash = await this.send(position, "unwrap_quote", {
+      chainId: position.chainId,
+      to: weth,
+      data: encodeFunctionData({ abi: wethAbi, functionName: "withdraw", args: [amount] }),
+      description: "unwrap_quote",
+    });
+    if (!hash) {
+      await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "unwrap_quote" });
+      return false;
+    }
+    await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+      unwrapQuoteAmount: amount.toString(),
+      unwrapQuoteTransactionHash: hash,
+      unwrapQuoteConfirmed: true,
+      settlementPhase: "accounting",
+    });
+    return true;
+  }
+
+  private wethQuoteToken(position: PositionRecord): Address | null {
+    if (!position.quoteToken || position.quoteToken.toLowerCase() === zeroAddress) return null;
+    const { registry } = this.chains.getById(position.chainId);
+    const weth = this.config.quoteTokens[registry.name]?.find((token) => token.symbol === "WETH");
+    return weth && weth.address.toLowerCase() === position.quoteToken.toLowerCase() ? weth.address : null;
+  }
+
+  private async saveSettlementBalance(position: PositionRecord, swapExpectedOut = 0n, swapTransactionHash?: Hex): Promise<bigint> {
     if (!position.quoteToken) throw new Error("Cannot record settlement without a quote token");
     // The in-memory object predates the closing status update. Read the durable
     // metadata so direct close proceeds and recorded gas cannot be lost on resume.
@@ -566,6 +604,7 @@ export class Executor {
       totalReceived: totalReceived.toString(),
       settlementUsd: settlementUsd.toString(),
     });
+    return totalReceived;
   }
 
   private async quoteOutputFromReceipt(position: PositionRecord, transactionHash: Hex): Promise<bigint> {
@@ -1210,6 +1249,34 @@ export class Executor {
       return false;
     } catch (error) {
       if (errorMessage(error).includes("transaction reverted")) throw error;
+      await this.rebroadcastPendingTransaction(position, pending.hash);
+      return true;
+    }
+  }
+
+  private async recoverPendingUnwrap(position: PositionRecord): Promise<boolean> {
+    const pending = parsePendingRawTransaction(position.metadata.pendingRawTransaction);
+    if (!pending || pending.stage !== "unwrap_quote") return false;
+    try {
+      const receipt = await this.getConfirmedReceipt(position.chainId, pending.hash);
+      if (receipt.status !== "success") {
+        await this.database.recordExecution(position.id, "unwrap_quote", "failed", pending.hash, "transaction reverted");
+        await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+          pendingRawTransaction: null,
+          unwrapQuoteConfirmed: null,
+          settlementPhase: "accounting",
+        });
+        return false;
+      }
+      await this.database.recordExecution(position.id, "unwrap_quote", "confirmed", pending.hash);
+      await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+        pendingRawTransaction: null,
+        unwrapQuoteTransactionHash: pending.hash,
+        unwrapQuoteConfirmed: true,
+        settlementPhase: "accounting",
+      });
+      return false;
+    } catch {
       await this.rebroadcastPendingTransaction(position, pending.hash);
       return true;
     }

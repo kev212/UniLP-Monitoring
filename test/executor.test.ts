@@ -6,6 +6,7 @@ import { bufferedGasLimit, Executor, effectiveRemoveSlippageBps, nextExitRetry, 
 import type { PositionRecord } from "../src/types.js";
 
 const usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as const;
+const weth = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73" as const;
 const token = "0xd7321801caae694090694ff55a9323139f043b88" as const;
 const nvda = "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec" as const;
 const owner = "0xeE924367213Ae3764b57d5b9a6214c8188d34060" as const;
@@ -41,6 +42,31 @@ const config = {
 } as RuntimeConfig;
 
 describe("Executor pending settlement recovery", () => {
+  it("unwraps only a WETH quote settlement and leaves USDG and native ETH unchanged", async () => {
+    const database = {
+      getPositionMetadata: vi.fn().mockResolvedValue({}),
+      setPositionStatusUnlessSettled: vi.fn(),
+    };
+    const chains = { getById: vi.fn(() => ({ registry: { name: "robinhood" } })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, {
+      ...config,
+      quoteTokens: { ...config.quoteTokens, robinhood: [{ symbol: "USDG", address: usdg }, { symbol: "WETH", address: weth }] },
+    });
+    const send = vi.spyOn(executor as any, "send").mockResolvedValue(hash);
+    const base = {
+      id: "position", chainId: 4663, protocol: "v3", positionKey: "1", owner, poolAddress: null,
+      token0: token, token1: weth, status: "closing", liquidity: null, openedAtBlock: null, metadata: {},
+    } as const;
+
+    await expect((executor as any).unwrapWethQuote({ ...base, quoteToken: weth }, 42n)).resolves.toBe(true);
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ quoteToken: weth }), "unwrap_quote", expect.objectContaining({ to: weth, description: "unwrap_quote" }));
+
+    send.mockClear();
+    await expect((executor as any).unwrapWethQuote({ ...base, quoteToken: usdg }, 42n)).resolves.toBe(true);
+    await expect((executor as any).unwrapWethQuote({ ...base, quoteToken: zeroAddress }, 42n)).resolves.toBe(true);
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it("derives net ERC-20 proceeds from confirmed receipt transfers", () => {
     const logs = [
       transferLog(token, sender, owner, 120n),
