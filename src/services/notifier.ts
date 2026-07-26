@@ -777,27 +777,28 @@ export class Notifier {
     const t0 = await this.tokenLabel(position.token0, position.chainId);
     const t1 = await this.tokenLabel(position.token1, position.chainId);
     const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
-    const reviewReason = position.status === "needs_review"
-      ? ` | ${reviewReasonDisplay(position.metadata)}`
-      : "";
-    const autoExitDisabled = position.metadata.autoExitDisabled === true ? " | ⚠️ AUTO EXIT DISABLED" : "";
-    const operationalStatus = position.status === "armed" ? "" : ` | ${statusDisplay(position.status)}`;
-    const base = `${index}. ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${operationalStatus}${reviewReason}${autoExitDisabled}`;
+    const reviewReason = position.status === "needs_review" ? ` · ${reviewReasonDisplay(position.metadata)}` : "";
+    const autoExitDisabled = position.metadata.autoExitDisabled === true ? " · ⚠️ AUTO EXIT DISABLED" : "";
+    const operationalStatus = position.status === "armed" ? "" : ` · ${statusDisplay(position.status)}`;
+    const feeTier = typeof position.metadata.fee === "number" ? position.metadata.fee : undefined;
+    const feeLabel = feeTier !== undefined ? ` · ${formatFeeTier(feeTier)}` : "";
 
     if (!snapshot || !position.quoteToken) {
-      if (!position.quoteToken) return `${base}\n`;
+      if (!position.quoteToken) return `${index}. ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}\n`;
       const blockNumber = observation?.blockNumber;
-      if (!blockNumber) return `${base} | ⏳ LOADING\n`;
+      if (!blockNumber) return `${index}. ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled} · ⏳ LOADING\n`;
       return this.formatStatusLine(position, pnl, blockNumber, index);
     }
 
     const qtSymbol = this.quoteSymbol(position.quoteToken);
     const qtDec = await this.decimals(position.quoteToken, position.chainId);
-    const cv = formatToken(snapshot.liquidationQuote, qtDec, 2);
-    const pnlText = `${pnlEmoji(snapshot.pnlBps)} ${formatBps(snapshot.pnlBps)}%`;
+    const cv = formatToken(snapshot.liquidationQuote, qtDec, qtSymbol === "USDG" || qtSymbol === "USDC" ? 2 : 4);
+    const pnlSign = snapshot.pnlBps >= 0n ? "+" : "";
+    const pnlPct = formatBps(snapshot.pnlBps);
+    const pnlArrow = snapshot.pnlBps > 0n ? "📈" : snapshot.pnlBps < 0n ? "📉" : "➖";
     const trailingPeak = trailingPeakDisplay(position.metadata);
     const feeUsdg = snapshot.feeQuoteUsdg ?? 0n;
-    const valueLine = `   💰 ${cv} ${qtSymbol} ${pnlText} | 🪙 ≈$${formatToken(feeUsdg, 6, 2)}${trailingPeak}`;
+    const headerEmoji = snapshot.pnlBps < 0n ? "🔴" : "🟢";
 
     const rangeInfo = observation?.rangeStatus && observation.rangeTickLower !== null && observation.rangeTickUpper !== null && observation.rangeCurrentTick !== null && observation.rangeSqrtPrice !== null
       ? {
@@ -808,43 +809,47 @@ export class Notifier {
           currentSqrtPrice: observation.rangeSqrtPrice,
         } as PositionRangeInfo
       : undefined;
-    const bins = await this.formatPositionBins(position, rangeInfo);
-    return `${base}\n${valueLine}${bins}\n`;
+    const rangeStr = await this.formatPositionRange(position, rangeInfo);
+    const base = `${index}. ${headerEmoji} ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}`;
+    const valueLine = `   💰 ${cv} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${pnlArrow} ${pnlSign}${pnlPct}%${trailingPeak}`;
+    return `${base}\n${valueLine}${rangeStr}\n`;
   }
 
   private async formatStatusLine(position: PositionRecord, pnl: PnlService, blockNumber: bigint | undefined, index: number): Promise<string> {
     const t0 = await this.tokenLabel(position.token0, position.chainId);
     const t1 = await this.tokenLabel(position.token1, position.chainId);
     const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
-    const reviewReason = position.status === "needs_review"
-      ? ` | ${reviewReasonDisplay(position.metadata)}`
-      : "";
-    const autoExitDisabled = position.metadata.autoExitDisabled === true ? " | ⚠️ AUTO EXIT DISABLED" : "";
-    const operationalStatus = position.status === "armed" ? "" : ` | ${statusDisplay(position.status)}`;
-    const base = `${index}. ${position.protocol.toUpperCase()} #${position.positionKey} ${pair}${operationalStatus}${reviewReason}${autoExitDisabled}`;
+    const reviewReason = position.status === "needs_review" ? ` · ${reviewReasonDisplay(position.metadata)}` : "";
+    const autoExitDisabled = position.metadata.autoExitDisabled === true ? " · ⚠️ AUTO EXIT DISABLED" : "";
+    const operationalStatus = position.status === "armed" ? "" : ` · ${statusDisplay(position.status)}`;
+    const feeTier = typeof position.metadata.fee === "number" ? position.metadata.fee : undefined;
+    const feeLabel = feeTier !== undefined ? ` · ${formatFeeTier(feeTier)}` : "";
 
-    if (!position.quoteToken || !blockNumber) return `${base}\n`;
+    if (!position.quoteToken || !blockNumber) return `${index}. ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}\n`;
     try {
       const valued = await pnl.value(position, blockNumber);
       const qtSymbol = this.quoteSymbol(position.quoteToken);
       const qtDec = await this.decimals(position.quoteToken, position.chainId);
-      const cv = formatToken(valued.snapshot.liquidationQuote, qtDec, 2);
-      const pnlText = `${pnlEmoji(valued.snapshot.pnlBps)} ${formatBps(valued.snapshot.pnlBps)}%`;
+      const cv = formatToken(valued.snapshot.liquidationQuote, qtDec, qtSymbol === "USDG" || qtSymbol === "USDC" ? 2 : 4);
+      const pnlSign = valued.snapshot.pnlBps >= 0n ? "+" : "";
+      const pnlPct = formatBps(valued.snapshot.pnlBps);
+      const pnlArrow = valued.snapshot.pnlBps > 0n ? "📈" : valued.snapshot.pnlBps < 0n ? "📉" : "➖";
       const trailingPeak = trailingPeakDisplay(position.metadata);
-      const valueLine = `   💰 ${cv} ${qtSymbol} ${pnlText} | 🪙 ≈$${formatToken(valued.snapshot.feeQuoteUsdg, 6, 2)}${trailingPeak}`;
-      const bins = await this.formatPositionBins(position, valued.range);
-      return `${base}\n${valueLine}${bins}\n`;
+      const feeUsdg = valued.snapshot.feeQuoteUsdg ?? 0n;
+      const headerEmoji = valued.snapshot.pnlBps < 0n ? "🔴" : "🟢";
+      const rangeStr = await this.formatPositionRange(position, valued.range);
+      const base = `${index}. ${headerEmoji} ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}`;
+      const valueLine = `   💰 ${cv} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${pnlArrow} ${pnlSign}${pnlPct}%${trailingPeak}`;
+      return `${base}\n${valueLine}${rangeStr}\n`;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const detail = message.includes("zero liquidity")
-        ? "⚠️ SETTLEMENT RECOVERY PENDING"
-        : "⚠️ VALUATION UNAVAILABLE";
-      return `${base} | ${detail}\n`;
+      const detail = message.includes("zero liquidity") ? "⚠️ SETTLEMENT RECOVERY PENDING" : "⚠️ VALUATION UNAVAILABLE";
+      return `${index}. ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled} · ${detail}\n`;
     }
   }
 
-  private async formatPositionBins(position: PositionRecord, range: import("../types.js").PositionRangeInfo | undefined): Promise<string> {
-    if (position.protocol === "v2") return "\n   ████████████████████████████  FULL RANGE";
+  private async formatPositionRange(position: PositionRecord, range: import("../types.js").PositionRangeInfo | undefined): Promise<string> {
+    if (position.protocol === "v2") return "\n   FULL RANGE";
     if (!range || !position.quoteToken) return "";
 
     const quoteIsToken0 = position.quoteToken.toLowerCase() === position.token0.toLowerCase();
@@ -858,11 +863,16 @@ export class Notifier {
     const maximum = lower > upper ? lower : upper;
     const quoteSymbol = this.quoteSymbol(position.quoteToken);
     const current = quotePriceScaled(range.currentSqrtPrice, quoteIsToken0, token0Decimals, token1Decimals);
-    const bins = positionRangeBins(minimum, maximum, current);
-    const prices = formatRangePrices(minimum, current, maximum, quoteSymbol);
-    const scaleSuffix = prices.scale ? ` ${prices.scale}` : "";
-    const rangeStatus = formatDashboardRangeStatus(quoteRangeState(range, quoteIsToken0)?.status, position.metadata);
-    return `\n   ${prices.low} ${bins.bar} ${prices.high}${scaleSuffix}\n   ${bins.marker} ${prices.cur}${rangeStatus}`;
+    const line = positionRangeLine(minimum, maximum, current);
+    const rangeStatus = quoteRangeState(range, quoteIsToken0)?.status;
+    const oorStatus = formatDashboardRangeStatus(rangeStatus, position.metadata);
+
+    if (rangeStatus === "below" || rangeStatus === "above") {
+      return `\n   ${line.bar}  ${oorStatus.replace(" | ⚠️ ", "")}\n   Range ${formatCompactPrice(minimum, quoteSymbol)} – ${formatCompactPrice(maximum, quoteSymbol)} · now ${formatCompactPrice(current, quoteSymbol)}`;
+    }
+
+    const pctLabel = line.percent !== null ? ` ${line.percent}%` : "";
+    return `\n   ${line.bar}${pctLabel}\n   Range ${formatCompactPrice(minimum, quoteSymbol)} – ${formatCompactPrice(maximum, quoteSymbol)} · now ${formatCompactPrice(current, quoteSymbol)}`;
   }
 
   private lastScanAt = 0;
@@ -1947,6 +1957,45 @@ function quotePriceScaled(sqrtPriceX96: bigint, quoteIsToken0: boolean, token0De
 }
 
 const POSITION_BIN_COUNT = 10;
+
+const SUBSCRIPT_MAP: Record<string, string> = {
+  "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄",
+  "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉",
+};
+
+function toSubscript(value: number): string {
+  return String(value).split("").map((c) => SUBSCRIPT_MAP[c] ?? c).join("");
+}
+
+export function formatCompactPrice(scaledValue: bigint, quoteSymbol: string): string {
+  const prefix = quoteSymbol === "USDG" || quoteSymbol === "USDC" ? "$" : "";
+  if (scaledValue === 0n) return `${prefix}0`;
+  const divisor = 10n ** 18n;
+  const intPart = scaledValue / divisor;
+  if (intPart > 0n) return `${prefix}${formatToken(scaledValue, 18, 4)}`;
+  const fracPart = scaledValue % divisor;
+  const fracStr = fracPart.toString().padStart(18, "0");
+  let leadingZeros = 0;
+  for (const ch of fracStr) { if (ch === "0") leadingZeros++; else break; }
+  if (leadingZeros <= 2) return `${prefix}${formatToken(scaledValue, 18, 4)}`;
+  const sig = fracStr.slice(leadingZeros).replace(/0+$/, "").slice(0, 4);
+  return `${prefix}0.0${toSubscript(leadingZeros)}${sig}`;
+}
+
+export function positionRangeLine(minimum: bigint, maximum: bigint, current: bigint): { bar: string; percent: number | null } {
+  const LEN = 10;
+  if (maximum <= minimum) return { bar: "🟢" + "━".repeat(LEN - 1), percent: null };
+  if (current <= minimum) return { bar: "🟢" + "━".repeat(LEN - 1), percent: 0 };
+  if (current >= maximum) return { bar: "━".repeat(LEN - 1) + "🟢", percent: 100 };
+  const pct = Math.round(Number(((current - minimum) * 100n) / (maximum - minimum)));
+  const idx = Math.max(0, Math.min(LEN - 1, Math.floor((pct / 100) * LEN)));
+  return { bar: "━".repeat(idx) + "🟢" + "━".repeat(LEN - 1 - idx), percent: pct };
+}
+
+export function formatFeeTier(fee: number): string {
+  const pct = fee / 10_000;
+  return `${Number.isInteger(pct) ? pct : pct.toFixed(2)}%`;
+}
 
 export function positionRangeBins(minimum: bigint, maximum: bigint, current: bigint): { bar: string; marker: "◀" | "🟨" | "▶"; markerIndex: number } {
   if (maximum <= minimum) {
