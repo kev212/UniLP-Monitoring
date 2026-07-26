@@ -97,7 +97,7 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[0]![0]).toContain("metadata->>'settlementPhase' = 'removing_liquidity'");
   });
 
-  it("excludes swap submissions already recorded as reverted", async () => {
+  it("excludes swap submissions already recorded as reverted or confirmed", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn().mockResolvedValue({ rowCount: 0, rows: [] });
     Object.defineProperty(database, "pool", { value: { query } });
@@ -105,7 +105,7 @@ describe("Database native USD backfill", () => {
     await database.getSubmittedSwapAttempt("position");
 
     expect(query.mock.calls[0]![0]).toContain("NOT EXISTS");
-    expect(query.mock.calls[0]![0]).toContain("terminal.status = 'failed'");
+    expect(query.mock.calls[0]![0]).toContain("terminal.status IN ('failed', 'confirmed')");
   });
 
   it("persists signed transaction recovery data and the submitted hash atomically", async () => {

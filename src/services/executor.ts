@@ -89,7 +89,12 @@ class PendingExecutionError extends Error {
   }
 }
 
-class RevertedExecutionError extends Error {}
+class RevertedExecutionError extends Error {
+  constructor(readonly stage: string, message: string) {
+    super(message);
+    this.name = "RevertedExecutionError";
+  }
+}
 
 export class Executor {
   private readonly account;
@@ -352,7 +357,7 @@ export class Executor {
       await this.completeSettlement(position, prepared.expectedOut, hash, hash);
     } catch (error) {
       if (error instanceof PendingExecutionError) return;
-      if (error instanceof RevertedExecutionError) {
+      if (error instanceof RevertedExecutionError && error.stage === "swap_to_quote") {
         const failedProvider = typeof position.metadata.swapProvider === "string" ? position.metadata.swapProvider : retry.lastProvider;
         const revertedRetry = nextSwapRetry(position.metadata, failedProvider, true, this.swapRetryCycleSize());
         position = { ...position, metadata: { ...position.metadata, swapRetry: revertedRetry } };
@@ -498,18 +503,33 @@ export class Executor {
   }
 
   private async completeSettlement(position: PositionRecord, swapExpectedOut = 0n, swapTransactionHash?: Hex, swapHash?: string): Promise<void> {
-    const totalReceived = await this.saveSettlementBalance(position, swapExpectedOut, swapTransactionHash);
+    const durableMeta = await this.database.getPositionMetadata(position.id);
+    const storedTotal = typeof durableMeta?.settlementTotalReceived === "string" ? durableMeta.settlementTotalReceived : null;
+    let totalReceived: bigint;
+    if (storedTotal) {
+      totalReceived = BigInt(storedTotal);
+    } else {
+      totalReceived = await this.saveSettlementBalance(position, swapExpectedOut, swapTransactionHash);
+      await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+        settlementTotalReceived: totalReceived.toString(),
+        ...(swapHash ? { swapTransactionHash: swapHash } : {}),
+      });
+    }
     await this.database.setPositionStatusUnlessSettled(position.id, "closing", { pendingSwap: null });
     if (!(await this.unwrapWethQuote(position, totalReceived))) return;
     await this.database.setPositionStatus(position.id, "settled", {
       pendingSwap: null,
-      ...(swapHash ? { swapTransactionHash: swapHash } : {}),
       settlementPhase: "settled",
       swapRetry: null,
       pendingRawTransaction: null,
     });
-    await this.notifier.settled(position);
-    this.finalizeCloseHistory(position);
+    const settledPosition = { ...position, status: "settled" as const, metadata: { ...position.metadata, totalReceived: totalReceived.toString() } };
+    this.finalizeCloseHistory(settledPosition);
+    try {
+      await this.notifier.settled(settledPosition);
+    } catch (error) {
+      log.warn({ error: errorMessage(error), positionId: position.id }, "settled notification failed");
+    }
   }
 
   private async unwrapWethQuote(position: PositionRecord, amount: bigint): Promise<boolean> {
@@ -534,6 +554,7 @@ export class Executor {
       return false;
     }
     await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+      pendingRawTransaction: null,
       unwrapQuoteAmount: amount.toString(),
       unwrapQuoteTransactionHash: hash,
       unwrapQuoteConfirmed: true,
@@ -1214,14 +1235,18 @@ export class Executor {
       const receipt = await waitForReceipt(client, hash, this.config.confirmations);
       if (receipt.status !== "success") {
         await this.database.recordExecution(position.id, stage, "failed", hash, "transaction reverted");
-        await this.database.setPositionStatusUnlessSettled(position.id, "closing", { pendingRawTransaction: null });
-        throw new RevertedExecutionError(`${stage} transaction reverted: ${hash}`);
+        if (stage !== "unwrap_quote") {
+          await this.database.setPositionStatusUnlessSettled(position.id, "closing", { pendingRawTransaction: null });
+        }
+        throw new RevertedExecutionError(stage, `${stage} transaction reverted: ${hash}`);
       }
       if (stage === "remove_liquidity" || stage === "swap_to_quote" || stage === "unwrap_quote") {
         this.confirmedReceipts.set(hash, receipt);
       }
       await this.database.recordExecution(position.id, stage, "confirmed", hash);
-      await this.database.setPositionStatusUnlessSettled(position.id, "closing", { pendingRawTransaction: null });
+      if (stage !== "unwrap_quote") {
+        await this.database.setPositionStatusUnlessSettled(position.id, "closing", { pendingRawTransaction: null });
+      }
       await this.recordNativeSettlementGas(position, receipt.gasUsed * receipt.effectiveGasPrice);
     } catch (error) {
       if (error instanceof RevertedExecutionError) throw error;
@@ -1444,10 +1469,14 @@ export class Executor {
       }
       await this.database.recordExecution(position.id, "remove_liquidity", "confirmed", withdrawalEvent.transactionHash);
       if (this.wethQuoteToken(position) && quoteValue > 0n) {
+        const quoteIsToken0 = position.quoteToken!.toLowerCase() === position.token0.toLowerCase();
+        const actualQuoteAmount = quoteIsToken0 ? amounts.outOfPool0 : amounts.outOfPool1;
+        const nonQuoteToken = quoteIsToken0 ? position.token1 : position.token0;
+        const nonQuoteAmount = quoteIsToken0 ? amounts.outOfPool1 : amounts.outOfPool0;
         await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
-          pendingSwap: null,
-          settlementPhase: "accounting",
-          settlementQuoteFromClose: quoteValue.toString(),
+          pendingSwap: nonQuoteAmount > 0n ? { token: nonQuoteToken, amount: nonQuoteAmount.toString() } satisfies PendingSwap : null,
+          settlementPhase: nonQuoteAmount > 0n ? "pending_swap" : "accounting",
+          settlementQuoteFromClose: actualQuoteAmount.toString(),
           closeReceiptAccounted: true,
           closeTransactionHash: withdrawalEvent.transactionHash,
           reason: "auto_settle_deferred_unwrap",
@@ -1512,10 +1541,14 @@ export class Executor {
 
       await this.database.recordExecution(position.id, "remove_liquidity", "confirmed", withdrawal.transactionHash);
       if (this.wethQuoteToken(position) && quoteValue > 0n) {
+        const quoteIsToken0 = position.quoteToken!.toLowerCase() === position.token0.toLowerCase();
+        const actualQuoteAmount = quoteIsToken0 ? (collect.args.amount0 ?? 0n) : (collect.args.amount1 ?? 0n);
+        const nonQuoteToken = quoteIsToken0 ? position.token1 : position.token0;
+        const nonQuoteAmount = quoteIsToken0 ? (collect.args.amount1 ?? 0n) : (collect.args.amount0 ?? 0n);
         await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
-          pendingSwap: null,
-          settlementPhase: "accounting",
-          settlementQuoteFromClose: quoteValue.toString(),
+          pendingSwap: nonQuoteAmount > 0n ? { token: nonQuoteToken, amount: nonQuoteAmount.toString() } satisfies PendingSwap : null,
+          settlementPhase: nonQuoteAmount > 0n ? "pending_swap" : "accounting",
+          settlementQuoteFromClose: actualQuoteAmount.toString(),
           closeReceiptAccounted: true,
           closeTransactionHash: withdrawal.transactionHash,
           reason: "auto_settle_deferred_unwrap",

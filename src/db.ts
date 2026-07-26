@@ -741,7 +741,7 @@ export class Database {
            WHERE terminal.position_id = submitted.position_id
              AND terminal.stage = submitted.stage
              AND terminal.transaction_hash = submitted.transaction_hash
-             AND terminal.status = 'failed'
+             AND terminal.status IN ('failed', 'confirmed')
          )
        ORDER BY submitted.created_at DESC
        LIMIT 1`,
