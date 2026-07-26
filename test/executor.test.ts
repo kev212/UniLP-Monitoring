@@ -480,6 +480,7 @@ describe("Executor pending settlement recovery", () => {
       releaseSettlementLease: vi.fn(),
       getPositionMetadata: vi.fn().mockResolvedValue({ pendingSwap: { token, amount: "5" } }),
       getSubmittedSwapAttempt: vi.fn().mockResolvedValue(null),
+      getConfirmedSwapAttempt: vi.fn().mockResolvedValue(null),
       recordExecution: vi.fn(),
       setPositionStatusUnlessSettled: vi.fn(),
     };
@@ -518,6 +519,7 @@ describe("Executor pending settlement recovery", () => {
       releaseSettlementLease: vi.fn(),
       getPositionMetadata: vi.fn().mockResolvedValue(metadata),
       getSubmittedSwapAttempt: vi.fn().mockResolvedValue(null),
+      getConfirmedSwapAttempt: vi.fn().mockResolvedValue(null),
       setPositionStatusUnlessSettled: vi.fn(),
     };
     const client = { readContract: vi.fn().mockResolvedValue(0n) };

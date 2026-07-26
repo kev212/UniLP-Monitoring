@@ -312,6 +312,18 @@ export class Executor {
       }
     }
 
+    const confirmedSwap = await this.database.getConfirmedSwapAttempt(position.id);
+    if (confirmedSwap) {
+      try {
+        await this.completeSettlement(position, 0n, confirmedSwap as Hex, confirmedSwap);
+        log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: confirmedSwap }, "reconciled confirmed swap from previous session");
+        return;
+      } catch (error) {
+        if (error instanceof PendingExecutionError) return;
+        log.warn({ error: errorMessage(error), positionId: position.id }, "confirmed swap reconciliation deferred");
+      }
+    }
+
     const actualBalance = await this.tokenBalance(position.chainId, pending.token);
     if (actualBalance < pending.amount) {
       const closeReceiptTrusted = position.metadata.closeReceiptAccounted === true

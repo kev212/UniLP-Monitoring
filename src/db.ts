@@ -750,6 +750,21 @@ export class Database {
     return result.rowCount ? result.rows[0]!.transaction_hash : null;
   }
 
+  async getConfirmedSwapAttempt(positionId: string): Promise<string | null> {
+    const result = await this.pool.query<{ transaction_hash: string }>(
+      `SELECT transaction_hash
+       FROM execution_attempts
+       WHERE position_id = $1
+         AND stage = 'swap_to_quote'
+         AND status = 'confirmed'
+         AND transaction_hash IS NOT NULL
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [positionId],
+    );
+    return result.rowCount ? result.rows[0]!.transaction_hash : null;
+  }
+
   async getLatestExecutionHash(positionId: string, stage: string): Promise<string | null> {
     const result = await this.pool.query<{ transaction_hash: string }>(
       `SELECT transaction_hash
