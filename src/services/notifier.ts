@@ -13,6 +13,7 @@ import type { PositionOpener, OpenPositionPreview } from "./position-opener.js";
 import { fmtUtc, renderPnlCard } from "./pnl-card.js";
 import { renderPnlCalendarCard } from "./pnl-calendar-card.js";
 import type { PoolMarketScan, PoolScanFilters, PoolScanner, ScoredPool, InvestigateResult } from "./pool-scanner.js";
+import type { PortfolioService } from "./portfolio.js";
 import type { GemScanner, GemScanResult } from "./gem-scanner.js";
 import type { GemCandidate } from "./gem-score.js";
 import { quoteRangeState } from "./quote-range.js";
@@ -86,6 +87,7 @@ export class Notifier {
   private readonly openConfirmations = new Map<string, OpenPositionPreview>();
   private positionOpener?: PositionOpener;
   private gemScanner?: GemScanner;
+  private portfolioService?: PortfolioService;
 
   constructor(
     private readonly config: RuntimeConfig,
@@ -107,6 +109,10 @@ export class Notifier {
 
   setGemScanner(scanner: GemScanner): void {
     this.gemScanner = scanner;
+  }
+
+  setPortfolioService(service: PortfolioService): void {
+    this.portfolioService = service;
   }
 
   registerCommands(database: Database, pnl: PnlService, executor: Executor, scanner: PoolScanner): void {
@@ -635,6 +641,13 @@ export class Notifier {
     const page = clampDashboardPage(requestedPage, pageCount);
     const first = page * DASHBOARD_PAGE_SIZE;
     const lines = ["LP DASHBOARD", ...(notice ? [notice] : []), `Updated: ${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC`, ""];
+    if (this.portfolioService) {
+      const portfolio = this.portfolioService.getSnapshot();
+      const age = portfolio.updatedAt.getTime() > 0 ? ` · updated ${formatAge(Date.now() - portfolio.updatedAt.getTime())} ago` : "";
+      lines.push(`💰 Total balance: ${portfolio.calculating ? "calculating..." : `$${formatUsdValue(portfolio.totalUsd)}${age}`}`);
+      if (portfolio.unpricedTokens > 0) lines.push(`⚠️ ${portfolio.unpricedTokens} token belum memiliki harga`);
+      lines.push("");
+    }
 
     if (active.length === 0) {
       lines.push("Tidak ada posisi aktif.");
@@ -2225,6 +2238,18 @@ function fmtUsd(value: number): string {
   if (value >= 1) return value.toFixed(2);
   if (value >= 0.01) return value.toFixed(4);
   return value.toExponential(2);
+}
+
+function formatUsdValue(value: number): string {
+  return value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function formatAge(milliseconds: number): string {
+  const seconds = Math.max(0, Math.floor(milliseconds / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h`;
 }
 
 function fmtPercent(value: number): string {

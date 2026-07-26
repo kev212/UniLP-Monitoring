@@ -15,6 +15,7 @@ import { UniswapTradingApi } from "./services/uniswap-trading-api.js";
 import { PoolScanner } from "./services/pool-scanner.js";
 import { PositionOpener } from "./services/position-opener.js";
 import { GemScanner } from "./services/gem-scanner.js";
+import { PortfolioService } from "./services/portfolio.js";
 import { KyberSwapAggregatorApi } from "./services/kyberswap-aggregator-api.js";
 import { isRiskSettings, type RiskSettings } from "./types.js";
 
@@ -42,13 +43,16 @@ async function main(): Promise<void> {
   const scanner = new PoolScanner(chains, database);
   const positionOpener = new PositionOpener(config, chains);
   const gemScanner = new GemScanner(chains, database, scanner, config.quoteTokens.robinhood);
+  const portfolio = new PortfolioService(config, chains, database, pnl);
   notifier.setPositionOpener(positionOpener);
   notifier.setGemScanner(gemScanner);
+  notifier.setPortfolioService(portfolio);
 
   notifier.registerCommands(database, pnl, executor, scanner);
 
   await database.connect();
   await database.migrate();
+  portfolio.start();
   const storedRiskSettings = await database.getGlobalRiskSettings();
   if (isRiskSettings(storedRiskSettings)) {
     applyRiskSettings(config, storedRiskSettings);
@@ -63,6 +67,7 @@ async function main(): Promise<void> {
   let botRunning = false;
   const shutdown = async (signal: string): Promise<void> => {
     log.info({ signal }, "shutting down");
+    portfolio.stop();
     if (botRunning) await notifier.stopBot();
     await database.close();
     process.exit(0);
