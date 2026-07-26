@@ -81,6 +81,7 @@ export interface SwapRetryState {
 }
 
 const SWAP_RETRY_CYCLE_DELAY_MS = 3_000;
+const API_SETTLEMENT_MINIMUM_FLOOR_BPS = 200;
 
 class PendingExecutionError extends Error {
   constructor(readonly stage: string, readonly transactionHash: Hex, cause: unknown) {
@@ -824,6 +825,9 @@ export class Executor {
     lastFailedProvider?: string,
     approvalRefreshes = 0,
   ): Promise<PreparedSwap | null> {
+    const localBenchmark = await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
+    if (!localBenchmark) throw new Error("No safe local route available to benchmark settlement swap");
+    const minimumAcceptableOut = applySlippage(localBenchmark.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
     const quoteJobs: Promise<ApiSwapCandidate | null>[] = [];
     if (this.tradingApi) {
       quoteJobs.push(this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
@@ -838,7 +842,15 @@ export class Executor {
     const candidates: ApiSwapCandidate[] = [];
     for (const result of results) {
       if (result.status === "fulfilled") {
-        if (result.value) candidates.push(result.value);
+        if (result.value) {
+          if (result.value.minimumOut < minimumAcceptableOut) {
+            const reason = `minimum output ${result.value.minimumOut} is below local 2% floor ${minimumAcceptableOut}`;
+            errors.push(`${result.value.provider}: ${reason}`);
+            log.warn({ positionKey: position.positionKey, provider: result.value.provider, expectedOut: result.value.expectedOut.toString(), minimumOut: result.value.minimumOut.toString(), localExpectedOut: localBenchmark.expectedOut.toString(), minimumAcceptableOut: minimumAcceptableOut.toString() }, "settlement swap candidate rejected below local minimum floor");
+            continue;
+          }
+          candidates.push(result.value);
+        }
       } else {
         errors.push(errorMessage(result.reason));
       }

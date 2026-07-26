@@ -224,7 +224,8 @@ describe("Executor pending settlement recovery", () => {
       approvalSpender: vi.fn().mockReturnValue(sender),
       createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: sender, data: "0x22", description: "kyber" }),
     };
-    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config, tradingApi as never, kyberswapApi as never);
+    const routes = { quoteDirect: vi.fn().mockResolvedValue({ expectedOut: 105n }) };
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, config, tradingApi as never, kyberswapApi as never);
     const position = {
       id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
       token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
@@ -241,6 +242,39 @@ describe("Executor pending settlement recovery", () => {
     expect(kyberswapApi.createSwap).toHaveBeenCalledTimes(1);
     expect(tradingApi.createSwap).not.toHaveBeenCalled();
     expect(client.call).toHaveBeenCalledWith(expect.objectContaining({ data: "0x22" }));
+  });
+
+  it("rejects an aggregator route below the local two-percent minimum floor", async () => {
+    const client = {
+      readContract: vi.fn().mockResolvedValue(5n),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const tradingApi = {
+      quote: vi.fn().mockResolvedValue({ routing: "CLASSIC", expectedOut: 100n, minimumOut: 98n, raw: {} }),
+      approval: vi.fn().mockResolvedValue(null),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: sender, data: "0x11", description: "uniswap" }),
+    };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 1n, minimumOut: 0n, router: sender }),
+      approvalSpender: vi.fn().mockReturnValue(sender),
+      createSwap: vi.fn(),
+    };
+    const routes = { quoteDirect: vi.fn().mockResolvedValue({ expectedOut: 100n }) };
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, config, tradingApi as never, kyberswapApi as never);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "365091", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    const prepared = await (executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string; expectedOut: bigint }>;
+    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
+
+    expect(prepared).toMatchObject({ provider: "uniswap", expectedOut: 100n });
+    expect(kyberswapApi.approvalSpender).not.toHaveBeenCalled();
+    expect(kyberswapApi.createSwap).not.toHaveBeenCalled();
   });
 
   it("falls back before broadcast when the best provider fails simulation", async () => {
@@ -263,7 +297,8 @@ describe("Executor pending settlement recovery", () => {
       approvalSpender: vi.fn().mockReturnValue(kyberTarget),
       createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: kyberTarget, data: "0x22", description: "kyber" }),
     };
-    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config, tradingApi as never, kyberswapApi as never);
+    const routes = { quoteDirect: vi.fn().mockResolvedValue({ expectedOut: 100n }) };
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, config, tradingApi as never, kyberswapApi as never);
     const position = {
       id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
       token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
