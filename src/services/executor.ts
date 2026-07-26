@@ -499,6 +499,7 @@ export class Executor {
 
   private async completeSettlement(position: PositionRecord, swapExpectedOut = 0n, swapTransactionHash?: Hex, swapHash?: string): Promise<void> {
     const totalReceived = await this.saveSettlementBalance(position, swapExpectedOut, swapTransactionHash);
+    await this.database.setPositionStatusUnlessSettled(position.id, "closing", { pendingSwap: null });
     if (!(await this.unwrapWethQuote(position, totalReceived))) return;
     await this.database.setPositionStatus(position.id, "settled", {
       pendingSwap: null,
@@ -1266,7 +1267,7 @@ export class Executor {
           unwrapQuoteConfirmed: null,
           settlementPhase: "accounting",
         });
-        return false;
+        return true;
       }
       await this.database.recordExecution(position.id, "unwrap_quote", "confirmed", pending.hash);
       await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
@@ -1275,7 +1276,7 @@ export class Executor {
         unwrapQuoteConfirmed: true,
         settlementPhase: "accounting",
       });
-      return false;
+      return true;
     } catch {
       await this.rebroadcastPendingTransaction(position, pending.hash);
       return true;
@@ -1441,12 +1442,24 @@ export class Executor {
           protocol: "v4", token0Amount: amounts.outOfPool0.toString(), token1Amount: amounts.outOfPool1.toString(), source: "auto_settle",
         });
       }
+      await this.database.recordExecution(position.id, "remove_liquidity", "confirmed", withdrawalEvent.transactionHash);
+      if (this.wethQuoteToken(position) && quoteValue > 0n) {
+        await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+          pendingSwap: null,
+          settlementPhase: "accounting",
+          settlementQuoteFromClose: quoteValue.toString(),
+          closeReceiptAccounted: true,
+          closeTransactionHash: withdrawalEvent.transactionHash,
+          reason: "auto_settle_deferred_unwrap",
+        });
+        log.info({ positionId: position.id, positionKey: position.positionKey, quoteValue: quoteValue.toString() }, "deferred WETH auto-settle to normal flow for unwrap");
+        return false;
+      }
       await this.database.setPositionStatus(position.id, "settled", {
         totalReceived: quoteValue.toString(),
         closeTransactionHash: withdrawalEvent.transactionHash,
         reason: "auto_settle_zero_liquidity",
       });
-      await this.database.recordExecution(position.id, "remove_liquidity", "confirmed", withdrawalEvent.transactionHash);
       this.finalizeCloseHistory({ ...position, status: "settled", metadata: { ...position.metadata, totalReceived: quoteValue.toString() } });
       log.info({ positionId: position.id, positionKey: position.positionKey, quoteValue: quoteValue.toString() }, "auto-settled zero-liquidity V4 position");
       await this.notifier.settled(position);
@@ -1497,13 +1510,25 @@ export class Executor {
       const quoteValue = await this.database.getCashflowQuoteValue(position.id, withdrawal.transactionHash, "withdrawal");
       if (quoteValue === null) return false;
 
+      await this.database.recordExecution(position.id, "remove_liquidity", "confirmed", withdrawal.transactionHash);
+      if (this.wethQuoteToken(position) && quoteValue > 0n) {
+        await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+          pendingSwap: null,
+          settlementPhase: "accounting",
+          settlementQuoteFromClose: quoteValue.toString(),
+          closeReceiptAccounted: true,
+          closeTransactionHash: withdrawal.transactionHash,
+          reason: "auto_settle_deferred_unwrap",
+        });
+        log.info({ positionId: position.id, positionKey: position.positionKey, quoteValue: quoteValue.toString(), closeTransactionHash: withdrawal.transactionHash }, "deferred WETH auto-settle to normal flow for unwrap");
+        return false;
+      }
       await this.database.setPositionStatus(position.id, "settled", {
         pendingSwap: null,
         totalReceived: quoteValue.toString(),
         closeTransactionHash: withdrawal.transactionHash,
         reason: "auto_settle_zero_liquidity_v3",
       });
-      await this.database.recordExecution(position.id, "remove_liquidity", "confirmed", withdrawal.transactionHash);
       this.finalizeCloseHistory({
         ...position,
         status: "settled",
