@@ -206,6 +206,46 @@ describe("Executor pending settlement recovery", () => {
     expect(() => bufferedGasLimit(100n, 99)).toThrow("between 100 and 500");
   });
 
+  it("approves max for non-protected tokens without reset and skips when sufficient", async () => {
+    const client = { readContract: vi.fn().mockResolvedValue(0n) };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
+    const send = vi.spyOn(executor as any, "send").mockResolvedValue(hash);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    const changed = await (executor as unknown as { ensureApproval(p: PositionRecord, t: Address, s: Address, a: bigint, st: string): Promise<boolean> })
+      .ensureApproval(position, token, sender, 100n, "approve_swap");
+    expect(changed).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+
+    send.mockClear();
+    client.readContract.mockResolvedValue((1n << 256n) - 1n);
+    const skipped = await (executor as unknown as { ensureApproval(p: PositionRecord, t: Address, s: Address, a: bigint, st: string): Promise<boolean> })
+      .ensureApproval(position, token, sender, 100n, "approve_swap");
+    expect(skipped).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("approves exact for protected quote tokens with reset when amount differs", async () => {
+    const client = { readContract: vi.fn().mockResolvedValue(50n) };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
+    const send = vi.spyOn(executor as any, "send").mockResolvedValue(hash);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
+      token0: token, token1: usdg, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    await (executor as unknown as { ensureApproval(p: PositionRecord, t: Address, s: Address, a: bigint, st: string): Promise<boolean> })
+      .ensureApproval(position, usdg, sender, 100n, "approve_swap");
+    expect(send).toHaveBeenCalledWith(expect.anything(), "approve_swap_reset", expect.anything());
+  });
+
   it("quotes providers in parallel and selects the best simulated output", async () => {
     const client = {
       readContract: vi.fn().mockResolvedValue(5n),

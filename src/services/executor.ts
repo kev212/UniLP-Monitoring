@@ -82,6 +82,9 @@ export interface SwapRetryState {
 
 const SWAP_RETRY_CYCLE_DELAY_MS = 3_000;
 const API_SETTLEMENT_MINIMUM_FLOOR_BPS = 200;
+const MAX_UINT256 = (1n << 256n) - 1n;
+const MAX_UINT160 = (1n << 160n) - 1n;
+const PERMIT2_MAX_EXPIRATION_SECONDS = 2_592_000;
 
 class PendingExecutionError extends Error {
   constructor(readonly stage: string, readonly transactionHash: Hex, cause: unknown) {
@@ -171,7 +174,7 @@ export class Executor {
       if (position.protocol === "v2") {
         if (!position.poolAddress) throw new Error("V2 position has no pair address");
         const { registry } = this.chains.getById(position.chainId);
-        const approvalChanged = await this.ensureExactApproval(position, position.poolAddress, registry.contracts.v2.router, value.liquidity, "approve_lp");
+        const approvalChanged = await this.ensureApproval(position, position.poolAddress, registry.contracts.v2.router, value.liquidity, "approve_lp");
         if (this.config.dryRun && approvalChanged) {
           await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve_lp then remove_liquidity" });
           return;
@@ -916,7 +919,7 @@ export class Executor {
       let quote = candidate.quote;
       let approvalChanged = false;
       if (tokenIn.toLowerCase() !== zeroAddress) {
-        approvalChanged = await this.ensureExactApproval(position, tokenIn, UNISWAP_API_ROUTER, amountIn, "approve_swap");
+        approvalChanged = await this.ensureApproval(position, tokenIn, UNISWAP_API_ROUTER, amountIn, "approve_swap");
         if (this.config.dryRun && approvalChanged) {
           await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve_swap then swap_to_quote" });
           return null;
@@ -936,7 +939,7 @@ export class Executor {
     let quote = candidate.quote;
     let approvalChanged = false;
     if (tokenIn.toLowerCase() !== zeroAddress) {
-      approvalChanged = await this.ensureExactApproval(position, tokenIn, this.kyberswapApi.approvalSpender(quote), amountIn, "approve_swap");
+      approvalChanged = await this.ensureApproval(position, tokenIn, this.kyberswapApi.approvalSpender(quote), amountIn, "approve_swap");
       if (this.config.dryRun && approvalChanged) {
         await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve_swap then swap_to_quote" });
         return null;
@@ -967,7 +970,7 @@ export class Executor {
       let approvalChanged = false;
       if (route.protocol === "v4") {
         const { registry } = this.chains.getById(position.chainId);
-        approvalChanged = await this.ensureExactApproval(position, tokenIn, registry.contracts.v4.permit2, amountIn, "approve_permit2");
+        approvalChanged = await this.ensureApproval(position, tokenIn, registry.contracts.v4.permit2, amountIn, "approve_permit2");
         if (this.config.dryRun && approvalChanged) {
           await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve_permit2 then permit2_approve then swap_to_quote" });
           return null;
@@ -979,7 +982,7 @@ export class Executor {
           return null;
         }
       } else {
-        approvalChanged = await this.ensureExactApproval(position, tokenIn, route.router, amountIn, "approve_swap");
+        approvalChanged = await this.ensureApproval(position, tokenIn, route.router, amountIn, "approve_swap");
         if (this.config.dryRun && approvalChanged) {
           await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve_swap then swap_to_quote" });
           return null;
@@ -1138,32 +1141,44 @@ export class Executor {
     };
   }
 
-  private async ensureExactApproval(position: PositionRecord, token: Address, spender: Address, amount: bigint, stage: string): Promise<boolean> {
+  private async ensureApproval(position: PositionRecord, token: Address, spender: Address, amount: bigint, stage: string): Promise<boolean> {
     if (token.toLowerCase() === zeroAddress) throw new Error("Native ETH does not require ERC-20 approval");
-    const { client } = this.chains.getById(position.chainId);
+    const { client, registry } = this.chains.getById(position.chainId);
     const allowance = await client.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [position.owner, spender] });
-    if (allowance === amount) return false;
-    if (allowance > 0n) {
-      await this.send(position, `${stage}_reset`, {
+
+    if (this.isProtectedToken(position.chainId, token)) {
+      if (allowance === amount) return false;
+      if (allowance > 0n) {
+        await this.send(position, `${stage}_reset`, {
+          chainId: position.chainId,
+          to: token,
+          data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [spender, 0n] }),
+          description: `reset ${stage} allowance`,
+        });
+        if (this.config.dryRun) return true;
+      }
+      await this.send(position, stage, {
         chainId: position.chainId,
         to: token,
-        data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [spender, 0n] }),
-        description: `reset ${stage} allowance`,
+        data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [spender, amount] }),
+        description: `set exact ${stage} allowance`,
       });
-      if (this.config.dryRun) return true;
+      return true;
     }
+
+    if (allowance >= amount) return false;
     await this.send(position, stage, {
       chainId: position.chainId,
       to: token,
-      data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [spender, amount] }),
-      description: `set exact ${stage} allowance`,
+      data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [spender, MAX_UINT256] }),
+      description: `set max ${stage} allowance`,
     });
     return true;
   }
 
   private async ensurePermit2Approval(position: PositionRecord, token: Address, spender: Address, amount: bigint): Promise<boolean> {
     if (token.toLowerCase() === zeroAddress) throw new Error("Native ETH does not require Permit2 approval");
-    if (amount > (1n << 160n) - 1n) throw new Error("Permit2 approval amount overflows uint160");
+    if (amount > MAX_UINT160) throw new Error("Permit2 approval amount overflows uint160");
     const { client, registry } = this.chains.getById(position.chainId);
     const allowance = await client.readContract({
       address: registry.contracts.v4.permit2,
@@ -1171,19 +1186,43 @@ export class Executor {
       functionName: "allowance",
       args: [position.owner, token, spender],
     });
-    const expiration = Math.floor(Date.now() / 1_000) + 300;
-    if (allowance[0] === amount && Number(allowance[1]) >= expiration) return false;
+
+    if (this.isProtectedToken(position.chainId, token)) {
+      const expiration = Math.floor(Date.now() / 1_000) + 300;
+      if (allowance[0] === amount && Number(allowance[1]) >= expiration) return false;
+      await this.send(position, "permit2_approve", {
+        chainId: position.chainId,
+        to: registry.contracts.v4.permit2,
+        data: encodeFunctionData({
+          abi: permit2Abi,
+          functionName: "approve",
+          args: [token, spender, amount, expiration],
+        }),
+        description: "set exact Permit2 swap allowance",
+      });
+      return true;
+    }
+
+    const now = Math.floor(Date.now() / 1_000);
+    if (allowance[0] >= amount && Number(allowance[1]) > now) return false;
+    const expiration = now + PERMIT2_MAX_EXPIRATION_SECONDS;
     await this.send(position, "permit2_approve", {
       chainId: position.chainId,
       to: registry.contracts.v4.permit2,
       data: encodeFunctionData({
         abi: permit2Abi,
         functionName: "approve",
-        args: [token, spender, amount, expiration],
+        args: [token, spender, MAX_UINT160, expiration],
       }),
-      description: "set exact Permit2 swap allowance",
+      description: "set max Permit2 swap allowance",
     });
     return true;
+  }
+
+  private isProtectedToken(chainId: number, token: Address): boolean {
+    const { registry } = this.chains.getById(chainId);
+    return this.config.quoteTokens[registry.name]
+      .some((qt) => qt.address.toLowerCase() === token.toLowerCase());
   }
 
   private executorClient(chainId: number): PublicClient {
