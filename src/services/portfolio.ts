@@ -28,6 +28,7 @@ interface DexTokenPair {
   baseToken?: { address?: string };
   quoteToken?: { address?: string };
   priceUsd?: string | null;
+  priceNative?: string | null;
   liquidity?: { usd?: number | null };
 }
 
@@ -163,9 +164,17 @@ export class PortfolioService {
 
   private async tokenPrices(chain: ChainName, addresses: readonly Address[]): Promise<Map<string, number>> {
     const prices = new Map<string, number>();
+    const stableAddresses = new Set<string>();
     for (const quote of this.config.quoteTokens[chain]) {
-      if (quote.symbol === "USDG" || quote.symbol === "USDC") prices.set(quote.address.toLowerCase(), 1);
+      if (quote.symbol === "USDG" || quote.symbol === "USDC") {
+        const address = quote.address.toLowerCase();
+        stableAddresses.add(address);
+        prices.set(address, 1);
+      }
     }
+    const wethAddress = this.config.quoteTokens[chain].find((token) => token.symbol === "WETH")?.address.toLowerCase();
+    let wethUsd: number | undefined;
+    let wethLiquidity = -1;
     const nonStable = addresses.filter((address) => !prices.has(address.toLowerCase()) && address.toLowerCase() !== zeroAddress);
     for (let offset = 0; offset < nonStable.length; offset += 25) {
       const batch = nonStable.slice(offset, offset + 25);
@@ -177,13 +186,27 @@ export class PortfolioService {
           const price = Number(pair.priceUsd);
           const base = pair.baseToken?.address?.toLowerCase();
           if (base && Number.isFinite(price) && price > 0 && !prices.has(base)) prices.set(base, price);
+          const quote = pair.quoteToken?.address?.toLowerCase();
+          const nativePrice = Number(pair.priceNative);
+          const liquidity = pair.liquidity?.usd ?? 0;
+          if (wethAddress && quote === wethAddress && base && stableAddresses.has(base)
+            && Number.isFinite(price) && price > 0 && Number.isFinite(nativePrice) && nativePrice > 0 && liquidity > wethLiquidity) {
+            wethUsd = price / nativePrice;
+            wethLiquidity = liquidity;
+          }
+          if (wethAddress && base === wethAddress && Number.isFinite(price) && price > 0 && liquidity > wethLiquidity) {
+            wethUsd = price;
+            wethLiquidity = liquidity;
+          }
         }
         } catch {
           // Tokens without a DexScreener USD price are excluded from the total.
         }
     }
-    const nativePrice = prices.get(this.config.quoteTokens[chain].find((token) => token.symbol === "WETH")?.address.toLowerCase() ?? "");
-    if (nativePrice !== undefined) prices.set(zeroAddress, nativePrice);
+    if (wethAddress && wethUsd !== undefined) {
+      prices.set(wethAddress, wethUsd);
+      prices.set(zeroAddress, wethUsd);
+    }
     return prices;
   }
 
