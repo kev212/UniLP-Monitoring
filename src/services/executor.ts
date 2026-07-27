@@ -11,6 +11,7 @@ import {
   isAddress,
   isHex,
   keccak256,
+  parseTransaction,
   zeroAddress,
   type Address,
   type Hex,
@@ -58,6 +59,7 @@ interface PendingRawTransaction {
   stage: string;
   hash: Hex;
   serializedTransaction: Hex;
+  submittedAt?: string;
 }
 
 type ApiSwapCandidate =
@@ -85,6 +87,7 @@ const API_SETTLEMENT_MINIMUM_FLOOR_BPS = 200;
 const MAX_UINT256 = (1n << 256n) - 1n;
 const MAX_UINT160 = (1n << 160n) - 1n;
 const PERMIT2_MAX_EXPIRATION_SECONDS = 2_592_000;
+const PENDING_APPROVAL_MAX_AGE_MS = 5 * 60_000;
 
 class PendingExecutionError extends Error {
   constructor(readonly stage: string, readonly transactionHash: Hex, cause: unknown) {
@@ -846,8 +849,8 @@ export class Executor {
     for (const result of results) {
       if (result.status === "fulfilled") {
         if (result.value) {
-          if (result.value.minimumOut < minimumAcceptableOut) {
-            const reason = `minimum output ${result.value.minimumOut} is below local 2% floor ${minimumAcceptableOut}`;
+          if (result.value.expectedOut < minimumAcceptableOut) {
+            const reason = `expected output ${result.value.expectedOut} is below local 2% floor ${minimumAcceptableOut}`;
             errors.push(`${result.value.provider}: ${reason}`);
             log.warn({ positionKey: position.positionKey, provider: result.value.provider, expectedOut: result.value.expectedOut.toString(), minimumOut: result.value.minimumOut.toString(), localExpectedOut: localBenchmark.expectedOut.toString(), minimumAcceptableOut: minimumAcceptableOut.toString() }, "settlement swap candidate rejected below local minimum floor");
             continue;
@@ -868,7 +871,12 @@ export class Executor {
 
     for (const [candidateIndex, candidate] of candidates.entries()) {
       try {
-        const prepared = await this.prepareApiSwap(position, tokenIn, amountIn, tokenOut, slippageBps, candidate, candidateIndex === 0 && approvalRefreshes < 1);
+        const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, minimumAcceptableOut);
+        if (!constrained) {
+          errors.push(`${candidate.provider}: cannot build calldata with local 2% floor ${minimumAcceptableOut}`);
+          continue;
+        }
+        const prepared = await this.prepareApiSwap(position, tokenIn, amountIn, tokenOut, slippageBps, constrained, candidateIndex === 0 && approvalRefreshes < 1, minimumAcceptableOut);
         if (!prepared) return null;
         if (prepared === "approval_changed") {
           log.info({ positionKey: position.positionKey, provider: candidate.provider }, "refreshing and re-ranking providers after approval");
@@ -905,6 +913,33 @@ export class Executor {
     throw new Error(`No executable settlement route${details ? `: ${details}` : ""}`);
   }
 
+  private async constrainApiCandidate(
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    candidate: ApiSwapCandidate,
+    minimumAcceptableOut: bigint,
+  ): Promise<ApiSwapCandidate | null> {
+    if (candidate.minimumOut >= minimumAcceptableOut) return candidate;
+    if (candidate.expectedOut <= minimumAcceptableOut) return null;
+    const maximumSlippageBps = Number((candidate.expectedOut - minimumAcceptableOut) * 10_000n / candidate.expectedOut);
+    const slippageBps = Math.min(candidate.quote.slippageBps, maximumSlippageBps);
+    if (slippageBps < 1) return null;
+    if (candidate.provider === "uniswap") {
+      if (!this.tradingApi) return null;
+      const quote = await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+      return quote && quote.minimumOut >= minimumAcceptableOut
+        ? { provider: "uniswap", expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote }
+        : null;
+    }
+    if (!this.kyberswapApi) return null;
+    const quote = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+    return quote && quote.minimumOut >= minimumAcceptableOut
+      ? { provider: "kyberswap", expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote }
+      : null;
+  }
+
   private async prepareApiSwap(
     position: PositionRecord,
     tokenIn: Address,
@@ -913,6 +948,7 @@ export class Executor {
     slippageBps: number,
     candidate: ApiSwapCandidate,
     refreshAllAfterApproval: boolean,
+    minimumAcceptableOut: bigint,
   ): Promise<PreparedSwap | "approval_changed" | null> {
     if (candidate.provider === "uniswap") {
       if (!this.tradingApi) throw new Error("Uniswap Trading API is unavailable");
@@ -928,6 +964,7 @@ export class Executor {
         if (approvalChanged) {
           const refreshed = await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
           if (!refreshed) throw new Error("Uniswap route disappeared after approval");
+          if (refreshed.minimumOut < minimumAcceptableOut) throw new Error("Uniswap route fell below local minimum floor after approval");
           quote = refreshed;
         }
       }
@@ -946,9 +983,10 @@ export class Executor {
       }
       if (approvalChanged && refreshAllAfterApproval) return "approval_changed";
       if (approvalChanged) {
-        const refreshed = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
-        if (!refreshed) throw new Error("KyberSwap route disappeared after approval");
-        quote = refreshed;
+          const refreshed = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+          if (!refreshed) throw new Error("KyberSwap route disappeared after approval");
+          if (refreshed.minimumOut < minimumAcceptableOut) throw new Error("KyberSwap route fell below local minimum floor after approval");
+          quote = refreshed;
       }
     }
     const plan = await this.kyberswapApi.createSwap(position, quote);
@@ -1338,9 +1376,31 @@ export class Executor {
       return false;
     } catch (error) {
       if (errorMessage(error).includes("transaction reverted")) throw error;
+      if (await this.pendingApprovalIsStale(position, pending)) {
+        await this.database.recordExecution(position.id, pending.stage, "failed", pending.hash, "signed approval was dropped before confirmation");
+        await this.database.setPositionStatusUnlessSettled(position.id, "closing", { pendingRawTransaction: null });
+        log.warn({ positionId: position.id, positionKey: position.positionKey, stage: pending.stage, hash: pending.hash }, "cleared stale pending approval for a fresh settlement attempt");
+        return false;
+      }
       await this.rebroadcastPendingTransaction(position, pending.hash);
       return true;
     }
+  }
+
+  private async pendingApprovalIsStale(position: PositionRecord, pending: PendingRawTransaction): Promise<boolean> {
+    let nonce: bigint;
+    try {
+      const transaction = parseTransaction(pending.serializedTransaction);
+      if (transaction.nonce === undefined) return false;
+      nonce = BigInt(transaction.nonce);
+    } catch {
+      return false;
+    }
+    const { client } = this.chains.getById(position.chainId);
+    const pendingNonce = await client.getTransactionCount({ address: position.owner, blockTag: "pending" }).catch(() => null);
+    if (pendingNonce !== null && pendingNonce > nonce) return true;
+    if (!pending.submittedAt) return false;
+    return Date.now() - Date.parse(pending.submittedAt) >= PENDING_APPROVAL_MAX_AGE_MS;
   }
 
   private async recoverPendingUnwrap(position: PositionRecord): Promise<boolean> {
@@ -1764,7 +1824,8 @@ function parsePendingRawTransaction(value: unknown): PendingRawTransaction | nul
   if (typeof raw.stage !== "string" || !raw.stage || typeof raw.hash !== "string" || !isHex(raw.hash) || raw.hash.length !== 66) return null;
   if (typeof raw.serializedTransaction !== "string" || !isHex(raw.serializedTransaction) || raw.serializedTransaction === "0x") return null;
   if (keccak256(raw.serializedTransaction as Hex) !== raw.hash.toLowerCase()) return null;
-  return { stage: raw.stage, hash: raw.hash as Hex, serializedTransaction: raw.serializedTransaction as Hex };
+  const submittedAt = typeof raw.submittedAt === "string" && Number.isFinite(Date.parse(raw.submittedAt)) ? raw.submittedAt : undefined;
+  return { stage: raw.stage, hash: raw.hash as Hex, serializedTransaction: raw.serializedTransaction as Hex, ...(submittedAt ? { submittedAt } : {}) };
 }
 
 function swapRetryState(metadata: Record<string, unknown>): SwapRetryState {

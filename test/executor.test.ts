@@ -317,6 +317,35 @@ describe("Executor pending settlement recovery", () => {
     expect(kyberswapApi.createSwap).not.toHaveBeenCalled();
   });
 
+  it("tightens an API quote so its calldata minimum preserves the local floor", async () => {
+    const client = {
+      readContract: vi.fn().mockResolvedValue(5n),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const tradingApi = {
+      quote: vi.fn()
+        .mockResolvedValueOnce({ routing: "CLASSIC", expectedOut: 99n, minimumOut: 97n, raw: {}, slippageBps: 200 })
+        .mockResolvedValueOnce({ routing: "CLASSIC", expectedOut: 99n, minimumOut: 98n, raw: {}, slippageBps: 101 }),
+      approval: vi.fn().mockResolvedValue(null),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: sender, data: "0x11", description: "uniswap" }),
+    };
+    const routes = { quoteDirect: vi.fn().mockResolvedValue({ expectedOut: 100n }) };
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, config, tradingApi as never);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "426429", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    const prepared = await (executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string; minimumOut: bigint }>;
+    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
+
+    expect(prepared).toMatchObject({ provider: "uniswap", minimumOut: 98n });
+    expect(tradingApi.quote).toHaveBeenNthCalledWith(2, position, token, 5n, usdg, 101);
+  });
+
   it("falls back before broadcast when the best provider fails simulation", async () => {
     const uniswapTarget = "0x0000000000000000000000000000000000000004" as const;
     const kyberTarget = "0x0000000000000000000000000000000000000005" as const;

@@ -707,9 +707,9 @@ export class Database {
       const updated = await client.query(
         `UPDATE positions
          SET status = 'closing',
-             metadata = metadata || jsonb_build_object(
-               'pendingRawTransaction',
-               jsonb_build_object('stage', $2::text, 'hash', $3::text, 'serializedTransaction', $4::text)
+              metadata = metadata || jsonb_build_object(
+                'pendingRawTransaction',
+                jsonb_build_object('stage', $2::text, 'hash', $3::text, 'serializedTransaction', $4::text, 'submittedAt', NOW()::text)
              ),
              updated_at = NOW()
          WHERE id = $1
