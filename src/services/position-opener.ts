@@ -250,7 +250,7 @@ export class PositionOpener {
     };
 
     if (mode === "dual") {
-      const split = this.computeDualSplit(position, quoteIsToken0, depositAmount, baseDecimals, quoteDecimals, sqrtPriceX96);
+      const split = this.computeDualSplit(position, quoteIsToken0, depositAmount, sqrtPriceX96);
       return { ...basePreview, baseToken, baseTokenSymbol: baseSymbol, ...split };
     }
 
@@ -519,8 +519,6 @@ export class PositionOpener {
     position: V3Position | V4Position,
     quoteIsToken0: boolean,
     depositAmount: bigint,
-    baseDecimals: number,
-    quoteDecimals: number,
     sqrtPriceX96: bigint,
   ): { quoteSideAmount: bigint; baseAmount: bigint; swapAmount: bigint; expectedBaseFromSwap: bigint } {
     const { amount0, amount1 } = position.mintAmounts;
@@ -533,8 +531,8 @@ export class PositionOpener {
 
     const square = sqrtPriceX96 * sqrtPriceX96;
     const baseInQuote = quoteIsToken0
-      ? (fullBaseAmount * Q192 * 10n ** BigInt(quoteDecimals)) / (square * 10n ** BigInt(baseDecimals))
-      : (fullBaseAmount * square * 10n ** BigInt(quoteDecimals)) / (Q192 * 10n ** BigInt(baseDecimals));
+      ? (fullBaseAmount * Q192) / square
+      : (fullBaseAmount * square) / Q192;
 
     const totalCost = fullQuoteAmount + baseInQuote;
     if (totalCost === 0n) throw new Error("Dual-side auto-split produced a zero total cost");

@@ -4,13 +4,12 @@ import { Pool as V4Pool, Position as V4Position } from "@uniswap/v4-sdk";
 import { describe, expect, it } from "vitest";
 import { zeroAddress } from "viem";
 
-import { selectOpenQuoteToken } from "../src/services/position-opener.js";
+import { PositionOpener, selectOpenQuoteToken } from "../src/services/position-opener.js";
 import { ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
 
 const chainId = 4663;
 const token0 = new Token(chainId, "0x0000000000000000000000000000000000000001", 6, "USDG");
 const token1 = new Token(chainId, "0x0000000000000000000000000000000000000002", 18, "VLAD");
-const equalDecimalsToken0 = new Token(chainId, "0x0000000000000000000000000000000000000003", 18, "QUOTE");
 const sqrtPriceX96 = (1n << 96n).toString();
 
 describe("SDK single-side liquidity", () => {
@@ -91,33 +90,19 @@ describe("SDK dual-side liquidity", () => {
   });
 
   it("computes a dual-side split where quote + base quote-value approximates the deposit", () => {
-    const pool = new V3Pool(equalDecimalsToken0, token1, FeeAmount.MEDIUM, sqrtPriceX96, "1000000", 0);
+    const pool = new V3Pool(token0, token1, FeeAmount.MEDIUM, sqrtPriceX96, "1000000", 0);
     const tickLower = -2760;
     const tickUpper = 2760;
-    const depositAmount = 200_000_000_000_000_000_000n;
+    const depositAmount = 200_000_000n;
     const position = V3Position.fromAmount0({ pool, tickLower, tickUpper, amount0: depositAmount.toString(), useFullPrecision: true });
 
-    const fullBaseAmount = BigInt(position.mintAmounts.amount1);
-    expect(fullBaseAmount).toBeGreaterThan(0n);
+    const opener = new PositionOpener({} as never, {} as never);
+    const split = (opener as any).computeDualSplit(position, true, depositAmount, 1n << 96n);
 
-    const square = ((1n << 96n) * 1_000_000n) ** 2n;
-    const Q192 = 1n << 192n;
-    const baseDecimals = 18;
-    const quoteDecimals = 18;
-    const baseInQuote = (fullBaseAmount * Q192 * 10n ** BigInt(quoteDecimals)) / (square * 10n ** BigInt(baseDecimals));
-    const fullQuoteAmount = BigInt(position.mintAmounts.amount0);
-    const totalCost = fullQuoteAmount + baseInQuote;
-    expect(totalCost).toBeGreaterThan(depositAmount);
-
-    const scale = depositAmount * 1_000_000n / totalCost;
-    const finalQuote = (fullQuoteAmount * scale) / 1_000_000n;
-    const finalBase = (fullBaseAmount * scale) / 1_000_000n;
-    const swapAmount = depositAmount - finalQuote;
-
-    expect(finalQuote).toBeGreaterThan(0n);
-    expect(finalBase).toBeGreaterThan(0n);
-    expect(swapAmount).toBeGreaterThan(0n);
-    expect(swapAmount).toBeLessThan(depositAmount);
+    expect(split.quoteSideAmount).toBeGreaterThan(0n);
+    expect(split.baseAmount).toBeGreaterThan(0n);
+    expect(split.swapAmount).toBeGreaterThan(0n);
+    expect(split.swapAmount).toBeLessThan(depositAmount);
   });
 
   it("fromAmount1 also produces both sides when range straddles the tick", () => {
