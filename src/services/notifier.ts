@@ -48,7 +48,7 @@ type DashboardAction =
   | { type: "calendar_page"; year: number; month: number }
   | { type: "history_page"; page: number }
   | { type: "open"; page: number }
-  | { type: "open_mode"; mode: "single" | "dual" }
+  | { type: "open_mode"; mode: "single" | "dual"; page: number }
   | { type: "open_pool_input"; page: number }
   | { type: "open_confirm"; requestId: string }
   | { type: "open_cancel"; page: number }
@@ -544,13 +544,16 @@ export class Notifier {
       }
       if (action.type === "open") {
         const keyboard = new InlineKeyboard()
-          .text("Single-side", "lp:openmode:single")
-          .text("Dual-side", "lp:openmode:dual");
+          .text("Single-side", `lp:openmode:single:${action.page}`)
+          .text("Dual-side", `lp:openmode:dual:${action.page}`)
+          .row()
+          .text("← Back", dashboardAction("status", action.page));
         await this.editDashboardMessage(chatId, message.message_id, "🟢 Open Position\nPilih mode:", keyboard);
         return;
       }
       if (action.type === "open_mode") {
         this.pendingInput.set(chatId, { kind: "open_pool", chain: "robinhood", mode: action.mode, dashboardMessageId: message.message_id });
+        await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
         await this.replyTemp(ctx, `🟢 Open Position (${action.mode === "dual" ? "Dual-side" : "Single-side"})\nKirim pool address (V3 contract) atau V4 pool ID.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
         return;
       }
@@ -1781,7 +1784,11 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
     return page === null ? null : { type: "history_page", page };
   }
   if (parts.length === 3 && parts[0] === "lp" && parts[1] === "openmode" && (parts[2] === "single" || parts[2] === "dual")) {
-    return { type: "open_mode", mode: parts[2] };
+    return { type: "open_mode", mode: parts[2], page: 0 };
+  }
+  if (parts.length === 4 && parts[0] === "lp" && parts[1] === "openmode" && (parts[2] === "single" || parts[2] === "dual")) {
+    const page = parseDashboardPage(parts[3]);
+    return page === null ? null : { type: "open_mode", mode: parts[2], page };
   }
   if (parts.length === 3 && parts[0] === "lp" && isDashboardAction(parts[1])) {
     const page = parseDashboardPage(parts[2]);

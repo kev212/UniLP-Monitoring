@@ -32,8 +32,8 @@ describe("Telegram dashboard callbacks", () => {
   });
 
   it("parses open mode callbacks", () => {
-    expect(parseDashboardAction("lp:openmode:single")).toEqual({ type: "open_mode", mode: "single" });
-    expect(parseDashboardAction("lp:openmode:dual")).toEqual({ type: "open_mode", mode: "dual" });
+    expect(parseDashboardAction("lp:openmode:single")).toEqual({ type: "open_mode", mode: "single", page: 0 });
+    expect(parseDashboardAction("lp:openmode:dual:2")).toEqual({ type: "open_mode", mode: "dual", page: 2 });
     expect(parseDashboardAction("lp:openmode:both")).toBeNull();
   });
 
