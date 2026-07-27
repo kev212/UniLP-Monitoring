@@ -88,6 +88,7 @@ const MAX_UINT256 = (1n << 256n) - 1n;
 const MAX_UINT160 = (1n << 160n) - 1n;
 const PERMIT2_MAX_EXPIRATION_SECONDS = 2_592_000;
 const PENDING_APPROVAL_MAX_AGE_MS = 5 * 60_000;
+const V4_WITHDRAWAL_LOG_BLOCK_RANGE = 2_000n;
 
 class PendingExecutionError extends Error {
   constructor(readonly stage: string, readonly transactionHash: Hex, cause: unknown) {
@@ -1565,21 +1566,7 @@ export class Executor {
     if (!salt) return false;
     const { client, registry } = this.chains.getById(position.chainId);
     try {
-      const events = await client.getLogs({
-        address: registry.contracts.v4.poolManager,
-        event: v4PoolManagerModifyLiquidityEvent,
-        args: { sender: registry.contracts.v4.positionManager },
-        fromBlock: position.openedAtBlock ?? 0n,
-        toBlock: "latest" as never,
-      });
-      let withdrawalEvent: (typeof events)[number] | null = null;
-      for (const event of events) {
-        const args = (event as unknown as { args: { salt?: Hex; liquidityDelta?: bigint } }).args;
-        if (args.salt?.toLowerCase() === salt.toLowerCase() && (args.liquidityDelta ?? 0n) < 0n) {
-          withdrawalEvent = event;
-          break;
-        }
-      }
+      const withdrawalEvent = await this.findV4WithdrawalEvent(position, salt);
       if (!withdrawalEvent || !withdrawalEvent.transactionHash || !withdrawalEvent.blockNumber) return false;
       const receipt = await client.getTransactionReceipt({ hash: withdrawalEvent.transactionHash });
       if (!receipt) return false;
@@ -1620,6 +1607,36 @@ export class Executor {
       log.warn({ err: error, positionId: position.id }, "auto-settle zero liquidity failed");
       return false;
     }
+  }
+
+  private async findV4WithdrawalEvent(position: PositionRecord, salt: Hex) {
+    const { registry } = this.chains.getById(position.chainId);
+    const { client } = this.chains.getForScan(registry.name);
+    const fromBlock = position.openedAtBlock ?? 0n;
+    let toBlock = await client.getBlockNumber();
+    while (toBlock >= fromBlock) {
+      const chunkFrom = toBlock - fromBlock >= V4_WITHDRAWAL_LOG_BLOCK_RANGE
+        ? toBlock - V4_WITHDRAWAL_LOG_BLOCK_RANGE + 1n
+        : fromBlock;
+      // Robinhood RPC rejects the indexed sender topic on this event. Filter it locally.
+      const events = await client.getLogs({
+        address: registry.contracts.v4.poolManager,
+        event: v4PoolManagerModifyLiquidityEvent,
+        fromBlock: chunkFrom,
+        toBlock,
+      });
+      for (const event of [...events].reverse()) {
+        const args = (event as unknown as { args: { sender?: Address; salt?: Hex; liquidityDelta?: bigint } }).args;
+        if (args.sender?.toLowerCase() === registry.contracts.v4.positionManager.toLowerCase()
+          && args.salt?.toLowerCase() === salt.toLowerCase()
+          && (args.liquidityDelta ?? 0n) < 0n) {
+          return event;
+        }
+      }
+      if (chunkFrom === fromBlock) break;
+      toBlock = chunkFrom - 1n;
+    }
+    return null;
   }
 
   async autoSettleZeroLiquidityV3(name: string, position: PositionRecord): Promise<boolean> {

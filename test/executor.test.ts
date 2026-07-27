@@ -246,6 +246,37 @@ describe("Executor pending settlement recovery", () => {
     expect(send).toHaveBeenCalledWith(expect.anything(), "approve_swap_reset", expect.anything());
   });
 
+  it("finds a V4 manual withdrawal with chunked unfiltered log queries", async () => {
+    const salt = "0x000000000000000000000000000000000000000000000000000000000005bab3" as const;
+    const poolManager = "0x0000000000000000000000000000000000000003" as const;
+    const positionManager = "0x0000000000000000000000000000000000000004" as const;
+    const event = {
+      args: { sender: positionManager, salt, liquidityDelta: -1n },
+      transactionHash: hash,
+      blockNumber: 2_500n,
+    };
+    const scanClient = {
+      getBlockNumber: vi.fn().mockResolvedValue(3_000n),
+      getLogs: vi.fn().mockResolvedValue([event]),
+    };
+    const chains = {
+      getById: vi.fn(() => ({ registry: { name: "robinhood", contracts: { v4: { poolManager, positionManager } } } })),
+      getForScan: vi.fn(() => ({ client: scanClient })),
+    };
+    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "375475", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "needs_review", liquidity: 0n,
+      openedAtBlock: 1_000n, metadata: {},
+    } as PositionRecord;
+
+    const found = await (executor as unknown as { findV4WithdrawalEvent(value: PositionRecord, valueSalt: Hex): Promise<unknown> })
+      .findV4WithdrawalEvent(position, salt);
+
+    expect(found).toBe(event);
+    expect(scanClient.getLogs).toHaveBeenCalledWith(expect.objectContaining({ fromBlock: 1_001n, toBlock: 3_000n }));
+  });
+
   it("quotes providers in parallel and selects the best simulated output", async () => {
     const client = {
       readContract: vi.fn().mockResolvedValue(5n),
