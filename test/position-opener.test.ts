@@ -5,10 +5,12 @@ import { describe, expect, it } from "vitest";
 import { zeroAddress } from "viem";
 
 import { selectOpenQuoteToken } from "../src/services/position-opener.js";
+import { ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
 
 const chainId = 4663;
 const token0 = new Token(chainId, "0x0000000000000000000000000000000000000001", 6, "USDG");
 const token1 = new Token(chainId, "0x0000000000000000000000000000000000000002", 18, "VLAD");
+const equalDecimalsToken0 = new Token(chainId, "0x0000000000000000000000000000000000000003", 18, "QUOTE");
 const sqrtPriceX96 = (1n << 96n).toString();
 
 describe("SDK single-side liquidity", () => {
@@ -60,5 +62,72 @@ describe("SDK single-side liquidity", () => {
     expect(v3.mintAmounts.amount1.toString()).toBe("20000000000000000000");
     expect(v4.mintAmounts.amount0.toString()).toBe("0");
     expect(v4.mintAmounts.amount1.toString()).toBe("20000000000000000000");
+  });
+});
+
+describe("SDK dual-side liquidity", () => {
+  it("uses true percentage bounds instead of equal logarithmic tick distances", () => {
+    const lower = ticksForDropPercent(30);
+    const upper = ticksForRisePercent(30);
+
+    expect(lower).toBeGreaterThan(upper);
+    expect(Math.exp(-lower * Math.log(1.0001))).toBeCloseTo(0.7, 3);
+    expect(Math.exp(upper * Math.log(1.0001))).toBeCloseTo(1.3, 3);
+  });
+
+  it("produces both token amounts when range straddles the current tick", () => {
+    const v3Pool = new V3Pool(token0, token1, FeeAmount.MEDIUM, sqrtPriceX96, "1000000", 0);
+    const v4Pool = new V4Pool(token0, token1, FeeAmount.MEDIUM, 60, zeroAddress, sqrtPriceX96, "1000000", 0);
+    const tickLower = -2760;
+    const tickUpper = 2760;
+
+    const v3 = V3Position.fromAmount0({ pool: v3Pool, tickLower, tickUpper, amount0: "200000000", useFullPrecision: true });
+    const v4 = V4Position.fromAmount0({ pool: v4Pool, tickLower, tickUpper, amount0: "200000000", useFullPrecision: true });
+
+    expect(BigInt(v3.mintAmounts.amount0)).toBeGreaterThan(0n);
+    expect(BigInt(v3.mintAmounts.amount1)).toBeGreaterThan(0n);
+    expect(BigInt(v4.mintAmounts.amount0)).toBeGreaterThan(0n);
+    expect(BigInt(v4.mintAmounts.amount1)).toBeGreaterThan(0n);
+  });
+
+  it("computes a dual-side split where quote + base quote-value approximates the deposit", () => {
+    const pool = new V3Pool(equalDecimalsToken0, token1, FeeAmount.MEDIUM, sqrtPriceX96, "1000000", 0);
+    const tickLower = -2760;
+    const tickUpper = 2760;
+    const depositAmount = 200_000_000_000_000_000_000n;
+    const position = V3Position.fromAmount0({ pool, tickLower, tickUpper, amount0: depositAmount.toString(), useFullPrecision: true });
+
+    const fullBaseAmount = BigInt(position.mintAmounts.amount1);
+    expect(fullBaseAmount).toBeGreaterThan(0n);
+
+    const square = ((1n << 96n) * 1_000_000n) ** 2n;
+    const Q192 = 1n << 192n;
+    const baseDecimals = 18;
+    const quoteDecimals = 18;
+    const baseInQuote = (fullBaseAmount * Q192 * 10n ** BigInt(quoteDecimals)) / (square * 10n ** BigInt(baseDecimals));
+    const fullQuoteAmount = BigInt(position.mintAmounts.amount0);
+    const totalCost = fullQuoteAmount + baseInQuote;
+    expect(totalCost).toBeGreaterThan(depositAmount);
+
+    const scale = depositAmount * 1_000_000n / totalCost;
+    const finalQuote = (fullQuoteAmount * scale) / 1_000_000n;
+    const finalBase = (fullBaseAmount * scale) / 1_000_000n;
+    const swapAmount = depositAmount - finalQuote;
+
+    expect(finalQuote).toBeGreaterThan(0n);
+    expect(finalBase).toBeGreaterThan(0n);
+    expect(swapAmount).toBeGreaterThan(0n);
+    expect(swapAmount).toBeLessThan(depositAmount);
+  });
+
+  it("fromAmount1 also produces both sides when range straddles the tick", () => {
+    const pool = new V3Pool(token0, token1, FeeAmount.MEDIUM, sqrtPriceX96, "1000000", 0);
+    const tickLower = -2760;
+    const tickUpper = 2760;
+
+    const position = V3Position.fromAmount1({ pool, tickLower, tickUpper, amount1: "20000000000000000000" });
+
+    expect(BigInt(position.mintAmounts.amount0)).toBeGreaterThan(0n);
+    expect(BigInt(position.mintAmounts.amount1)).toBeGreaterThan(0n);
   });
 });

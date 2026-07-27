@@ -87,3 +87,8 @@ export function ticksForDropPercent(dropPercent: number): number {
   const ratio = 1 / (1 - dropPercent / 100);
   return Math.round(Math.log(ratio) / Math.log(1.0001));
 }
+
+export function ticksForRisePercent(risePercent: number): number {
+  const ratio = 1 + risePercent / 100;
+  return Math.round(Math.log(ratio) / Math.log(1.0001));
+}

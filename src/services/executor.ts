@@ -47,6 +47,7 @@ import type { RoutePlanner, SwapRoute } from "./route-planner.js";
 import { UNISWAP_API_ROUTER, type TradingApiQuote, type UniswapTradingApi } from "./uniswap-trading-api.js";
 import type { KyberSwapAggregatorApi, KyberSwapQuote } from "./kyberswap-aggregator-api.js";
 import { hasPendingSettlement } from "./pending-settlement.js";
+import { buildSwapPlan } from "./swap-builder.js";
 import { receiptTokenTransfers } from "./discovery.js";
 import { applySlippage } from "./uniswap-math.js";
 
@@ -1028,7 +1029,7 @@ export class Executor {
         }
       }
       if (approvalChanged && attempt < 2) continue;
-      const plan = this.swapPlan(position, route);
+      const plan = buildSwapPlan(position.chainId, position.owner, route, BigInt(Math.floor(Date.now() / 1_000) + 300));
       log.info({ positionKey: position.positionKey, protocol: route.protocol, path: route.path, expectedOut: route.expectedOut.toString(), minimumOut: route.minimumOut.toString(), slippageBps }, "local settlement route selected");
       return { provider: "local", expectedOut: route.expectedOut, minimumOut: route.minimumOut, plan };
     }
@@ -1089,94 +1090,6 @@ export class Executor {
       to: registry.contracts.v4.positionManager,
       data: encodeFunctionData({ abi: v4PositionManagerAbi, functionName: "modifyLiquidities", args: [unlockData, deadline] }),
       description: "burn V4 position and take pair",
-    };
-  }
-
-  private swapPlan(position: PositionRecord, route: SwapRoute): TransactionPlan {
-    const deadline = BigInt(Math.floor(Date.now() / 1_000) + 300);
-    if (route.protocol === "v2") {
-      return {
-        chainId: position.chainId,
-        to: route.router,
-        data: encodeFunctionData({
-          abi: v2RouterAbi,
-          functionName: "swapExactTokensForTokens",
-          args: [route.amountIn, route.minimumOut, route.path, position.owner, deadline],
-        }),
-        description: "swap V2 route to quote token",
-      };
-    }
-    if (route.protocol === "v4") {
-      if (!route.v4PoolKey || route.amountIn > (1n << 128n) - 1n || route.minimumOut > (1n << 128n) - 1n) {
-        throw new Error("V4 route has an invalid pool key or amount");
-      }
-      const zeroForOne = route.tokenIn.toLowerCase() === route.v4PoolKey.currency0.toLowerCase();
-      const exactInputSingle = encodeAbiParameters(
-        [{
-          type: "tuple",
-          components: [
-            {
-              name: "poolKey",
-              type: "tuple",
-              components: [
-                { name: "currency0", type: "address" },
-                { name: "currency1", type: "address" },
-                { name: "fee", type: "uint24" },
-                { name: "tickSpacing", type: "int24" },
-                { name: "hooks", type: "address" },
-              ],
-            },
-            { name: "zeroForOne", type: "bool" },
-            { name: "amountIn", type: "uint128" },
-            { name: "amountOutMinimum", type: "uint128" },
-            { name: "minHopPriceX36", type: "uint256" },
-            { name: "hookData", type: "bytes" },
-          ],
-        }],
-        [{
-          poolKey: route.v4PoolKey,
-          zeroForOne,
-          amountIn: route.amountIn,
-          amountOutMinimum: route.minimumOut,
-          minHopPriceX36: 0n,
-          hookData: "0x",
-        }],
-      );
-      const settleAll = encodeAbiParameters(
-        [{ type: "address" }, { type: "uint256" }],
-        [route.tokenIn, route.amountIn],
-      );
-      const takeAll = encodeAbiParameters(
-        [{ type: "address" }, { type: "uint256" }],
-        [route.tokenOut, route.minimumOut],
-      );
-      const v4Input = encodeAbiParameters(
-        [{ type: "bytes" }, { type: "bytes[]" }],
-        ["0x060c0f", [exactInputSingle, settleAll, takeAll]],
-      );
-      return {
-        chainId: position.chainId,
-        to: route.router,
-        data: encodeFunctionData({ abi: v4UniversalRouterAbi, functionName: "execute", args: ["0x10" as Hex, [v4Input], deadline] }),
-        description: "swap V4 route to quote token",
-      };
-    }
-    if (!route.encodedPath) throw new Error("V3 route is missing an encoded path");
-    return {
-      chainId: position.chainId,
-      to: route.router,
-      data: encodeFunctionData({
-        abi: v3SwapRouterAbi,
-        functionName: "exactInput",
-        args: [{
-          path: route.encodedPath,
-          recipient: position.owner,
-          deadline,
-          amountIn: route.amountIn,
-          amountOutMinimum: route.minimumOut,
-        }],
-      }),
-      description: "swap V3 route to quote token",
     };
   }
 

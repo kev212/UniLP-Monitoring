@@ -48,6 +48,7 @@ type DashboardAction =
   | { type: "calendar_page"; year: number; month: number }
   | { type: "history_page"; page: number }
   | { type: "open"; page: number }
+  | { type: "open_mode"; mode: "single" | "dual" }
   | { type: "open_pool_input"; page: number }
   | { type: "open_confirm"; requestId: string }
   | { type: "open_cancel"; page: number }
@@ -59,9 +60,9 @@ type PendingInput =
   | { kind: "scan_token"; chain: ChainName }
   | { kind: "config"; key: PoolSettingKey; dashboardMessageId: number }
   | { kind: "risk"; key: RiskSettingKey; dashboardMessageId: number }
-  | { kind: "open_pool"; chain: ChainName; dashboardMessageId: number }
-  | { kind: "open_range"; chain: ChainName; poolAddress: string; dashboardMessageId: number }
-  | { kind: "open_amount"; chain: ChainName; poolAddress: string; dropPercent: number; quoteToken: QuoteToken; dashboardMessageId: number };
+  | { kind: "open_pool"; chain: ChainName; mode: "single" | "dual"; dashboardMessageId: number }
+  | { kind: "open_range"; chain: ChainName; poolAddress: string; mode: "single" | "dual"; dashboardMessageId: number }
+  | { kind: "open_amount"; chain: ChainName; poolAddress: string; rangePercent: number; mode: "single" | "dual"; quoteToken: QuoteToken; dashboardMessageId: number };
 
 interface DashboardView {
   text: string;
@@ -542,8 +543,15 @@ export class Notifier {
         return;
       }
       if (action.type === "open") {
-        this.pendingInput.set(chatId, { kind: "open_pool", chain: "robinhood", dashboardMessageId: message.message_id });
-        await this.replyTemp(ctx, "🟢 Open Position\nKirim pool address (V3 contract) atau V4 pool ID.", { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
+        const keyboard = new InlineKeyboard()
+          .text("Single-side", "lp:openmode:single")
+          .text("Dual-side", "lp:openmode:dual");
+        await this.editDashboardMessage(chatId, message.message_id, "🟢 Open Position\nPilih mode:", keyboard);
+        return;
+      }
+      if (action.type === "open_mode") {
+        this.pendingInput.set(chatId, { kind: "open_pool", chain: "robinhood", mode: action.mode, dashboardMessageId: message.message_id });
+        await this.replyTemp(ctx, `🟢 Open Position (${action.mode === "dual" ? "Dual-side" : "Single-side"})\nKirim pool address (V3 contract) atau V4 pool ID.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
         return;
       }
       if (action.type === "open_confirm") {
@@ -560,7 +568,9 @@ export class Notifier {
           if (!this.positionOpener) throw new Error("Position opener is not configured");
           const result = await this.positionOpener.executeOpen(preview);
           const hashLabel = result.hash ? `\ntx: ${result.hash.slice(0, 18)}...` : "";
-          await this.replyTemp(ctx, `🟢 LP OPENED\n${preview.protocol.toUpperCase()} ${preview.pair} | ${preview.feeLabel}\nRange: ${preview.lowerPrice} → ${preview.upperPrice}\nDeposit: ${(Number(preview.depositAmount) / 10 ** (preview.quoteTokenSymbol === "USDG" ? 6 : 18)).toFixed(2)} ${preview.quoteTokenSymbol}${hashLabel}`);
+          const swapLabel = result.swapHash ? `\nswap: ${result.swapHash.slice(0, 18)}...` : "";
+          const depositFormatted = (Number(preview.depositAmount) / 10 ** (preview.quoteTokenSymbol === "USDG" ? 6 : 18)).toFixed(2);
+          await this.replyTemp(ctx, `🟢 LP OPENED\n${preview.protocol.toUpperCase()} ${preview.pair} | ${preview.feeLabel}\nRange: ${preview.lowerPrice} → ${preview.upperPrice}\nDeposit: ${depositFormatted} ${preview.quoteTokenSymbol}${swapLabel}${hashLabel}`);
         } catch (error) {
           await this.replyTemp(ctx, `❌ Open position gagal: ${errorMessage(error).slice(0, 200)}`);
         }
@@ -1207,20 +1217,23 @@ export class Notifier {
           await this.replyTemp(ctx, "Address atau link pool Uniswap Robinhood tidak valid.");
           return;
         }
-        this.pendingInput.set(chatId, { kind: "open_range", chain: pending.chain, poolAddress, dashboardMessageId: pending.dashboardMessageId });
-        await this.replyTemp(ctx, "Kirim range drop % (contoh: -60 untuk 60% di bawah harga sekarang).", { reply_markup: { force_reply: true } as any });
+        this.pendingInput.set(chatId, { kind: "open_range", chain: pending.chain, poolAddress, mode: pending.mode, dashboardMessageId: pending.dashboardMessageId });
+        const prompt = pending.mode === "dual"
+          ? "Kirim range ±% (contoh: 30 untuk ±30% di sekitar harga sekarang)."
+          : "Kirim range drop % (contoh: -60 untuk 60% di bawah harga sekarang).";
+        await this.replyTemp(ctx, prompt, { reply_markup: { force_reply: true } as any });
         return;
       }
       if (pending.kind === "open_range") {
-        const dropPercent = Number(text.replace(/[%\s,]/g, ""));
-        if (!Number.isFinite(dropPercent) || dropPercent <= 0 || dropPercent >= 100) {
+        const rangePercent = Number(text.replace(/[%\s,]/g, ""));
+        if (!Number.isFinite(rangePercent) || rangePercent <= 0 || rangePercent >= 100) {
           this.pendingInput.set(chatId, pending);
-          await this.replyTemp(ctx, "Range tidak valid. Kirim angka 1-99, contoh: -60.");
+          await this.replyTemp(ctx, "Range tidak valid. Kirim angka 1-99, contoh: 30 atau 60.");
           return;
         }
         if (!this.positionOpener) throw new Error("Position opener is not configured");
         const quoteToken = await this.positionOpener.detectQuoteToken(pending.poolAddress, pending.chain);
-        this.pendingInput.set(chatId, { kind: "open_amount", chain: pending.chain, poolAddress: pending.poolAddress, dropPercent, quoteToken, dashboardMessageId: pending.dashboardMessageId });
+        this.pendingInput.set(chatId, { kind: "open_amount", chain: pending.chain, poolAddress: pending.poolAddress, rangePercent, mode: pending.mode, quoteToken, dashboardMessageId: pending.dashboardMessageId });
         const example = quoteToken.symbol === "USDG" || quoteToken.symbol === "USDC" ? "200" : "0.01";
         await this.replyTemp(ctx, `Kirim jumlah deposit dalam ${quoteToken.symbol} (contoh: ${example}).`, { reply_markup: { force_reply: true } as any });
         return;
@@ -1232,7 +1245,7 @@ export class Notifier {
           await this.replyTemp(ctx, "Jumlah tidak valid. Kirim angka positif.");
           return;
         }
-        await this.handleOpenPreview(ctx, pending.chain, pending.poolAddress, pending.dropPercent, amount, pending.quoteToken);
+        await this.handleOpenPreview(ctx, pending.chain, pending.poolAddress, pending.rangePercent, amount, pending.quoteToken, pending.mode);
         return;
       }
       if (pending.kind === "risk") {
@@ -1258,7 +1271,7 @@ export class Notifier {
     }
   }
 
-  private async handleOpenPreview(ctx: Context, chain: ChainName, poolAddress: string, dropPercent: number, amount: string, quoteToken: QuoteToken): Promise<void> {
+  private async handleOpenPreview(ctx: Context, chain: ChainName, poolAddress: string, rangePercent: number, amount: string, quoteToken: QuoteToken, mode: "single" | "dual"): Promise<void> {
     if (!this.positionOpener) {
       await this.replyTemp(ctx, "❌ Position opener belum dikonfigurasi.");
       return;
@@ -1268,7 +1281,7 @@ export class Notifier {
     let preview: OpenPositionPreview;
     try {
       const decimals = await this.positionOpener.quoteTokenDecimals(chain, quoteToken.address);
-      preview = await this.positionOpener.prepareOpen(poolAddress, chain, dropPercent, parseUnits(amount, decimals), quoteToken);
+      preview = await this.positionOpener.prepareOpen(poolAddress, chain, rangePercent, parseUnits(amount, decimals), quoteToken, mode);
     } catch (error) {
       await this.replyTemp(ctx, `❌ Gagal membaca pool: ${errorMessage(error).slice(0, 200)}`);
       return;
@@ -1285,12 +1298,25 @@ export class Notifier {
       `Current price: ${preview.currentPrice}`,
       `Range: ${preview.lowerPrice} → ${preview.upperPrice}`,
       `Ticks: ${preview.tickLower} → ${preview.tickUpper} | current ${preview.currentTick}`,
-      `Drop: -${dropPercent}%`,
-      `Deposit: ${depositFormatted} ${preview.quoteTokenSymbol}`,
-      `Quote side: single-side ${preview.quoteTokenSymbol}`,
-      "",
-      `${this.config.dryRun ? "⚠️ DRY_RUN — simulasi tanpa broadcast" : "Konfirmasi untuk eksekusi."}`,
     ];
+
+    if (mode === "dual" && preview.baseTokenSymbol !== undefined && preview.quoteSideAmount !== undefined && preview.swapAmount !== undefined && preview.baseAmount !== undefined) {
+      const quoteDec = preview.quoteTokenSymbol === "USDG" || preview.quoteTokenSymbol === "USDC" ? 6 : 18;
+      const baseDec = preview.baseTokenSymbol === "USDG" || preview.baseTokenSymbol === "USDC" ? 6 : 18;
+      lines.push(`Range: ±${rangePercent}%`);
+      lines.push(`Deposit: ${depositFormatted} ${preview.quoteTokenSymbol}`);
+      lines.push("");
+      lines.push("Mode: DUAL-SIDE");
+      lines.push(`Quote side: ${(Number(preview.quoteSideAmount) / 10 ** quoteDec).toFixed(4)} ${preview.quoteTokenSymbol}`);
+      lines.push(`Swap: ${(Number(preview.swapAmount) / 10 ** quoteDec).toFixed(4)} ${preview.quoteTokenSymbol} → ≈${(Number(preview.baseAmount) / 10 ** baseDec).toFixed(4)} ${preview.baseTokenSymbol}`);
+      lines.push(`Base side: ≈${(Number(preview.baseAmount) / 10 ** baseDec).toFixed(4)} ${preview.baseTokenSymbol}`);
+    } else {
+      lines.push(`Drop: -${rangePercent}%`);
+      lines.push(`Deposit: ${depositFormatted} ${preview.quoteTokenSymbol}`);
+      lines.push(`Quote side: single-side ${preview.quoteTokenSymbol}`);
+    }
+
+    lines.push("", `${this.config.dryRun ? "⚠️ DRY_RUN — simulasi tanpa broadcast" : "Konfirmasi untuk eksekusi."}`);
 
     const keyboard = new InlineKeyboard()
       .text("✅ Confirm", `lp:open_confirm:${requestId}`)
@@ -1753,6 +1779,9 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
   if (parts.length === 3 && parts[0] === "lp" && parts[1] === "histpg") {
     const page = parseDashboardPage(parts[2]);
     return page === null ? null : { type: "history_page", page };
+  }
+  if (parts.length === 3 && parts[0] === "lp" && parts[1] === "openmode" && (parts[2] === "single" || parts[2] === "dual")) {
+    return { type: "open_mode", mode: parts[2] };
   }
   if (parts.length === 3 && parts[0] === "lp" && isDashboardAction(parts[1])) {
     const page = parseDashboardPage(parts[2]);
