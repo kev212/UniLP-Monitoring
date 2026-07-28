@@ -4,7 +4,7 @@ import { Pool as V4Pool, Position as V4Position } from "@uniswap/v4-sdk";
 import { describe, expect, it } from "vitest";
 import { zeroAddress } from "viem";
 
-import { PositionOpener, selectOpenQuoteToken } from "../src/services/position-opener.js";
+import { openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken } from "../src/services/position-opener.js";
 import { ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
 
 const chainId = 4663;
@@ -29,10 +29,11 @@ describe("SDK single-side liquidity", () => {
     expect(selectOpenQuoteToken(allowed, nvda, usdg)).toEqual({ symbol: "USDG", address: usdg });
   });
 
-  it("maps a V3 WETH pool quote to ETH funding", async () => {
+  it("uses wrapped ETH for V3 and native ETH for V4 quote matching", async () => {
     const weth = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73" as const;
-    // The SDK's Robinhood native currency resolves to the deployed WETH token.
     expect(Ether.onChain(chainId).wrapped.address).toBe(weth);
+    expect(openPoolQuoteAddress("v3", chainId, { symbol: "ETH", address: zeroAddress })).toBe(weth);
+    expect(openPoolQuoteAddress("v4", chainId, { symbol: "ETH", address: zeroAddress })).toBe(zeroAddress);
   });
 
   it("keeps token0 deposits above the current tick for V3 and V4", () => {

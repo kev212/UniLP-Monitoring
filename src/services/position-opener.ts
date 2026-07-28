@@ -189,10 +189,7 @@ export class PositionOpener {
     mode: OpenMode,
   ): Promise<OpenPositionPreview> {
     const client = this.client(chain);
-    // A V3 pool stores wrapped native currency, while the open flow accepts ETH.
-    const quoteAddr = (quoteToken.address === zeroAddress
-      ? Ether.onChain(this.chains.get(chain).registry.chain.id).wrapped.address
-      : quoteToken.address).toLowerCase() as Address;
+    const quoteAddr = openPoolQuoteAddress(protocol, this.chains.get(chain).registry.chain.id, quoteToken).toLowerCase() as Address;
     const quoteIsToken0 = quoteAddr === token0.toLowerCase();
     if (!quoteIsToken0 && quoteAddr !== token1.toLowerCase()) {
       throw new Error("Quote token is neither token0 nor token1 of this pool");
@@ -763,4 +760,11 @@ export function selectOpenQuoteToken(allowed: readonly QuoteToken[], token0: Add
     OPEN_QUOTE_PRIORITY.includes(symbol) && (address.toLowerCase() === token0.toLowerCase() || address.toLowerCase() === token1.toLowerCase()),
   );
   return matches.sort((a, b) => OPEN_QUOTE_PRIORITY.indexOf(a.symbol) - OPEN_QUOTE_PRIORITY.indexOf(b.symbol))[0] ?? null;
+}
+
+export function openPoolQuoteAddress(protocol: "v3" | "v4", chainId: number, quoteToken: QuoteToken): Address {
+  // V3 pools store WETH, while V4 pools can represent native ETH as zeroAddress.
+  return protocol === "v3" && quoteToken.address === zeroAddress
+    ? Ether.onChain(chainId).wrapped.address as Address
+    : quoteToken.address;
 }
