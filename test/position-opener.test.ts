@@ -4,7 +4,7 @@ import { Pool as V4Pool, Position as V4Position } from "@uniswap/v4-sdk";
 import { describe, expect, it } from "vitest";
 import { zeroAddress } from "viem";
 
-import { openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken } from "../src/services/position-opener.js";
+import { openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken, wrappedNativeShortfall } from "../src/services/position-opener.js";
 import { ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
 
 const chainId = 4663;
@@ -34,6 +34,11 @@ describe("SDK single-side liquidity", () => {
     expect(Ether.onChain(chainId).wrapped.address).toBe(weth);
     expect(openPoolQuoteAddress("v3", chainId, { symbol: "ETH", address: zeroAddress })).toBe(weth);
     expect(openPoolQuoteAddress("v4", chainId, { symbol: "ETH", address: zeroAddress })).toBe(zeroAddress);
+  });
+
+  it("wraps only the WETH shortfall required for a V4 open", () => {
+    expect(wrappedNativeShortfall(10n, 10n)).toBe(0n);
+    expect(wrappedNativeShortfall(7n, 10n)).toBe(3n);
   });
 
   it("keeps token0 deposits above the current tick for V3 and V4", () => {

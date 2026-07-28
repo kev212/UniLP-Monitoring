@@ -8,7 +8,10 @@ export const erc20Abi = parseAbi([
   "function symbol() view returns (string)",
 ]);
 
-export const wethAbi = parseAbi(["function withdraw(uint256 wad)"]);
+export const wethAbi = parseAbi([
+  "function deposit() payable",
+  "function withdraw(uint256 wad)",
+]);
 
 export const erc20TransferEvent = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 value)");
 export const erc721TransferEvent = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)");

@@ -1238,7 +1238,8 @@ export class Notifier {
         const quoteToken = await this.positionOpener.detectQuoteToken(pending.poolAddress, pending.chain);
         this.pendingInput.set(chatId, { kind: "open_amount", chain: pending.chain, poolAddress: pending.poolAddress, rangePercent, mode: pending.mode, quoteToken, dashboardMessageId: pending.dashboardMessageId });
         const example = quoteToken.symbol === "USDG" || quoteToken.symbol === "USDC" ? "200" : "0.01";
-        await this.replyTemp(ctx, `Kirim jumlah deposit dalam ${quoteToken.symbol} (contoh: ${example}).`, { reply_markup: { force_reply: true } as any });
+        const fundingHint = quoteToken.symbol === "WETH" ? " ETH native akan di-wrap otomatis bila saldo WETH kurang." : "";
+        await this.replyTemp(ctx, `Kirim jumlah deposit dalam ${quoteToken.symbol} (contoh: ${example}).${fundingHint}`, { reply_markup: { force_reply: true } as any });
         return;
       }
       if (pending.kind === "open_amount") {

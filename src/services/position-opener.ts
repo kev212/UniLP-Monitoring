@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { createPublicClient, createWalletClient, encodeFunctionData, http, type Address, type Hex, type PublicClient, zeroAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
-import { erc20Abi, permit2Abi, v3PoolAbi, v4PoolKeysAbi, v4StateViewAbi } from "../abi.js";
+import { erc20Abi, permit2Abi, v3PoolAbi, v4PoolKeysAbi, v4StateViewAbi, wethAbi } from "../abi.js";
 import type { RuntimeConfig } from "../config.js";
 import { log } from "../log.js";
 import type { ChainName, PositionRecord, QuoteToken } from "../types.js";
@@ -267,6 +267,9 @@ export class PositionOpener {
 
     if (!this.isStillStraddling(preview, refreshed.currentTick)) throw new Error("Pool price moved outside the dual-side range; review and confirm again");
 
+    if (preview.protocol === "v4") {
+      await this.ensureWrappedNativeFunding(this.client(preview.chain), preview.chain, preview.quoteToken, preview.depositAmount, this.config.executorAddress);
+    }
     const swapResult = await this.swapQuoteForBase(merged);
     const baseAmount = swapResult.actualBaseOut;
     const quoteSideAmount = merged.quoteSideAmount ?? 0n;
@@ -302,6 +305,7 @@ export class PositionOpener {
     const positionManager = registry.contracts.v4.positionManager;
     const executor = this.config.executorAddress;
 
+    await this.ensureWrappedNativeFunding(client, preview.chain, preview.quoteToken, preview.depositAmount, executor);
     await this.ensureApproval(client, preview.quoteToken, registry.contracts.v4.permit2, preview.depositAmount, executor, preview.chain);
     await this.ensurePermit2Approval(client, preview.quoteToken, positionManager, preview.depositAmount, executor, preview.chain);
     const position = this.v4PositionFromPreview(preview);
@@ -690,6 +694,28 @@ export class PositionOpener {
     if (balance < amount) throw new Error("Insufficient native ETH balance for open position");
   }
 
+  private async ensureWrappedNativeFunding(client: PublicClient, chain: ChainName, token: Address, amount: bigint, owner: Address): Promise<void> {
+    const wrappedNative = Ether.onChain(this.chains.get(chain).registry.chain.id).wrapped.address.toLowerCase();
+    if (token.toLowerCase() !== wrappedNative) return;
+
+    const balance = await client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
+    const shortfall = wrappedNativeShortfall(balance, amount);
+    if (shortfall === 0n) return;
+    await this.ensureNativeBalance(client, owner, shortfall);
+
+    if (this.config.dryRun) {
+      log.info({ token, shortfall: shortfall.toString() }, "dry-run: native ETH wrap needed for V4 open");
+      return;
+    }
+
+    const wallet = this.walletClient(chain);
+    const data = encodeFunctionData({ abi: wethAbi, functionName: "deposit" });
+    const hash = await wallet.sendTransaction({ to: token, data, value: shortfall, account: this.account!, chain: this.chains.get(chain).registry.chain });
+    const receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
+    if (receipt.status !== "success") throw new Error(`Native ETH wrap reverted for ${token}`);
+    log.info({ hash, token, shortfall: shortfall.toString() }, "native ETH wrapped for V4 open");
+  }
+
   private async tokenBalance(client: PublicClient, token: Address, owner: Address): Promise<bigint> {
     if (token.toLowerCase() === zeroAddress) return client.getBalance({ address: owner });
     return client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
@@ -767,4 +793,8 @@ export function openPoolQuoteAddress(protocol: "v3" | "v4", chainId: number, quo
   return protocol === "v3" && quoteToken.address === zeroAddress
     ? Ether.onChain(chainId).wrapped.address as Address
     : quoteToken.address;
+}
+
+export function wrappedNativeShortfall(wrappedBalance: bigint, requiredAmount: bigint): bigint {
+  return wrappedBalance >= requiredAmount ? 0n : requiredAmount - wrappedBalance;
 }
