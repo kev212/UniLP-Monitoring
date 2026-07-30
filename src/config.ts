@@ -18,10 +18,15 @@ const envSchema = z.object({
   ROBINHOOD_RPC_HTTP: z.string().url(),
   ROBINHOOD_RPC_WSS: z.string().url().optional().or(z.literal("")),
   ROBINHOOD_RPC_HTTP_FALLBACK: z.string().url().optional().or(z.literal("")),
+  BSC_RPC_HTTP: z.string().url().default("https://bsc-dataseed.bnbchain.org"),
+  BSC_RPC_WSS: z.string().url().optional().or(z.literal("")),
+  BSC_RPC_HTTP_FALLBACK: z.string().url().optional().or(z.literal("")),
   ALCHEMY_BASE_HTTP: z.string().url().optional().or(z.literal("")),
   ALCHEMY_ROBINHOOD_HTTP: z.string().url().optional().or(z.literal("")),
+  ALCHEMY_BSC_HTTP: z.string().url().optional().or(z.literal("")),
   QUOTE_TOKEN_ALLOWLIST_BASE: z.string().default(""),
   QUOTE_TOKEN_ALLOWLIST_ROBINHOOD: z.string().default(""),
+  QUOTE_TOKEN_ALLOWLIST_BSC: z.string().default("USDT:0x55d398326f99059fF775485246999027B3197955,WBNB:0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"),
   STOP_LOSS_PERCENT: z.coerce.number().negative(),
   TAKE_PROFIT_PERCENT: z.coerce.number().positive(),
   TRAILING_STOP_ACTIVATION_PERCENT: z.coerce.number().positive().default(5),
@@ -32,6 +37,7 @@ const envSchema = z.object({
   POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).default(5_000),
   BASE_POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).optional(),
   ROBINHOOD_POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).optional(),
+  BSC_POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).optional(),
   DISCOVERY_INTERVAL_MS: z.coerce.number().int().min(5_000).max(300_000).default(30_000),
   POSITION_MONITOR_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(2),
   MAX_SWAP_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(100),
@@ -71,6 +77,7 @@ const envSchema = z.object({
   RPC_BOOTSTRAP_LOOKBACK_BLOCKS: z.coerce.number().int().min(1_000).max(1_000_000).default(50_000),
   START_BLOCK_BASE: z.coerce.bigint().min(0n).default(0n),
   START_BLOCK_ROBINHOOD: z.coerce.bigint().min(0n).default(0n),
+  START_BLOCK_BSC: z.coerce.bigint().min(0n).default(0n),
   TELEGRAM_BOT_TOKEN: z.string().optional(),
   TELEGRAM_CHAT_ID: z.string().optional(),
   TELEGRAM_USER_ID: z.string().regex(/^\d+$/).optional(),
@@ -141,8 +148,8 @@ function parseChains(value: string): ChainName[] {
     .map((item) => item.trim())
     .filter(Boolean);
 
-  if (chains.length === 0 || chains.some((chain) => chain !== "base" && chain !== "robinhood")) {
-    throw new Error("CHAINS must contain only base and/or robinhood");
+  if (chains.length === 0 || chains.some((chain) => chain !== "base" && chain !== "robinhood" && chain !== "bsc")) {
+    throw new Error("CHAINS must contain only base, robinhood, and/or bsc");
   }
 
   return [...new Set(chains)] as ChainName[];
@@ -184,6 +191,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
   const env = envSchema.parse(environment);
   const alchemyBase = env.ALCHEMY_BASE_HTTP || undefined;
   const alchemyRobinhood = env.ALCHEMY_ROBINHOOD_HTTP || undefined;
+  const alchemyBsc = env.ALCHEMY_BSC_HTTP || undefined;
   const telegram = env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID
     ? {
         token: env.TELEGRAM_BOT_TOKEN,
@@ -201,7 +209,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     throw new Error("TELEGRAM_USER_ID is required when TELEGRAM_CHAT_ID is a group");
   }
 
-  const rpcUsesAlchemy = Boolean(detectAlchemyEndpoint(env.BASE_RPC_HTTP) || detectAlchemyEndpoint(env.ROBINHOOD_RPC_HTTP));
+  const rpcUsesAlchemy = Boolean(detectAlchemyEndpoint(env.BASE_RPC_HTTP) || detectAlchemyEndpoint(env.ROBINHOOD_RPC_HTTP) || detectAlchemyEndpoint(env.BSC_RPC_HTTP));
   if (env.SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS < env.SETTLEMENT_SWAP_SLIPPAGE_BPS) {
     throw new Error("SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS must be at least SETTLEMENT_SWAP_SLIPPAGE_BPS");
   }
@@ -220,22 +228,27 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     rpcHttp: {
       base: env.BASE_RPC_HTTP,
       robinhood: env.ROBINHOOD_RPC_HTTP,
+      bsc: env.BSC_RPC_HTTP,
     },
     rpcWss: {
       ...(env.BASE_RPC_WSS ? { base: env.BASE_RPC_WSS } : {}),
       ...(env.ROBINHOOD_RPC_WSS ? { robinhood: env.ROBINHOOD_RPC_WSS } : {}),
+      ...(env.BSC_RPC_WSS ? { bsc: env.BSC_RPC_WSS } : {}),
     },
     rpcHttpFallback: {
       ...(env.BASE_RPC_HTTP_FALLBACK ? { base: env.BASE_RPC_HTTP_FALLBACK } : {}),
       ...(env.ROBINHOOD_RPC_HTTP_FALLBACK ? { robinhood: env.ROBINHOOD_RPC_HTTP_FALLBACK } : {}),
+      ...(env.BSC_RPC_HTTP_FALLBACK ? { bsc: env.BSC_RPC_HTTP_FALLBACK } : {}),
     },
     alchemyHttp: {
       ...(alchemyBase ? { base: alchemyBase } : {}),
       ...(alchemyRobinhood ? { robinhood: alchemyRobinhood } : {}),
+      ...(alchemyBsc ? { bsc: alchemyBsc } : {}),
     },
     quoteTokens: {
       base: parseQuoteTokens(env.QUOTE_TOKEN_ALLOWLIST_BASE, "QUOTE_TOKEN_ALLOWLIST_BASE"),
       robinhood: parseQuoteTokens(env.QUOTE_TOKEN_ALLOWLIST_ROBINHOOD, "QUOTE_TOKEN_ALLOWLIST_ROBINHOOD"),
+      bsc: parseQuoteTokens(env.QUOTE_TOKEN_ALLOWLIST_BSC, "QUOTE_TOKEN_ALLOWLIST_BSC"),
     },
     stopLossPercent: env.STOP_LOSS_PERCENT,
     takeProfitPercent: env.TAKE_PROFIT_PERCENT,
@@ -249,6 +262,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     chainMonitorIntervalMs: {
       ...(env.BASE_POSITION_MONITOR_INTERVAL_MS !== undefined ? { base: env.BASE_POSITION_MONITOR_INTERVAL_MS } : {}),
       ...(env.ROBINHOOD_POSITION_MONITOR_INTERVAL_MS !== undefined ? { robinhood: env.ROBINHOOD_POSITION_MONITOR_INTERVAL_MS } : {}),
+      ...(env.BSC_POSITION_MONITOR_INTERVAL_MS !== undefined ? { bsc: env.BSC_POSITION_MONITOR_INTERVAL_MS } : {}),
     },
     positionMonitorConcurrency: env.POSITION_MONITOR_CONCURRENCY,
     maxSwapSlippageBps: env.MAX_SWAP_SLIPPAGE_BPS,
@@ -291,7 +305,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
       ? env.RPC_REQUEST_DELAY_MS
       : (rpcUsesAlchemy ? 25 : 0),
     rpcBootstrapLookbackBlocks: BigInt(env.RPC_BOOTSTRAP_LOOKBACK_BLOCKS),
-    startBlocks: { base: env.START_BLOCK_BASE, robinhood: env.START_BLOCK_ROBINHOOD },
+    startBlocks: { base: env.START_BLOCK_BASE, robinhood: env.START_BLOCK_ROBINHOOD, bsc: env.START_BLOCK_BSC },
     telegram,
   };
 }

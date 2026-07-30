@@ -1,4 +1,4 @@
-import { decodeEventLog, encodeAbiParameters, keccak256, pad, toHex, zeroAddress, type Address, type Hex, type Log, type PublicClient } from "viem";
+import { decodeEventLog, encodeAbiParameters, keccak256, pad, toHex, zeroAddress, zeroHash, type Address, type Hex, type Log, type PublicClient } from "viem";
 
 import {
   erc20Abi,
@@ -64,16 +64,23 @@ export class DiscoveryService {
     if (fromBlock > latest) return;
     const toBlock = minBigInt(latest, fromBlock + this.config.scanBlockRange - 1n);
 
+    if (!registry.monitoringEnabled && !bootstrap && registry.discoveryProtocols.includes("v3")) {
+      await this.discoverOwnedV3Positions(name, latest);
+      await this.database.markBootstrapComplete(registry.chain.id, "owner_enumeration", latest);
+    }
+
     if (useLimitedRpcFallback) {
       log.warn({ chain: name, fromBlock, toBlock }, "Alchemy bootstrap is unavailable; using limited RPC lookback instead of genesis scan");
     }
     log.info({ chain: name, fromBlock, toBlock }, "syncing discovery range");
-    const v2Transfers = await this.getWalletTransferLogs(name, fromBlock, toBlock);
-    await this.discoverV2(name, v2Transfers);
-    await this.discoverV3(name, fromBlock, toBlock);
-    await this.discoverV4(name, fromBlock, toBlock);
-    await this.syncV3Cashflows(name, fromBlock, toBlock);
-    await this.syncV4Cashflows(name, fromBlock, toBlock);
+    if (registry.discoveryProtocols.includes("v2")) {
+      const v2Transfers = await this.getWalletTransferLogs(name, fromBlock, toBlock);
+      await this.discoverV2(name, v2Transfers);
+    }
+    if (registry.discoveryProtocols.includes("v3")) await this.discoverV3(name, fromBlock, toBlock);
+    if (registry.discoveryProtocols.includes("v4")) await this.discoverV4(name, fromBlock, toBlock);
+    if (registry.monitoringEnabled && registry.discoveryProtocols.includes("v3")) await this.syncV3Cashflows(name, fromBlock, toBlock);
+    if (registry.monitoringEnabled && registry.discoveryProtocols.includes("v4")) await this.syncV4Cashflows(name, fromBlock, toBlock);
     await this.database.saveCursor(registry.chain.id, toBlock);
   }
 
@@ -264,6 +271,7 @@ export class DiscoveryService {
         });
         if (pool === zeroAddress) continue;
         const quoteToken = this.findQuoteToken(name, token0, token1);
+        const detectionOnly = !registry.monitoringEnabled;
         const position = await this.database.upsertPosition({
           chainId: registry.chain.id,
           protocol: "v3",
@@ -273,15 +281,16 @@ export class DiscoveryService {
           token0,
           token1,
           quoteToken,
-          status: quoteToken && candidate.historyTrusted ? "syncing" : "needs_review",
+          status: detectionOnly ? "needs_review" : quoteToken && candidate.historyTrusted ? "syncing" : "needs_review",
           liquidity,
           openedAtBlock: candidate.blockNumber,
           metadata: {
             fee,
             positionManager: registry.contracts.v3.positionManager,
-            source: "nft_transfer",
+            source: detectionOnly ? "owner_enumeration" : "nft_transfer",
             historyTrusted: candidate.historyTrusted,
-            ...(candidate.historyTrusted ? {} : { reason: "v3_position_transferred_or_history_unavailable" }),
+            dex: registry.dex,
+            ...(detectionOnly ? { detectionOnly: true, reason: "detection_only_chain" } : candidate.historyTrusted ? {} : { reason: "v3_position_transferred_or_history_unavailable" }),
           },
         });
         positions.push(position);
@@ -291,6 +300,34 @@ export class DiscoveryService {
       }
     }
     return positions;
+  }
+
+  async discoverOwnedV3Positions(name: ChainName, blockNumber: bigint): Promise<PositionRecord[]> {
+    const { client, registry } = this.chains.get(name);
+    const balance = await client.readContract({
+      address: registry.contracts.v3.positionManager,
+      abi: v3PositionManagerAbi,
+      functionName: "balanceOf",
+      args: [this.config.executorAddress],
+    });
+    const candidates: NftActivity[] = [];
+    for (let index = 0n; index < balance; index += 1n) {
+      const tokenId = await client.readContract({
+        address: registry.contracts.v3.positionManager,
+        abi: v3PositionManagerAbi,
+        functionName: "tokenOfOwnerByIndex",
+        args: [this.config.executorAddress, index],
+      });
+      candidates.push({
+        asset: registry.contracts.v3.positionManager,
+        transactionHash: zeroHash,
+        blockNumber,
+        to: this.config.executorAddress,
+        tokenId,
+        historyTrusted: false,
+      });
+    }
+    return this.discoverV3Candidates(name, candidates);
   }
 
   private async discoverV4(name: ChainName, fromBlock: bigint, toBlock: bigint): Promise<void> {

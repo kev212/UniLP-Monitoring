@@ -17,7 +17,7 @@ export class ChainClients {
 
   constructor(config: RuntimeConfig) {
     this.enabledChains = new Set(config.chains);
-    for (const name of ["base", "robinhood"] as const) {
+    for (const name of ["base", "robinhood", "bsc"] as const) {
       const registry = chainRegistry[name];
       const wsUrl = config.rpcWss[name];
       const primary = config.rpcHttp[name];

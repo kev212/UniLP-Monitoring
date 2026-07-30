@@ -5,6 +5,7 @@ Monitor dan auto-exit Uniswap LP untuk Base dan Robinhood Chain. UniLP mendeteks
 ## Fitur
 
 - Dukungan Uniswap V2, V3, dan V4.
+- Deteksi-only PancakeSwap V3 BSC untuk NFT yang langsung dimiliki wallet executor.
 - Stop loss, take profit, trailing stop, dan auto-exit out-of-range.
 - PnL receipt-backed, history close, PnL card, dan kalender realized PnL UTC.
 - Dashboard Telegram untuk status, manual close, scan token, dan pool scan.
@@ -44,10 +45,13 @@ Mulai dengan `DRY_RUN=true`. Ubah ke `false` hanya setelah cashflow, PnL, dan si
 | `SWAP_GAS_LIMIT_MULTIPLIER_PERCENT` | Multiplier gas limit swap untuk menghindari RPC underestimation. Default 300%. |
 | `OOR_AUTO_CLOSE_ENABLED` | Aktifkan auto-exit saat quote token cukup jauh above range. |
 | `BASE_RPC_HTTP`, `ROBINHOOD_RPC_HTTP` | Endpoint RPC untuk monitoring dan discovery. |
+| `BSC_RPC_HTTP` | Endpoint BSC untuk discovery PancakeSwap V3. |
 | `ALCHEMY_BASE_HTTP`, `ALCHEMY_ROBINHOOD_HTTP` | Endpoint archive/bootstrap opsional. |
 | `TELEGRAM_CHAT_ID`, `TELEGRAM_USER_ID` | Chat dan user yang diizinkan mengakses bot. |
 
 Lihat `.env.example` untuk seluruh variable dan nilai default.
+
+PancakeSwap V3 BSC harus diaktifkan eksplisit melalui `CHAINS=bsc` atau ditambahkan ke daftar chain. Posisi BSC disimpan sebagai `needs_review` dan tidak dimonitor atau dieksekusi otomatis.
 
 ## Telegram Commands
 

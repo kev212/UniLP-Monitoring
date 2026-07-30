@@ -11,8 +11,10 @@ function environment(overrides: Record<string, string> = {}): NodeJS.ProcessEnv 
     BASE_RPC_WSS: "",
     ROBINHOOD_RPC_HTTP: "https://rpc.mainnet.chain.robinhood.com",
     ROBINHOOD_RPC_WSS: "",
+    BSC_RPC_HTTP: "https://bsc-dataseed.bnbchain.org",
     QUOTE_TOKEN_ALLOWLIST_BASE: "USDC:0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913,WETH:0x4200000000000000000000000000000000000006",
     QUOTE_TOKEN_ALLOWLIST_ROBINHOOD: "USDG:0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168,WETH:0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    QUOTE_TOKEN_ALLOWLIST_BSC: "USDT:0x55d398326f99059fF775485246999027B3197955,WBNB:0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
     STOP_LOSS_PERCENT: "-10",
     TAKE_PROFIT_PERCENT: "20",
     TRAILING_STOP_ACTIVATION_PERCENT: "5",
@@ -34,6 +36,7 @@ function environment(overrides: Record<string, string> = {}): NodeJS.ProcessEnv 
     RPC_BOOTSTRAP_LOOKBACK_BLOCKS: "50000",
     START_BLOCK_BASE: "0",
     START_BLOCK_ROBINHOOD: "0",
+    START_BLOCK_BSC: "0",
     ...overrides,
   };
 }
@@ -83,6 +86,14 @@ describe("loadConfig", () => {
   it("enables scanv2 only when explicitly configured", () => {
     expect(loadConfig(environment({ SCANV2_ENABLED: "true" })).scanV2Enabled).toBe(true);
     expect(() => loadConfig(environment({ SCANV2_ENABLED: "yes" }))).toThrow("SCANV2_ENABLED");
+  });
+
+  it("configures BSC Pancake V3 discovery explicitly", () => {
+    const config = loadConfig(environment({ CHAINS: "bsc", START_BLOCK_BSC: "26956207" }));
+    expect(config.chains).toEqual(["bsc"]);
+    expect(config.rpcHttp.bsc).toBe("https://bsc-dataseed.bnbchain.org");
+    expect(config.quoteTokens.bsc.map((token) => token.symbol)).toEqual(["USDT", "WBNB"]);
+    expect(config.startBlocks.bsc).toBe(26_956_207n);
   });
 
   it("loads a local Uniswap Trading API key", () => {

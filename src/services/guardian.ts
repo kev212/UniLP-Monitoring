@@ -99,6 +99,7 @@ export class Guardian {
 
   private async retryNeedsReview(name: ChainName): Promise<void> {
     const { client, registry } = this.chains.get(name);
+    if (!registry.monitoringEnabled) return;
     const blockNumber = await client.getBlockNumber();
     const positions = (await this.database.listOpenPositions(registry.chain.id))
       .filter((position) => position.status === "needs_review"
@@ -144,6 +145,7 @@ export class Guardian {
 
   private async evaluateChain(name: ChainName): Promise<void> {
     const { client, registry } = this.chains.get(name);
+    if (!registry.monitoringEnabled) return;
     const blockNumber = await client.getBlockNumber();
     if (this.lastEvaluatedBlock.get(registry.chain.id) === blockNumber) return;
     const positions = (await this.database.listOpenPositions(registry.chain.id))

@@ -49,22 +49,24 @@ export class AlchemyBootstrapper {
     if (!endpoint) return;
 
     const activities = await this.listWalletActivities(endpoint, this.config.executorAddress);
-    const v2Activities = activities.filter((activity) => activity.category === "erc20");
-    const v2Positions = await this.discovery.discoverV2Activities(name, v2Activities);
-    const v3Candidates = this.nftCandidates(activities, registry.contracts.v3.positionManager);
-    const v4Candidates = this.nftCandidates(activities, registry.contracts.v4.positionManager);
-    const v3Positions = await this.discovery.discoverV3Candidates(name, v3Candidates);
-    await this.discovery.discoverV4Candidates(name, v4Candidates);
-    await this.discovery.reconcileV4Liquidity(name);
+    const v2Activities = registry.discoveryProtocols.includes("v2") ? activities.filter((activity) => activity.category === "erc20") : [];
+    const v2Positions = registry.discoveryProtocols.includes("v2") ? await this.discovery.discoverV2Activities(name, v2Activities) : [];
+    const v3Candidates = registry.discoveryProtocols.includes("v3") ? this.nftCandidates(activities, registry.contracts.v3.positionManager) : [];
+    const v4Candidates = registry.discoveryProtocols.includes("v4") ? this.nftCandidates(activities, registry.contracts.v4.positionManager) : [];
+    const v3Positions = registry.discoveryProtocols.includes("v3") ? await this.discovery.discoverV3Candidates(name, v3Candidates) : [];
+    if (registry.discoveryProtocols.includes("v4")) {
+      await this.discovery.discoverV4Candidates(name, v4Candidates);
+      await this.discovery.reconcileV4Liquidity(name);
+    }
 
     const latest = await client.getBlockNumber();
-    for (const position of v3Positions) {
+    for (const position of registry.monitoringEnabled ? v3Positions : []) {
       const candidate = v3Candidates.find((item) => item.tokenId.toString() === position.positionKey);
       if (candidate?.historyTrusted) {
         await this.discovery.hydrateV3History(name, position, candidate.blockNumber, latest);
       }
     }
-    await this.discovery.hydrateV4Activities(name, activities);
+    if (registry.monitoringEnabled && registry.discoveryProtocols.includes("v4")) await this.discovery.hydrateV4Activities(name, activities);
     await this.database.saveCursor(registry.chain.id, latest);
     await this.database.markBootstrapComplete(registry.chain.id, "alchemy", latest);
     log.info({

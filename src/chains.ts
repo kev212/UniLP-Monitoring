@@ -1,5 +1,5 @@
-import { defineChain, type Address, type Chain } from "viem";
-import { base } from "viem/chains";
+import { defineChain, zeroAddress, type Address, type Chain } from "viem";
+import { base, bsc } from "viem/chains";
 
 import type { ChainName } from "./types.js";
 
@@ -25,12 +25,18 @@ export interface ChainRegistry {
   name: ChainName;
   chain: Chain;
   contracts: UniswapContracts;
+  discoveryProtocols: readonly ("v2" | "v3" | "v4")[];
+  monitoringEnabled: boolean;
+  dex: "uniswap" | "pancakeswap-v3";
 }
 
 export const chainRegistry: Record<ChainName, ChainRegistry> = {
   base: {
     name: "base",
     chain: base,
+    discoveryProtocols: ["v2", "v3", "v4"],
+    monitoringEnabled: true,
+    dex: "uniswap",
     contracts: {
       v2: {
         factory: "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6",
@@ -55,6 +61,9 @@ export const chainRegistry: Record<ChainName, ChainRegistry> = {
   robinhood: {
     name: "robinhood",
     chain: robinhood,
+    discoveryProtocols: ["v2", "v3", "v4"],
+    monitoringEnabled: true,
+    dex: "uniswap",
     contracts: {
       v2: {
         factory: "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
@@ -73,6 +82,30 @@ export const chainRegistry: Record<ChainName, ChainRegistry> = {
         stateView: "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b",
         universalRouter: "0x8876789976decbfcbbbe364623c63652db8c0904",
         permit2: "0x000000000022d473030f116ddee9f6b43ac78ba3",
+      },
+    },
+  },
+  bsc: {
+    name: "bsc",
+    chain: bsc,
+    discoveryProtocols: ["v3"],
+    monitoringEnabled: false,
+    dex: "pancakeswap-v3",
+    contracts: {
+      v2: { factory: zeroAddress, router: zeroAddress },
+      v3: {
+        factory: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+        positionManager: "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364",
+        quoter: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
+        swapRouter: "0x1b81D678ffb9C0263b24A97847620C99d213eB14",
+      },
+      v4: {
+        poolManager: zeroAddress,
+        positionManager: zeroAddress,
+        quoter: zeroAddress,
+        stateView: zeroAddress,
+        universalRouter: zeroAddress,
+        permit2: zeroAddress,
       },
     },
   },

@@ -134,6 +134,7 @@ export class Executor {
   }
 
   async execute(position: PositionRecord, trigger?: ExitTrigger): Promise<void> {
+    if (position.metadata.detectionOnly === true) throw new Error("Detection-only positions cannot be executed");
     return this.runSettlementExclusive(position.id, () => this.executeUnlocked(position, trigger));
   }
 

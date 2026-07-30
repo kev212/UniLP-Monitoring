@@ -1,6 +1,6 @@
 import type { Address, Hex } from "viem";
 
-export type ChainName = "base" | "robinhood";
+export type ChainName = "base" | "robinhood" | "bsc";
 export type Protocol = "v2" | "v3" | "v4";
 export type PositionStatus =
   | "discovered"
