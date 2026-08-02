@@ -39,6 +39,48 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[1]![0]).toContain("DELETE FROM global_risk_settings");
   });
 
+  it("upserts positions against the production dex composite key", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({
+      rows: [{
+        id: "position",
+        chain_id: 4663,
+        protocol: "v4",
+        position_key: "437787",
+        owner: "0x0000000000000000000000000000000000000001",
+        pool_address: null,
+        token0: "0x0000000000000000000000000000000000000002",
+        token1: "0x0000000000000000000000000000000000000003",
+        quote_token: "0x0000000000000000000000000000000000000003",
+        status: "syncing",
+        liquidity: "1",
+        opened_at_block: "100",
+        metadata: { dex: "uniswap" },
+      }],
+    });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await database.upsertPosition({
+      chainId: 4663,
+      protocol: "v4",
+      positionKey: "437787",
+      owner: "0x0000000000000000000000000000000000000001",
+      poolAddress: null,
+      token0: "0x0000000000000000000000000000000000000002",
+      token1: "0x0000000000000000000000000000000000000003",
+      quoteToken: "0x0000000000000000000000000000000000000003",
+      status: "syncing",
+      liquidity: 1n,
+      openedAtBlock: 100n,
+      metadata: { dex: "uniswap" },
+    });
+
+    expect(query.mock.calls[0]![0]).toContain("INSERT INTO positions");
+    expect(query.mock.calls[0]![0]).toContain("ON CONFLICT (chain_id, protocol, dex, position_key)");
+    expect(query.mock.calls[0]![1]).toHaveLength(13);
+    expect(query.mock.calls[0]![1]![12]).toBe("uniswap");
+  });
+
   it("loads the global risk-settings override when present", async () => {
     const database = new Database("postgres://unused");
     const settings = {

@@ -71,6 +71,17 @@ export class Database {
       );
       ALTER TABLE positions ADD COLUMN IF NOT EXISTS settlement_lease_token TEXT;
       ALTER TABLE positions ADD COLUMN IF NOT EXISTS settlement_lease_until TIMESTAMPTZ;
+      ALTER TABLE positions ADD COLUMN IF NOT EXISTS dex TEXT NOT NULL DEFAULT 'uniswap';
+      UPDATE positions SET dex = metadata->>'dex' WHERE metadata->>'dex' IS NOT NULL;
+      ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_chain_id_protocol_position_key_key;
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'positions_chain_id_protocol_dex_position_key_key'
+        ) THEN
+          ALTER TABLE positions ADD CONSTRAINT positions_chain_id_protocol_dex_position_key_key UNIQUE(chain_id, protocol, dex, position_key);
+        END IF;
+      END $$;
       CREATE TABLE IF NOT EXISTS cashflows (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         position_id UUID NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
@@ -264,13 +275,14 @@ export class Database {
   }
 
   async upsertPosition(position: Omit<PositionRecord, "id">): Promise<PositionRecord> {
+    const dex = typeof position.metadata.dex === "string" ? position.metadata.dex : "uniswap";
     const result = await this.pool.query<PositionRow>(
-      `INSERT INTO positions (chain_id, protocol, position_key, owner, pool_address, token0, token1, quote_token, status, liquidity, opened_at_block, metadata)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-       ON CONFLICT (chain_id, protocol, position_key) DO UPDATE SET
-         owner = EXCLUDED.owner, pool_address = EXCLUDED.pool_address, token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
-          quote_token = EXCLUDED.quote_token, status = CASE WHEN positions.status IN ('closing', 'settled', 'armed') THEN positions.status ELSE EXCLUDED.status END,
-         liquidity = EXCLUDED.liquidity, opened_at_block = COALESCE(positions.opened_at_block, EXCLUDED.opened_at_block),
+      `INSERT INTO positions (chain_id, protocol, position_key, owner, pool_address, token0, token1, quote_token, status, liquidity, opened_at_block, metadata, dex)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       ON CONFLICT (chain_id, protocol, dex, position_key) DO UPDATE SET
+          owner = EXCLUDED.owner, pool_address = EXCLUDED.pool_address, token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
+           quote_token = EXCLUDED.quote_token, status = CASE WHEN positions.status IN ('closing', 'settled', 'armed') THEN positions.status ELSE EXCLUDED.status END,
+          liquidity = EXCLUDED.liquidity, opened_at_block = COALESCE(positions.opened_at_block, EXCLUDED.opened_at_block),
          metadata = positions.metadata || EXCLUDED.metadata, updated_at = NOW()
        RETURNING *`,
       [
@@ -282,11 +294,12 @@ export class Database {
         position.token0.toLowerCase(),
         position.token1.toLowerCase(),
         position.quoteToken?.toLowerCase() ?? null,
-        position.status,
-        position.liquidity?.toString() ?? null,
-        position.openedAtBlock?.toString() ?? null,
-        JSON.stringify(position.metadata),
-      ],
+         position.status,
+         position.liquidity?.toString() ?? null,
+         position.openedAtBlock?.toString() ?? null,
+         JSON.stringify(position.metadata),
+         dex,
+       ],
     );
     return mapPosition(result.rows[0]!);
   }
