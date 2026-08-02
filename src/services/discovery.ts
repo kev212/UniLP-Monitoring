@@ -644,7 +644,8 @@ export class DiscoveryService {
     const currency1 = metadata.currency1 as Address | undefined;
     if (!salt || tickLower === undefined || tickUpper === undefined || fee === undefined || tickSpacing === undefined || !hooks || !currency0 || !currency1) return;
 
-    const { client, registry } = this.chains.get(name);
+    const { registry } = this.chains.get(name);
+    const historicalClient = this.chains.getForScan(name).client;
     const events = await this.getLogsChunked(name, {
       address: registry.contracts.v4.poolManager,
       event: v4PoolManagerModifyLiquidityEvent,
@@ -660,7 +661,7 @@ export class DiscoveryService {
     const liquidityDelta = logArgs<{ liquidityDelta?: bigint }>(event).liquidityDelta;
     if (!liquidityDelta || liquidityDelta <= 0n) return;
     const poolId = v4PoolId(currency0, currency1, fee, tickSpacing, hooks);
-    const slot0 = await client.readContract({
+    const slot0 = await historicalClient.readContract({
       address: registry.contracts.v4.stateView,
       abi: v4StateViewAbi,
       functionName: "getSlot0",
@@ -959,13 +960,14 @@ export class DiscoveryService {
 
   private async quoteV4AmountsAtBlock(position: PositionRecord, amount0: bigint, amount1: bigint, blockNumber: bigint): Promise<bigint> {
     if (!position.quoteToken) throw new Error("V4 position has no quote token");
-    const { client, registry } = this.chains.getById(position.chainId);
+    const { registry } = this.chains.getById(position.chainId);
+    const historicalClient = this.chains.getForScan(registry.name).client;
     const metadata = position.metadata as { currency0?: Address; currency1?: Address; fee?: number; tickSpacing?: number; hooks?: Address };
     if (!metadata.currency0 || !metadata.currency1 || metadata.fee === undefined || metadata.tickSpacing === undefined || !metadata.hooks) {
       throw new Error("V4 position metadata is incomplete");
     }
     const poolId = v4PoolId(metadata.currency0, metadata.currency1, metadata.fee, metadata.tickSpacing, metadata.hooks);
-    const slot0 = await client.readContract({
+    const slot0 = await historicalClient.readContract({
       address: registry.contracts.v4.stateView,
       abi: v4StateViewAbi,
       functionName: "getSlot0",
