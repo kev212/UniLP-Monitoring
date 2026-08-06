@@ -278,6 +278,103 @@ describe("fresh valuation quotes", () => {
     expect(valued.snapshot.liquidationQuote).toBe(1_099_000n);
   });
 
+  it("does not use an unrelated local route when native quote validation has no Kyber quote", async () => {
+    const froge = "0x0000000000000000000000000000000000000002" as Address;
+    const native = zeroAddress;
+    const position = {
+      id: "position",
+      chainId: 4663,
+      protocol: "v4",
+      positionKey: "1",
+      owner: "0x0000000000000000000000000000000000000004" as Address,
+      poolAddress: null,
+      token0: native,
+      token1: froge,
+      quoteToken: native,
+      status: "armed",
+      liquidity: 1n,
+      openedAtBlock: 1n,
+      metadata: {},
+    } as const;
+    const database = {
+      getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 1_000_000n, realized: 0n }),
+    };
+    const reader = {
+      read: vi.fn().mockResolvedValue({
+        protocol: "v4",
+        poolKey: "pool",
+        sourcePool: null,
+        token0: { token: position.token0, amount: 100n },
+        token1: { token: froge, amount: 10n ** 18n },
+        liquidity: 1n,
+        priceMarker: 1n,
+        minAmount0: 0n,
+        minAmount1: 0n,
+        unclaimedFees0: 0n,
+        unclaimedFees1: 0n,
+        observedBlock: 1n,
+      }),
+    };
+    const routes = {
+      quoteDirect: vi.fn().mockResolvedValue({ expectedOut: 900_000n, path: [froge, froge] }),
+    };
+    const pnl = new PnlService(database as never, reader as never, routes as never, config);
+
+    await expect(pnl.valueLocal(position, 1n)).rejects.toThrow("No safe direct Uniswap route from LP asset to quote token");
+
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
+  });
+
+  it("uses KyberSwap for native quote validation", async () => {
+    const froge = "0x0000000000000000000000000000000000000002" as Address;
+    const native = zeroAddress;
+    const position = {
+      id: "position",
+      chainId: 4663,
+      protocol: "v4",
+      positionKey: "1",
+      owner: "0x0000000000000000000000000000000000000004" as Address,
+      poolAddress: null,
+      token0: native,
+      token1: froge,
+      quoteToken: native,
+      status: "armed",
+      liquidity: 1n,
+      openedAtBlock: 1n,
+      metadata: {},
+    } as const;
+    const database = {
+      getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 1_000_000n, realized: 0n }),
+    };
+    const reader = {
+      read: vi.fn().mockResolvedValue({
+        protocol: "v4",
+        poolKey: "pool",
+        sourcePool: null,
+        token0: { token: native, amount: 100n },
+        token1: { token: froge, amount: 10n ** 18n },
+        liquidity: 1n,
+        priceMarker: 1n,
+        minAmount0: 0n,
+        minAmount1: 0n,
+        unclaimedFees0: 0n,
+        unclaimedFees1: 0n,
+        observedBlock: 1n,
+      }),
+    };
+    const routes = { quoteDirect: vi.fn() };
+    const kyberswap = {
+      quote: vi.fn().mockResolvedValue({ expectedOut: 900_000n, minimumOut: 891_000n }),
+    };
+    const pnl = new PnlService(database as never, reader as never, routes as never, config, undefined, kyberswap as never);
+
+    const valued = await pnl.valueLocal(position, 1n);
+
+    expect(kyberswap.quote).toHaveBeenCalledWith(position, froge, 10n ** 18n, native, 100);
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
+    expect(valued.snapshot.liquidationQuote).toBe(891_100n);
+  });
+
   it("uses native ETH as a quote token without an ERC-20 route", async () => {
     const token = "0x0000000000000000000000000000000000000002" as Address;
     const position = {

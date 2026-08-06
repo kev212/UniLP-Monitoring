@@ -834,7 +834,16 @@ export class Executor {
     lastFailedProvider?: string,
     approvalRefreshes = 0,
   ): Promise<PreparedSwap | null> {
-    const localBenchmark = await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
+    const isNativeSettlement = tokenIn.toLowerCase() === zeroAddress || tokenOut.toLowerCase() === zeroAddress;
+    let nativeBenchmark: KyberSwapQuote | null = null;
+    if (isNativeSettlement) {
+      if (!this.kyberswapApi) throw new Error("KyberSwap is required to benchmark native settlement swap");
+      nativeBenchmark = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+      if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark native settlement swap");
+    }
+    const localBenchmark = isNativeSettlement
+      ? nativeBenchmark
+      : await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
     if (!localBenchmark) throw new Error("No safe local route available to benchmark settlement swap");
     const minimumAcceptableOut = applySlippage(localBenchmark.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
     const quoteJobs: Promise<ApiSwapCandidate | null>[] = [];
@@ -843,7 +852,8 @@ export class Executor {
         .then((quote) => quote ? { provider: "uniswap" as const, expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote } : null));
     }
     if (this.kyberswapApi) {
-      quoteJobs.push(this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
+      const quote = nativeBenchmark ?? this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+      quoteJobs.push(Promise.resolve(quote)
         .then((quote) => quote ? { provider: "kyberswap" as const, expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote } : null));
     }
     const results = await Promise.allSettled(quoteJobs);

@@ -1,10 +1,11 @@
-import type { Address } from "viem";
+import { zeroAddress, type Address } from "viem";
 
 import { chainRegistry } from "../chains.js";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
 import type { ExitTrigger, LiquidationQuote, PnlSnapshot, PositionRangeInfo, PositionRecord, TrailingStopState } from "../types.js";
+import type { KyberSwapAggregatorApi } from "./kyberswap-aggregator-api.js";
 import type { PositionReader } from "./position-reader.js";
 import type { RoutePlanner } from "./route-planner.js";
 import type { UniswapTradingApi } from "./uniswap-trading-api.js";
@@ -40,6 +41,7 @@ export class PnlService {
     private readonly routes: RoutePlanner,
     private readonly config: RuntimeConfig,
     private readonly tradingApi?: UniswapTradingApi,
+    private readonly kyberswapApi?: KyberSwapAggregatorApi,
   ) {}
 
   async value(
@@ -207,6 +209,16 @@ export class PnlService {
       }
     }
 
+    if (this.kyberswapApi && (tokenIn.toLowerCase() === zeroAddress || tokenOut.toLowerCase() === zeroAddress)) {
+      try {
+        const quote = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+        if (quote) return { expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, path: [tokenIn, tokenOut] };
+      } catch (error) {
+        log.warn({ err: error, positionId: position.id, tokenIn, tokenOut }, "KyberSwap native valuation quote failed; native route unavailable");
+      }
+    }
+
+    if (tokenIn.toLowerCase() === zeroAddress || tokenOut.toLowerCase() === zeroAddress) return null;
     const route = await withTimeout(
       this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut),
       ROUTE_QUOTE_TIMEOUT_MS,

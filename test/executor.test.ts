@@ -315,6 +315,36 @@ describe("Executor pending settlement recovery", () => {
     expect(client.call).toHaveBeenCalledWith(expect.objectContaining({ data: "0x22" }));
   });
 
+  it("uses KyberSwap as the native settlement benchmark", async () => {
+    const client = {
+      readContract: vi.fn().mockResolvedValue(5n),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const kyberQuote = { source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: sender };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue(kyberQuote),
+      approvalSpender: vi.fn().mockReturnValue(sender),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: sender, data: "0x22", description: "kyber" }),
+    };
+    const routes = { quoteDirect: vi.fn().mockRejectedValue(new Error("native V4 quote is unsupported")) };
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, config, undefined, kyberswapApi as never);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
+      token0: zeroAddress, token1: token, quoteToken: zeroAddress, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    const prepared = await (executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string; expectedOut: bigint }>;
+    }).prepareBestSettlementSwap(position, token, 5n, zeroAddress, 200);
+
+    expect(prepared).toMatchObject({ provider: "kyberswap", expectedOut: 110n });
+    expect(kyberswapApi.quote).toHaveBeenCalledTimes(1);
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
+    expect(client.call).toHaveBeenCalledWith(expect.objectContaining({ data: "0x22" }));
+  });
+
   it("rejects an aggregator route below the local two-percent minimum floor", async () => {
     const client = {
       readContract: vi.fn().mockResolvedValue(5n),
