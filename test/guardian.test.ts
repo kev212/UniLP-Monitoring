@@ -4,7 +4,7 @@ import { Guardian, shouldResumeExitRetry, shouldWaitForExitRetry } from "../src/
 import { quoteRangeState } from "../src/services/quote-range.js";
 import { sqrtRatioAtTick } from "../src/services/uniswap-math.js";
 import type { RuntimeConfig } from "../src/config.js";
-import type { PositionRecord } from "../src/types.js";
+import type { PnlSnapshot, PositionRecord } from "../src/types.js";
 
 describe("quote-oriented range triggers", () => {
   const range = (status: "in_range" | "above" | "below", currentTick: number) => ({
@@ -190,6 +190,56 @@ describe("pending settlement status recovery", () => {
     expect(database.setPositionStatusUnlessSettled).toHaveBeenCalledWith("pending-position", "needs_review", {
       reason: "settlement_retry_disabled",
     });
+  });
+});
+
+describe("stop-loss local quote validation", () => {
+  const position = {
+    id: "position",
+    chainId: 4663,
+    protocol: "v4" as const,
+    positionKey: "1",
+    owner: "0x0000000000000000000000000000000000000001",
+    poolAddress: null,
+    token0: "0x0000000000000000000000000000000000000002",
+    token1: "0x0000000000000000000000000000000000000003",
+    quoteToken: "0x0000000000000000000000000000000000000002",
+    status: "armed" as const,
+    liquidity: null,
+    openedAtBlock: null,
+    metadata: {},
+  } satisfies PositionRecord;
+
+  const snapshot = (pnlBps: bigint): PnlSnapshot => ({
+    positionId: position.id,
+    quoteToken: position.quoteToken,
+    depositsQuote: 1_000_000n,
+    realizedQuote: 0n,
+    liquidationQuote: 1_000_000n + pnlBps,
+    pnlQuote: pnlBps,
+    pnlBps,
+    blockNumber: 10n,
+    liquidity: 1n,
+    feeQuote: 0n,
+    feeNonQuote: null,
+    feeQuoteUsdg: 0n,
+  });
+
+  it("cancels an API-triggered SL when the local quote is above the threshold", async () => {
+    const database = { setPositionStatus: vi.fn().mockResolvedValue(undefined) };
+    const pnl = {
+      valueLocal: vi.fn().mockResolvedValue({ snapshot: snapshot(-1_000n), range: undefined }),
+      shouldTrigger: vi.fn().mockReturnValue(null),
+    };
+    const guardian = new Guardian({} as RuntimeConfig, database as never, {} as never, {} as never, {} as never, pnl as never, {} as never, {} as never);
+
+    const result = await (guardian as unknown as {
+      validateStopLossWithLocalQuote(position: PositionRecord, blockNumber: bigint, apiSnapshot: PnlSnapshot): Promise<PnlSnapshot | null>;
+    }).validateStopLossWithLocalQuote(position, 10n, snapshot(-5_844n));
+
+    expect(result).toBeNull();
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "armed", { slTwapWaitStartedAt: null });
+    expect(pnl.valueLocal).toHaveBeenCalledWith(position, 10n);
   });
 });
 

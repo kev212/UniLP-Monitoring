@@ -226,6 +226,58 @@ describe("fresh valuation quotes", () => {
     expect(valued.snapshot.liquidationQuote).toBe(1_099_000n);
   });
 
+  it("uses only the local route for SL revalidation", async () => {
+    const usdg = "0x0000000000000000000000000000000000000001" as Address;
+    const token = "0x0000000000000000000000000000000000000002" as Address;
+    const position = {
+      id: "position",
+      chainId: 8453,
+      protocol: "v4",
+      positionKey: "1",
+      owner: "0x0000000000000000000000000000000000000003" as Address,
+      poolAddress: null,
+      token0: usdg,
+      token1: token,
+      quoteToken: usdg,
+      status: "armed",
+      liquidity: 1n,
+      openedAtBlock: 1n,
+      metadata: {},
+    } as const;
+    const database = {
+      getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 1_000_000n, realized: 0n }),
+    };
+    const reader = {
+      read: vi.fn().mockResolvedValue({
+        protocol: "v4",
+        poolKey: "pool",
+        sourcePool: null,
+        token0: { token: usdg, amount: 1_000_000n },
+        token1: { token, amount: 10n ** 18n },
+        liquidity: 1n,
+        priceMarker: 1n,
+        minAmount0: 0n,
+        minAmount1: 0n,
+        unclaimedFees0: 0n,
+        unclaimedFees1: 0n,
+        observedBlock: 1n,
+      }),
+    };
+    const routes = {
+      quoteDirect: vi.fn().mockResolvedValue({ expectedOut: 100_000n, path: [token, usdg] }),
+    };
+    const tradingApi = {
+      quote: vi.fn().mockResolvedValue({ expectedOut: 1n, minimumOut: 1n }),
+    };
+    const pnl = new PnlService(database as never, reader as never, routes as never, config, tradingApi as never);
+
+    const valued = await pnl.valueLocal(position, 1n);
+
+    expect(tradingApi.quote).not.toHaveBeenCalled();
+    expect(routes.quoteDirect).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg);
+    expect(valued.snapshot.liquidationQuote).toBe(1_099_000n);
+  });
+
   it("uses native ETH as a quote token without an ERC-20 route", async () => {
     const token = "0x0000000000000000000000000000000000000002" as Address;
     const position = {

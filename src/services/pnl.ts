@@ -47,6 +47,7 @@ export class PnlService {
     blockNumber: bigint,
     quoteSlippageBps = this.config.maxSwapSlippageBps,
     recordObservations = true,
+    localOnly = false,
   ): Promise<ValuedPosition> {
     if (!position.quoteToken) throw new Error("Position has no eligible quote token");
     const value = await withTimeout(
@@ -79,8 +80,8 @@ export class PnlService {
     const quoteSideFee = quoteIsToken0 ? value.unclaimedFees0 : value.unclaimedFees1;
     const nonQuoteFee = quoteIsToken0 ? value.unclaimedFees1 : value.unclaimedFees0;
     const [route, feeRoute] = await Promise.all([
-       this.quoteFresh(position, nonQuote.token, nonQuote.amount, position.quoteToken, quoteSlippageBps),
-       this.quoteFresh(position, nonQuote.token, nonQuoteFee, position.quoteToken, quoteSlippageBps),
+       this.quoteFresh(position, nonQuote.token, nonQuote.amount, position.quoteToken, quoteSlippageBps, localOnly),
+       this.quoteFresh(position, nonQuote.token, nonQuoteFee, position.quoteToken, quoteSlippageBps, localOnly),
     ]);
     if (nonQuote.amount > 0n && !route) throw new Error("No safe direct Uniswap route from LP asset to quote token");
 
@@ -99,7 +100,7 @@ export class PnlService {
     if (chainName) {
       const stable = this.config.quoteTokens[chainName]?.[0]?.address;
       if (stable && position.quoteToken.toLowerCase() !== stable.toLowerCase() && feeQuote > 0n) {
-        const stableRoute = await this.quoteFresh(position, position.quoteToken, feeQuote, stable, quoteSlippageBps);
+        const stableRoute = await this.quoteFresh(position, position.quoteToken, feeQuote, stable, quoteSlippageBps, localOnly);
         feeQuoteUsdg = stableRoute?.minimumOut ?? 0n;
       }
     }
@@ -135,6 +136,10 @@ export class PnlService {
       twapGuard,
       range: value.range,
     };
+  }
+
+  async valueLocal(position: PositionRecord, blockNumber: bigint, quoteSlippageBps = this.config.maxSwapSlippageBps): Promise<ValuedPosition> {
+    return this.value(position, blockNumber, quoteSlippageBps, false, true);
   }
 
   shouldTrigger(snapshot: PnlSnapshot, range: PositionRangeInfo | undefined, quoteIsToken0: boolean): ExitTrigger | null {
@@ -180,9 +185,16 @@ export class PnlService {
     return state.peakPnlBps - percentToBps(this.config.trailingStopDrawdownPercent);
   }
 
-  private async quoteFresh(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address, slippageBps = this.config.maxSwapSlippageBps): Promise<ValuationRoute | null> {
+  private async quoteFresh(
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    slippageBps = this.config.maxSwapSlippageBps,
+    localOnly = false,
+  ): Promise<ValuationRoute | null> {
     if (amountIn === 0n || tokenIn.toLowerCase() === tokenOut.toLowerCase()) return null;
-    if (this.tradingApi) {
+    if (this.tradingApi && !localOnly) {
       try {
         const quote = slippageBps === this.config.maxSwapSlippageBps
           ? await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut)

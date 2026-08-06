@@ -315,16 +315,22 @@ export class Guardian {
       if (effectiveTrigger === "trailing_take_profit") {
         if (!(await this.trailingExitEstimateAllowed(position, blockNumber))) return true;
       }
+      let exitSnapshot = valued.snapshot;
+      if (effectiveTrigger === "stop_loss") {
+        const localSnapshot = await this.validateStopLossWithLocalQuote(position, blockNumber, valued.snapshot);
+        if (!localSnapshot) return true;
+        exitSnapshot = localSnapshot;
+      }
       try {
         await this.database.setPositionStatus(position.id, position.status, {
           slTwapWaitStartedAt: null,
           exitSnapshot: {
-            pnlBps: valued.snapshot.pnlBps.toString(),
-            pnlQuote: valued.snapshot.pnlQuote.toString(),
-            blockNumber: valued.snapshot.blockNumber.toString(),
+            pnlBps: exitSnapshot.pnlBps.toString(),
+            pnlQuote: exitSnapshot.pnlQuote.toString(),
+            blockNumber: exitSnapshot.blockNumber.toString(),
           },
         });
-        await this.executeExit(position, effectiveTrigger, valued.snapshot);
+        await this.executeExit(position, effectiveTrigger, exitSnapshot);
         return true;
       } catch (error) {
         log.warn({ err: error, positionId: position.id, trigger: effectiveTrigger }, "exit attempt failed; waiting for fresh PnL before retry");
@@ -372,6 +378,30 @@ export class Guardian {
       } catch (error) {
         log.warn({ err: error, positionId: position.id }, "settlement retry deferred");
       }
+    }
+  }
+
+  private async validateStopLossWithLocalQuote(position: PositionRecord, blockNumber: bigint, apiSnapshot: PnlSnapshot): Promise<PnlSnapshot | null> {
+    try {
+      const localValuation = await this.pnl.valueLocal(position, blockNumber);
+      const quoteIsToken0 = position.quoteToken?.toLowerCase() === position.token0.toLowerCase();
+      const localTrigger = this.pnl.shouldTrigger(localValuation.snapshot, localValuation.range, quoteIsToken0);
+      await this.database.setPositionStatus(position.id, position.status, { slTwapWaitStartedAt: null });
+      if (localTrigger !== "stop_loss") {
+        log.warn({
+          positionId: position.id,
+          positionKey: position.positionKey,
+          apiPnlBps: apiSnapshot.pnlBps,
+          localPnlBps: localValuation.snapshot.pnlBps,
+          localLiquidationQuote: localValuation.snapshot.liquidationQuote,
+        }, "SL cancelled by local quote validation");
+        return null;
+      }
+      return localValuation.snapshot;
+    } catch (error) {
+      await this.database.setPositionStatus(position.id, position.status, { slTwapWaitStartedAt: null });
+      log.warn({ err: error, positionId: position.id, positionKey: position.positionKey }, "SL local quote validation failed; skipping exit");
+      return null;
     }
   }
 
