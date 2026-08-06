@@ -260,9 +260,10 @@ export class Guardian {
       const effectiveTrigger: ExitTrigger | null = trigger ?? retryTrigger;
       if (!effectiveTrigger) {
         const staleDynamicRetry = pendingRetry && !shouldResumeExitRetry(pendingRetry.reason);
-        if (position.metadata.slTwapWaitStartedAt !== undefined || staleDynamicRetry) {
+        if (position.metadata.slTwapWaitStartedAt !== undefined || position.metadata.trailingTwapWaitStartedAt !== undefined || staleDynamicRetry) {
           await this.database.setPositionStatus(position.id, position.status, {
             slTwapWaitStartedAt: null,
+            trailingTwapWaitStartedAt: null,
             ...(staleDynamicRetry ? { exitRetry: null } : {}),
           });
         }
@@ -293,7 +294,9 @@ export class Guardian {
             positionId: position.id,
             trigger: effectiveTrigger,
             elapsed: Date.now() - slWaitStartedAt,
-          }, "SL executing after TWAP guard max wait override");
+            }, "SL executing after TWAP guard max wait override");
+        } else if (effectiveTrigger === "trailing_take_profit") {
+          if (!(await this.allowTrailingAfterTwapWait(position, valued.twapGuard.deviationBps))) return true;
         } else {
           log.warn({
             positionId: position.id,
@@ -405,6 +408,32 @@ export class Guardian {
     }
   }
 
+  private async allowTrailingAfterTwapWait(position: PositionRecord, deviationBps?: bigint): Promise<boolean> {
+    const maxWaitMs = this.config.trailingTwapGuardMaxWaitMs;
+    if (maxWaitMs === 0) {
+      log.warn({ positionId: position.id, positionKey: position.positionKey, deviationBps }, "trailing executing without TWAP guard wait");
+      return true;
+    }
+
+    const startedAt = typeof position.metadata.trailingTwapWaitStartedAt === "number"
+      ? position.metadata.trailingTwapWaitStartedAt
+      : null;
+    if (startedAt === null) {
+      await this.database.setPositionStatus(position.id, position.status, { trailingTwapWaitStartedAt: Date.now() });
+      log.warn({ positionId: position.id, positionKey: position.positionKey, deviationBps }, "trailing threshold reached but TWAP not ready; starting guard wait");
+      return false;
+    }
+
+    const elapsed = Math.max(0, Date.now() - startedAt);
+    if (elapsed < maxWaitMs) {
+      log.info({ positionId: position.id, positionKey: position.positionKey, elapsed, maxWaitMs, deviationBps }, "trailing waiting for TWAP guard to stabilize");
+      return false;
+    }
+
+    log.warn({ positionId: position.id, positionKey: position.positionKey, elapsed, maxWaitMs, deviationBps }, "trailing executing after TWAP guard max wait override");
+    return true;
+  }
+
   private async executeExit(position: PositionRecord, trigger: ExitTrigger, triggerSnapshot: PnlSnapshot): Promise<void> {
     if (this.queuedExitPositions.has(position.id)) return;
     this.queuedExitPositions.add(position.id);
@@ -427,6 +456,7 @@ export class Guardian {
         }
         position = latestPosition;
       }
+      await this.database.setPositionStatus(position.id, position.status, { trailingTwapWaitStartedAt: null });
       void this.notifier.trigger(position, triggerSnapshot, trigger);
       await this.executor.execute(position, trigger);
     });

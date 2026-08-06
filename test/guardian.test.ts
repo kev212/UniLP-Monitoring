@@ -52,6 +52,7 @@ describe("profit + OOR above timer", () => {
     trailingStopActivationPercent: 5,
     profitOorAboveThresholdPercent: 3,
     slTwapGuardMaxWaitMs: 15_000,
+    trailingTwapGuardMaxWaitMs: 15_000,
     oorAboveProfitDurationMs: 300_000,
     oorAutoCloseEnabled: true,
     oorAboveMinDistancePercent: 10,
@@ -155,6 +156,92 @@ describe("profit + OOR above timer", () => {
     expect(shouldResumeExitRetry("stop_loss")).toBe(true);
     expect(shouldResumeExitRetry("take_profit")).toBe(true);
     expect(shouldResumeExitRetry("manual")).toBe(true);
+  });
+});
+
+describe("trailing TWAP guard timeout", () => {
+  const config = { trailingTwapGuardMaxWaitMs: 15_000 } as RuntimeConfig;
+  const position = {
+    id: "trailing-position",
+    chainId: 4663,
+    protocol: "v3" as const,
+    positionKey: "1",
+    owner: "0x0000000000000000000000000000000000000001",
+    poolAddress: null,
+    token0: "0x0000000000000000000000000000000000000002",
+    token1: "0x0000000000000000000000000000000000000003",
+    quoteToken: "0x0000000000000000000000000000000000000002",
+    status: "armed" as const,
+    liquidity: null,
+    openedAtBlock: null,
+    metadata: {},
+  } satisfies PositionRecord;
+
+  function makeGuardian(value = config): Guardian {
+    const database = { setPositionStatus: vi.fn().mockResolvedValue(undefined) };
+    return new Guardian(value, database as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never);
+  }
+
+  async function allow(guardian: Guardian, value: PositionRecord): Promise<boolean> {
+    return (guardian as unknown as {
+      allowTrailingAfterTwapWait(position: PositionRecord, deviationBps?: bigint): Promise<boolean>;
+    }).allowTrailingAfterTwapWait(value, 900n);
+  }
+
+  it("starts a bounded wait when the trailing guard is not ready", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    try {
+      const guardian = makeGuardian();
+      await expect(allow(guardian, position)).resolves.toBe(false);
+      const database = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
+      expect(database.setPositionStatus).toHaveBeenCalledWith("trailing-position", "armed", { trailingTwapWaitStartedAt: 100_000 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("continues waiting until the trailing timeout expires", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    try {
+      const guardian = makeGuardian();
+      await expect(allow(guardian, { ...position, metadata: { trailingTwapWaitStartedAt: 90_001 } })).resolves.toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("allows conservative trailing evaluation after the timeout", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    try {
+      const guardian = makeGuardian();
+      await expect(allow(guardian, { ...position, metadata: { trailingTwapWaitStartedAt: 84_999 } })).resolves.toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("allows an explicitly disabled wait without storing timer state", async () => {
+    const guardian = makeGuardian({ trailingTwapGuardMaxWaitMs: 0 } as RuntimeConfig);
+    await expect(allow(guardian, position)).resolves.toBe(true);
+    const database = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
+    expect(database.setPositionStatus).not.toHaveBeenCalled();
+  });
+
+  it("keeps the hard-floor override below the conservative estimate gate", async () => {
+    const database = { setPositionStatusUnlessSettled: vi.fn().mockResolvedValue(true) };
+    const pnl = {
+      trailingExitEstimateGateBps: vi.fn().mockReturnValue(365n),
+      trailingFloorBps: vi.fn().mockReturnValue(406n),
+    };
+    const guardian = new Guardian(config, database as never, {} as never, {} as never, {} as never, pnl as never, {} as never, {} as never);
+    const valued = { snapshot: { pnlBps: 206n } };
+
+    await expect((guardian as unknown as {
+      trailingExitEstimateAllowed(value: PositionRecord, blockNumber: bigint, estimate: typeof valued): Promise<unknown>;
+    }).trailingExitEstimateAllowed(position, 10n, valued)).resolves.toBe(valued.snapshot);
   });
 });
 

@@ -55,6 +55,7 @@ describe("loadConfig", () => {
     expect(config.trailingExitEstimateBufferPercent).toBe(10);
     expect(config.profitOorAboveThresholdPercent).toBe(3);
     expect(config.slTwapGuardMaxWaitMs).toBe(15_000);
+    expect(config.trailingTwapGuardMaxWaitMs).toBe(15_000);
     expect(config.positionMonitorIntervalMs).toBe(5_000);
     expect(config.discoveryIntervalMs).toBe(30_000);
     expect(config.oorAboveMinDistancePercent).toBe(10);

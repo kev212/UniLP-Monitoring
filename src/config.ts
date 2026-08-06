@@ -34,6 +34,7 @@ const envSchema = z.object({
   TRAILING_EXIT_ESTIMATE_BUFFER_PERCENT: z.coerce.number().nonnegative().max(50).default(10),
   PROFIT_OOR_ABOVE_THRESHOLD_PERCENT: z.coerce.number().positive().default(3),
   SL_TWAP_GUARD_MAX_WAIT_MS: z.coerce.number().int().min(0).max(300_000).default(15_000),
+  TRAILING_TWAP_GUARD_MAX_WAIT_MS: z.coerce.number().int().min(0).max(300_000).default(15_000),
   POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).default(5_000),
   BASE_POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).optional(),
   ROBINHOOD_POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).optional(),
@@ -100,6 +101,7 @@ export interface RuntimeConfig {
   trailingExitEstimateBufferPercent: number;
   profitOorAboveThresholdPercent: number;
   slTwapGuardMaxWaitMs: number;
+  trailingTwapGuardMaxWaitMs: number;
   positionMonitorIntervalMs: number;
   discoveryIntervalMs: number;
   chainMonitorIntervalMs: Partial<Record<ChainName, number>>;
@@ -257,6 +259,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     trailingExitEstimateBufferPercent: env.TRAILING_EXIT_ESTIMATE_BUFFER_PERCENT,
     profitOorAboveThresholdPercent: env.PROFIT_OOR_ABOVE_THRESHOLD_PERCENT,
     slTwapGuardMaxWaitMs: env.SL_TWAP_GUARD_MAX_WAIT_MS,
+    trailingTwapGuardMaxWaitMs: env.TRAILING_TWAP_GUARD_MAX_WAIT_MS,
     positionMonitorIntervalMs: env.POSITION_MONITOR_INTERVAL_MS,
     discoveryIntervalMs: env.DISCOVERY_INTERVAL_MS,
     chainMonitorIntervalMs: {
