@@ -456,10 +456,14 @@ export class Guardian {
     const groups = await this.database.listPositionGroups();
     for (const group of groups) {
       const closeHash = group.closeTransactionHash ?? group.metadata.closeTransactionHash;
+      const pendingSwap = group.metadata.pendingSwap !== null
+        && typeof group.metadata.pendingSwap === "object"
+        && !Array.isArray(group.metadata.pendingSwap);
       const recoverable = group.status === "closing"
         || group.status === "settling"
         || group.pendingRawTransaction !== null
-        || typeof closeHash === "string";
+        || typeof closeHash === "string"
+        || pendingSwap;
       if (!recoverable) continue;
       try {
         await this.executor.executeGroup(group.id, typeof group.metadata.exitTrigger === "string" ? group.metadata.exitTrigger as import("../types.js").ExitTrigger : undefined);

@@ -1020,38 +1020,64 @@ export class Executor {
     }
     const pending = parsePendingGroupSwap(group.metadata.pendingSwap);
     if (!pending || pending.amount === 0n) {
-      const quoteAmount = typeof group.metadata.totalReceivedQuote === "string"
-        ? BigInt(group.metadata.totalReceivedQuote)
-        : group.totalReceivedQuote;
-      const totals = await this.database.getPositionGroupCashflowTotals(group.id);
-      const deposits = totals.deposits > 0n ? totals.deposits : group.deployedCostQuote;
-      const finalPnlQuote = totals.realized - deposits;
-      const finalPnlBps = deposits > 0n ? (finalPnlQuote * 10_000n) / deposits : 0n;
-      const finalize = this.groupDatabase().finalizePositionGroup;
-      if (typeof finalize !== "function") throw new GroupIntegrityError("Position group settlement finalizer is unavailable");
-      const exitTrigger = typeof group.metadata.exitTrigger === "string" ? group.metadata.exitTrigger : "manual";
-      const settled = await finalize.call(this.database, group.id, hash, quoteAmount, finalPnlQuote, finalPnlBps, trigger ?? exitTrigger);
-      if (!settled) throw new Error("position group settlement finalization failed");
+      await this.finalizeGroupFromCloseProceeds(group, hash, trigger, "no pending swap");
       return;
     }
     if (pending.token.toLowerCase() === zeroAddress.toLowerCase()) {
       throw new GroupIntegrityError("Aggregate native-token settlement requires a supported native swap route");
     }
     const synthetic = groupSettlementPosition(group);
-    const prepared = await this.prepareGroupSettlementSwap(group, synthetic, pending);
-    if (!prepared) throw new Error("No safe route is available for aggregate position group settlement");
+    let prepared: TransactionPlan | null;
+    try {
+      prepared = await this.prepareGroupSettlementSwap(group, synthetic, pending);
+    } catch (error) {
+      if (error instanceof Error && /reverted|route/i.test(error.message)) {
+        await this.finalizeGroupFromCloseProceeds(group, hash, trigger, `aggregate settlement swap is unquotable: ${errorMessage(error)}`);
+        return;
+      }
+      throw error;
+    }
+    if (!prepared) {
+      await this.finalizeGroupFromCloseProceeds(group, hash, trigger, "no safe route is available for aggregate group settlement");
+      return;
+    }
     await this.setGroupStatus(group.id, "settling", {
       closeTransactionHash: hash,
       settlementPhase: "pending_swap",
       lastExecutionError: "aggregate group settlement requires a quote conversion",
       pendingSwap: { token: pending.token, amount: pending.amount.toString() },
     });
-    const swapHash = await this.sendGroup(group, "settlement_swap", prepared);
+    let swapHash: Hex | null;
+    try {
+      swapHash = await this.sendGroup(group, "settlement_swap", prepared);
+    } catch (error) {
+      if (error instanceof PendingExecutionError) throw error;
+      await this.finalizeGroupFromCloseProceeds(group, hash, trigger, `aggregate settlement swap produced no output: ${errorMessage(error)}`);
+      return;
+    }
     if (!swapHash) {
       await this.setGroupStatus(group.id, "settling", { dryRunPlan: prepared.description });
       return;
     }
     await this.reconcileGroupSettlementSwap(group, swapHash, trigger);
+  }
+
+  private async finalizeGroupFromCloseProceeds(group: PositionGroupRecord, closeHash: Hex, trigger?: ExitTrigger, reason?: string): Promise<void> {
+    if (reason) {
+      log.warn({ groupId: group.id, closeHash, reason }, "position group settling from close proceeds without an aggregate swap");
+    }
+    const quoteAmount = typeof group.metadata.totalReceivedQuote === "string"
+      ? BigInt(group.metadata.totalReceivedQuote)
+      : group.totalReceivedQuote;
+    const totals = await this.database.getPositionGroupCashflowTotals(group.id);
+    const deposits = totals.deposits > 0n ? totals.deposits : group.deployedCostQuote;
+    const finalPnlQuote = totals.realized - deposits;
+    const finalPnlBps = deposits > 0n ? (finalPnlQuote * 10_000n) / deposits : 0n;
+    const finalize = this.groupDatabase().finalizePositionGroup;
+    if (typeof finalize !== "function") throw new GroupIntegrityError("Position group settlement finalizer is unavailable");
+    const exitTrigger = typeof group.metadata.exitTrigger === "string" ? group.metadata.exitTrigger : "manual";
+    const settled = await finalize.call(this.database, group.id, closeHash, quoteAmount, finalPnlQuote, finalPnlBps, trigger ?? exitTrigger);
+    if (!settled) throw new Error("position group settlement finalization failed");
   }
 
   private async prepareGroupSettlementSwap(
