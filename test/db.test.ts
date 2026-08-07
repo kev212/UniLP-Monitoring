@@ -125,6 +125,26 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[0]![1]).toEqual(["group", "settling", JSON.stringify(metadata)]);
   });
 
+  it("keeps group finalization numeric parameters consistently typed", async () => {
+    const database = new Database("postgres://unused");
+    const clientQuery = vi.fn()
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "group" }] })
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({});
+    const connect = vi.fn().mockResolvedValue({ query: clientQuery, release: vi.fn() });
+    Object.defineProperty(database, "pool", { value: { connect } });
+
+    await expect(database.finalizePositionGroup("group", "0xclose", 100n, 2n, 200n, "manual")).resolves.toBe(true);
+
+    const parentQuery = clientQuery.mock.calls[1]![0] as string;
+    expect(parentQuery).toContain("total_received_quote = $3::numeric");
+    expect(parentQuery).toContain("'totalReceivedQuote', ($3::numeric)::text");
+    expect(parentQuery).toContain("'finalPnlQuote', ($4::numeric)::text");
+    expect(parentQuery).toContain("'finalPnlBps', ($5::numeric)::text");
+  });
+
   it("renews a group lease only while its token owns the parent", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ id: "group" }] });
