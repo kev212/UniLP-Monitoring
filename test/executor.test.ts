@@ -1002,6 +1002,70 @@ describe("Executor pending settlement recovery", () => {
     expect(closeReceiptAmounts).not.toHaveBeenCalled();
   });
 
+  it("resumes the aggregate settlement swap after the close receipt was accounted in the same process", async () => {
+    const group = {
+      ...groupRecord(),
+      status: "settling",
+      closeTransactionHash: hash,
+      metadata: {
+        closeTransactionHash: hash,
+        closeReceiptAccounted: true,
+        settlementPhase: "pending_swap",
+        pendingSwap: { token, amount: "500" },
+        totalReceivedQuote: "100",
+        exitTrigger: "manual",
+      },
+    };
+    const swapReceipt = {
+      status: "success" as const,
+      blockNumber: 102n,
+      logs: [transferLog(usdg, sender, owner, 200n)],
+    };
+    const client = {
+      getTransactionReceipt: vi.fn().mockResolvedValue(swapReceipt),
+      readContract: vi.fn().mockResolvedValue(10n ** 30n),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const database = {
+      getPositionGroup: vi.fn().mockResolvedValue(group),
+      claimPositionGroupLease: vi.fn().mockResolvedValue(true),
+      releasePositionGroupLease: vi.fn().mockResolvedValue(undefined),
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      withExecutionLock: vi.fn(async (_chainId: number, _address: Address, work: () => Promise<unknown>) => work()),
+      recordPositionGroupExecution: vi.fn().mockResolvedValue(undefined),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+      getPositionGroupCashflowTotals: vi.fn().mockResolvedValue({ deposits: 100n, realized: 300n }),
+      addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
+      finalizePositionGroup: vi.fn().mockResolvedValue(true),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const routes = {
+      quoteDirect: vi.fn().mockResolvedValue({
+        protocol: "v3",
+        pool: groupPool,
+        pools: [groupPool],
+        router: "0x0000000000000000000000000000000000000300",
+        tokenIn: token,
+        tokenOut: usdg,
+        path: [token, usdg],
+        encodedPath: "0x00",
+        amountIn: 500n,
+        expectedOut: 500n,
+        minimumOut: 500n,
+      }),
+    };
+    const executor = new Executor(database as never, chains as never, {} as never, routes as never, {} as never, config);
+    (executor as any).accountedGroupCloses.add(groupId);
+    const sendGroup = vi.spyOn(executor as any, "sendGroup").mockResolvedValue(hash);
+
+    await executor.executeGroup(groupId, "manual");
+
+    expect(routes.quoteDirect).toHaveBeenCalledWith(expect.anything(), token, 500n, usdg);
+    expect(sendGroup).toHaveBeenCalledWith(group, "settlement_swap", expect.anything());
+    expect(database.addPositionGroupCashflow).toHaveBeenCalledWith(groupId, 102n, hash, "settlement_swap", 200n, 0n, 0n, expect.any(Object));
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 300n, 200n, 20000n, "manual");
+  });
+
   it("keeps all Bid-Ask children active and the parent retryable when the batch reverts", async () => {
     const group = groupRecord();
     const children = [groupChild("child-7", 7n), groupChild("child-8", 8n)];

@@ -310,7 +310,7 @@ export class Executor {
     try {
       if (await this.recoverPendingGroupExecution(group, trigger)) return;
       group = await this.database.getPositionGroup(groupId) ?? group;
-      if (this.accountedGroupCloses.has(group.id)) return;
+      if (this.accountedGroupCloses.has(group.id) && group.metadata.settlementPhase === "complete") return;
 
       let storedCloseHash = this.groupCloseHash(group);
       if (!storedCloseHash) {
