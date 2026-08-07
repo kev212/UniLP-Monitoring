@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { PositionOpener } from "../src/services/position-opener.js";
-import { canRequestManualClose, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatRangePrices, invokeBidAskOpenerMethod, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
+import { canRequestManualClose, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatRangePrices, invokeBidAskOpenerMethod, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins, positionRangeLine } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -182,6 +182,10 @@ describe("Telegram dashboard callbacks", () => {
   it("pins the marker to the edge when price is outside the range", () => {
     expect(positionRangeBins(100n, 200n, 50n)).toMatchObject({ marker: "◀", markerIndex: 0 });
     expect(positionRangeBins(100n, 200n, 250n)).toMatchObject({ marker: "▶", markerIndex: 9 });
+  });
+
+  it("uses the normal price progress bar marker", () => {
+    expect(positionRangeLine(0n, 100n, 50n)).toEqual({ bar: "━━━━━│━━━━", percent: 50 });
   });
 
   it("shows textual range status only outside the range", () => {

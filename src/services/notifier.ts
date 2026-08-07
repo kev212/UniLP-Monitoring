@@ -947,20 +947,47 @@ export class Notifier {
     const t0 = await this.tokenLabel(position.token0, position.chainId);
     const t1 = await this.tokenLabel(position.token1, position.chainId);
     const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
-    const snapshot = await database.getLatestPositionGroupPnlSnapshot(position.metadata.positionGroupId as string);
+    const groupId = position.metadata.positionGroupId as string;
+    const snapshot = await database.getLatestPositionGroupPnlSnapshot(groupId);
     const status = typeof position.metadata.groupStatus === "string" ? position.metadata.groupStatus : position.status;
     const statusLabel = status === "active" ? "" : ` · ${statusDisplay(status as PositionStatus)}`;
     const bins = typeof position.metadata.mintableBinCount === "number" ? position.metadata.mintableBinCount : "?";
-    const lower = typeof position.metadata.outerTickLower === "number" ? position.metadata.outerTickLower : "?";
-    const upper = typeof position.metadata.outerTickUpper === "number" ? position.metadata.outerTickUpper : "?";
-    const base = `${index}. ${snapshot && snapshot.pnlBps < 0n ? "🔴" : "🟢"} BID-ASK ${shortHash(position.metadata.positionGroupId as string)} ${pair} · ${position.protocol.toUpperCase()}${statusLabel}`;
-    if (!snapshot) return `${base}\n   ⏳ LOADING · ${bins} bins · ticks ${lower} → ${upper}\n`;
+    const base = `${index}. ${snapshot && snapshot.pnlBps < 0n ? "🔴" : "🟢"} ${pair} · ${position.protocol.toUpperCase()} · BID-ASK${statusLabel}`;
+    if (!snapshot) return `${base}\n   ⏳ LOADING · ${bins} bins\n`;
     const qtSymbol = this.quoteSymbol(position.quoteToken!);
     const qtDec = await this.decimals(position.quoteToken!, position.chainId);
     const value = formatToken(snapshot.liquidationQuote, qtDec, qtSymbol === "USDG" || qtSymbol === "USDC" ? 2 : 4);
+    const fee = formatToken(snapshot.feeQuote, qtDec, qtSymbol === "USDG" || qtSymbol === "USDC" ? 2 : 4);
+    const feeLabel = qtSymbol === "USDG" || qtSymbol === "USDC" ? `🪙 ≈$${fee}` : `🪙 ${fee} ${qtSymbol}`;
     const sign = snapshot.pnlBps >= 0n ? "+" : "";
     const arrow = snapshot.pnlBps > 0n ? "📈" : snapshot.pnlBps < 0n ? "📉" : "➖";
-    return `${base}\n   💰 ${value} ${qtSymbol} · ${arrow} ${sign}${formatBps(snapshot.pnlBps)}% · ${bins} bins · ticks ${lower} → ${upper}\n`;
+    const valueLine = `   💰 ${value} ${qtSymbol} · ${feeLabel} · ${arrow} ${sign}${formatBps(snapshot.pnlBps)}%`;
+    const rangeLine = await this.formatGroupPositionRange(position, database, groupId, bins);
+    return `${base}\n${valueLine}${rangeLine}\n`;
+  }
+
+  private async formatGroupPositionRange(position: PositionRecord, database: Database, groupId: string, bins: number | string): Promise<string> {
+    const lower = typeof position.metadata.outerTickLower === "number" ? position.metadata.outerTickLower : undefined;
+    const upper = typeof position.metadata.outerTickUpper === "number" ? position.metadata.outerTickUpper : undefined;
+    if (lower === undefined || upper === undefined) return `\n   ⏳ LOADING · ${bins} bins`;
+
+    const children = await database.listPositionGroupChildren(groupId);
+    const positionIds = children
+      .filter((child) => child.bin.status === "minted" && child.position !== null)
+      .map((child) => child.position!.id);
+    const observations = await database.getLatestObservations(positionIds);
+    const current = [...observations.values()].find((observation) => observation.rangeCurrentTick !== null && observation.rangeSqrtPrice !== null);
+    if (!current || current.rangeCurrentTick === null || current.rangeSqrtPrice === null) return `\n   ⏳ LOADING · ${bins} bins`;
+
+    const currentTick = current.rangeCurrentTick;
+    const range: PositionRangeInfo = {
+      tickLower: lower,
+      tickUpper: upper,
+      currentTick,
+      currentSqrtPrice: current.rangeSqrtPrice,
+      status: currentTick >= upper ? "above" : currentTick < lower ? "below" : "in_range",
+    };
+    return this.formatPositionRange(position, range, `${bins} bins`);
   }
 
   private async formatStatusLine(position: PositionRecord, pnl: PnlService, blockNumber: bigint | undefined, index: number): Promise<string> {
@@ -996,7 +1023,7 @@ export class Notifier {
     }
   }
 
-  private async formatPositionRange(position: PositionRecord, range: import("../types.js").PositionRangeInfo | undefined): Promise<string> {
+  private async formatPositionRange(position: PositionRecord, range: import("../types.js").PositionRangeInfo | undefined, suffix = ""): Promise<string> {
     if (position.protocol === "v2") return "\n   FULL RANGE";
     if (!range || !position.quoteToken) return "";
 
@@ -1014,13 +1041,14 @@ export class Notifier {
     const line = positionRangeLine(minimum, maximum, current);
     const rangeStatus = quoteRangeState(range, quoteIsToken0)?.status;
     const oorStatus = formatDashboardRangeStatus(rangeStatus, position.metadata);
+    const suffixLabel = suffix ? ` · ${suffix}` : "";
 
     if (rangeStatus === "below" || rangeStatus === "above") {
-      return `\n   ${line.bar}  ${oorStatus.replace(" | ⚠️ ", "")}\n   ${formatCompactPrice(minimum, quoteSymbol)} – ${formatCompactPrice(maximum, quoteSymbol)} · ${formatCompactPrice(current, quoteSymbol)}`;
+      return `\n   ${line.bar}  ${oorStatus.replace(" | ⚠️ ", "")}${suffixLabel}\n   ${formatCompactPrice(minimum, quoteSymbol)} – ${formatCompactPrice(maximum, quoteSymbol)} · ${formatCompactPrice(current, quoteSymbol)}`;
     }
 
     const pctLabel = line.percent !== null ? ` ${line.percent}%` : "";
-    return `\n   ${line.bar}${pctLabel}\n   ${formatCompactPrice(minimum, quoteSymbol)} – ${formatCompactPrice(maximum, quoteSymbol)} · ${formatCompactPrice(current, quoteSymbol)}`;
+    return `\n   ${line.bar}${pctLabel}${suffixLabel}\n   ${formatCompactPrice(minimum, quoteSymbol)} – ${formatCompactPrice(maximum, quoteSymbol)} · ${formatCompactPrice(current, quoteSymbol)}`;
   }
 
   private lastScanAt = 0;
