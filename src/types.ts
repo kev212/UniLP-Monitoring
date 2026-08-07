@@ -227,6 +227,8 @@ export interface PositionGroupPnlSnapshot {
   pnlBps: bigint;
   blockNumber: bigint;
   groupGasQuote: bigint;
+  rangeCurrentTick: number | null;
+  rangeCurrentSqrtPrice: bigint | null;
 }
 
 export interface PositionGroupPnlSnapshotRecord extends PositionGroupPnlSnapshot {

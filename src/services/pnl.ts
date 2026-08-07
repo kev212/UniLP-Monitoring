@@ -229,6 +229,8 @@ export class PnlService {
       pnlBps,
       blockNumber,
       groupGasQuote: 0n,
+      rangeCurrentTick: range.currentTick,
+      rangeCurrentSqrtPrice: range.currentSqrtPrice,
     };
     if (recordSnapshot) await this.database.addPositionGroupPnlSnapshot(snapshot);
     return {

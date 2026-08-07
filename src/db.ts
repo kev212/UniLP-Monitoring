@@ -147,6 +147,8 @@ interface PositionGroupPnlSnapshotRow {
   pnl_bps: string;
   block_number: string;
   group_gas_quote: string;
+  range_current_tick: number | null;
+  range_current_sqrt_price: string | null;
   created_at: Date | string;
 }
 
@@ -337,9 +339,13 @@ export class Database {
         pnl_bps NUMERIC(78, 0) NOT NULL,
         block_number NUMERIC(78, 0) NOT NULL,
         group_gas_quote NUMERIC(78, 0) NOT NULL DEFAULT 0,
+        range_current_tick INTEGER,
+        range_current_sqrt_price NUMERIC(78, 0),
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE(group_id, block_number)
       );
+      ALTER TABLE position_group_pnl_snapshots ADD COLUMN IF NOT EXISTS range_current_tick INTEGER;
+      ALTER TABLE position_group_pnl_snapshots ADD COLUMN IF NOT EXISTS range_current_sqrt_price NUMERIC(78, 0);
       CREATE INDEX IF NOT EXISTS position_group_pnl_snapshots_group_created_idx
         ON position_group_pnl_snapshots(group_id, created_at DESC);
       CREATE TABLE IF NOT EXISTS cashflows (
@@ -1116,17 +1122,19 @@ export class Database {
   async addPositionGroupPnlSnapshot(snapshot: PositionGroupPnlSnapshot): Promise<void> {
     await this.pool.query(
       `INSERT INTO position_group_pnl_snapshots
-        (group_id, quote_token, deposits_quote, realized_quote, liquidation_quote, fee_quote, pnl_quote, pnl_bps, block_number, group_gas_quote)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        (group_id, quote_token, deposits_quote, realized_quote, liquidation_quote, fee_quote, pnl_quote, pnl_bps, block_number, group_gas_quote, range_current_tick, range_current_sqrt_price)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        ON CONFLICT (group_id, block_number) DO UPDATE SET
          quote_token = EXCLUDED.quote_token,
          deposits_quote = EXCLUDED.deposits_quote,
          realized_quote = EXCLUDED.realized_quote,
          liquidation_quote = EXCLUDED.liquidation_quote,
          fee_quote = EXCLUDED.fee_quote,
-         pnl_quote = EXCLUDED.pnl_quote,
-         pnl_bps = EXCLUDED.pnl_bps,
-         group_gas_quote = EXCLUDED.group_gas_quote,
+          pnl_quote = EXCLUDED.pnl_quote,
+          pnl_bps = EXCLUDED.pnl_bps,
+          range_current_tick = EXCLUDED.range_current_tick,
+          range_current_sqrt_price = EXCLUDED.range_current_sqrt_price,
+          group_gas_quote = EXCLUDED.group_gas_quote,
          created_at = NOW()`,
       [
         snapshot.groupId,
@@ -1136,10 +1144,12 @@ export class Database {
         snapshot.liquidationQuote.toString(),
         snapshot.feeQuote.toString(),
         snapshot.pnlQuote.toString(),
-        snapshot.pnlBps.toString(),
-        snapshot.blockNumber.toString(),
-        snapshot.groupGasQuote.toString(),
-      ],
+         snapshot.pnlBps.toString(),
+         snapshot.blockNumber.toString(),
+         snapshot.groupGasQuote.toString(),
+         snapshot.rangeCurrentTick,
+         snapshot.rangeCurrentSqrtPrice?.toString() ?? null,
+       ],
     );
   }
 
@@ -2073,6 +2083,8 @@ function mapPositionGroupPnlSnapshot(row: PositionGroupPnlSnapshotRow): Position
     pnlBps: BigInt(row.pnl_bps),
     blockNumber: BigInt(row.block_number),
     groupGasQuote: BigInt(row.group_gas_quote),
+    rangeCurrentTick: row.range_current_tick === null ? null : Number(row.range_current_tick),
+    rangeCurrentSqrtPrice: row.range_current_sqrt_price === null ? null : BigInt(row.range_current_sqrt_price),
     createdAt: new Date(row.created_at),
   };
 }

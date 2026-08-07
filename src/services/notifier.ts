@@ -5,7 +5,7 @@ import sharp from "sharp";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionGroupRecord, PositionRangeInfo, PositionRecord, PositionStatus, Protocol, QuoteToken, RiskSettings } from "../types.js";
+import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionGroupPnlSnapshot, PositionGroupRecord, PositionRangeInfo, PositionRecord, PositionStatus, Protocol, QuoteToken, RiskSettings } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
@@ -962,29 +962,23 @@ export class Notifier {
     const sign = snapshot.pnlBps >= 0n ? "+" : "";
     const arrow = snapshot.pnlBps > 0n ? "📈" : snapshot.pnlBps < 0n ? "📉" : "➖";
     const valueLine = `   💰 ${value} ${qtSymbol} · ${feeLabel} · ${arrow} ${sign}${formatBps(snapshot.pnlBps)}%`;
-    const rangeLine = await this.formatGroupPositionRange(position, database, groupId, bins);
+    const rangeLine = await this.formatGroupPositionRange(position, snapshot, bins);
     return `${base}\n${valueLine}${rangeLine}\n`;
   }
 
-  private async formatGroupPositionRange(position: PositionRecord, database: Database, groupId: string, bins: number | string): Promise<string> {
+  private async formatGroupPositionRange(position: PositionRecord, snapshot: Pick<PositionGroupPnlSnapshot, "rangeCurrentTick" | "rangeCurrentSqrtPrice">, bins: number | string): Promise<string> {
     const lower = typeof position.metadata.outerTickLower === "number" ? position.metadata.outerTickLower : undefined;
     const upper = typeof position.metadata.outerTickUpper === "number" ? position.metadata.outerTickUpper : undefined;
     if (lower === undefined || upper === undefined) return `\n   ⏳ LOADING · ${bins} bins`;
 
-    const children = await database.listPositionGroupChildren(groupId);
-    const positionIds = children
-      .filter((child) => child.bin.status === "minted" && child.position !== null)
-      .map((child) => child.position!.id);
-    const observations = await database.getLatestObservations(positionIds);
-    const current = [...observations.values()].find((observation) => observation.rangeCurrentTick !== null && observation.rangeSqrtPrice !== null);
-    if (!current || current.rangeCurrentTick === null || current.rangeSqrtPrice === null) return `\n   ⏳ LOADING · ${bins} bins`;
+    if (snapshot.rangeCurrentTick === null || snapshot.rangeCurrentSqrtPrice === null) return `\n   ⏳ LOADING · ${bins} bins`;
 
-    const currentTick = current.rangeCurrentTick;
+    const currentTick = snapshot.rangeCurrentTick;
     const range: PositionRangeInfo = {
       tickLower: lower,
       tickUpper: upper,
       currentTick,
-      currentSqrtPrice: current.rangeSqrtPrice,
+      currentSqrtPrice: snapshot.rangeCurrentSqrtPrice,
       status: currentTick >= upper ? "above" : currentTick < lower ? "below" : "in_range",
     };
     return this.formatPositionRange(position, range, `${bins} bins`);
