@@ -706,11 +706,11 @@ export class Notifier {
     try {
       const groupId = managedPositionGroupId(position);
       if (groupId) {
-        const executeGroup = optionalExecutorMethod(executor, "executeGroup");
+        const executeGroup = optionalExecutorMethod(executor, "executeRelatedGroup");
         if (!executeGroup) throw new Error("Bid-Ask parent close is not available yet");
         await executeGroup.call(executor, groupId, "manual");
       } else {
-        await executor.execute(position, "manual");
+        await executor.executeRelatedPosition(position, "manual");
       }
       await this.refreshDashboardMessage(database, pnl, chatId, messageId, page);
     } catch (error) {
@@ -1973,12 +1973,12 @@ export class Notifier {
     await this.replyTemp(ctx, `Menutup ${closeTarget}...`);
     try {
       if (groupId) {
-        const executeGroup = optionalExecutorMethod(executor, "executeGroup");
+        const executeGroup = optionalExecutorMethod(executor, "executeRelatedGroup");
         if (!executeGroup) throw new Error("Bid-Ask parent close is not available yet");
         await executeGroup.call(executor, groupId, "manual");
         await this.replyTemp(ctx, `${closeTarget} — atomic close dimulai.`);
       } else {
-        await executor.execute(found, "manual");
+        await executor.executeRelatedPosition(found, "manual");
         await this.replyTemp(ctx, `Posisi ${found.positionKey} — penutupan dimulai.`);
       }
     } catch (error: unknown) {

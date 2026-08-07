@@ -207,7 +207,7 @@ export class Guardian {
         return true;
       }
       log.warn({ groupId: group.id, chain: name, trigger, pnlBps: valued.snapshot.pnlBps, quoteIsToken0 }, "position group exit triggered");
-      await this.executor.executeGroup(group.id, trigger);
+      await this.executor.executeRelatedGroup(group.id, trigger);
       return true;
     } catch (error) {
       if (error instanceof Error && error.message.includes("cost basis")) {
@@ -547,7 +547,7 @@ export class Guardian {
       }
       await this.database.setPositionStatus(position.id, position.status, { trailingTwapWaitStartedAt: null });
       void this.notifier.trigger(position, triggerSnapshot, trigger);
-      await this.executor.execute(position, trigger);
+      await this.executor.executeRelatedPosition(position, trigger);
     });
     this.exitQueue = attempt.catch(() => undefined);
     try {

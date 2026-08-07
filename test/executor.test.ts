@@ -160,6 +160,31 @@ function groupChild(id: string, tokenId: bigint): PositionRecord {
   };
 }
 
+function relatedPosition(
+  id: string,
+  token0: Address = usdg,
+  token1: Address = token,
+  quoteToken: Address = usdg,
+  status: PositionRecord["status"] = "armed",
+  metadata: Record<string, unknown> = {},
+): PositionRecord {
+  return {
+    id,
+    chainId: 4663,
+    protocol: "v3",
+    positionKey: id,
+    owner,
+    poolAddress: groupPool,
+    token0,
+    token1,
+    quoteToken,
+    status,
+    liquidity: 10n,
+    openedAtBlock: 90n,
+    metadata,
+  };
+}
+
 function groupValue(lower: number, upper: number, liquidity = 10n) {
   return {
     protocol: "v3" as const,
@@ -1410,5 +1435,77 @@ describe("Executor pending settlement recovery", () => {
     expect(database.setPositionGroupStatus).toHaveBeenLastCalledWith(groupId, "active", expect.objectContaining({ reason: "close_batch transaction reverted" }));
     expect(database.recordPositionGroupExecution).toHaveBeenCalledWith(groupId, "close_batch", "failed", undefined, undefined, undefined, "close_batch transaction reverted");
     expect(database).not.toHaveProperty("setPositionStatus");
+  });
+
+  it("cascades a normal-position trigger to the matching Bid-Ask group and normal siblings", async () => {
+    const source = relatedPosition("source", token, usdg, usdg);
+    const sibling = relatedPosition("sibling", usdg, token, usdg);
+    const group = groupRecord();
+    const child = relatedPosition("child", usdg, token, usdg, "armed", { managedBy: "position_group", positionGroupId: group.id });
+    const protectedPosition = relatedPosition("review", usdg, token, usdg, "needs_review");
+    const differentPair = relatedPosition("different", nvda, usdg, usdg);
+    const database = {
+      listActivePositions: vi.fn().mockResolvedValue([source, sibling, child, protectedPosition, differentPair]),
+      listPositionGroups: vi.fn().mockResolvedValue([group]),
+    };
+    const chains = { getById: vi.fn(() => ({ registry: { name: "robinhood" } })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
+    const executePosition = vi.spyOn(executor, "execute").mockResolvedValue(undefined);
+    const executeGroup = vi.spyOn(executor, "executeGroup").mockResolvedValue(undefined);
+
+    await executor.executeRelatedPosition(source, "take_profit");
+
+    expect(executePosition).toHaveBeenCalledWith(source, "take_profit");
+    expect(executePosition).toHaveBeenCalledWith(sibling, "take_profit");
+    expect(executePosition).not.toHaveBeenCalledWith(child, "take_profit");
+    expect(executePosition).not.toHaveBeenCalledWith(protectedPosition, "take_profit");
+    expect(executePosition).not.toHaveBeenCalledWith(differentPair, "take_profit");
+    expect(executeGroup).toHaveBeenCalledWith(group.id, "take_profit");
+  });
+
+  it("matches native ETH and WETH exposures across a Bid-Ask group and a normal position", async () => {
+    const group = {
+      ...groupRecord("v4"),
+      id: "eth-group",
+      token0: zeroAddress,
+      token1: token,
+      quoteToken: zeroAddress,
+    };
+    const wethPosition = relatedPosition("weth-position", weth, token, weth);
+    const database = {
+      getPositionGroup: vi.fn().mockResolvedValue(group),
+      listActivePositions: vi.fn().mockResolvedValue([wethPosition]),
+      listPositionGroups: vi.fn().mockResolvedValue([group]),
+    };
+    const chains = { getById: vi.fn(() => ({ registry: { name: "robinhood" } })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, wethConfig);
+    const executePosition = vi.spyOn(executor, "execute").mockResolvedValue(undefined);
+    const executeGroup = vi.spyOn(executor, "executeGroup").mockResolvedValue(undefined);
+
+    await executor.executeRelatedGroup(group.id, "out_of_range_above");
+
+    expect(executeGroup).toHaveBeenCalledWith(group.id, "out_of_range_above");
+    expect(executePosition).toHaveBeenCalledWith(wethPosition, "out_of_range_above");
+  });
+
+  it("deduplicates simultaneous related-pair close requests", async () => {
+    const source = relatedPosition("source", token, usdg, usdg);
+    const sibling = relatedPosition("sibling", usdg, token, usdg);
+    const database = {
+      listActivePositions: vi.fn().mockResolvedValue([source, sibling]),
+      listPositionGroups: vi.fn().mockResolvedValue([]),
+    };
+    const chains = { getById: vi.fn(() => ({ registry: { name: "robinhood" } })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
+    const executePosition = vi.spyOn(executor, "execute").mockResolvedValue(undefined);
+
+    await Promise.all([
+      executor.executeRelatedPosition(source, "manual"),
+      executor.executeRelatedPosition(sibling, "manual"),
+    ]);
+
+    expect(executePosition).toHaveBeenCalledTimes(2);
+    expect(database.listActivePositions).toHaveBeenCalledTimes(1);
+    expect(database.listPositionGroups).toHaveBeenCalledTimes(1);
   });
 });

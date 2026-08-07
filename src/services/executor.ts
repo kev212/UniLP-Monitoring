@@ -145,6 +145,10 @@ interface GroupChild {
   value: PositionValue;
 }
 
+type RelatedPairTarget =
+  | { kind: "position"; value: PositionRecord }
+  | { kind: "group"; value: PositionGroupRecord };
+
 export class Executor {
   private readonly account;
   private readonly executorClientCache = new Map<string, PublicClient>();
@@ -156,6 +160,7 @@ export class Executor {
   private readonly activeGroupLeases = new Map<string, string>();
   private readonly confirmedGroupCloses = new Map<string, Hex>();
   private readonly accountedGroupCloses = new Set<string>();
+  private readonly relatedPairJobs = new Map<string, Promise<void>>();
   private readonly reportedGroupDbGaps = new Set<string>();
   private transactionTail: Promise<unknown> = Promise.resolve();
 
@@ -185,6 +190,83 @@ export class Executor {
 
   async executeGroup(groupId: string, trigger?: ExitTrigger): Promise<void> {
     return this.runGroupExclusive(groupId, () => this.executeGroupUnlocked(groupId, trigger));
+  }
+
+  async executeRelatedPosition(position: PositionRecord, trigger: ExitTrigger): Promise<void> {
+    if (position.metadata.detectionOnly === true) throw new Error("Detection-only positions cannot be executed");
+    return this.executeRelatedPair({ kind: "position", value: position }, trigger);
+  }
+
+  async executeRelatedGroup(groupId: string, trigger: ExitTrigger): Promise<void> {
+    const group = await this.database.getPositionGroup(groupId);
+    if (!group) throw new Error(`Position group ${groupId} was not found`);
+    return this.executeRelatedPair({ kind: "group", value: group }, trigger);
+  }
+
+  private executeRelatedPair(origin: RelatedPairTarget, trigger: ExitTrigger): Promise<void> {
+    const pairKey = this.relatedPairKey(origin.value.chainId, origin.value.token0, origin.value.token1);
+    const existing = this.relatedPairJobs.get(pairKey);
+    if (existing) return existing;
+
+    const run = this.closeRelatedPair(origin, pairKey, trigger);
+    const tracked = run.finally(() => {
+      if (this.relatedPairJobs.get(pairKey) === tracked) this.relatedPairJobs.delete(pairKey);
+    });
+    this.relatedPairJobs.set(pairKey, tracked);
+    return tracked;
+  }
+
+  private async closeRelatedPair(origin: RelatedPairTarget, pairKey: string, trigger: ExitTrigger): Promise<void> {
+    const [positions, groups] = await Promise.all([
+      this.database.listActivePositions(origin.value.chainId),
+      this.database.listPositionGroups(origin.value.chainId),
+    ]);
+    const targets: RelatedPairTarget[] = [];
+    const seen = new Set<string>();
+    const addTarget = (target: RelatedPairTarget): void => {
+      const key = `${target.kind}:${target.value.id}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      targets.push(target);
+    };
+
+    if (isRelatedPairTarget(origin)) addTarget(origin);
+    for (const group of groups) {
+      if (!isCascadeGroup(group) || group.owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) continue;
+      if (this.relatedPairKey(group.chainId, group.token0, group.token1) !== pairKey) continue;
+      addTarget({ kind: "group", value: group });
+    }
+    for (const position of positions) {
+      if (!isCascadePosition(position) || isManagedGroupChild(position)) continue;
+      if (position.owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) continue;
+      if (this.relatedPairKey(position.chainId, position.token0, position.token1) !== pairKey) continue;
+      addTarget({ kind: "position", value: position });
+    }
+
+    const failures: string[] = [];
+    for (const target of targets) {
+      try {
+        if (target.kind === "group") await this.executeGroup(target.value.id, trigger);
+        else await this.execute(target.value, trigger);
+      } catch (error) {
+        const id = target.kind === "group" ? target.value.id : target.value.positionKey;
+        failures.push(`${target.kind}:${id}`);
+        log.warn({ err: error, pairKey, trigger, target: id, targetKind: target.kind }, "related pair close target failed");
+      }
+    }
+    if (failures.length > 0) {
+      throw new Error(`related pair close had ${failures.length} failed target(s): ${failures.join(", ")}`);
+    }
+  }
+
+  private relatedPairKey(chainId: number, token0: Address, token1: Address): string {
+    const { registry } = this.chains.getById(chainId);
+    const weth = this.config.quoteTokens[registry.name]?.find((token) => token.symbol === "WETH")?.address.toLowerCase();
+    const canonical = (token: Address): string => {
+      const normalized = token.toLowerCase();
+      return weth && (normalized === zeroAddress.toLowerCase() || normalized === weth) ? weth : normalized;
+    };
+    return `${chainId}:${[canonical(token0), canonical(token1)].sort().join(":")}`;
   }
 
   private async executeUnlocked(position: PositionRecord, trigger?: ExitTrigger): Promise<void> {
@@ -2679,6 +2761,26 @@ function groupSettlementPosition(group: PositionGroupRecord): PositionRecord {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isRelatedPairTarget(target: RelatedPairTarget): boolean {
+  return target.kind === "group" ? isCascadeGroup(target.value) : isCascadePosition(target.value);
+}
+
+function isCascadePosition(position: PositionRecord): boolean {
+  return position.status === "discovered"
+    || position.status === "syncing"
+    || position.status === "armed"
+    || position.status === "closing";
+}
+
+function isCascadeGroup(group: PositionGroupRecord): boolean {
+  return group.status === "active" || group.status === "closing" || group.status === "settling";
+}
+
+function isManagedGroupChild(position: PositionRecord): boolean {
+  return position.metadata.managedBy === "position_group"
+    && typeof position.metadata.positionGroupId === "string";
 }
 
 function firstRecord(...values: unknown[]): Record<string, unknown> | null {
