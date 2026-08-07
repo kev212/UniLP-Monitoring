@@ -459,11 +459,13 @@ export class Guardian {
       const pendingSwap = group.metadata.pendingSwap !== null
         && typeof group.metadata.pendingSwap === "object"
         && !Array.isArray(group.metadata.pendingSwap);
-      const recoverable = group.status === "closing"
+      const recoverable = group.status !== "settled"
+        && group.status !== "cancelled"
+        && (group.status === "closing"
         || group.status === "settling"
         || group.pendingRawTransaction !== null
         || typeof closeHash === "string"
-        || pendingSwap;
+        || pendingSwap);
       if (!recoverable) continue;
       try {
         await this.executor.executeGroup(group.id, typeof group.metadata.exitTrigger === "string" ? group.metadata.exitTrigger as import("../types.js").ExitTrigger : undefined);

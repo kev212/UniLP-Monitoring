@@ -155,6 +155,7 @@ export class Executor {
   private readonly confirmedReceipts = new Map<Hex, TransactionReceipt>();
   private readonly settlementJobs = new Map<string, Promise<void>>();
   private readonly settlementRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly groupSettlementRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly activeSettlementLeases = new Map<string, string>();
   private readonly groupSettlementJobs = new Map<string, Promise<void>>();
   private readonly activeGroupLeases = new Map<string, string>();
@@ -189,6 +190,11 @@ export class Executor {
   }
 
   async executeGroup(groupId: string, trigger?: ExitTrigger): Promise<void> {
+    const scheduled = this.groupSettlementRetryTimers.get(groupId);
+    if (scheduled) {
+      clearTimeout(scheduled);
+      this.groupSettlementRetryTimers.delete(groupId);
+    }
     return this.runGroupExclusive(groupId, () => this.executeGroupUnlocked(groupId, trigger));
   }
 
@@ -918,14 +924,20 @@ export class Executor {
         throw new RevertedExecutionError(pending.stage, `${pending.stage} transaction reverted: ${pending.hash}`);
       }
       if (pending.stage === "settlement_swap" || pending.stage === "unwrap_quote") {
+        const retry = pending.stage === "settlement_swap"
+          ? nextSwapRetry(group.metadata, typeof group.metadata.swapProvider === "string" ? group.metadata.swapProvider : undefined, true, this.swapRetryCycleSize())
+          : swapRetryState(group.metadata);
         await this.setGroupStatus(group.id, "settling", {
           closeReceiptAccounted: true,
-          settlementPhase: "accounting",
-          pendingSwap: null,
+          settlementPhase: pending.stage === "settlement_swap" ? "pending_swap" : "accounting",
           pendingRawTransaction: null,
           lastExecutionError: `${pending.stage} reverted during recovery: ${pending.hash}`,
-          ...(pending.stage === "unwrap_quote" ? { unwrapQuoteFailed: true } : {}),
+          ...(pending.stage === "settlement_swap" ? { swapRetry: retry } : {
+            unwrapQuoteConfirmed: null,
+            unwrapQuoteDelta: null,
+          }),
         });
+        this.scheduleGroupSettlementRetry(group.id, retry, trigger);
         return true;
       }
       throw new RevertedExecutionError(pending.stage, `${pending.stage} transaction reverted: ${pending.hash}`);
@@ -1122,22 +1134,23 @@ export class Executor {
       await this.finalizeGroupFromCloseProceeds(group, hash, trigger, "no pending swap");
       return;
     }
-    if (pending.token.toLowerCase() === zeroAddress.toLowerCase()) {
-      throw new GroupIntegrityError("Aggregate native-token settlement requires a supported native swap route");
-    }
+    const retry = swapRetryState(group.metadata);
+    if (retry.nextAttemptAt && Date.parse(retry.nextAttemptAt) > Date.now()) return;
+    const effectiveSlippageBps = Math.min(
+      this.config.settlementSwapMaxSlippageBps,
+      this.config.settlementSwapSlippageBps + retry.broadcastAttempts * 100,
+    );
     const synthetic = groupSettlementPosition(group);
-    let prepared: TransactionPlan | null;
+    let prepared: PreparedSwap | null;
     try {
-      prepared = await this.prepareGroupSettlementSwap(group, synthetic, pending);
+      prepared = await this.prepareGroupSettlementSwap(group, synthetic, pending, effectiveSlippageBps, retry.lastProvider);
     } catch (error) {
-      if (error instanceof Error && /reverted|route/i.test(error.message)) {
-        await this.finalizeGroupFromCloseProceeds(group, hash, trigger, `aggregate settlement swap is unquotable: ${errorMessage(error)}`);
-        return;
-      }
-      throw error;
+      if (error instanceof PendingExecutionError) throw error;
+      await this.deferGroupSettlementSwap(group, hash, pending, trigger, errorMessage(error), retry.lastProvider);
+      return;
     }
     if (!prepared) {
-      await this.finalizeGroupFromCloseProceeds(group, hash, trigger, "no safe route is available for aggregate group settlement");
+      await this.deferGroupSettlementSwap(group, hash, pending, trigger, "no safe route is available for aggregate group settlement", retry.lastProvider);
       return;
     }
     await this.setGroupStatus(group.id, "settling", {
@@ -1145,17 +1158,37 @@ export class Executor {
       settlementPhase: "pending_swap",
       lastExecutionError: "aggregate group settlement requires a quote conversion",
       pendingSwap: { token: pending.token, amount: pending.amount.toString() },
+      swapProvider: prepared.provider,
+      swapExpectedOut: prepared.expectedOut.toString(),
+      swapMinimumOut: prepared.minimumOut.toString(),
+      swapSlippageBps: effectiveSlippageBps,
+      swapRetry: retry,
     });
     let swapHash: Hex | null;
     try {
-      swapHash = await this.sendGroup(group, "settlement_swap", prepared);
+      swapHash = await this.sendGroup(group, "settlement_swap", prepared.plan);
     } catch (error) {
       if (error instanceof PendingExecutionError) throw error;
-      await this.finalizeGroupFromCloseProceeds(group, hash, trigger, `aggregate settlement swap produced no output: ${errorMessage(error)}`);
+      const nextRetry = nextSwapRetry(group.metadata, prepared.provider, true, this.swapRetryCycleSize());
+      const retryGroup = { ...group, metadata: { ...group.metadata, swapRetry: nextRetry } };
+      await this.setGroupStatus(group.id, "settling", {
+        closeTransactionHash: hash,
+        settlementPhase: "pending_swap",
+        pendingSwap: { token: pending.token, amount: pending.amount.toString() },
+        swapProvider: prepared.provider,
+        swapRetry: nextRetry,
+        lastExecutionError: `aggregate settlement swap failed: ${errorMessage(error)}`,
+        pendingRawTransaction: null,
+      });
+      if (nextRetry.cycleBroadcastAttempts === 0) {
+        this.scheduleGroupSettlementRetry(group.id, nextRetry, trigger);
+        return;
+      }
+      await this.resumeGroupSettlement(retryGroup, hash, trigger);
       return;
     }
     if (!swapHash) {
-      await this.setGroupStatus(group.id, "settling", { dryRunPlan: prepared.description });
+      await this.setGroupStatus(group.id, "settling", { dryRunPlan: prepared.plan.description });
       return;
     }
     await this.reconcileGroupSettlementSwap(group, swapHash, trigger);
@@ -1185,20 +1218,27 @@ export class Executor {
     const weth = this.config.quoteTokens[registry.name]?.find((token) => token.symbol === "WETH");
     if (!weth || group.quoteToken.toLowerCase() !== weth.address.toLowerCase() || amount <= 0n) return true;
     const metadata = group.metadata as Record<string, unknown>;
-    if (metadata.unwrapQuoteConfirmed === true && metadata.unwrapQuoteAmount === amount.toString()) return true;
+    const confirmedAmount = metadata.unwrapQuoteConfirmed === true
+      && typeof metadata.unwrapQuoteAmount === "string"
+      && /^\d+$/.test(metadata.unwrapQuoteAmount)
+      ? BigInt(metadata.unwrapQuoteAmount)
+      : 0n;
+    if (confirmedAmount >= amount) return true;
     if (metadata.unwrapQuoteFailed === true) {
       log.warn({ groupId: group.id, closeHash, amount: amount.toString() }, "position group unwrap previously failed; settling without native unwrap");
       return true;
     }
+    const amountToUnwrap = amount - confirmedAmount;
     await this.setGroupStatus(group.id, "settling", {
       closeTransactionHash: closeHash,
       settlementPhase: "unwrapping_quote",
       unwrapQuoteAmount: amount.toString(),
+      unwrapQuoteDelta: amountToUnwrap.toString(),
     });
     const plan: TransactionPlan = {
       chainId: group.chainId,
       to: weth.address as Address,
-      data: encodeFunctionData({ abi: wethAbi, functionName: "withdraw", args: [amount] }),
+      data: encodeFunctionData({ abi: wethAbi, functionName: "withdraw", args: [amountToUnwrap] }),
       description: "unwrap_quote",
     };
     let hash: Hex | null;
@@ -1226,7 +1266,7 @@ export class Executor {
     }
     try {
       const receipt = await this.getConfirmedReceipt(group.chainId, hash);
-      await this.database.addPositionGroupCashflow(group.id, receipt.blockNumber, hash, "unwrap_quote", amount, 0n, 0n, {
+      await this.database.addPositionGroupCashflow(group.id, receipt.blockNumber, hash, "unwrap_quote", amountToUnwrap, 0n, 0n, {
         source: "group_quote_unwrap",
         trigger: trigger ?? (typeof metadata.exitTrigger === "string" ? metadata.exitTrigger : "manual"),
       });
@@ -1238,6 +1278,7 @@ export class Executor {
       settlementPhase: "complete",
       unwrapQuoteConfirmed: true,
       unwrapQuoteAmount: amount.toString(),
+      unwrapQuoteDelta: null,
       unwrapQuoteTransactionHash: hash,
       pendingRawTransaction: null,
     });
@@ -1246,8 +1287,11 @@ export class Executor {
 
   private async reconcileGroupUnwrap(group: PositionGroupRecord, hash: Hex, trigger?: ExitTrigger): Promise<void> {
     const receipt = await this.getConfirmedReceipt(group.chainId, hash);
-    const rawAmount = (group.metadata as Record<string, unknown>).unwrapQuoteAmount;
-    const amount = typeof rawAmount === "string" && /^\d+$/.test(rawAmount) ? BigInt(rawAmount) : 0n;
+    const metadata = group.metadata as Record<string, unknown>;
+    const rawTotal = metadata.unwrapQuoteAmount;
+    const rawDelta = metadata.unwrapQuoteDelta ?? rawTotal;
+    const totalAmount = typeof rawTotal === "string" && /^\d+$/.test(rawTotal) ? BigInt(rawTotal) : 0n;
+    const amount = typeof rawDelta === "string" && /^\d+$/.test(rawDelta) ? BigInt(rawDelta) : 0n;
     await this.database.addPositionGroupCashflow(group.id, receipt.blockNumber, hash, "unwrap_quote", amount, 0n, 0n, {
       source: "group_quote_unwrap",
       trigger: trigger ?? (typeof group.metadata.exitTrigger === "string" ? group.metadata.exitTrigger : "manual"),
@@ -1255,27 +1299,175 @@ export class Executor {
     await this.setGroupStatus(group.id, "settling", {
       settlementPhase: "complete",
       unwrapQuoteConfirmed: true,
-      unwrapQuoteAmount: amount.toString(),
+      unwrapQuoteAmount: totalAmount.toString(),
+      unwrapQuoteDelta: null,
       unwrapQuoteTransactionHash: hash,
       pendingRawTransaction: null,
     });
+  }
+
+  private async deferGroupSettlementSwap(
+    group: PositionGroupRecord,
+    closeHash: Hex,
+    pending: { token: Address; amount: bigint },
+    trigger: ExitTrigger | undefined,
+    reason: string,
+    lastProvider?: string,
+  ): Promise<void> {
+    const retry = nextSwapRetry(group.metadata, lastProvider, false, this.swapRetryCycleSize());
+    await this.setGroupStatus(group.id, "settling", {
+      closeTransactionHash: closeHash,
+      closeReceiptAccounted: true,
+      settlementPhase: "pending_swap",
+      pendingSwap: { token: pending.token, amount: pending.amount.toString() },
+      swapRetry: retry,
+      settlementRetryDisabled: null,
+      lastExecutionError: reason,
+    });
+    log.warn({ groupId: group.id, closeHash, reason, retry }, "group settlement swap cycle failed; retry scheduled");
+    this.scheduleGroupSettlementRetry(group.id, retry, trigger);
+  }
+
+  private scheduleGroupSettlementRetry(groupId: string, retry: SwapRetryState, trigger?: ExitTrigger): void {
+    const retryAt = retry.nextAttemptAt ? Date.parse(retry.nextAttemptAt) : Date.now() + SWAP_RETRY_CYCLE_DELAY_MS;
+    const existing = this.groupSettlementRetryTimers.get(groupId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.groupSettlementRetryTimers.delete(groupId);
+      void this.executeGroup(groupId, trigger).catch((error) => {
+        log.warn({ err: error, groupId }, "scheduled group settlement retry deferred");
+      });
+    }, Math.max(0, retryAt - Date.now()));
+    timer.unref?.();
+    this.groupSettlementRetryTimers.set(groupId, timer);
   }
 
   private async prepareGroupSettlementSwap(
     group: PositionGroupRecord,
     position: PositionRecord,
     pending: { token: Address; amount: bigint },
-  ): Promise<TransactionPlan | null> {
-    const route = await this.routes.quoteDirect(position, pending.token, pending.amount, group.quoteToken);
-    if (!route) return null;
-    const minimumOut = applySlippage(route.expectedOut, this.config.settlementSwapSlippageBps);
-    await this.ensureGroupSettlementApproval(group, position, route.protocol, route.router, pending.token, pending.amount);
-    return buildSwapPlan(
-      group.chainId,
-      group.owner,
-      { ...route, minimumOut },
-      BigInt(Math.floor(Date.now() / 1_000) + 300),
-    );
+    slippageBps: number,
+    lastFailedProvider?: string,
+  ): Promise<PreparedSwap | null> {
+    const { token: tokenIn, amount: amountIn } = pending;
+    const tokenOut = group.quoteToken;
+    const isNativeSettlement = tokenIn.toLowerCase() === zeroAddress || tokenOut.toLowerCase() === zeroAddress;
+    let nativeBenchmark: KyberSwapQuote | null = null;
+    if (isNativeSettlement) {
+      if (!this.kyberswapApi) throw new Error("KyberSwap is required to benchmark native group settlement swap");
+      nativeBenchmark = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+      if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark native group settlement swap");
+    }
+    const localBenchmark = isNativeSettlement
+      ? nativeBenchmark
+      : await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
+    if (!localBenchmark) throw new Error("No safe local route available to benchmark group settlement swap");
+    const minimumAcceptableOut = applySlippage(localBenchmark.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
+    const quoteJobs: Promise<ApiSwapCandidate | null>[] = [];
+    if (this.tradingApi) {
+      quoteJobs.push(this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
+        .then((quote) => quote ? { provider: "uniswap" as const, expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote } : null));
+    }
+    if (this.kyberswapApi) {
+      const quote = nativeBenchmark ?? this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+      quoteJobs.push(Promise.resolve(quote)
+        .then((quote) => quote ? { provider: "kyberswap" as const, expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote } : null));
+    }
+    const results = await Promise.allSettled(quoteJobs);
+    const errors: string[] = [];
+    const candidates: ApiSwapCandidate[] = [];
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        if (result.value) {
+          if (result.value.expectedOut < minimumAcceptableOut) {
+            errors.push(`${result.value.provider}: expected output is below local 2% floor`);
+            continue;
+          }
+          candidates.push(result.value);
+        }
+      } else {
+        errors.push(errorMessage(result.reason));
+      }
+    }
+    candidates.sort((left, right) => {
+      if (lastFailedProvider && left.provider !== right.provider) {
+        if (left.provider === lastFailedProvider) return 1;
+        if (right.provider === lastFailedProvider) return -1;
+      }
+      return left.expectedOut === right.expectedOut ? 0 : left.expectedOut > right.expectedOut ? -1 : 1;
+    });
+
+    for (const [candidateIndex, candidate] of candidates.entries()) {
+      try {
+        const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, minimumAcceptableOut);
+        if (!constrained) {
+          errors.push(`${candidate.provider}: calldata minimum output is below local floor`);
+          continue;
+        }
+        const prepared = await this.prepareGroupApiSwap(group, position, tokenIn, amountIn, tokenOut, slippageBps, constrained, minimumAcceptableOut);
+        await this.simulateGroupPlan(group, prepared.plan);
+        log.info({ groupId: group.id, provider: prepared.provider, expectedOut: prepared.expectedOut.toString(), minimumOut: prepared.minimumOut.toString(), slippageBps }, "group settlement swap candidate selected");
+        return prepared;
+      } catch (error) {
+        if (error instanceof PendingExecutionError) throw error;
+        errors.push(`${candidate.provider}: ${errorMessage(error)}`);
+        log.warn({ groupId: group.id, provider: candidate.provider, error: errorMessage(error), candidateIndex }, "group settlement swap candidate rejected before broadcast");
+      }
+    }
+
+    try {
+      const route = await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
+      if (!route) throw new Error("No safe local route remains for group settlement swap");
+      const minimumOut = applySlippage(route.expectedOut, slippageBps);
+      await this.ensureGroupSettlementApproval(group, position, route.protocol, route.router, tokenIn, amountIn);
+      const plan = buildSwapPlan(group.chainId, group.owner, { ...route, minimumOut }, BigInt(Math.floor(Date.now() / 1_000) + 300));
+      await this.simulateGroupPlan(group, plan);
+      return { provider: "local", expectedOut: route.expectedOut, minimumOut, plan };
+    } catch (error) {
+      if (error instanceof PendingExecutionError) throw error;
+      errors.push(`local: ${errorMessage(error)}`);
+    }
+    const details = errors.filter(Boolean).slice(0, 4).join(" | ");
+    throw new Error(`No executable group settlement route${details ? `: ${details}` : ""}`);
+  }
+
+  private async prepareGroupApiSwap(
+    group: PositionGroupRecord,
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    slippageBps: number,
+    candidate: ApiSwapCandidate,
+    minimumAcceptableOut: bigint,
+  ): Promise<PreparedSwap> {
+    if (candidate.provider === "uniswap") {
+      let quote = candidate.quote;
+      const approvalChanged = await this.ensureGroupSettlementApproval(group, position, "v3", UNISWAP_API_ROUTER, tokenIn, amountIn);
+      if (approvalChanged) {
+        const refreshed = await this.tradingApi!.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+        if (!refreshed) throw new Error("uniswap route disappeared after approval");
+        if (refreshed.minimumOut < minimumAcceptableOut) throw new Error("uniswap route fell below local minimum floor after approval");
+        quote = refreshed;
+      }
+      const plan = await this.tradingApi!.createSwap(position, quote);
+      return { provider: "uniswap", expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, plan, approvalChanged };
+    }
+
+    let quote = candidate.quote;
+    const approvalChanged = await this.ensureGroupSettlementApproval(group, position, "v3", this.kyberswapApi!.approvalSpender(quote), tokenIn, amountIn);
+    if (approvalChanged) {
+      const refreshed = await this.kyberswapApi!.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+      if (!refreshed) throw new Error("kyberswap route disappeared after approval");
+      if (refreshed.minimumOut < minimumAcceptableOut) throw new Error("kyberswap route fell below local minimum floor after approval");
+      quote = refreshed;
+    }
+    const plan = await this.kyberswapApi!.createSwap(position, quote);
+    return { provider: "kyberswap", expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, plan, approvalChanged };
+  }
+
+  private simulateGroupPlan(group: PositionGroupRecord, plan: TransactionPlan): Promise<unknown> {
+    return this.executorClient(plan.chainId).call({ account: group.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n });
   }
 
   private async ensureGroupSettlementApproval(
@@ -1285,10 +1477,11 @@ export class Executor {
     router: Address,
     token: Address,
     amount: bigint,
-  ): Promise<void> {
-    if (token.toLowerCase() === zeroAddress.toLowerCase()) return;
+  ): Promise<boolean> {
+    if (token.toLowerCase() === zeroAddress.toLowerCase()) return false;
     const { client, registry } = this.chains.getById(group.chainId);
     const spender = protocol === "v4" ? registry.contracts.v4.permit2 : router;
+    let changed = false;
     const allowance = await client.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [group.owner, spender] });
     if (allowance < amount) {
       const approvalHash = await this.sendGroup(group, "approve_quote", {
@@ -1298,8 +1491,9 @@ export class Executor {
         description: "approve aggregate settlement input",
       });
       if (!approvalHash && !this.config.dryRun) throw new Error("Aggregate settlement approval was not confirmed");
+      changed = true;
     }
-    if (protocol !== "v4") return;
+    if (protocol !== "v4") return changed;
     if (amount > MAX_UINT160) throw new Error("Aggregate settlement amount overflows Permit2 uint160");
     const permitAllowance = await client.readContract({
       address: registry.contracts.v4.permit2,
@@ -1308,7 +1502,7 @@ export class Executor {
       args: [group.owner, token, router],
     });
     const expiration = Math.floor(Date.now() / 1_000) + 300;
-    if (permitAllowance[0] >= amount && Number(permitAllowance[1]) >= expiration) return;
+    if (permitAllowance[0] >= amount && Number(permitAllowance[1]) >= expiration) return changed;
     const permitHash = await this.sendGroup(group, "permit2_approve", {
       chainId: group.chainId,
       to: registry.contracts.v4.permit2,
@@ -1316,6 +1510,7 @@ export class Executor {
       description: "approve aggregate settlement input through Permit2",
     });
     if (!permitHash && !this.config.dryRun) throw new Error("Aggregate Permit2 approval was not confirmed");
+    return true;
   }
 
   private async reconcileGroupSettlementSwap(group: PositionGroupRecord, hash: Hex, trigger?: ExitTrigger): Promise<void> {
