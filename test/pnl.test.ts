@@ -4,6 +4,7 @@ import { zeroAddress, type Address } from "viem";
 import type { RuntimeConfig } from "../src/config.js";
 import { PnlService } from "../src/services/pnl.js";
 import { amountsForLiquidity, applySlippage, sqrtRatioAtTick } from "../src/services/uniswap-math.js";
+import type { PositionGroupRecord } from "../src/types.js";
 
 const config: RuntimeConfig = {
   databaseUrl: "postgres://unused",
@@ -437,5 +438,144 @@ describe("concentrated-liquidity math", () => {
     expect(below.amount1).toBe(0n);
     expect(above.amount0).toBe(0n);
     expect(above.amount1).toBeGreaterThan(0n);
+  });
+});
+
+describe("position group valuation fees", () => {
+  const stable = "0x0000000000000000000000000000000000000005" as Address;
+  const weth = "0x0000000000000000000000000000000000000004" as Address;
+  const token = "0x0000000000000000000000000000000000000002" as Address;
+
+  function groupRecord(quoteToken: Address, token0: Address, token1: Address): PositionGroupRecord {
+    return {
+      id: "group",
+      chainId: 8453,
+      protocol: "v4",
+      positionManager: "0x0000000000000000000000000000000000000006" as Address,
+      poolKey: "0xpool",
+      owner: "0x0000000000000000000000000000000000000001" as Address,
+      token0,
+      token1,
+      quoteToken,
+      shape: "bid_ask",
+      shapeVersion: "delta-amount-linear-v1",
+      requestedBinCount: 2,
+      generatedBinCount: 2,
+      mintableBinCount: 2,
+      outerTickLower: -100,
+      outerTickUpper: 100,
+      anchorBinIndex: 0,
+      totalDeposit: 1_000_000n,
+      deployedCostQuote: 1_000_000n,
+      directCloseAmount0: 1_000_000n,
+      directCloseAmount1: 0n,
+      totalReceivedQuote: 0n,
+      status: "active",
+      planHash: "plan",
+      planJson: {},
+      referenceBlock: 10n,
+      referenceTick: 0,
+      referencePrice: 1n,
+      openTransactionHash: null,
+      closeTransactionHash: null,
+      pendingRawTransaction: null,
+      executionLeaseToken: null,
+      executionLeaseUntil: null,
+      finalPnlQuote: null,
+      finalPnlBps: null,
+      finalPnlUsd: null,
+      settledAt: null,
+      metadata: {},
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    };
+  }
+
+  function setup(
+    token0: Address,
+    token1: Address,
+    quoteToken: Address,
+    amount0: bigint,
+    amount1: bigint,
+    fee0: bigint,
+    fee1: bigint,
+    quoteTokensBase: Array<{ symbol: string; address: Address }>,
+  ) {
+    const baseConfig = { ...config, chains: ["base" as const], quoteTokens: { base: quoteTokensBase, robinhood: [] } };
+    const database = {
+      listPositionGroupChildren: vi.fn().mockResolvedValue([
+        {
+          bin: { binIndex: 0, tickLower: -100, tickUpper: 0, status: "minted" },
+          position: { id: "child-0", positionKey: "10" },
+        },
+        {
+          bin: { binIndex: 1, tickLower: 0, tickUpper: 100, status: "minted" },
+          position: { id: "child-1", positionKey: "11" },
+        },
+      ]),
+      getPositionGroupCashflowTotals: vi.fn().mockResolvedValue({ deposits: 1_000_000n, realized: 0n }),
+      addPositionGroupPnlSnapshot: vi.fn().mockResolvedValue(undefined),
+      getPoolObservationAtOrBefore: vi.fn().mockResolvedValue(null),
+      recordPoolObservation: vi.fn().mockResolvedValue(undefined),
+    };
+    const reader = {
+      read: vi.fn(async (position: { positionKey: string }) => {
+        const lower = position.positionKey === "10" ? -100 : 0;
+        const upper = position.positionKey === "10" ? 0 : 100;
+        return {
+          protocol: "v4",
+          poolKey: "0xpool",
+          sourcePool: null,
+          token0: { token: token0, amount: amount0 },
+          token1: { token: token1, amount: amount1 },
+          liquidity: 100n,
+          priceMarker: 100n,
+          minAmount0: 0n,
+          minAmount1: 0n,
+          range: { tickLower: lower, tickUpper: upper, currentTick: 0, currentSqrtPrice: 1n, status: "in_range" },
+          unclaimedFees0: fee0,
+          unclaimedFees1: fee1,
+          observedBlock: 10n,
+        };
+      }),
+    };
+    const routes = {
+      quoteDirect: vi.fn(async (_position: never, tokenIn: Address, amountIn: bigint, tokenOut: Address) => ({
+        expectedOut: amountIn,
+        path: [tokenIn, tokenOut],
+      })),
+    };
+    const pnl = new PnlService(database as never, reader as never, routes as never, baseConfig as unknown as RuntimeConfig);
+    return { pnl, database, routes, group: groupRecord(quoteToken, token0, token1) };
+  }
+
+  it("converts WETH group fees into the chain stable token", async () => {
+    const { pnl, database, group } = setup(token, weth, weth, 0n, 500n, 0n, 60n, [{ symbol: "USDC", address: stable }]);
+
+    const valued = await pnl.valueGroup(group, 10n);
+
+    expect(valued.snapshot.feeQuote).toBe(120n);
+    expect(valued.snapshot.feeQuoteUsdg).toBe(118n);
+    expect(database.addPositionGroupPnlSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+      feeQuote: 120n,
+      feeQuoteUsdg: 118n,
+      quoteToken: weth,
+    }));
+  });
+
+  it("keeps feeQuoteUsdg equal to feeQuote when no stable quote token is configured", async () => {
+    const { pnl, group } = setup(token, weth, weth, 0n, 500n, 0n, 60n, []);
+
+    const valued = await pnl.valueGroup(group, 10n);
+
+    expect(valued.snapshot.feeQuoteUsdg).toBe(120n);
+  });
+
+  it("keeps feeQuoteUsdg equal to feeQuote when the quote token is already the stable", async () => {
+    const { pnl, group } = setup(stable, weth, stable, 500n, 0n, 60n, 0n, [{ symbol: "USDC", address: stable }]);
+
+    const valued = await pnl.valueGroup(group, 10n);
+
+    expect(valued.snapshot.feeQuoteUsdg).toBe(120n);
   });
 });

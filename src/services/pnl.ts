@@ -207,6 +207,15 @@ export class PnlService {
 
     const liquidationQuote = quoteAmount + (route?.minimumOut ?? 0n);
     const feeQuote = quoteFee + (feeRoute?.minimumOut ?? 0n);
+    let feeQuoteUsdg = feeQuote;
+    const chainName = this.config.chains.find((name) => chainRegistry[name].chain.id === group.chainId);
+    if (chainName) {
+      const stable = this.config.quoteTokens[chainName]?.[0]?.address;
+      if (stable && group.quoteToken.toLowerCase() !== stable.toLowerCase() && feeQuote > 0n) {
+        const stableRoute = await this.quoteFresh(children[0]!, group.quoteToken, feeQuote, stable, quoteSlippageBps, localOnly);
+        feeQuoteUsdg = stableRoute?.minimumOut ?? 0n;
+      }
+    }
     const totals = await this.database.getPositionGroupCashflowTotals(group.id);
     const deposits = totals.deposits > 0n ? totals.deposits : group.deployedCostQuote;
     if (deposits <= 0n) throw new Error("Position group cost basis has not been reconstructed");
@@ -225,6 +234,7 @@ export class PnlService {
       realizedQuote,
       liquidationQuote,
       feeQuote,
+      feeQuoteUsdg,
       pnlQuote,
       pnlBps,
       blockNumber,

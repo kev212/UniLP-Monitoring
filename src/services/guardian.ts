@@ -184,7 +184,7 @@ export class Guardian {
         blockNumber: valued.snapshot.blockNumber,
         feeQuote: valued.snapshot.feeQuote,
         feeNonQuote: null,
-        feeQuoteUsdg: valued.snapshot.feeQuote,
+        feeQuoteUsdg: valued.snapshot.feeQuoteUsdg,
       };
       const trailing = this.pnl.evaluateTrailingStop(group.metadata, syntheticSnapshot);
       if (trailing.action === "reset") {

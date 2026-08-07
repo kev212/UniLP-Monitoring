@@ -957,11 +957,10 @@ export class Notifier {
     const qtSymbol = this.quoteSymbol(position.quoteToken!);
     const qtDec = await this.decimals(position.quoteToken!, position.chainId);
     const value = formatToken(snapshot.liquidationQuote, qtDec, qtSymbol === "USDG" || qtSymbol === "USDC" ? 2 : 4);
-    const fee = formatToken(snapshot.feeQuote, qtDec, qtSymbol === "USDG" || qtSymbol === "USDC" ? 2 : 4);
-    const feeLabel = qtSymbol === "USDG" || qtSymbol === "USDC" ? `🪙 ≈$${fee}` : `🪙 ${fee} ${qtSymbol}`;
+    const feeUsdg = snapshot.feeQuoteUsdg ?? 0n;
     const sign = snapshot.pnlBps >= 0n ? "+" : "";
     const arrow = snapshot.pnlBps > 0n ? "📈" : snapshot.pnlBps < 0n ? "📉" : "➖";
-    const valueLine = `   💰 ${value} ${qtSymbol} · ${feeLabel} · ${arrow} ${sign}${formatBps(snapshot.pnlBps)}%`;
+    const valueLine = `   💰 ${value} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${arrow} ${sign}${formatBps(snapshot.pnlBps)}%`;
     const rangeLine = await this.formatGroupPositionRange(position, snapshot, bins);
     return `${base}\n${valueLine}${rangeLine}\n`;
   }

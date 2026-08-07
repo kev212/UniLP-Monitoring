@@ -223,6 +223,7 @@ export interface PositionGroupPnlSnapshot {
   realizedQuote: bigint;
   liquidationQuote: bigint;
   feeQuote: bigint;
+  feeQuoteUsdg: bigint;
   pnlQuote: bigint;
   pnlBps: bigint;
   blockNumber: bigint;

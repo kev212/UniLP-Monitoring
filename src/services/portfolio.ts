@@ -144,7 +144,8 @@ export class PortfolioService {
       const quotePrice = this.usdPrice(chain, group.quoteToken, prices);
       if (quotePrice === null) continue;
       const decimals = await this.tokenDecimals(chain, group.quoteToken);
-      activeLpUsd += Number(snapshot.liquidationQuote + snapshot.feeQuote) / 10 ** decimals * quotePrice;
+      activeLpUsd += Number(snapshot.liquidationQuote) / 10 ** decimals * quotePrice;
+      activeLpUsd += Number(snapshot.feeQuoteUsdg) / 10 ** stableDecimals;
     }
     return { walletUsd, activeLpUsd };
   }
