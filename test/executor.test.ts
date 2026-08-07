@@ -13,6 +13,7 @@ const nvda = "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec" as const;
 const owner = "0xeE924367213Ae3764b57d5b9a6214c8188d34060" as const;
 const sender = "0x0000000000000000000000000000000000000002" as const;
 const hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
+const unwrapHash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" as const;
 const groupId = "group";
 const groupManager = "0x0000000000000000000000000000000000000100" as Address;
 const groupPool = "0x0000000000000000000000000000000000000200" as Address;
@@ -56,6 +57,11 @@ const config = {
   removeLiquiditySlippageBps: 200,
   removeLiquidityMaxSlippageBps: 500,
   confirmations: 1,
+} as RuntimeConfig;
+
+const wethConfig = {
+  ...config,
+  quoteTokens: { base: [], robinhood: [{ symbol: "USDG", address: usdg }, { symbol: "WETH", address: weth }] },
 } as RuntimeConfig;
 
 function groupRecord(protocol: "v3" | "v4" = "v3"): PositionGroupRecord {
@@ -1155,6 +1161,225 @@ describe("Executor pending settlement recovery", () => {
 
     expect(sendGroup).toHaveBeenCalledWith(group, "settlement_swap", expect.anything());
     expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 100n, 200n, 20000n, "manual");
+  });
+
+  it("unwraps WETH quote proceeds to native ETH before finalizing a Bid-Ask group without a settlement swap", async () => {
+    const group = {
+      ...groupRecord(),
+      quoteToken: weth,
+      status: "settling",
+      closeTransactionHash: hash,
+      metadata: {
+        closeTransactionHash: hash,
+        closeReceiptAccounted: true,
+        settlementPhase: "accounting",
+        totalReceivedQuote: "100",
+        exitTrigger: "manual",
+      },
+    };
+    const receipt = { status: "success" as const, blockNumber: 102n, logs: [] };
+    const client = { getTransactionReceipt: vi.fn().mockResolvedValue(receipt), readContract: vi.fn().mockResolvedValue(10n ** 30n), call: vi.fn().mockResolvedValue({ data: "0x" }) };
+    const database = {
+      getPositionGroup: vi.fn().mockResolvedValue(group),
+      claimPositionGroupLease: vi.fn().mockResolvedValue(true),
+      releasePositionGroupLease: vi.fn().mockResolvedValue(undefined),
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      withExecutionLock: vi.fn(async (_chainId: number, _address: Address, work: () => Promise<unknown>) => work()),
+      recordPositionGroupExecution: vi.fn().mockResolvedValue(undefined),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+      getPositionGroupCashflowTotals: vi.fn().mockResolvedValue({ deposits: 100n, realized: 300n }),
+      addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
+      finalizePositionGroup: vi.fn().mockResolvedValue(true),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, wethConfig);
+    const sendGroup = vi.spyOn(executor as any, "sendGroup").mockResolvedValue(unwrapHash);
+
+    await executor.executeGroup(groupId, "manual");
+
+    expect(sendGroup).toHaveBeenCalledWith(group, "unwrap_quote", expect.objectContaining({ to: weth, description: "unwrap_quote" }));
+    expect(database.addPositionGroupCashflow).toHaveBeenCalledWith(groupId, 102n, unwrapHash, "unwrap_quote", 100n, 0n, 0n, expect.objectContaining({ source: "group_quote_unwrap" }));
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 100n, 200n, 20000n, "manual");
+  });
+
+  it("unwraps the combined WETH proceeds after the aggregate settlement swap of a Bid-Ask group", async () => {
+    const group = {
+      ...groupRecord(),
+      quoteToken: weth,
+      status: "settling",
+      closeTransactionHash: hash,
+      metadata: {
+        closeTransactionHash: hash,
+        closeReceiptAccounted: true,
+        settlementPhase: "pending_swap",
+        pendingSwap: { token, amount: "500" },
+        totalReceivedQuote: "100",
+        exitTrigger: "manual",
+      },
+    };
+    const receipt = { status: "success" as const, blockNumber: 102n, logs: [transferLog(weth, sender, owner, 200n)] };
+    const client = { getTransactionReceipt: vi.fn().mockResolvedValue(receipt), readContract: vi.fn().mockResolvedValue(10n ** 30n), call: vi.fn().mockResolvedValue({ data: "0x" }) };
+    const database = {
+      getPositionGroup: vi.fn().mockResolvedValue(group),
+      claimPositionGroupLease: vi.fn().mockResolvedValue(true),
+      releasePositionGroupLease: vi.fn().mockResolvedValue(undefined),
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      withExecutionLock: vi.fn(async (_chainId: number, _address: Address, work: () => Promise<unknown>) => work()),
+      recordPositionGroupExecution: vi.fn().mockResolvedValue(undefined),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+      getPositionGroupCashflowTotals: vi.fn().mockResolvedValue({ deposits: 100n, realized: 300n }),
+      addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
+      finalizePositionGroup: vi.fn().mockResolvedValue(true),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const routes = {
+      quoteDirect: vi.fn().mockResolvedValue({
+        protocol: "v3",
+        pool: groupPool,
+        pools: [groupPool],
+        router: "0x0000000000000000000000000000000000000300",
+        tokenIn: token,
+        tokenOut: weth,
+        path: [token, weth],
+        encodedPath: "0x00",
+        amountIn: 500n,
+        expectedOut: 200n,
+        minimumOut: 200n,
+      }),
+    };
+    const executor = new Executor(database as never, chains as never, {} as never, routes as never, {} as never, wethConfig);
+    const sendGroup = vi.spyOn(executor as any, "sendGroup")
+      .mockImplementation(async (_group: unknown, stage: string) => stage === "settlement_swap" ? hash : unwrapHash);
+
+    await executor.executeGroup(groupId, "manual");
+
+    expect(sendGroup).toHaveBeenCalledWith(group, "settlement_swap", expect.anything());
+    expect(sendGroup).toHaveBeenCalledWith(group, "unwrap_quote", expect.objectContaining({ to: weth, description: "unwrap_quote" }));
+    expect(database.addPositionGroupCashflow).toHaveBeenCalledWith(groupId, 102n, unwrapHash, "unwrap_quote", 300n, 0n, 0n, expect.anything());
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 300n, 200n, 20000n, "manual");
+  });
+
+  it("finalizes a WETH-quoted Bid-Ask group without unwrap when the unwrap transaction reverts", async () => {
+    const group = {
+      ...groupRecord(),
+      quoteToken: weth,
+      status: "settling",
+      closeTransactionHash: hash,
+      metadata: {
+        closeTransactionHash: hash,
+        closeReceiptAccounted: true,
+        settlementPhase: "accounting",
+        totalReceivedQuote: "100",
+        exitTrigger: "manual",
+      },
+    };
+    const client = { readContract: vi.fn().mockResolvedValue(10n ** 30n), call: vi.fn().mockResolvedValue({ data: "0x" }) };
+    const database = {
+      getPositionGroup: vi.fn().mockResolvedValue(group),
+      claimPositionGroupLease: vi.fn().mockResolvedValue(true),
+      releasePositionGroupLease: vi.fn().mockResolvedValue(undefined),
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      withExecutionLock: vi.fn(async (_chainId: number, _address: Address, work: () => Promise<unknown>) => work()),
+      recordPositionGroupExecution: vi.fn().mockResolvedValue(undefined),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+      getPositionGroupCashflowTotals: vi.fn().mockResolvedValue({ deposits: 100n, realized: 300n }),
+      addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
+      finalizePositionGroup: vi.fn().mockResolvedValue(true),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, wethConfig);
+    vi.spyOn(executor as any, "sendGroup").mockRejectedValue(new Error("unwrap_quote transaction reverted"));
+
+    await executor.executeGroup(groupId, "manual");
+
+    expect(database.setPositionGroupStatus).toHaveBeenLastCalledWith(groupId, "settling", expect.objectContaining({ unwrapQuoteFailed: true }));
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 100n, 200n, 20000n, "manual");
+  });
+
+  it("skips a confirmed group unwrap on resume and finalizes the WETH-quoted Bid-Ask group", async () => {
+    const group = {
+      ...groupRecord(),
+      quoteToken: weth,
+      status: "settling",
+      closeTransactionHash: hash,
+      metadata: {
+        closeTransactionHash: hash,
+        closeReceiptAccounted: true,
+        settlementPhase: "unwrapping_quote",
+        totalReceivedQuote: "100",
+        exitTrigger: "manual",
+        unwrapQuoteConfirmed: true,
+        unwrapQuoteAmount: "100",
+      },
+    };
+    const client = { readContract: vi.fn().mockResolvedValue(10n ** 30n), call: vi.fn().mockResolvedValue({ data: "0x" }) };
+    const database = {
+      getPositionGroup: vi.fn().mockResolvedValue(group),
+      claimPositionGroupLease: vi.fn().mockResolvedValue(true),
+      releasePositionGroupLease: vi.fn().mockResolvedValue(undefined),
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      withExecutionLock: vi.fn(async (_chainId: number, _address: Address, work: () => Promise<unknown>) => work()),
+      recordPositionGroupExecution: vi.fn().mockResolvedValue(undefined),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+      getPositionGroupCashflowTotals: vi.fn().mockResolvedValue({ deposits: 100n, realized: 300n }),
+      addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
+      finalizePositionGroup: vi.fn().mockResolvedValue(true),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, wethConfig);
+    const sendGroup = vi.spyOn(executor as any, "sendGroup");
+
+    await executor.executeGroup(groupId, "manual");
+
+    expect(sendGroup).not.toHaveBeenCalled();
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 100n, 200n, 20000n, "manual");
+  });
+
+  it("reconciles a confirmed pending group unwrap transaction on recovery", async () => {
+    const pendingRaw = stringToHex("pending-unwrap");
+    const pendingHash = keccak256(pendingRaw);
+    const group = {
+      ...groupRecord(),
+      quoteToken: weth,
+      status: "settling",
+      closeTransactionHash: hash,
+      pendingRawTransaction: {
+        stage: "unwrap_quote",
+        hash: pendingHash,
+        serializedTransaction: pendingRaw,
+        nonce: "0",
+        submittedAt: new Date().toISOString(),
+      },
+      metadata: {
+        closeTransactionHash: hash,
+        closeReceiptAccounted: true,
+        settlementPhase: "unwrapping_quote",
+        unwrapQuoteAmount: "100",
+        exitTrigger: "manual",
+      },
+    };
+    const receipt = { status: "success" as const, blockNumber: 102n, logs: [] };
+    const client = { getTransactionReceipt: vi.fn().mockResolvedValue(receipt), readContract: vi.fn().mockResolvedValue(10n ** 30n), call: vi.fn().mockResolvedValue({ data: "0x" }) };
+    const database = {
+      getPositionGroup: vi.fn().mockResolvedValue(group),
+      claimPositionGroupLease: vi.fn().mockResolvedValue(true),
+      releasePositionGroupLease: vi.fn().mockResolvedValue(undefined),
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      withExecutionLock: vi.fn(async (_chainId: number, _address: Address, work: () => Promise<unknown>) => work()),
+      recordPositionGroupExecution: vi.fn().mockResolvedValue(undefined),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+      getPositionGroupCashflowTotals: vi.fn().mockResolvedValue({ deposits: 100n, realized: 300n }),
+      addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
+      finalizePositionGroup: vi.fn().mockResolvedValue(true),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, wethConfig);
+
+    await executor.executeGroup(groupId, "manual");
+
+    expect(database.recordPositionGroupExecution).toHaveBeenCalledWith(groupId, "unwrap_quote", "confirmed", pendingHash);
+    expect(database.addPositionGroupCashflow).toHaveBeenCalledWith(groupId, 102n, pendingHash, "unwrap_quote", 100n, 0n, 0n, expect.anything());
+    expect(database.setPositionGroupStatus).toHaveBeenLastCalledWith(groupId, "settling", expect.objectContaining({ unwrapQuoteConfirmed: true }));
   });
 
   it("keeps all Bid-Ask children active and the parent retryable when the batch reverts", async () => {

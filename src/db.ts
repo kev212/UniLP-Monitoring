@@ -1112,7 +1112,7 @@ export class Database {
     const result = await this.pool.query<{ deposits: string; realized: string }>(
       `SELECT
          COALESCE(SUM(quote_value) FILTER (WHERE flow_type = 'open_debit'), 0) AS deposits,
-         COALESCE(SUM(quote_value) FILTER (WHERE flow_type IN ('close_receipt', 'settlement_swap', 'unwrap_quote')), 0) AS realized
+         COALESCE(SUM(quote_value) FILTER (WHERE flow_type IN ('close_receipt', 'settlement_swap')), 0) AS realized
        FROM position_group_cashflows
        WHERE group_id = $1
          AND (cardinality($2::text[]) = 0 OR transaction_hash <> ALL($2::text[]))`,

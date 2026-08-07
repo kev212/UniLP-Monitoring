@@ -374,7 +374,7 @@ export class Executor {
     } catch (error) {
       if (error instanceof PendingExecutionError) {
         await this.setGroupStatus(group.id, "closing", {
-          closeTransactionHash: error.transactionHash,
+          ...(error.stage === "close_batch" ? { closeTransactionHash: error.transactionHash } : {}),
           settlementPhase: "group_close",
           lastExecutionError: error.message,
         });
@@ -831,7 +831,21 @@ export class Executor {
     }
     if (receipt.status !== "success") {
       await this.recordGroupExecutionFailure(group.id, pending.stage, "transaction reverted", pending.hash);
-      if (pending.stage === "close_batch") await this.markGroupRetryable(group, trigger, `close_batch transaction reverted: ${pending.hash}`);
+      if (pending.stage === "close_batch") {
+        await this.markGroupRetryable(group, trigger, `close_batch transaction reverted: ${pending.hash}`);
+        throw new RevertedExecutionError(pending.stage, `${pending.stage} transaction reverted: ${pending.hash}`);
+      }
+      if (pending.stage === "settlement_swap" || pending.stage === "unwrap_quote") {
+        await this.setGroupStatus(group.id, "settling", {
+          closeReceiptAccounted: true,
+          settlementPhase: "accounting",
+          pendingSwap: null,
+          pendingRawTransaction: null,
+          lastExecutionError: `${pending.stage} reverted during recovery: ${pending.hash}`,
+          ...(pending.stage === "unwrap_quote" ? { unwrapQuoteFailed: true } : {}),
+        });
+        return true;
+      }
       throw new RevertedExecutionError(pending.stage, `${pending.stage} transaction reverted: ${pending.hash}`);
     }
 
@@ -844,6 +858,8 @@ export class Executor {
       await this.reconcileGroupClose(group, pending.hash, trigger);
     } else if (pending.stage === "settlement_swap") {
       await this.reconcileGroupSettlementSwap(group, pending.hash, trigger);
+    } else if (pending.stage === "unwrap_quote") {
+      await this.reconcileGroupUnwrap(group, pending.hash, trigger);
     }
     return true;
   }
@@ -940,6 +956,7 @@ export class Executor {
       const realized = totals.realized;
       const finalPnlQuote = realized - deposits;
       const finalPnlBps = deposits > 0n ? (finalPnlQuote * 10_000n) / deposits : 0n;
+      if (!(await this.unwrapGroupQuote(group, quoteAmount, hash, trigger ?? "manual"))) return;
       const finalize = this.groupDatabase().finalizePositionGroup;
       if (typeof finalize === "function") {
         const settled = await finalize.call(this.database, group.id, hash, quoteAmount, finalPnlQuote, finalPnlBps, trigger ?? "manual");
@@ -1073,11 +1090,93 @@ export class Executor {
     const deposits = totals.deposits > 0n ? totals.deposits : group.deployedCostQuote;
     const finalPnlQuote = totals.realized - deposits;
     const finalPnlBps = deposits > 0n ? (finalPnlQuote * 10_000n) / deposits : 0n;
+    if (!(await this.unwrapGroupQuote(group, quoteAmount, closeHash, trigger))) return;
     const finalize = this.groupDatabase().finalizePositionGroup;
     if (typeof finalize !== "function") throw new GroupIntegrityError("Position group settlement finalizer is unavailable");
     const exitTrigger = typeof group.metadata.exitTrigger === "string" ? group.metadata.exitTrigger : "manual";
     const settled = await finalize.call(this.database, group.id, closeHash, quoteAmount, finalPnlQuote, finalPnlBps, trigger ?? exitTrigger);
     if (!settled) throw new Error("position group settlement finalization failed");
+  }
+
+  private async unwrapGroupQuote(group: PositionGroupRecord, amount: bigint, closeHash: string, trigger?: ExitTrigger): Promise<boolean> {
+    const { registry } = this.chains.getById(group.chainId);
+    const weth = this.config.quoteTokens[registry.name]?.find((token) => token.symbol === "WETH");
+    if (!weth || group.quoteToken.toLowerCase() !== weth.address.toLowerCase() || amount <= 0n) return true;
+    const metadata = group.metadata as Record<string, unknown>;
+    if (metadata.unwrapQuoteConfirmed === true && metadata.unwrapQuoteAmount === amount.toString()) return true;
+    if (metadata.unwrapQuoteFailed === true) {
+      log.warn({ groupId: group.id, closeHash, amount: amount.toString() }, "position group unwrap previously failed; settling without native unwrap");
+      return true;
+    }
+    await this.setGroupStatus(group.id, "settling", {
+      closeTransactionHash: closeHash,
+      settlementPhase: "unwrapping_quote",
+      unwrapQuoteAmount: amount.toString(),
+    });
+    const plan: TransactionPlan = {
+      chainId: group.chainId,
+      to: weth.address as Address,
+      data: encodeFunctionData({ abi: wethAbi, functionName: "withdraw", args: [amount] }),
+      description: "unwrap_quote",
+    };
+    let hash: Hex | null;
+    try {
+      hash = await this.sendGroup(group, "unwrap_quote", plan);
+    } catch (error) {
+      if (error instanceof PendingExecutionError) throw error;
+      await this.setGroupStatus(group.id, "settling", {
+        closeTransactionHash: closeHash,
+        settlementPhase: "complete",
+        unwrapQuoteFailed: true,
+        pendingRawTransaction: null,
+        lastExecutionError: `unwrap_quote failed: ${errorMessage(error)}`,
+      });
+      return true;
+    }
+    if (!hash) {
+      await this.setGroupStatus(group.id, "settling", {
+        closeTransactionHash: closeHash,
+        settlementPhase: "unwrapping_quote",
+        unwrapQuoteAmount: amount.toString(),
+        dryRunPlan: "unwrap_quote",
+      });
+      return false;
+    }
+    try {
+      const receipt = await this.getConfirmedReceipt(group.chainId, hash);
+      await this.database.addPositionGroupCashflow(group.id, receipt.blockNumber, hash, "unwrap_quote", amount, 0n, 0n, {
+        source: "group_quote_unwrap",
+        trigger: trigger ?? (typeof metadata.exitTrigger === "string" ? metadata.exitTrigger : "manual"),
+      });
+    } catch (error) {
+      log.warn({ error: errorMessage(error), groupId: group.id, hash }, "position group unwrap cashflow deferred");
+    }
+    await this.setGroupStatus(group.id, "settling", {
+      closeTransactionHash: closeHash,
+      settlementPhase: "complete",
+      unwrapQuoteConfirmed: true,
+      unwrapQuoteAmount: amount.toString(),
+      unwrapQuoteTransactionHash: hash,
+      pendingRawTransaction: null,
+    });
+    return true;
+  }
+
+  private async reconcileGroupUnwrap(group: PositionGroupRecord, hash: Hex, trigger?: ExitTrigger): Promise<void> {
+    const receipt = await this.getConfirmedReceipt(group.chainId, hash);
+    const rawAmount = (group.metadata as Record<string, unknown>).unwrapQuoteAmount;
+    const amount = typeof rawAmount === "string" && /^\d+$/.test(rawAmount) ? BigInt(rawAmount) : 0n;
+    await this.database.addPositionGroupCashflow(group.id, receipt.blockNumber, hash, "unwrap_quote", amount, 0n, 0n, {
+      source: "group_quote_unwrap",
+      trigger: trigger ?? (typeof group.metadata.exitTrigger === "string" ? group.metadata.exitTrigger : "manual"),
+    });
+    await this.setGroupStatus(group.id, "settling", {
+      settlementPhase: "complete",
+      unwrapQuoteConfirmed: true,
+      unwrapQuoteAmount: amount.toString(),
+      unwrapQuoteTransactionHash: hash,
+      pendingRawTransaction: null,
+    });
   }
 
   private async prepareGroupSettlementSwap(
@@ -1160,6 +1259,7 @@ export class Executor {
     if (typeof finalize !== "function") throw new GroupIntegrityError("Position group settlement finalizer is unavailable");
     const storedCloseHash = group.closeTransactionHash
       ?? (typeof group.metadata.closeTransactionHash === "string" ? group.metadata.closeTransactionHash : hash);
+    if (!(await this.unwrapGroupQuote(group, totalReceivedQuote, storedCloseHash, trigger))) return;
     const settled = await finalize.call(this.database, group.id, storedCloseHash, totalReceivedQuote, finalPnlQuote, finalPnlBps, trigger ?? "manual");
     if (!settled) throw new Error("position group settlement finalization failed");
     this.accountedGroupCloses.add(group.id);
