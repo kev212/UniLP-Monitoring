@@ -952,7 +952,8 @@ export class Notifier {
     const status = typeof position.metadata.groupStatus === "string" ? position.metadata.groupStatus : position.status;
     const statusLabel = status === "active" ? "" : ` · ${statusDisplay(status as PositionStatus)}`;
     const bins = typeof position.metadata.mintableBinCount === "number" ? position.metadata.mintableBinCount : "?";
-    const base = `${index}. ${snapshot && snapshot.pnlBps < 0n ? "🔴" : "🟢"} ${pair} · ${position.protocol.toUpperCase()} · BID-ASK${statusLabel}`;
+    const feeLabel = await this.groupFeeLabel(position, database);
+    const base = `${index}. ${snapshot && snapshot.pnlBps < 0n ? "🔴" : "🟢"} ${pair}${feeLabel} · ${position.protocol.toUpperCase()} · BA${statusLabel}`;
     if (!snapshot) return `${base}\n   ⏳ LOADING · ${bins} bins\n`;
     const qtSymbol = this.quoteSymbol(position.quoteToken!);
     const qtDec = await this.decimals(position.quoteToken!, position.chainId);
@@ -963,6 +964,25 @@ export class Notifier {
     const valueLine = `   💰 ${value} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${arrow} ${sign}${formatBps(snapshot.pnlBps)}%`;
     const rangeLine = await this.formatGroupPositionRange(position, snapshot, bins);
     return `${base}\n${valueLine}${rangeLine}\n`;
+  }
+
+  private async groupFeeLabel(position: PositionRecord, database: Database): Promise<string> {
+    const direct = typeof position.metadata.feeTier === "number"
+      ? position.metadata.feeTier
+      : typeof position.metadata.fee === "number"
+        ? position.metadata.fee
+        : undefined;
+    if (direct !== undefined) return ` · ${formatFeeTier(direct)}`;
+    const groupId = typeof position.metadata.positionGroupId === "string" ? position.metadata.positionGroupId : null;
+    if (!groupId) return "";
+    try {
+      const children = await database.listPositionGroupChildren(groupId);
+      const child = children.find((entry) => entry.position !== null)?.position;
+      const fee = child && typeof child.metadata.fee === "number" ? child.metadata.fee : undefined;
+      return fee === undefined ? "" : ` · ${formatFeeTier(fee)}`;
+    } catch {
+      return "";
+    }
   }
 
   private async formatGroupPositionRange(position: PositionRecord, snapshot: Pick<PositionGroupPnlSnapshot, "rangeCurrentTick" | "rangeCurrentSqrtPrice">, bins: number | string): Promise<string> {
@@ -2319,7 +2339,26 @@ function isGroupParent(position: PositionRecord): boolean {
   return position.metadata.groupParent === true && typeof position.metadata.positionGroupId === "string";
 }
 
+export function groupFeeTier(group: PositionGroupRecord): number | undefined {
+  const candidates: Array<Record<string, unknown> | null | undefined> = [
+    group.metadata,
+    group.planJson,
+    isRecord(group.planJson.plan) ? group.planJson.plan : null,
+    isRecord(group.planJson.preview) ? group.planJson.preview : null,
+    isRecord(group.planJson.poolKey) ? group.planJson.poolKey : null,
+    isRecord(group.planJson.v4PoolKey) ? group.planJson.v4PoolKey : null,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const fee = candidate.feeTier ?? candidate.fee;
+    if (typeof fee === "number" && Number.isFinite(fee)) return fee;
+    if (typeof fee === "string" && /^\d+$/.test(fee)) return Number(fee);
+  }
+  return undefined;
+}
+
 function groupDashboardPosition(group: PositionGroupRecord): PositionRecord {
+  const feeTier = groupFeeTier(group);
   return {
     id: group.id,
     chainId: group.chainId,
@@ -2335,6 +2374,7 @@ function groupDashboardPosition(group: PositionGroupRecord): PositionRecord {
     openedAtBlock: group.referenceBlock,
     metadata: {
       ...group.metadata,
+      ...(feeTier === undefined ? {} : { feeTier }),
       groupParent: true,
       managedBy: "position_group",
       positionGroupId: group.id,

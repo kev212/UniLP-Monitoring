@@ -1037,6 +1037,7 @@ export class PositionOpener {
         transaction: preview.batchPlan,
         poolAddress: preview.poolAddress,
         poolKey: preview.poolKey,
+        feeTier: preview.feeTier,
         atomicOpenGasEstimate: preview.estimatedGas,
         blockGasLimit: preview.blockGasLimit,
         atomicBatchFeasible: preview.atomicBatchFeasible,
@@ -1061,6 +1062,7 @@ export class PositionOpener {
         atomicBatch: true,
         noOpeningSwap: true,
         poolAddress: preview.poolAddress,
+        feeTier: preview.feeTier,
         quoteTokenSymbol: preview.quoteTokenSymbol,
       },
     } satisfies Omit<PositionGroupRecord, "id" | "createdAt" | "updatedAt">);

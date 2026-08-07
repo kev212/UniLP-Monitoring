@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { PositionOpener } from "../src/services/position-opener.js";
-import { canRequestManualClose, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatRangePrices, invokeBidAskOpenerMethod, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins, positionRangeLine } from "../src/services/notifier.js";
+import { canRequestManualClose, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins, positionRangeLine } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -168,6 +168,22 @@ describe("Telegram dashboard callbacks", () => {
     expect(isExpiredCallbackError(new Error("400: Bad Request: query is too old and response timeout expired"))).toBe(true);
     expect(isExpiredCallbackError(new Error("400: Bad Request: query ID is invalid"))).toBe(true);
     expect(isExpiredCallbackError(new Error("400: Bad Request: message is not modified"))).toBe(false);
+  });
+
+  it("renders the fee tier percentage like normal positions", () => {
+    expect(formatFeeTier(500)).toBe("0.05%");
+    expect(formatFeeTier(10_000)).toBe("1%");
+    expect(formatFeeTier(30_000)).toBe("3%");
+    expect(formatFeeTier(0x800000)).toBe("dynamic");
+  });
+
+  it("extracts the fee tier from group metadata, plan, or pool key", () => {
+    const group = (planJson: Record<string, unknown>, metadata: Record<string, unknown> = {}) => ({ metadata, planJson } as never);
+    expect(groupFeeTier(group({}, { feeTier: 500 }))).toBe(500);
+    expect(groupFeeTier(group({ plan: { fee: 3000 } }))).toBe(3000);
+    expect(groupFeeTier(group({ preview: { feeTier: "10000" } }))).toBe(10000);
+    expect(groupFeeTier(group({ poolKey: { fee: 25_120 } }))).toBe(25_120);
+    expect(groupFeeTier(group({}))).toBeUndefined();
   });
 
   it("renders a centered bin marker for an in-range price", () => {
