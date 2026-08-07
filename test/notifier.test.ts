@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { canRequestManualClose, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatRangePrices, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
+import type { PositionOpener } from "../src/services/position-opener.js";
+import { canRequestManualClose, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatRangePrices, invokeBidAskOpenerMethod, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -45,6 +46,20 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseBidAskRangeInput("below 60")).toEqual({ direction: "below", rangePercent: 60 });
     expect(parseBidAskRangeInput("+30%")).toEqual({ direction: "above", rangePercent: 30 });
     expect(parseBidAskRangeInput("100")).toBeNull();
+  });
+
+  it("preserves the PositionOpener receiver for Bid-Ask method aliases", async () => {
+    const opener = {
+      prepareBidAskOpen(...args: unknown[]) {
+        expect(this).toBe(opener);
+        return args;
+      },
+    } as unknown as PositionOpener;
+    const prepareBidAskLadder = async function(this: PositionOpener, ...args: unknown[]) {
+      return (this as typeof opener).prepareBidAskOpen(...args);
+    };
+
+    await expect(invokeBidAskOpenerMethod(opener, prepareBidAskLadder, ["preview"])).resolves.toEqual(["preview"]);
   });
 
   it("renders atomic semantics and per-bin allocations in the ladder review", () => {

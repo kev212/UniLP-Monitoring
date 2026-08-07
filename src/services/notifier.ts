@@ -1580,8 +1580,8 @@ export class Notifier {
         maxRetries: this.config.bidAskLadderMaxRetries,
       };
       const result = await Promise.resolve(prepare.name === "prepareBidAskOpen" || prepare.call.length > 1
-        ? prepare.call(this.positionOpener, request.poolAddress, request.chain, request.rangePercent, request.depositAmount, request.quoteToken, request.binCount)
-        : prepare.call(this.positionOpener, request));
+        ? invokeBidAskOpenerMethod(this.positionOpener, prepare.call, [request.poolAddress, request.chain, request.rangePercent, request.depositAmount, request.quoteToken, request.binCount])
+        : invokeBidAskOpenerMethod(this.positionOpener, prepare.call, [request]));
       if (!isRecord(result)) throw new Error("Bid-Ask ladder preview is invalid");
       preview = result;
       const protocol = stringValue(preview.protocol);
@@ -1605,7 +1605,7 @@ export class Notifier {
     if (!this.positionOpener) throw new Error("Position opener is not configured");
     const execute = optionalPositionOpenerMethod(this.positionOpener, ["executeBidAskLadder", "executeBidAskOpen", "executeBidAsk"]);
     if (!execute) throw new Error("Bid-Ask Ladder execution is not available yet");
-    const result = await Promise.resolve(execute.call(this.positionOpener, preview));
+    const result = await Promise.resolve(invokeBidAskOpenerMethod(this.positionOpener, execute.call, [preview]));
     if (typeof result === "string") return { hash: result };
     if (!isRecord(result)) return { hash: null };
     const hash = stringValue(result.hash);
@@ -2271,6 +2271,10 @@ function optionalPositionOpenerMethod(opener: PositionOpener, names: readonly st
     if (typeof method === "function") return { name, call: method as BidAskOpenerMethod };
   }
   return undefined;
+}
+
+export function invokeBidAskOpenerMethod(opener: PositionOpener, method: BidAskOpenerMethod, args: readonly unknown[]): unknown {
+  return Reflect.apply(method, opener, args);
 }
 
 function optionalExecutorMethod(executor: Executor, name: string): BidAskOpenerMethod | undefined {
