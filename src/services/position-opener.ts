@@ -147,7 +147,12 @@ type BidAskDatabase = Pick<
   | "withExecutionLock"
 >;
 
-export type BidAskOpenReconciler = (chain: ChainName, groupId: string, transactionHash: Hex) => Promise<PositionRecord[]>;
+export type BidAskOpenReconciler = (
+  chain: ChainName,
+  groupId: string,
+  transactionHash: Hex,
+  receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>,
+) => Promise<PositionRecord[]>;
 
 interface BidAskPoolState {
   protocol: "v3" | "v4";
@@ -582,7 +587,7 @@ export class PositionOpener {
     });
     const result = await this.broadcastBidAsk(preview.chain, groupId, batchPlan.to, batchPlan.data, batchPlan.value ?? 0n);
     if (result.hash) {
-      await this.reconcileBidAskOpen(preview.chain, groupId, result.hash);
+      await this.reconcileBidAskOpen(preview.chain, groupId, result.hash, result.receipt);
     }
     return {
       hash: result.hash,
@@ -1094,10 +1099,10 @@ export class PositionOpener {
     return group.id;
   }
 
-  private async broadcastBidAsk(chain: ChainName, groupId: string, to: Address, data: Hex, value = 0n): Promise<{ hash: Hex | null }> {
+  private async broadcastBidAsk(chain: ChainName, groupId: string, to: Address, data: Hex, value = 0n): Promise<{ hash: Hex | null; receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>> }> {
     if (!this.database) throw new Error("Bid-Ask group database is not configured");
     const chainId = this.chains.get(chain).registry.chain.id;
-    const run = async (): Promise<{ hash: Hex | null }> => {
+    const run = async (): Promise<{ hash: Hex | null; receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>> }> => {
       const client = this.client(chain);
       const executor = this.config.executorAddress;
       await client.call({ account: executor, to, data, value });
@@ -1136,13 +1141,12 @@ export class PositionOpener {
           });
           throw new Error(`Bid-Ask open transaction reverted: ${hash}`);
         }
+        await this.database!.recordPositionGroupExecution(groupId, "open_batch", "confirmed", hash);
+        return { hash, receipt };
       } catch (error) {
         if (error instanceof Error && error.message.includes("reverted")) throw error;
         throw new Error(`open_batch transaction ${hash} is pending reconciliation: ${error instanceof Error ? error.message : String(error)}`);
       }
-
-      await this.database!.recordPositionGroupExecution(groupId, "open_batch", "confirmed", hash);
-      return { hash };
     };
 
     return this.database.withExecutionLock(chainId, this.config.executorAddress, run);

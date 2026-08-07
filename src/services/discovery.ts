@@ -26,6 +26,11 @@ import type { ChainClients } from "./chain-client.js";
 import type { Notifier } from "./notifier.js";
 import { amountsForLiquidity } from "./uniswap-math.js";
 
+const OPEN_RECEIPT_RETRY_BACKOFF_MS = 60_000;
+const OPEN_RECEIPT_CORRELATION_FAILED = "group_open_receipt_correlation_failed";
+
+type TransactionReceipt = Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>;
+
 export interface WalletActivity {
   asset: Address;
   transactionHash: Hex;
@@ -51,6 +56,7 @@ export class DiscoveryService {
     name: ChainName,
     groupOrId: PositionGroupRecord | string,
     transactionHash: Hex,
+    receipt?: TransactionReceipt,
   ): Promise<PositionRecord[]> {
     const group = typeof groupOrId === "string" ? await this.database.getPositionGroup(groupOrId) : groupOrId;
     if (!group) throw new Error(`Position group ${typeof groupOrId === "string" ? groupOrId : "unknown"} was not found`);
@@ -67,13 +73,13 @@ export class DiscoveryService {
         throw new Error("position group is not a Bid-Ask group");
       }
 
-      const receipt = await client.getTransactionReceipt({ hash: transactionHash });
-      if (receipt.status !== undefined && receipt.status !== "success") throw new Error("position group open transaction reverted");
+      const resolvedReceipt = receipt ?? await client.getTransactionReceipt({ hash: transactionHash });
+      if (resolvedReceipt.status !== undefined && resolvedReceipt.status !== "success") throw new Error("position group open transaction reverted");
       const plannedBins = plannedGroupBins(group, bins);
       if (group.protocol === "v3") {
-        return await this.reconcileV3PositionGroupOpen(name, group, plannedBins, transactionHash, receipt);
+        return await this.reconcileV3PositionGroupOpen(name, group, plannedBins, transactionHash, resolvedReceipt);
       }
-      return await this.reconcileV4PositionGroupOpen(name, group, plannedBins, transactionHash, receipt);
+      return await this.reconcileV4PositionGroupOpen(name, group, plannedBins, transactionHash, resolvedReceipt);
     } catch (error) {
       await this.markPositionGroupOpenNeedsReview(group, bins, transactionHash, errorMessage(error));
       throw error;
@@ -84,24 +90,32 @@ export class DiscoveryService {
     name: ChainName,
     groupOrId: PositionGroupRecord | string,
     transactionHash: Hex,
+    receipt?: TransactionReceipt,
   ): Promise<PositionRecord[]> {
-    return this.reconcilePositionGroupOpen(name, groupOrId, transactionHash);
+    return this.reconcilePositionGroupOpen(name, groupOrId, transactionHash, receipt);
   }
 
   async reconcilePendingPositionGroupOpens(name: ChainName): Promise<void> {
     const { client, registry } = this.chains.get(name);
     const groups = await this.database.listPositionGroups(registry.chain.id);
     for (const group of groups) {
-      if (group.status !== "opening" || !group.openTransactionHash || !isHex(group.openTransactionHash) || group.openTransactionHash.length !== 66) continue;
-      let receipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>;
+      if (group.status !== "opening") {
+        if (group.status !== "needs_review" || group.metadata.reason !== OPEN_RECEIPT_CORRELATION_FAILED) continue;
+        const retriedAt = typeof group.metadata.openReceiptRetriedAt === "string"
+          ? Date.parse(group.metadata.openReceiptRetriedAt)
+          : Number.NaN;
+        if (Number.isFinite(retriedAt) && Date.now() - retriedAt < OPEN_RECEIPT_RETRY_BACKOFF_MS) continue;
+      }
+      if (!group.openTransactionHash || !isHex(group.openTransactionHash) || group.openTransactionHash.length !== 66) continue;
+      let receipt: TransactionReceipt;
       try {
         receipt = await client.getTransactionReceipt({ hash: group.openTransactionHash as Hex });
       } catch {
-        // The signed transaction may still be pending. Keep the parent opening and let the next cycle retry.
+        // The signed transaction may still be pending. Keep the parent group and let the next cycle retry.
         continue;
       }
       try {
-        await this.reconcilePositionGroupOpen(name, group, group.openTransactionHash as Hex);
+        await this.reconcilePositionGroupOpen(name, group, group.openTransactionHash as Hex, receipt);
         log.info({ chain: name, groupId: group.id, transactionHash: group.openTransactionHash, status: receipt.status }, "reconciled pending Bid-Ask open");
       } catch (error) {
         log.warn({ err: error, chain: name, groupId: group.id, transactionHash: group.openTransactionHash }, "pending Bid-Ask open requires review");
@@ -327,7 +341,9 @@ export class DiscoveryService {
   ): Promise<PositionRecord[]> {
     const positions: PositionRecord[] = [];
     const newlyLinkedPositions: PositionRecord[] = [];
+    const freshlyCreatedPositions: PositionRecord[] = [];
     for (const child of children) {
+      const existing = await this.database.findPositionByKey(group.chainId, group.protocol, child.tokenId.toString());
       const position = await this.database.upsertPosition({
         chainId: group.chainId,
         protocol: group.protocol,
@@ -359,6 +375,7 @@ export class DiscoveryService {
       if (updated === false) throw new Error(`could not update position group bin ${current.binIndex}`);
       positions.push(position);
       if (!alreadyLinked) newlyLinkedPositions.push(position);
+      if (existing === null) freshlyCreatedPositions.push(position);
     }
 
     const aggregateAmount0 = children.reduce((total, child) => total + child.openingAmount0, 0n);
@@ -395,7 +412,7 @@ export class DiscoveryService {
         source: "position_group_open_receipt_reconciliation",
       });
     }
-    for (const position of newlyLinkedPositions) {
+    for (const position of freshlyCreatedPositions) {
       try {
         await this.notifier?.positionDiscovered(position);
       } catch (error) {
@@ -413,10 +430,11 @@ export class DiscoveryService {
   ): Promise<void> {
     try {
       await this.database.setPositionGroupStatus(group.id, "needs_review", {
-        reason: "group_open_receipt_correlation_failed",
+        reason: OPEN_RECEIPT_CORRELATION_FAILED,
         correlationError: reason,
         openTransactionHash: transactionHash,
         pendingRawTransaction: null,
+        openReceiptRetriedAt: new Date().toISOString(),
       });
       for (const bin of bins.filter((candidate) => candidate.status !== "skipped")) {
         await this.database.updatePositionGroupBin(group.id, bin.binIndex, { status: "needs_review" });

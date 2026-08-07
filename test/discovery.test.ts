@@ -136,6 +136,7 @@ function groupDatabase(bins: PositionGroupBinRecord[]) {
     updatePositionGroupBin,
     setPositionGroupOpenTransaction: vi.fn().mockResolvedValue(true),
     setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+    findPositionByKey: vi.fn().mockResolvedValue(null),
   };
 }
 
@@ -308,5 +309,165 @@ describe("known Bid-Ask open receipt correlation", () => {
     await expect(discovery.reconcilePositionGroupOpen("base", group("v4", poolId, manager), openHash)).rejects.toThrow(/exact ModifyLiquidity/);
     expect(database.setPositionGroupStatus).toHaveBeenCalledWith("v4-group", "needs_review", expect.objectContaining({ reason: "group_open_receipt_correlation_failed" }));
     expect(database.setPositionGroupOpenTransaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("pending Bid-Ask open reconciliation retries", () => {
+  function v4ReviewSetup(bins: PositionGroupBinRecord[]) {
+    const manager = chainRegistry.base.contracts.v4.positionManager;
+    const poolManager = chainRegistry.base.contracts.v4.poolManager;
+    const poolKey = { currency0: token0, currency1: token1, fee: 500, tickSpacing: 10, hooks: zeroAddress as Address };
+    const poolId = keccak256(encodeAbiParameters(
+      [{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }],
+      [poolKey.currency0, poolKey.currency1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks],
+    ));
+    const tokenIds = [7n, 8n];
+    const packInfo = (lower: number, upper: number) => (BigInt(lower & 0xffffff) << 8n) | (BigInt(upper & 0xffffff) << 32n);
+    const receipt = {
+      status: "success",
+      blockNumber: 456n,
+      logs: [
+        transferLog(manager, tokenIds[0]!),
+        modifyLiquidityLog(poolManager, poolId, manager, -100, -50, 10n, indexed(tokenIds[1]!)),
+        transferLog(manager, tokenIds[1]!),
+        modifyLiquidityLog(poolManager, poolId, manager, -200, -100, 20n, indexed(tokenIds[0]!)),
+      ],
+    };
+    const client = {
+      getTransactionReceipt: vi.fn().mockResolvedValue(receipt),
+      readContract: vi.fn(async ({ functionName, args }: { functionName: string; args?: readonly unknown[] }) => {
+        if (functionName === "ownerOf") return owner;
+        if (functionName === "getPoolAndPositionInfo") {
+          const tokenId = args?.[0] as bigint;
+          return [poolKey, tokenId === tokenIds[0] ? packInfo(-200, -100) : packInfo(-100, -50)];
+        }
+        if (functionName === "getPositionLiquidity") {
+          const tokenId = args?.[0] as bigint;
+          return tokenId === tokenIds[0] ? 20n : 10n;
+        }
+        throw new Error(`unexpected ${functionName}`);
+      }),
+    };
+    const database = {
+      ...groupDatabase(bins),
+      listPositionGroups: vi.fn().mockResolvedValue([{
+        ...group("v4", poolId, manager),
+        status: "needs_review",
+        openTransactionHash: openHash,
+        metadata: {
+          reason: "group_open_receipt_correlation_failed",
+          openReceiptRetriedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+        },
+      }]),
+    };
+    const discovery = new DiscoveryService(
+      database as never,
+      { get: vi.fn(() => ({ client, registry: chainRegistry.base })) } as never,
+      { executorAddress: owner } as never,
+    );
+    return { database, discovery, manager, tokenIds, poolId, client };
+  }
+
+  it("retries needs_review correlation-failed opens and links previously discovered fallback positions", async () => {
+    const manager = chainRegistry.base.contracts.v4.positionManager;
+    const bins = [
+      { ...bin("v4-group", 0, -200, -100, 20n), positionManager: manager, status: "needs_review" as const },
+      { ...bin("v4-group", 1, -100, -50, 10n), positionManager: manager, status: "needs_review" as const },
+    ];
+    const { database, discovery } = v4ReviewSetup(bins);
+    vi.mocked(database.findPositionByKey).mockResolvedValue({ id: "fallback-position-7" } as never);
+
+    await discovery.reconcilePendingPositionGroupOpens("base");
+
+    expect(database.setPositionGroupOpenTransaction).toHaveBeenCalledWith("v4-group", openHash, "active");
+    expect(database.updatePositionGroupBin).toHaveBeenCalledWith("v4-group", 0, expect.objectContaining({ tokenId: 7n, status: "minted" }));
+    expect(database.findPositionByKey).toHaveBeenCalledWith(chainRegistry.base.chain.id, "v4", "7");
+  });
+
+  it("does not re-notify positions that were already discovered as fallbacks", async () => {
+    const manager = chainRegistry.base.contracts.v4.positionManager;
+    const bins = [
+      { ...bin("v4-group", 0, -200, -100, 20n), positionManager: manager, status: "needs_review" as const },
+      { ...bin("v4-group", 1, -100, -50, 10n), positionManager: manager, status: "needs_review" as const },
+    ];
+    const { database, poolId, client } = v4ReviewSetup(bins);
+    vi.mocked(database.findPositionByKey).mockResolvedValue({ id: "existing-fallback" } as never);
+    const notifier = { positionDiscovered: vi.fn() };
+
+    const discoveryWithNotifier = new DiscoveryService(
+      database as never,
+      { get: vi.fn(() => ({ client, registry: chainRegistry.base })) } as never,
+      { executorAddress: owner } as never,
+      notifier as never,
+    );
+    await discoveryWithNotifier.reconcileKnownGroupOpen("base", { ...group("v4", poolId, manager), status: "needs_review" }, openHash);
+
+    expect(notifier.positionDiscovered).not.toHaveBeenCalled();
+  });
+
+  it("skips needs_review correlation-failed opens that were retried recently", async () => {
+    const manager = chainRegistry.base.contracts.v4.positionManager;
+    const database = {
+      ...groupDatabase([]),
+      listPositionGroups: vi.fn().mockResolvedValue([{
+        ...group("v4", `0x${"c".repeat(64)}`, manager),
+        status: "needs_review",
+        openTransactionHash: openHash,
+        metadata: { reason: "group_open_receipt_correlation_failed", openReceiptRetriedAt: new Date().toISOString() },
+      }]),
+    };
+    const client = { getTransactionReceipt: vi.fn() };
+    const discovery = new DiscoveryService(
+      database as never,
+      { get: vi.fn(() => ({ client, registry: chainRegistry.base })) } as never,
+      { executorAddress: owner } as never,
+    );
+
+    await discovery.reconcilePendingPositionGroupOpens("base");
+
+    expect(client.getTransactionReceipt).not.toHaveBeenCalled();
+    expect(database.setPositionGroupOpenTransaction).not.toHaveBeenCalled();
+  });
+
+  it("uses a provided receipt without a second RPC receipt lookup", async () => {
+    const manager = chainRegistry.base.contracts.v3.positionManager;
+    const tokenIds = [101n, 205n];
+    const receipt = {
+      status: "success",
+      blockNumber: 123n,
+      logs: [
+        transferLog(manager, tokenIds[1]!),
+        increaseLog(manager, tokenIds[0]!, 10n, 7n, 0n),
+        transferLog(manager, tokenIds[0]!),
+        increaseLog(manager, tokenIds[1]!, 20n, 13n, 0n),
+      ],
+    };
+    const client = {
+      getTransactionReceipt: vi.fn(() => { throw new Error("receipt lookup must not run when a receipt is provided"); }),
+      readContract: vi.fn(async ({ functionName, args }: { functionName: string; args?: readonly unknown[] }) => {
+        if (functionName === "getPool") return v3Pool;
+        if (functionName === "ownerOf") return owner;
+        if (functionName === "positions") {
+          const tokenId = args?.[0] as bigint;
+          return tokenId === tokenIds[0]
+            ? [0n, zeroAddress, token0, token1, 500, -200, -100, 10n, 0n, 0n, 0n, 0n]
+            : [0n, zeroAddress, token0, token1, 500, -100, 0, 20n, 0n, 0n, 0n, 0n];
+        }
+        throw new Error(`unexpected ${functionName}`);
+      }),
+    };
+    const bins = [bin("v3-group", 0, -200, -100), bin("v3-group", 1, -100, 0)];
+    const database = groupDatabase(bins);
+    const discovery = new DiscoveryService(
+      database as never,
+      { get: vi.fn(() => ({ client, registry: chainRegistry.base })) } as never,
+      { executorAddress: owner } as never,
+    );
+
+    const positions = await discovery.reconcileKnownGroupOpen("base", group("v3", v3Pool, manager, { feeTier: 500 }), openHash, receipt);
+
+    expect(positions.map((position) => position.positionKey).sort()).toEqual(["101", "205"]);
+    expect(client.getTransactionReceipt).not.toHaveBeenCalled();
+    expect(database.setPositionGroupOpenTransaction).toHaveBeenCalledWith("v3-group", openHash, "active");
   });
 });

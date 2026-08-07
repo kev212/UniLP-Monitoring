@@ -47,7 +47,7 @@ async function main(): Promise<void> {
     routes,
     tradingApi,
     database,
-    (chain, groupId, transactionHash) => discovery.reconcileKnownGroupOpen(chain, groupId, transactionHash),
+    (chain, groupId, transactionHash, receipt) => discovery.reconcileKnownGroupOpen(chain, groupId, transactionHash, receipt),
   );
   const gemScanner = new GemScanner(chains, database, scanner, config.quoteTokens.robinhood);
   const portfolio = new PortfolioService(config, chains, database);
