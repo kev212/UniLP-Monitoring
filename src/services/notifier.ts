@@ -5,7 +5,7 @@ import sharp from "sharp";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionRangeInfo, PositionRecord, PositionStatus, Protocol, QuoteToken, RiskSettings } from "../types.js";
+import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionGroupRecord, PositionRangeInfo, PositionRecord, PositionStatus, Protocol, QuoteToken, RiskSettings } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Executor } from "./executor.js";
 import type { PnlService } from "./pnl.js";
@@ -20,6 +20,38 @@ import { quoteRangeState } from "./quote-range.js";
 import { sqrtRatioAtTick } from "./uniswap-math.js";
 
 type ChatContext = CommandContext<Context>;
+
+type BidAskLadderChain = "base" | "robinhood";
+type BidAskLadderDirection = "above" | "below";
+type BidAskLadderProtocol = "v3" | "v4";
+
+export interface BidAskLadderOpenRequest {
+  poolAddress: string;
+  chain: BidAskLadderChain;
+  direction: BidAskLadderDirection;
+  rangePercent: number;
+  binCount: number;
+  depositAmount: bigint;
+  quoteToken: QuoteToken;
+  protocols: readonly BidAskLadderProtocol[];
+  maxBins: number;
+  maxPriceDeviationBps: number;
+  atomicMaxBlockGasBps: number;
+  transactionDeadlineSeconds: number;
+  maxRetries: number;
+}
+
+type BidAskLadderPreview = Record<string, unknown>;
+
+type OpenConfirmation =
+  | { kind: "normal"; preview: OpenPositionPreview }
+  | { kind: "bid_ask"; request: BidAskLadderOpenRequest; preview: BidAskLadderPreview };
+
+type BidAskOpenerMethod = (...args: unknown[]) => unknown;
+interface NamedBidAskOpenerMethod {
+  name: string;
+  call: BidAskOpenerMethod;
+}
 
 const DASHBOARD_PAGE_SIZE = 6;
 const DASHBOARD_VALUE_CONCURRENCY = 3;
@@ -49,6 +81,8 @@ type DashboardAction =
   | { type: "history_page"; page: number }
   | { type: "open"; page: number }
   | { type: "open_mode"; mode: "single" | "dual"; page: number }
+  | { type: "open_ladder"; page: number }
+  | { type: "open_ladder_chain"; chain: BidAskLadderChain; page: number }
   | { type: "open_pool_input"; page: number }
   | { type: "open_confirm"; requestId: string }
   | { type: "open_cancel"; page: number }
@@ -62,7 +96,11 @@ type PendingInput =
   | { kind: "risk"; key: RiskSettingKey; dashboardMessageId: number }
   | { kind: "open_pool"; chain: ChainName; mode: "single" | "dual"; dashboardMessageId: number }
   | { kind: "open_range"; chain: ChainName; poolAddress: string; mode: "single" | "dual"; dashboardMessageId: number }
-  | { kind: "open_amount"; chain: ChainName; poolAddress: string; rangePercent: number; mode: "single" | "dual"; quoteToken: QuoteToken; dashboardMessageId: number };
+  | { kind: "open_amount"; chain: ChainName; poolAddress: string; rangePercent: number; mode: "single" | "dual"; quoteToken: QuoteToken; dashboardMessageId: number }
+  | { kind: "bid_ask_pool"; chain: BidAskLadderChain; dashboardMessageId: number }
+  | { kind: "bid_ask_range"; chain: BidAskLadderChain; poolAddress: string; dashboardMessageId: number }
+  | { kind: "bid_ask_bins"; chain: BidAskLadderChain; poolAddress: string; direction: BidAskLadderDirection; rangePercent: number; dashboardMessageId: number }
+  | { kind: "bid_ask_amount"; chain: BidAskLadderChain; poolAddress: string; direction: BidAskLadderDirection; rangePercent: number; binCount: number; quoteToken: QuoteToken; dashboardMessageId: number };
 
 interface DashboardView {
   text: string;
@@ -85,7 +123,7 @@ export class Notifier {
   private gemScanRunning = false;
   private stockScanRunning = false;
   private deletionTimer: ReturnType<typeof setInterval> | null = null;
-  private readonly openConfirmations = new Map<string, OpenPositionPreview>();
+  private readonly openConfirmations = new Map<string, OpenConfirmation>();
   private positionOpener?: PositionOpener;
   private gemScanner?: GemScanner;
   private portfolioService?: PortfolioService;
@@ -546,9 +584,35 @@ export class Notifier {
         const keyboard = new InlineKeyboard()
           .text("Single-side", `lp:openmode:single:${action.page}`)
           .text("Dual-side", `lp:openmode:dual:${action.page}`)
-          .row()
-          .text("← Back", dashboardAction("status", action.page));
+          .row();
+        if (this.config.bidAskLadderEnabled) {
+          keyboard.text("Bid-Ask Ladder", dashboardAction("open_ladder", action.page)).row();
+        }
+        keyboard.text("← Back", dashboardAction("status", action.page));
         await this.editDashboardMessage(chatId, message.message_id, "🟢 Open Position\nPilih mode:", keyboard);
+        return;
+      }
+      if (action.type === "open_ladder") {
+        if (!this.config.bidAskLadderEnabled) {
+          await this.replyTemp(ctx, "Bid-Ask Ladder sedang dimatikan.");
+          return;
+        }
+        const keyboard = new InlineKeyboard()
+          .text("Base", `lp:open_ladder_chain:base:${action.page}`)
+          .text("Robinhood", `lp:open_ladder_chain:robinhood:${action.page}`)
+          .row()
+          .text("← Back", dashboardAction("open", action.page));
+        await this.editDashboardMessage(chatId, message.message_id, "🟣 Bid-Ask Ladder\nPilih chain:", keyboard);
+        return;
+      }
+      if (action.type === "open_ladder_chain") {
+        if (!this.config.bidAskLadderEnabled) {
+          await this.replyTemp(ctx, "Bid-Ask Ladder sedang dimatikan.");
+          return;
+        }
+        this.pendingInput.set(chatId, { kind: "bid_ask_pool", chain: action.chain, dashboardMessageId: message.message_id });
+        await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
+        await this.replyTemp(ctx, `🟣 Bid-Ask Ladder (${action.chain === "base" ? "Base" : "Robinhood"})\nKirim pool address (V3 contract) atau V4 pool ID.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
         return;
       }
       if (action.type === "open_mode") {
@@ -558,8 +622,8 @@ export class Notifier {
         return;
       }
       if (action.type === "open_confirm") {
-        const preview = this.openConfirmations.get(action.requestId);
-        if (!preview) {
+        const confirmation = this.openConfirmations.get(action.requestId);
+        if (!confirmation) {
           await this.dismissOpenReview(ctx, chatId, message.message_id);
           await this.replyTemp(ctx, "❌ Konfirmasi open position sudah kadaluarsa. Ulangi dari awal.");
           return;
@@ -569,11 +633,17 @@ export class Notifier {
         await this.replyTemp(ctx, "⏳ Membuka posisi...");
         try {
           if (!this.positionOpener) throw new Error("Position opener is not configured");
-          const result = await this.positionOpener.executeOpen(preview);
+          if (confirmation.kind === "bid_ask") {
+            const result = await this.executeBidAskLadder(confirmation.preview);
+            const hashLabel = result.hash ? `\ntx: ${shortHash(result.hash)}` : "";
+            await this.replyTemp(ctx, `🟢 BID-ASK LADDER OPENED\n${formatBidAskLadderTarget(confirmation.preview, confirmation.request)}\nAtomic: one transaction for all mintable bins${hashLabel}`);
+            return;
+          }
+          const result = await this.positionOpener.executeOpen(confirmation.preview);
           const hashLabel = result.hash ? `\ntx: ${result.hash.slice(0, 18)}...` : "";
           const swapLabel = result.swapHash ? `\nswap: ${result.swapHash.slice(0, 18)}...` : "";
-          const depositFormatted = (Number(preview.depositAmount) / 10 ** (preview.quoteTokenSymbol === "USDG" ? 6 : 18)).toFixed(2);
-          await this.replyTemp(ctx, `🟢 LP OPENED\n${preview.protocol.toUpperCase()} ${preview.pair} | ${preview.feeLabel}\nRange: ${preview.lowerPrice} → ${preview.upperPrice}\nDeposit: ${depositFormatted} ${preview.quoteTokenSymbol}${swapLabel}${hashLabel}`);
+          const depositFormatted = (Number(confirmation.preview.depositAmount) / 10 ** (confirmation.preview.quoteTokenSymbol === "USDG" ? 6 : 18)).toFixed(2);
+          await this.replyTemp(ctx, `🟢 LP OPENED\n${confirmation.preview.protocol.toUpperCase()} ${confirmation.preview.pair} | ${confirmation.preview.feeLabel}\nRange: ${confirmation.preview.lowerPrice} → ${confirmation.preview.upperPrice}\nDeposit: ${depositFormatted} ${confirmation.preview.quoteTokenSymbol}${swapLabel}${hashLabel}`);
         } catch (error) {
           await this.replyTemp(ctx, `❌ Open position gagal: ${errorMessage(error).slice(0, 200)}`);
         }
@@ -594,7 +664,7 @@ export class Notifier {
         return;
       }
       if (action.type === "select") {
-        await this.showCloseConfirmation(chatId, message.message_id, position, action.page);
+        await this.showCloseConfirmation(database, chatId, message.message_id, position, action.page);
         return;
       }
       if (this.dashboardCloseInFlight.has(position.id)) {
@@ -634,7 +704,14 @@ export class Notifier {
 
   private async executeDashboardClose(database: Database, pnl: PnlService, executor: Executor, chatId: string, messageId: number, position: PositionRecord, page: number): Promise<void> {
     try {
-      await executor.execute(position, "manual");
+      const groupId = managedPositionGroupId(position);
+      if (groupId) {
+        const executeGroup = optionalExecutorMethod(executor, "executeGroup");
+        if (!executeGroup) throw new Error("Bid-Ask parent close is not available yet");
+        await executeGroup.call(executor, groupId, "manual");
+      } else {
+        await executor.execute(position, "manual");
+      }
       await this.refreshDashboardMessage(database, pnl, chatId, messageId, page);
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
@@ -665,13 +742,15 @@ export class Notifier {
       lines.push("Tidak ada posisi aktif.");
     } else {
       const pagePositions = active.slice(first, first + DASHBOARD_PAGE_SIZE);
-      const positionIds = pagePositions.map((p) => p.id);
+      const positionIds = pagePositions.filter((position) => !isGroupParent(position)).map((p) => p.id);
       const [snapshotMap, observationMap] = await Promise.all([
         database.getLatestSnapshots(positionIds),
         database.getLatestObservations(positionIds),
       ]);
       const statusLines = await Promise.all(pagePositions.map((position, index) =>
-        this.formatStatusLineFromSnapshot(position, snapshotMap.get(position.id), observationMap.get(position.id), pnl, first + index + 1),
+        isGroupParent(position)
+          ? this.formatGroupStatusLine(position, database, first + index + 1)
+          : this.formatStatusLineFromSnapshot(position, snapshotMap.get(position.id), observationMap.get(position.id), pnl, first + index + 1),
       ));
       lines.push(...statusLines.map((line) => line.trimEnd()));
     }
@@ -686,11 +765,16 @@ export class Notifier {
     const blocks: Record<number, bigint> = {};
     const results = await Promise.all(this.config.chains.map(async (chain) => {
       const { client, registry } = this.chains.get(chain);
-      const [positions, block] = await Promise.all([
+      const [positions, groups, block] = await Promise.all([
         database.listActivePositions(registry.chain.id),
+        database.listPositionGroups(registry.chain.id),
         includeBlocks ? client.getBlockNumber() : Promise.resolve(undefined),
       ]);
-      return { chainId: registry.chain.id, positions, block };
+      const normalPositions = positions.filter((position) => !isManagedGroupChild(position));
+      const groupParents = groups
+        .filter((group) => group.status !== "settled" && group.status !== "cancelled")
+        .map((group) => groupDashboardPosition(group));
+      return { chainId: registry.chain.id, positions: [...normalPositions, ...groupParents], block };
     }));
     for (const result of results) {
       if (result.block !== undefined) blocks[result.chainId] = result.block;
@@ -759,26 +843,45 @@ export class Notifier {
     await this.editDashboardMessage(chatId, messageId, lines.join("\n"), keyboard);
   }
 
-  private async showCloseConfirmation(chatId: string, messageId: number, position: PositionRecord, page: number): Promise<void> {
+  private async showCloseConfirmation(database: Database, chatId: string, messageId: number, position: PositionRecord, page: number): Promise<void> {
     const pair = await this.pairLabel(position);
+    const groupId = managedPositionGroupId(position);
+    const group = groupId ? await this.positionGroup(database, groupId) : null;
     const keyboard = new InlineKeyboard()
       .text("✅ Confirm close", dashboardPositionAction("confirm", page, position))
       .text("Cancel", dashboardAction("close", page));
+    const target = groupId
+      ? `BID-ASK parent ${shortHash(group?.id ?? groupId)}`
+      : `${position.protocol.toUpperCase()} #${position.positionKey}`;
     await this.editDashboardMessage(chatId, messageId, [
       "⚠️ CONFIRM CLOSE",
-      `${position.protocol.toUpperCase()} #${position.positionKey} ${pair}`,
-      "Aksi ini menghapus liquidity dan memulai settlement ke quote token.",
+      `${target} ${pair}`,
+      groupId
+        ? `Semua child NFT ditutup secara atomic${group ? ` (${group.mintableBinCount} bins)` : ""}; satu kegagalan me-revert seluruh batch.`
+        : "Aksi ini menghapus liquidity dan memulai settlement ke quote token.",
     ].join("\n"), keyboard);
   }
 
   private async closeButtonLabel(position: PositionRecord): Promise<string> {
-    const label = `${position.protocol.toUpperCase()} #${position.positionKey} ${await this.pairLabel(position)}`;
+    const groupId = managedPositionGroupId(position);
+    const target = groupId ? `BID-ASK parent ${shortHash(groupId)}` : `${position.protocol.toUpperCase()} #${position.positionKey}`;
+    const label = `${target} ${await this.pairLabel(position)}`;
     return label.length <= 64 ? label : `${label.slice(0, 61)}...`;
   }
 
   private async findDashboardPosition(database: Database, action: Extract<DashboardAction, { type: "select" | "confirm" }>): Promise<PositionRecord | null> {
     if (!this.config.chains.some((chain) => this.chains.get(chain).registry.chain.id === action.chainId)) return null;
-    return database.findPositionByKey(action.chainId, action.protocol, action.positionKey);
+    const position = await database.findPositionByKey(action.chainId, action.protocol, action.positionKey);
+    if (position) return position;
+    const group = await database.getPositionGroup(action.positionKey);
+    return group && group.chainId === action.chainId && group.protocol === action.protocol
+      ? groupDashboardPosition(group)
+      : null;
+  }
+
+  private async positionGroup(database: Database, groupId: string): Promise<PositionGroupRecord | null> {
+    const getGroup = (database as Database & { getPositionGroup?: (id: string) => Promise<PositionGroupRecord | null> }).getPositionGroup;
+    return typeof getGroup === "function" ? getGroup.call(database, groupId) : null;
   }
 
   private async editDashboardMessage(chatId: string, messageId: number, text: string, replyMarkup?: InlineKeyboard): Promise<void> {
@@ -838,6 +941,26 @@ export class Notifier {
     const base = `${index}. ${headerEmoji} ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}`;
     const valueLine = `   💰 ${cv} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${pnlArrow} ${pnlSign}${pnlPct}%${trailingPeak}`;
     return `${base}\n${valueLine}${rangeStr}\n`;
+  }
+
+  private async formatGroupStatusLine(position: PositionRecord, database: Database, index: number): Promise<string> {
+    const t0 = await this.tokenLabel(position.token0, position.chainId);
+    const t1 = await this.tokenLabel(position.token1, position.chainId);
+    const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
+    const snapshot = await database.getLatestPositionGroupPnlSnapshot(position.metadata.positionGroupId as string);
+    const status = typeof position.metadata.groupStatus === "string" ? position.metadata.groupStatus : position.status;
+    const statusLabel = status === "active" ? "" : ` · ${statusDisplay(status as PositionStatus)}`;
+    const bins = typeof position.metadata.mintableBinCount === "number" ? position.metadata.mintableBinCount : "?";
+    const lower = typeof position.metadata.outerTickLower === "number" ? position.metadata.outerTickLower : "?";
+    const upper = typeof position.metadata.outerTickUpper === "number" ? position.metadata.outerTickUpper : "?";
+    const base = `${index}. ${snapshot && snapshot.pnlBps < 0n ? "🔴" : "🟢"} BID-ASK ${shortHash(position.metadata.positionGroupId as string)} ${pair} · ${position.protocol.toUpperCase()}${statusLabel}`;
+    if (!snapshot) return `${base}\n   ⏳ LOADING · ${bins} bins · ticks ${lower} → ${upper}\n`;
+    const qtSymbol = this.quoteSymbol(position.quoteToken!);
+    const qtDec = await this.decimals(position.quoteToken!, position.chainId);
+    const value = formatToken(snapshot.liquidationQuote, qtDec, qtSymbol === "USDG" || qtSymbol === "USDC" ? 2 : 4);
+    const sign = snapshot.pnlBps >= 0n ? "+" : "";
+    const arrow = snapshot.pnlBps > 0n ? "📈" : snapshot.pnlBps < 0n ? "📉" : "➖";
+    return `${base}\n   💰 ${value} ${qtSymbol} · ${arrow} ${sign}${formatBps(snapshot.pnlBps)}% · ${bins} bins · ticks ${lower} → ${upper}\n`;
   }
 
   private async formatStatusLine(position: PositionRecord, pnl: PnlService, blockNumber: bigint | undefined, index: number): Promise<string> {
@@ -1252,6 +1375,92 @@ export class Notifier {
         await this.handleOpenPreview(ctx, pending.chain, pending.poolAddress, pending.rangePercent, amount, pending.quoteToken, pending.mode);
         return;
       }
+      if (pending.kind === "bid_ask_pool") {
+        if (!this.config.bidAskLadderEnabled) {
+          await this.replyTemp(ctx, "Bid-Ask Ladder sedang dimatikan.");
+          return;
+        }
+        const poolAddress = parseBidAskPoolInput(text, pending.chain);
+        if (!poolAddress) {
+          this.pendingInput.set(chatId, pending);
+          await this.replyTemp(ctx, "Pool tidak valid. Kirim V3 address, V4 pool ID, atau link pool Base/Robinhood.");
+          return;
+        }
+        this.pendingInput.set(chatId, { kind: "bid_ask_range", chain: pending.chain, poolAddress, dashboardMessageId: pending.dashboardMessageId });
+        await this.replyTemp(ctx, "Kirim range/drop satu sisi dalam persen, contoh: 60.", { reply_markup: { force_reply: true } as any });
+        return;
+      }
+      if (pending.kind === "bid_ask_range") {
+        if (!this.config.bidAskLadderEnabled) {
+          await this.replyTemp(ctx, "Bid-Ask Ladder sedang dimatikan.");
+          return;
+        }
+        const parsed = parseBidAskRangeInput(text);
+        if (!parsed) {
+          this.pendingInput.set(chatId, pending);
+          await this.replyTemp(ctx, "Range tidak valid. Gunakan angka 1-99.");
+          return;
+        }
+        this.pendingInput.set(chatId, {
+          kind: "bid_ask_bins",
+          chain: pending.chain,
+          poolAddress: pending.poolAddress,
+          direction: parsed.direction,
+          rangePercent: parsed.rangePercent,
+          dashboardMessageId: pending.dashboardMessageId,
+        });
+        await this.replyTemp(ctx, `Kirim jumlah bin (1-${this.config.bidAskLadderMaxBins}).`, { reply_markup: { force_reply: true } as any });
+        return;
+      }
+      if (pending.kind === "bid_ask_bins") {
+        if (!this.config.bidAskLadderEnabled) {
+          await this.replyTemp(ctx, "Bid-Ask Ladder sedang dimatikan.");
+          return;
+        }
+        const binCount = parseStrictPositiveInteger(text);
+        if (binCount === null || binCount > this.config.bidAskLadderMaxBins) {
+          this.pendingInput.set(chatId, pending);
+          await this.replyTemp(ctx, `Jumlah bin tidak valid. Gunakan integer 1-${this.config.bidAskLadderMaxBins}.`);
+          return;
+        }
+        if (!this.positionOpener) throw new Error("Position opener is not configured");
+        const quoteToken = await this.positionOpener.detectQuoteToken(pending.poolAddress, pending.chain);
+        this.pendingInput.set(chatId, {
+          kind: "bid_ask_amount",
+          chain: pending.chain,
+          poolAddress: pending.poolAddress,
+          direction: pending.direction,
+          rangePercent: pending.rangePercent,
+          binCount,
+          quoteToken,
+          dashboardMessageId: pending.dashboardMessageId,
+        });
+        const example = quoteToken.symbol === "USDG" || quoteToken.symbol === "USDC" ? "200" : "0.01";
+        await this.replyTemp(ctx, `Kirim jumlah deposit dalam ${quoteToken.symbol} (contoh: ${example}). Tidak ada opening swap; hanya ${quoteToken.symbol} yang dialokasikan ke bins.`, { reply_markup: { force_reply: true } as any });
+        return;
+      }
+      if (pending.kind === "bid_ask_amount") {
+        if (!this.config.bidAskLadderEnabled) {
+          await this.replyTemp(ctx, "Bid-Ask Ladder sedang dimatikan.");
+          return;
+        }
+        const amount = text.replace(/[$,\s]/g, "");
+        if (!isPositiveDecimalText(amount)) {
+          this.pendingInput.set(chatId, pending);
+          await this.replyTemp(ctx, "Jumlah tidak valid. Kirim angka positif.");
+          return;
+        }
+        await this.handleBidAskPreview(ctx, {
+          poolAddress: pending.poolAddress,
+          chain: pending.chain,
+          direction: pending.direction,
+          rangePercent: pending.rangePercent,
+          binCount: pending.binCount,
+          amount,
+          quoteToken: pending.quoteToken,
+        });
+        return;
+      }
       if (pending.kind === "risk") {
         const next = { ...this.riskSettings(), ...parseRiskSettingInput(pending.key, text) };
         await database.setGlobalRiskSettings(next);
@@ -1292,7 +1501,7 @@ export class Notifier {
     }
 
     const requestId = `${chatId}-${Date.now()}`;
-    this.openConfirmations.set(requestId, preview);
+    this.openConfirmations.set(requestId, { kind: "normal", preview });
 
     const depositFormatted = amount;
     const lines = [
@@ -1326,6 +1535,81 @@ export class Notifier {
       .text("✅ Confirm", `lp:open_confirm:${requestId}`)
       .text("❌ Cancel", `lp:open_cancel:0`);
     await this.replyTemp(ctx, lines.join("\n"), { reply_markup: keyboard as any }, 120_000);
+  }
+
+  private async handleBidAskPreview(
+    ctx: Context,
+    input: {
+      poolAddress: string;
+      chain: BidAskLadderChain;
+      direction: BidAskLadderDirection;
+      rangePercent: number;
+      binCount: number;
+      amount: string;
+      quoteToken: QuoteToken;
+    },
+  ): Promise<void> {
+    if (!this.positionOpener) {
+      await this.replyTemp(ctx, "❌ Position opener belum dikonfigurasi.");
+      return;
+    }
+    const prepare = optionalPositionOpenerMethod(this.positionOpener, ["prepareBidAskLadder", "prepareBidAskOpen", "prepareBidAsk"]);
+    if (!prepare) {
+      await this.replyTemp(ctx, "❌ Bid-Ask Ladder enabled, tetapi PositionOpener belum menyediakan metode ladder. Tidak ada transaksi yang disiapkan.");
+      return;
+    }
+
+    const chatId = ctx.chat!.id.toString();
+    let preview: BidAskLadderPreview;
+    let request: BidAskLadderOpenRequest;
+    try {
+      const decimals = await this.positionOpener.quoteTokenDecimals(input.chain, input.quoteToken.address);
+      request = {
+        poolAddress: input.poolAddress,
+        chain: input.chain,
+        direction: input.direction,
+        rangePercent: input.rangePercent,
+        binCount: input.binCount,
+        depositAmount: parseUnits(input.amount, decimals),
+        quoteToken: input.quoteToken,
+        protocols: this.config.bidAskLadderProtocols,
+        maxBins: this.config.bidAskLadderMaxBins,
+        maxPriceDeviationBps: this.config.bidAskLadderMaxPriceDeviationBps,
+        atomicMaxBlockGasBps: this.config.bidAskLadderAtomicMaxBlockGasBps,
+        transactionDeadlineSeconds: this.config.bidAskLadderTransactionDeadlineSeconds,
+        maxRetries: this.config.bidAskLadderMaxRetries,
+      };
+      const result = await Promise.resolve(prepare.name === "prepareBidAskOpen" || prepare.call.length > 1
+        ? prepare.call(this.positionOpener, request.poolAddress, request.chain, request.rangePercent, request.depositAmount, request.quoteToken, request.binCount)
+        : prepare.call(this.positionOpener, request));
+      if (!isRecord(result)) throw new Error("Bid-Ask ladder preview is invalid");
+      preview = result;
+      const protocol = stringValue(preview.protocol);
+      if (protocol && !this.config.bidAskLadderProtocols.includes(protocol as BidAskLadderProtocol)) {
+        throw new Error(`Bid-Ask protocol ${protocol} is disabled by BIDASK_LADDER_PROTOCOLS`);
+      }
+    } catch (error) {
+      await this.replyTemp(ctx, `❌ Gagal menyiapkan Bid-Ask Ladder: ${errorMessage(error).slice(0, 240)}`);
+      return;
+    }
+
+    const requestId = `${chatId}-${Date.now()}`;
+    this.openConfirmations.set(requestId, { kind: "bid_ask", request, preview });
+    const keyboard = new InlineKeyboard()
+      .text("✅ Confirm", `lp:open_confirm:${requestId}`)
+      .text("❌ Cancel", `lp:open_cancel:0`);
+    await this.replyTemp(ctx, formatBidAskLadderReview(preview, request), { reply_markup: keyboard as any }, 120_000);
+  }
+
+  private async executeBidAskLadder(preview: BidAskLadderPreview): Promise<{ hash: string | null }> {
+    if (!this.positionOpener) throw new Error("Position opener is not configured");
+    const execute = optionalPositionOpenerMethod(this.positionOpener, ["executeBidAskLadder", "executeBidAskOpen", "executeBidAsk"]);
+    if (!execute) throw new Error("Bid-Ask Ladder execution is not available yet");
+    const result = await Promise.resolve(execute.call(this.positionOpener, preview));
+    if (typeof result === "string") return { hash: result };
+    if (!isRecord(result)) return { hash: null };
+    const hash = stringValue(result.hash);
+    return { hash: hash ?? null };
   }
 
   private async poolScanSettings(database: Database, chatId: string): Promise<PoolScanSettings> {
@@ -1625,6 +1909,10 @@ export class Notifier {
         if (found) break;
       }
     }
+    if (!found) {
+      const group = await database.getPositionGroup(key);
+      if (group) found = groupDashboardPosition(group);
+    }
 
     if (!found) {
       await this.replyTemp(ctx, `Posisi "${key}" tidak ditemukan. Jalankan /status dulu, lalu gunakan nomor (contoh: /close 1) atau position key (contoh: /close 33850).`);
@@ -1639,10 +1927,19 @@ export class Notifier {
       return;
     }
 
-    await this.replyTemp(ctx, `Menutup ${found.protocol.toUpperCase()} #${found.positionKey}...`);
+    const groupId = managedPositionGroupId(found);
+    const closeTarget = groupId ? `BID-ASK parent ${shortHash(groupId)}` : `${found.protocol.toUpperCase()} #${found.positionKey}`;
+    await this.replyTemp(ctx, `Menutup ${closeTarget}...`);
     try {
-      await executor.execute(found, "manual");
-      await this.replyTemp(ctx, `Posisi ${found.positionKey} — penutupan dimulai.`);
+      if (groupId) {
+        const executeGroup = optionalExecutorMethod(executor, "executeGroup");
+        if (!executeGroup) throw new Error("Bid-Ask parent close is not available yet");
+        await executeGroup.call(executor, groupId, "manual");
+        await this.replyTemp(ctx, `${closeTarget} — atomic close dimulai.`);
+      } else {
+        await executor.execute(found, "manual");
+        await this.replyTemp(ctx, `Posisi ${found.positionKey} — penutupan dimulai.`);
+      }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       void message;
@@ -1743,7 +2040,7 @@ export class Notifier {
   }
 }
 
-function dashboardAction(type: "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "risk" | "risk_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset" | "open", page: number): string {
+function dashboardAction(type: "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "risk" | "risk_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset" | "open" | "open_ladder", page: number): string {
   return `lp:${type}:${page}`;
 }
 
@@ -1790,6 +2087,10 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
   if (parts.length === 4 && parts[0] === "lp" && parts[1] === "openmode" && (parts[2] === "single" || parts[2] === "dual")) {
     const page = parseDashboardPage(parts[3]);
     return page === null ? null : { type: "open_mode", mode: parts[2], page };
+  }
+  if (parts.length === 4 && parts[0] === "lp" && parts[1] === "open_ladder_chain" && isBidAskLadderChain(parts[2])) {
+    const page = parseDashboardPage(parts[3]);
+    return page === null ? null : { type: "open_ladder_chain", chain: parts[2], page };
   }
   if (parts.length === 3 && parts[0] === "lp" && isDashboardAction(parts[1])) {
     const page = parseDashboardPage(parts[2]);
@@ -1841,8 +2142,8 @@ function parseDashboardPage(value: string | undefined): number | null {
   return Number.isSafeInteger(page) ? page : null;
 }
 
-function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "risk" | "risk_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset" | "open" {
-  return value === "refresh" || value === "close" || value === "status" || value === "scan" || value === "scan_pools" || value === "config" || value === "config_reset" || value === "risk" || value === "risk_reset" || value === "history" || value === "pnl_card" || value === "bg_upload" || value === "bg_reset" || value === "open";
+function isDashboardAction(value: string | undefined): value is "refresh" | "close" | "status" | "scan" | "scan_pools" | "config" | "config_reset" | "risk" | "risk_reset" | "history" | "pnl_card" | "bg_upload" | "bg_reset" | "open" | "open_ladder" {
+  return value === "refresh" || value === "close" || value === "status" || value === "scan" || value === "scan_pools" || value === "config" || value === "config_reset" || value === "risk" || value === "risk_reset" || value === "history" || value === "pnl_card" || value === "bg_upload" || value === "bg_reset" || value === "open" || value === "open_ladder";
 }
 
 function monthLabel(year: number, month: number): string {
@@ -1865,6 +2166,10 @@ function isRiskSettingKey(value: string | undefined): value is RiskSettingKey {
   return value === "stop_loss" || value === "take_profit" || value === "trailing_activation" || value === "trailing_drawdown";
 }
 
+function isBidAskLadderChain(value: string | undefined): value is BidAskLadderChain {
+  return value === "base" || value === "robinhood";
+}
+
 export function isExpiredCallbackError(error: unknown): boolean {
   const message = errorMessage(error).toLowerCase();
   return message.includes("query is too old") || message.includes("response timeout expired") || message.includes("query id is invalid");
@@ -1872,6 +2177,215 @@ export function isExpiredCallbackError(error: unknown): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+export function formatBidAskLadderReview(preview: unknown, request: BidAskLadderOpenRequest): string {
+  const details = isRecord(preview) ? preview : {};
+  const plan = isRecord(details.plan) ? details.plan : details;
+  const protocol = (stringValue(firstValue(details.protocol, plan.protocol)) ?? request.protocols.join("/")).toUpperCase();
+  const pair = stringValue(firstValue(details.pair, plan.pair)) ?? `${request.quoteToken.symbol} / pool`;
+  const pool = stringValue(firstValue(details.poolAddress, plan.poolAddress)) ?? request.poolAddress;
+  const fee = stringValue(firstValue(details.feeLabel, plan.feeLabel, details.feeTier, plan.feeTier));
+  const currentPrice = stringValue(firstValue(details.currentPrice, plan.currentPrice));
+  const lowerPrice = stringValue(firstValue(details.lowerPrice, plan.lowerPrice));
+  const upperPrice = stringValue(firstValue(details.upperPrice, plan.upperPrice));
+  const poolKey = structuredValue(firstValue(details.v4PoolKey, plan.v4PoolKey, details.poolKey, plan.poolKey));
+  const outerLower = numberValue(firstValue(plan.outerTickLower, details.outerTickLower));
+  const outerUpper = numberValue(firstValue(plan.outerTickUpper, details.outerTickUpper));
+  const requested = numberValue(firstValue(plan.requestedBinCount, details.requestedBinCount)) ?? request.binCount;
+  const generated = numberValue(firstValue(plan.generatedBinCount, details.generatedBinCount)) ?? binArray(plan).length;
+  const mintable = numberValue(firstValue(plan.mintableBinCount, details.mintableBinCount)) ?? generated;
+  const skipped = numberValue(firstValue(plan.skippedBinCount, details.skippedBinCount)) ?? Math.max(0, requested - mintable);
+  const quoteDecimals = safeDecimals(firstValue(details.quoteTokenDecimals, plan.quoteTokenDecimals), request.quoteToken.symbol);
+  const token0Symbol = stringValue(firstValue(details.token0Symbol, plan.token0Symbol)) ?? "token0";
+  const token1Symbol = stringValue(firstValue(details.token1Symbol, plan.token1Symbol)) ?? "token1";
+  const token0Decimals = safeDecimals(firstValue(details.token0Decimals, plan.token0Decimals), token0Symbol);
+  const token1Decimals = safeDecimals(firstValue(details.token1Decimals, plan.token1Decimals), token1Symbol);
+  const bins = binArray(plan);
+
+  const lines = [
+    "🟣 BID-ASK LADDER — ATOMIC REVIEW",
+    `${protocol} | ${request.chain} | ${pair}`,
+    `Pool: ${pool}${fee ? ` | fee ${fee}` : ""}`,
+    ...(poolKey ? [`V4 pool key: ${poolKey}`] : []),
+    `One-sided range: ${request.rangePercent}% | quote-oriented | no opening swap`,
+    ...(currentPrice ? [`Current price: ${currentPrice}`] : []),
+    ...(lowerPrice && upperPrice
+      ? [`Outer range: ${lowerPrice} → ${upperPrice}`]
+      : outerLower !== undefined && outerUpper !== undefined
+        ? [`Outer ticks: ${outerLower} → ${outerUpper}`]
+        : []),
+    `Bins: requested ${requested} | generated ${generated} | skipped ${skipped} | mintable ${mintable}`,
+    `Deposit: ${formatToken(request.depositAmount, quoteDecimals)} ${request.quoteToken.symbol}`,
+    `Limits: ${request.maxPriceDeviationBps} bps price deviation | ${request.atomicMaxBlockGasBps} bps block gas | ${request.transactionDeadlineSeconds}s deadline | ${request.maxRetries} retries`,
+    "",
+    bins.length > 0 ? "Bin allocations:" : "Bin allocations: unavailable from PositionOpener preview",
+  ];
+
+  for (const [index, bin] of bins.entries()) {
+    const binIndex = numberValue(bin.index) ?? index;
+    const tickLower = numberValue(bin.tickLower);
+    const tickUpper = numberValue(bin.tickUpper);
+    const side = stringValue(bin.side) ?? (binIndex === numberValue(plan.anchorIndex) ? "anchor" : "");
+    let amount0 = bigintValue(bin.allocatedAmount0);
+    let amount1 = bigintValue(bin.allocatedAmount1);
+    const selectedAmount = bigintValue(bin.allocatedAmount);
+    if (selectedAmount !== null && amount0 === null && amount1 === null) {
+      if (side === "token0") amount0 = selectedAmount;
+      else amount1 = selectedAmount;
+    }
+    const amounts = [
+      amount0 === null ? null : `${formatToken(amount0, token0Decimals)} ${token0Symbol}`,
+      amount1 === null ? null : `${formatToken(amount1, token1Decimals)} ${token1Symbol}`,
+    ].filter((value): value is string => value !== null).join(" + ");
+    const weight = numberValue(bin.weightMicros);
+    const liquidity = bigintValue(bin.expectedLiquidity);
+    lines.push(`  bin ${binIndex}: ticks ${tickLower ?? "?"} → ${tickUpper ?? "?"} | ${side || "one-sided"}${weight === undefined ? "" : ` | weight ${weight}`} | ${amounts || "allocation pending"}${liquidity === null ? "" : ` | L ${liquidity.toString()}`}`);
+  }
+
+  const openGas = stringValue(firstValue(details.atomicOpenGasEstimate, details.openGasEstimate, details.estimatedOpenGas, details.estimatedGas, plan.atomicOpenGasEstimate));
+  const closeGas = stringValue(firstValue(details.atomicCloseGasEstimate, details.closeGasEstimate, details.estimatedCloseGas, plan.atomicCloseGasEstimate));
+  const closeFeasible = firstValue(details.atomicCloseFeasible, details.closeFeasible, plan.atomicCloseFeasible);
+  lines.push(
+    "",
+    `Atomic open: ${openGas ?? "estimate pending"}${typeof details.atomicBatchFeasible === "boolean" ? ` | feasible ${details.atomicBatchFeasible ? "yes" : "no"}` : ""}`,
+    `Projected atomic close: ${closeGas ?? "estimate pending"}${typeof closeFeasible === "boolean" ? ` | feasible ${closeFeasible ? "yes" : "no"}` : ""}`,
+    "Preparation: approval and wrap transactions are separate when required.",
+    "Invariant: one failed batch reverts every NFT in that batch; no sequential fallback.",
+    "",
+    "Review the complete bin allocation before confirming.",
+  );
+  return lines.join("\n");
+}
+
+function formatBidAskLadderTarget(preview: BidAskLadderPreview, request: BidAskLadderOpenRequest): string {
+  const protocol = stringValue(preview.protocol)?.toUpperCase() ?? request.protocols.join("/").toUpperCase();
+  const pair = stringValue(preview.pair) ?? `${request.quoteToken.symbol} / pool`;
+  return `${protocol} ${pair} | ${request.chain}`;
+}
+
+function optionalPositionOpenerMethod(opener: PositionOpener, names: readonly string[]): NamedBidAskOpenerMethod | undefined {
+  const record = opener as unknown as Record<string, unknown>;
+  for (const name of names) {
+    const method = record[name];
+    if (typeof method === "function") return { name, call: method as BidAskOpenerMethod };
+  }
+  return undefined;
+}
+
+function optionalExecutorMethod(executor: Executor, name: string): BidAskOpenerMethod | undefined {
+  const method = (executor as unknown as Record<string, unknown>)[name];
+  return typeof method === "function" ? method as BidAskOpenerMethod : undefined;
+}
+
+function managedPositionGroupId(position: PositionRecord): string | null {
+  const metadata = position.metadata;
+  const groupId = firstValue(metadata.positionGroupId, metadata.groupId);
+  return typeof groupId === "string" && groupId.length > 0 ? groupId : null;
+}
+
+function isManagedGroupChild(position: PositionRecord): boolean {
+  return position.metadata.managedBy === "position_group"
+    && typeof position.metadata.positionGroupId === "string"
+    && position.metadata.groupParent !== true;
+}
+
+function isGroupParent(position: PositionRecord): boolean {
+  return position.metadata.groupParent === true && typeof position.metadata.positionGroupId === "string";
+}
+
+function groupDashboardPosition(group: PositionGroupRecord): PositionRecord {
+  return {
+    id: group.id,
+    chainId: group.chainId,
+    protocol: group.protocol,
+    positionKey: group.id,
+    owner: group.owner,
+    poolAddress: group.protocol === "v3" ? group.poolKey as Address : null,
+    token0: group.token0,
+    token1: group.token1,
+    quoteToken: group.quoteToken,
+    status: groupPositionStatus(group.status),
+    liquidity: null,
+    openedAtBlock: group.referenceBlock,
+    metadata: {
+      ...group.metadata,
+      groupParent: true,
+      managedBy: "position_group",
+      positionGroupId: group.id,
+      groupStatus: group.status,
+      mintableBinCount: group.mintableBinCount,
+      outerTickLower: group.outerTickLower,
+      outerTickUpper: group.outerTickUpper,
+    },
+  };
+}
+
+function groupPositionStatus(status: PositionGroupRecord["status"]): PositionStatus {
+  if (status === "active") return "armed";
+  if (status === "closing" || status === "settling") return "closing";
+  if (status === "needs_review") return "needs_review";
+  if (status === "settled") return "settled";
+  if (status === "cancelled") return "paused";
+  return "syncing";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function firstValue(...values: unknown[]): unknown {
+  return values.find((value) => value !== undefined && value !== null);
+}
+
+function stringValue(value: unknown): string | undefined {
+  if (typeof value === "string" && value.length > 0) return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "bigint") return value.toString();
+  return undefined;
+}
+
+function structuredValue(value: unknown): string | undefined {
+  const primitive = stringValue(value);
+  if (primitive) return primitive;
+  if (!isRecord(value)) return undefined;
+  try {
+    return JSON.stringify(value, (_key, nested) => typeof nested === "bigint" ? nested.toString() : nested);
+  } catch {
+    return undefined;
+  }
+}
+
+function numberValue(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "bigint") {
+    const converted = Number(value);
+    return Number.isFinite(converted) ? converted : undefined;
+  }
+  if (typeof value === "string" && /^-?\d+(?:\.\d+)?$/.test(value)) {
+    const converted = Number(value);
+    return Number.isFinite(converted) ? converted : undefined;
+  }
+  return undefined;
+}
+
+function bigintValue(value: unknown): bigint | null {
+  if (typeof value === "bigint") return value;
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    try { return BigInt(value); } catch { return null; }
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value)) return BigInt(value);
+  return null;
+}
+
+function safeDecimals(value: unknown, symbol: string): number {
+  const explicit = numberValue(value);
+  if (explicit !== undefined && Number.isInteger(explicit) && explicit >= 0 && explicit <= 18) return explicit;
+  return symbol === "USDG" || symbol === "USDC" ? 6 : 18;
+}
+
+function binArray(value: Record<string, unknown>): Record<string, unknown>[] {
+  return Array.isArray(value.bins) ? value.bins.filter(isRecord) : [];
 }
 
 async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number, work: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -1948,6 +2462,61 @@ export function parseOpenPoolInput(raw: string): string | null {
   const identifier = parts[3]!;
   if (isAddress(identifier, { strict: false }) || /^0x[0-9a-fA-F]{64}$/.test(identifier)) return identifier.toLowerCase();
   return null;
+}
+
+export function parseBidAskPoolInput(raw: string, chain: BidAskLadderChain): string | null {
+  const value = raw.trim();
+  if (isAddress(value, { strict: false }) || /^0x[0-9a-fA-F]{64}$/.test(value)) return value.toLowerCase();
+
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" || url.hostname !== "app.uniswap.org") return null;
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts.length !== 4 || parts[0] !== "explore" || parts[1] !== "pools" || parts[2] !== chain) return null;
+  const identifier = parts[3]!;
+  return isAddress(identifier, { strict: false }) || /^0x[0-9a-fA-F]{64}$/.test(identifier)
+    ? identifier.toLowerCase()
+    : null;
+}
+
+export function parseBidAskRangeInput(raw: string): { direction: BidAskLadderDirection; rangePercent: number } | null {
+  let value = raw.trim().toLowerCase().replace(/%$/, "");
+  let direction: BidAskLadderDirection = "below";
+  if (value.startsWith("below")) {
+    direction = "below";
+    value = value.slice("below".length).trim();
+  } else if (value.startsWith("above")) {
+    direction = "above";
+    value = value.slice("above".length).trim();
+  } else if (value.startsWith("-")) {
+    direction = "below";
+    value = value.slice(1).trim();
+  } else if (value.startsWith("+")) {
+    direction = "above";
+    value = value.slice(1).trim();
+  }
+  if (!/^\d+(?:\.\d+)?$/.test(value)) return null;
+  const rangePercent = Number(value);
+  return Number.isFinite(rangePercent) && rangePercent > 0 && rangePercent < 100
+    ? { direction, rangePercent }
+    : null;
+}
+
+function parseStrictPositiveInteger(raw: string): number | null {
+  const value = raw.trim();
+  if (!/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function isPositiveDecimalText(value: string): boolean {
+  if (!/^\d+(?:\.\d+)?$/.test(value)) return false;
+  const [whole, fraction = ""] = value.split(".");
+  return !/^0+$/.test(whole ?? "") || /[1-9]/.test(fraction);
 }
 
 export function parseScanV2Input(raw: string): { chain: ChainName; token: Address; range: number } | null {

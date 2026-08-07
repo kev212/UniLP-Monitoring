@@ -70,6 +70,13 @@ const envSchema = z.object({
   KYBERSWAP_ENABLED: z.string().default("true"),
   KYBERSWAP_CLIENT_ID: z.string().trim().min(1).max(64).regex(/^[A-Za-z0-9._-]+$/).default("UniLP-Monitoring-kev212"),
   KYBERSWAP_MAX_ROUTE_AGE_MS: z.coerce.number().int().min(2_000).max(30_000).default(10_000),
+  BIDASK_LADDER_ENABLED: z.string().default("false"),
+  BIDASK_LADDER_PROTOCOLS: z.string().default("v3,v4"),
+  BIDASK_LADDER_MAX_BINS: strictInteger(1, 10_000, 16),
+  BIDASK_LADDER_MAX_PRICE_DEVIATION_BPS: strictInteger(0, 10_000, 100),
+  BIDASK_LADDER_ATOMIC_MAX_BLOCK_GAS_BPS: strictInteger(1, 10_000, 8_000),
+  BIDASK_LADDER_TRANSACTION_DEADLINE_SECONDS: strictInteger(1, 86_400, 300),
+  BIDASK_LADDER_MAX_RETRIES: strictInteger(0, 100, 3),
   THEGRAPH_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
   CONFIRMATIONS: z.coerce.number().int().min(1).max(32).default(2),
   SCAN_BLOCK_RANGE: z.coerce.number().int().min(100).max(100_000).default(2_000),
@@ -128,6 +135,13 @@ export interface RuntimeConfig {
   kyberswapEnabled: boolean;
   kyberswapClientId: string;
   kyberswapMaxRouteAgeMs: number;
+  bidAskLadderEnabled: boolean;
+  bidAskLadderProtocols: Array<"v3" | "v4">;
+  bidAskLadderMaxBins: number;
+  bidAskLadderMaxPriceDeviationBps: number;
+  bidAskLadderAtomicMaxBlockGasBps: number;
+  bidAskLadderTransactionDeadlineSeconds: number;
+  bidAskLadderMaxRetries: number;
   thegraphApiKey?: string;
   confirmations: number;
   scanBlockRange: bigint;
@@ -142,6 +156,25 @@ function parseBoolean(value: string, field: string): boolean {
   if (value === "true") return true;
   if (value === "false") return false;
   throw new Error(`${field} must be true or false`);
+}
+
+function strictInteger(min: number, max: number, defaultValue: number) {
+  return z.string()
+    .regex(/^\d+$/, "must be a base-10 integer")
+    .transform(Number)
+    .pipe(z.number().int().min(min).max(max))
+    .default(defaultValue);
+}
+
+function parseBidAskProtocols(value: string): Array<"v3" | "v4"> {
+  const protocols = value.split(",").map((protocol) => protocol.trim());
+  if (protocols.length === 0 || protocols.some((protocol) => protocol !== "v3" && protocol !== "v4")) {
+    throw new Error("BIDASK_LADDER_PROTOCOLS must contain only v3 and/or v4");
+  }
+  if (new Set(protocols).size !== protocols.length) {
+    throw new Error("BIDASK_LADDER_PROTOCOLS must not contain duplicates");
+  }
+  return protocols as Array<"v3" | "v4">;
 }
 
 function parseChains(value: string): ChainName[] {
@@ -298,6 +331,13 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     kyberswapEnabled: parseBoolean(env.KYBERSWAP_ENABLED, "KYBERSWAP_ENABLED"),
     kyberswapClientId: env.KYBERSWAP_CLIENT_ID,
     kyberswapMaxRouteAgeMs: env.KYBERSWAP_MAX_ROUTE_AGE_MS,
+    bidAskLadderEnabled: parseBoolean(env.BIDASK_LADDER_ENABLED, "BIDASK_LADDER_ENABLED"),
+    bidAskLadderProtocols: parseBidAskProtocols(env.BIDASK_LADDER_PROTOCOLS),
+    bidAskLadderMaxBins: env.BIDASK_LADDER_MAX_BINS,
+    bidAskLadderMaxPriceDeviationBps: env.BIDASK_LADDER_MAX_PRICE_DEVIATION_BPS,
+    bidAskLadderAtomicMaxBlockGasBps: env.BIDASK_LADDER_ATOMIC_MAX_BLOCK_GAS_BPS,
+    bidAskLadderTransactionDeadlineSeconds: env.BIDASK_LADDER_TRANSACTION_DEADLINE_SECONDS,
+    bidAskLadderMaxRetries: env.BIDASK_LADDER_MAX_RETRIES,
     thegraphApiKey: env.THEGRAPH_API_KEY,
     confirmations: env.CONFIRMATIONS,
     scanBlockRange: BigInt(env.SCAN_BLOCK_RANGE),

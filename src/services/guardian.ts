@@ -1,7 +1,7 @@
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, ExitTrigger, PnlSnapshot, PositionRecord } from "../types.js";
+import type { ChainName, ExitTrigger, PnlSnapshot, PositionGroupRecord, PositionRecord } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { AlchemyBootstrapper } from "./alchemy-bootstrap.js";
 import type { DiscoveryService } from "./discovery.js";
@@ -103,6 +103,7 @@ export class Guardian {
     const blockNumber = await client.getBlockNumber();
     const positions = (await this.database.listOpenPositions(registry.chain.id))
       .filter((position) => position.status === "needs_review"
+        && !isManagedGroupChild(position)
         && !hasPendingSettlement(position.status, position.metadata));
 
     for (const position of positions) {
@@ -148,14 +149,83 @@ export class Guardian {
     if (!registry.monitoringEnabled) return;
     const blockNumber = await client.getBlockNumber();
     if (this.lastEvaluatedBlock.get(registry.chain.id) === blockNumber) return;
+    const groups = (await this.database.listPositionGroups(registry.chain.id)).filter((group) => group.status === "active");
     const positions = (await this.database.listOpenPositions(registry.chain.id))
-      .filter((position) => position.status !== "needs_review" && position.status !== "failed" && position.status !== "paused");
-    const results = await mapWithConcurrency(
-      positions,
-      this.config.positionMonitorConcurrency,
-      (position) => this.evaluatePositionWithTimeout(name, position, blockNumber),
-    );
-    if (results.every(Boolean)) this.lastEvaluatedBlock.set(registry.chain.id, blockNumber);
+      .filter((position) => !isManagedGroupChild(position)
+        && position.status !== "needs_review" && position.status !== "failed" && position.status !== "paused");
+    const [groupResults, positionResults] = await Promise.all([
+      mapWithConcurrency(groups, this.config.positionMonitorConcurrency, (group) => this.evaluatePositionGroupWithTimeout(name, group, blockNumber)),
+      mapWithConcurrency(positions, this.config.positionMonitorConcurrency, (position) => this.evaluatePositionWithTimeout(name, position, blockNumber)),
+    ]);
+    if ([...groupResults, ...positionResults].every(Boolean)) this.lastEvaluatedBlock.set(registry.chain.id, blockNumber);
+  }
+
+  private async evaluatePositionGroupWithTimeout(name: ChainName, group: PositionGroupRecord, blockNumber: bigint): Promise<boolean> {
+    const evaluation = this.evaluatePositionGroup(name, group, blockNumber);
+    try {
+      return await withTimeout(evaluation, POSITION_EVALUATION_TIMEOUT_MS);
+    } catch (error) {
+      log.warn({ err: error, groupId: group.id, timeoutMs: POSITION_EVALUATION_TIMEOUT_MS }, "position group valuation timed out; continuing monitor cycle");
+      return true;
+    }
+  }
+
+  private async evaluatePositionGroup(name: ChainName, group: PositionGroupRecord, blockNumber: bigint): Promise<boolean> {
+    try {
+      const valued = await this.pnl.valueGroup(group, blockNumber);
+      const syntheticSnapshot: PnlSnapshot = {
+        positionId: group.id,
+        quoteToken: valued.snapshot.quoteToken,
+        depositsQuote: valued.snapshot.depositsQuote,
+        realizedQuote: valued.snapshot.realizedQuote,
+        liquidationQuote: valued.snapshot.liquidationQuote,
+        pnlQuote: valued.snapshot.pnlQuote,
+        pnlBps: valued.snapshot.pnlBps,
+        blockNumber: valued.snapshot.blockNumber,
+        feeQuote: valued.snapshot.feeQuote,
+        feeNonQuote: null,
+        feeQuoteUsdg: valued.snapshot.feeQuote,
+      };
+      const trailing = this.pnl.evaluateTrailingStop(group.metadata, syntheticSnapshot);
+      if (trailing.action === "reset") {
+        await this.database.setPositionGroupStatus(group.id, group.status, { trailingStop: null });
+      } else if (trailing.action === "activate" || trailing.action === "raise_peak") {
+        await this.database.setPositionGroupStatus(group.id, group.status, { trailingStop: trailing.state });
+      }
+
+      const quoteIsToken0 = group.quoteToken.toLowerCase() === group.token0.toLowerCase();
+      const staticTrigger = this.pnl.shouldTriggerGroup(valued.snapshot);
+      const oorTrigger = await this.updateGroupOorAboveTimer(group, valued.range);
+      const profitOorTrigger = await this.updateGroupProfitOorAboveTimer(group, valued.range, valued.snapshot.pnlBps);
+      const trigger = staticTrigger
+        ?? (trailing.action === "trigger" ? "trailing_take_profit" : null)
+        ?? profitOorTrigger
+        ?? oorTrigger;
+      if (!trigger || !valued.twapGuard.ready) return true;
+      if (trigger === "trailing_take_profit" && this.pnl.trailingExitEstimateGateBps(group.metadata) === null) {
+        await this.database.setPositionGroupStatus(group.id, "needs_review", { reason: "trailing_exit_state_missing", settlementRetryDisabled: true });
+        return true;
+      }
+      log.warn({ groupId: group.id, chain: name, trigger, pnlBps: valued.snapshot.pnlBps, quoteIsToken0 }, "position group exit triggered");
+      await this.executor.executeGroup(group.id, trigger);
+      return true;
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("cost basis")) {
+        log.warn({ err: error, groupId: group.id }, "position group cost basis is not yet available");
+        return false;
+      }
+      const reason = error instanceof Error ? error.message : String(error);
+      if (/Position group child|zero liquidity|NOT_MINTED|different pool|different token pair|ticks differ/i.test(reason)) {
+        await this.database.setPositionGroupStatus(group.id, "needs_review", {
+          reason: "position_group_child_integrity_changed",
+          correlationError: reason,
+          settlementRetryDisabled: true,
+        });
+        return true;
+      }
+      log.warn({ err: error, groupId: group.id }, "could not value position group");
+      return false;
+    }
   }
 
   private async evaluatePositionWithTimeout(name: ChainName, position: PositionRecord, blockNumber: bigint): Promise<boolean> {
@@ -371,7 +441,7 @@ export class Guardian {
   }
 
   private async resumeClosingPositions(): Promise<void> {
-    const positions = await this.database.listPendingSwapPositions();
+    const positions = (await this.database.listPendingSwapPositions()).filter((position) => !isManagedGroupChild(position));
     for (const position of positions) {
       try {
         if (position.status !== "closing") {
@@ -380,6 +450,21 @@ export class Guardian {
         await this.executor.resume({ ...position, status: "closing" });
       } catch (error) {
         log.warn({ err: error, positionId: position.id }, "settlement retry deferred");
+      }
+    }
+
+    const groups = await this.database.listPositionGroups();
+    for (const group of groups) {
+      const closeHash = group.closeTransactionHash ?? group.metadata.closeTransactionHash;
+      const recoverable = group.status === "closing"
+        || group.status === "settling"
+        || group.pendingRawTransaction !== null
+        || typeof closeHash === "string";
+      if (!recoverable) continue;
+      try {
+        await this.executor.executeGroup(group.id, typeof group.metadata.exitTrigger === "string" ? group.metadata.exitTrigger as import("../types.js").ExitTrigger : undefined);
+      } catch (error) {
+        log.warn({ err: error, groupId: group.id }, "position group settlement recovery deferred");
       }
     }
   }
@@ -539,6 +624,34 @@ export class Guardian {
     return "out_of_range_above";
   }
 
+  private async updateGroupOorAboveTimer(group: PositionGroupRecord, range?: import("../types.js").PositionRangeInfo): Promise<ExitTrigger | null> {
+    const meta = group.metadata as Record<string, unknown>;
+    const quoteIsToken0 = group.quoteToken.toLowerCase() === group.token0.toLowerCase();
+    const state = quoteRangeState(range, quoteIsToken0);
+    if (!state || !this.config.oorAutoCloseEnabled) return null;
+    const thresholdBps = BigInt(Math.round(this.config.oorAboveMinDistancePercent * 100));
+    const active = state.status === "above" && state.aboveDistanceBps >= thresholdBps;
+    if (active && typeof meta.oorAboveSeenAt !== "number") {
+      await this.database.setPositionGroupStatus(group.id, group.status, {
+        oorAboveSeenAt: Date.now(),
+        oorAboveDistanceBps: Number(state.aboveDistanceBps),
+        oorStatus: state.status,
+      });
+      return null;
+    }
+    if (!active && typeof meta.oorAboveSeenAt === "number") {
+      await this.database.setPositionGroupStatus(group.id, group.status, {
+        oorAboveSeenAt: null,
+        oorAboveDistanceBps: null,
+        oorStatus: state.status,
+      });
+      return null;
+    }
+    const seenAt = meta.oorAboveSeenAt;
+    if (typeof seenAt !== "number" || Date.now() - seenAt < this.config.oorAboveMinDurationMs) return null;
+    return "out_of_range_above";
+  }
+
   private async updateProfitOorAboveTimer(position: PositionRecord, range: import("../types.js").PositionRangeInfo | undefined, pnlBps: bigint): Promise<ExitTrigger | null> {
     const meta = position.metadata as Record<string, unknown>;
     const quoteIsToken0 = position.quoteToken?.toLowerCase() === position.token0.toLowerCase();
@@ -568,7 +681,39 @@ export class Guardian {
     return "profit_oor_above";
   }
 
+  private async updateGroupProfitOorAboveTimer(group: PositionGroupRecord, range: import("../types.js").PositionRangeInfo | undefined, pnlBps: bigint): Promise<ExitTrigger | null> {
+    const meta = group.metadata as Record<string, unknown>;
+    const quoteIsToken0 = group.quoteToken.toLowerCase() === group.token0.toLowerCase();
+    const state = quoteRangeState(range, quoteIsToken0);
+    if (!state) return null;
+    const thresholdBps = BigInt(Math.round(this.config.profitOorAboveThresholdPercent * 100));
+    const active = state.status === "above" && pnlBps >= thresholdBps;
+    if (active && typeof meta.profitOorAboveSeenAt !== "number") {
+      await this.database.setPositionGroupStatus(group.id, group.status, {
+        profitOorAboveSeenAt: Date.now(),
+        profitOorAbovePnlBps: Number(pnlBps),
+      });
+      return null;
+    }
+    if (!active && typeof meta.profitOorAboveSeenAt === "number") {
+      await this.database.setPositionGroupStatus(group.id, group.status, {
+        profitOorAboveSeenAt: null,
+        profitOorAbovePnlBps: null,
+      });
+      return null;
+    }
+    const seenAt = meta.profitOorAboveSeenAt;
+    if (typeof seenAt !== "number" || Date.now() - seenAt < this.config.oorAboveProfitDurationMs) return null;
+    return "profit_oor_above";
+  }
+
 }
+
+function isManagedGroupChild(position: PositionRecord): boolean {
+  return position.metadata.managedBy === "position_group"
+    && typeof position.metadata.positionGroupId === "string";
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

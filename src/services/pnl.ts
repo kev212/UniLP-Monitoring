@@ -4,13 +4,22 @@ import { chainRegistry } from "../chains.js";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ExitTrigger, LiquidationQuote, PnlSnapshot, PositionRangeInfo, PositionRecord, TrailingStopState } from "../types.js";
+import type {
+  ExitTrigger,
+  LiquidationQuote,
+  PnlSnapshot,
+  PositionGroupPnlSnapshot,
+  PositionGroupRecord,
+  PositionRangeInfo,
+  PositionRecord,
+  TrailingStopState,
+} from "../types.js";
 import type { KyberSwapAggregatorApi } from "./kyberswap-aggregator-api.js";
 import type { PositionReader } from "./position-reader.js";
 import type { RoutePlanner } from "./route-planner.js";
 import type { UniswapTradingApi } from "./uniswap-trading-api.js";
 import { quoteRangeState } from "./quote-range.js";
-import { applySlippage } from "./uniswap-math.js";
+import { applySlippage, sqrtRatioAtTick } from "./uniswap-math.js";
 
 const POSITION_READ_TIMEOUT_MS = 15_000;
 const ROUTE_QUOTE_TIMEOUT_MS = 15_000;
@@ -18,6 +27,13 @@ const ROUTE_QUOTE_TIMEOUT_MS = 15_000;
 export interface ValuedPosition {
   snapshot: PnlSnapshot;
   liquidation: LiquidationQuote;
+  twapGuard: { ready: boolean; deviationBps?: bigint };
+  range?: PositionRangeInfo;
+}
+
+export interface ValuedPositionGroup {
+  snapshot: PositionGroupPnlSnapshot;
+  liquidation: Pick<LiquidationQuote, "token0Amount" | "token1Amount" | "nonQuoteInput" | "quoteOutput" | "route" | "blockNumber">;
   twapGuard: { ready: boolean; deviationBps?: bigint };
   range?: PositionRangeInfo;
 }
@@ -144,7 +160,101 @@ export class PnlService {
     return this.value(position, blockNumber, quoteSlippageBps, false, true);
   }
 
+  async valueGroup(
+    group: PositionGroupRecord,
+    blockNumber: bigint,
+    quoteSlippageBps = this.config.maxSwapSlippageBps,
+    recordSnapshot = true,
+    localOnly = false,
+  ): Promise<ValuedPositionGroup> {
+    const childRows = (await this.database.listPositionGroupChildren(group.id))
+      .filter((child) => child.bin.status === "minted" && child.position !== null);
+    const children = childRows.map((child) => child.position!);
+    if (children.length === 0) throw new Error("Position group has no active children to value");
+
+    const values = await Promise.all(children.map((position) => this.reader.read(position, blockNumber)));
+    for (let index = 0; index < values.length; index += 1) {
+      const value = values[index]!;
+      const bin = childRows[index]!.bin;
+      if (value.liquidity <= 0n) throw new Error(`Position group child ${children[index]!.positionKey} has zero liquidity`);
+      if (value.poolKey.toLowerCase() !== group.poolKey.toLowerCase()) throw new Error(`Position group child ${children[index]!.positionKey} resolved to a different pool`);
+      if (value.token0.token.toLowerCase() !== group.token0.toLowerCase() || value.token1.token.toLowerCase() !== group.token1.toLowerCase()) {
+        throw new Error(`Position group child ${children[index]!.positionKey} resolved to a different token pair`);
+      }
+      if (!value.range || value.range.tickLower !== bin.tickLower || value.range.tickUpper !== bin.tickUpper) {
+        throw new Error(`Position group child ${children[index]!.positionKey} ticks differ from bin ${bin.binIndex}`);
+      }
+    }
+    const token0Amount = values.reduce((total, value) => total + value.token0.amount, 0n);
+    const token1Amount = values.reduce((total, value) => total + value.token1.amount, 0n);
+    const token0Fee = values.reduce((total, value) => total + value.unclaimedFees0, 0n);
+    const token1Fee = values.reduce((total, value) => total + value.unclaimedFees1, 0n);
+    const quoteIsToken0 = group.quoteToken.toLowerCase() === group.token0.toLowerCase();
+    if (!quoteIsToken0 && group.quoteToken.toLowerCase() !== group.token1.toLowerCase()) {
+      throw new Error("Position group quote token is not part of the child pair");
+    }
+    const quoteAmount = quoteIsToken0 ? token0Amount : token1Amount;
+    const nonQuote = quoteIsToken0
+      ? { token: group.token1, amount: token1Amount }
+      : { token: group.token0, amount: token0Amount };
+    const quoteFee = quoteIsToken0 ? token0Fee : token1Fee;
+    const nonQuoteFee = quoteIsToken0 ? token1Fee : token0Fee;
+    const [route, feeRoute] = await Promise.all([
+      this.quoteFresh(children[0]!, nonQuote.token, nonQuote.amount, group.quoteToken, quoteSlippageBps, localOnly),
+      this.quoteFresh(children[0]!, nonQuote.token, nonQuoteFee, group.quoteToken, quoteSlippageBps, localOnly),
+    ]);
+    if (nonQuote.amount > 0n && !route) throw new Error("No safe direct Uniswap route from group LP asset to quote token");
+
+    const liquidationQuote = quoteAmount + (route?.minimumOut ?? 0n);
+    const feeQuote = quoteFee + (feeRoute?.minimumOut ?? 0n);
+    const totals = await this.database.getPositionGroupCashflowTotals(group.id);
+    const deposits = totals.deposits > 0n ? totals.deposits : group.deployedCostQuote;
+    if (deposits <= 0n) throw new Error("Position group cost basis has not been reconstructed");
+    const realizedQuote = totals.realized + feeQuote;
+    const pnlQuote = realizedQuote + liquidationQuote - deposits;
+    const pnlBps = (pnlQuote * 10_000n) / deposits;
+    const sourceRange = values.find((value) => value.range)?.range;
+    const currentTick = sourceRange?.currentTick ?? group.referenceTick ?? 0;
+    const currentSqrtPrice = sourceRange?.currentSqrtPrice ?? group.referencePrice ?? 0n;
+    const range = groupRange(group, currentTick, currentSqrtPrice);
+    const twapGuard = await this.recordAndCheckPrice(children[0]!, group.poolKey, values[0]!.priceMarker, blockNumber);
+    const snapshot: PositionGroupPnlSnapshot = {
+      groupId: group.id,
+      quoteToken: group.quoteToken,
+      depositsQuote: deposits,
+      realizedQuote,
+      liquidationQuote,
+      feeQuote,
+      pnlQuote,
+      pnlBps,
+      blockNumber,
+      groupGasQuote: 0n,
+    };
+    if (recordSnapshot) await this.database.addPositionGroupPnlSnapshot(snapshot);
+    return {
+      snapshot,
+      liquidation: {
+        token0Amount,
+        token1Amount,
+        nonQuoteInput: nonQuote.amount > 0n ? nonQuote : null,
+        quoteOutput: route?.expectedOut ?? 0n,
+        route: route?.path ?? [],
+        blockNumber,
+      },
+      twapGuard,
+      range,
+    };
+  }
+
   shouldTrigger(snapshot: PnlSnapshot, range: PositionRangeInfo | undefined, quoteIsToken0: boolean): ExitTrigger | null {
+    const stopLossBps = percentToBps(this.config.stopLossPercent);
+    const takeProfitBps = percentToBps(this.config.takeProfitPercent);
+    if (snapshot.pnlBps <= stopLossBps) return "stop_loss";
+    if (snapshot.pnlBps >= takeProfitBps) return "take_profit";
+    return null;
+  }
+
+  shouldTriggerGroup(snapshot: PositionGroupPnlSnapshot): ExitTrigger | null {
     const stopLossBps = percentToBps(this.config.stopLossPercent);
     const takeProfitBps = percentToBps(this.config.takeProfitPercent);
     if (snapshot.pnlBps <= stopLossBps) return "stop_loss";
@@ -242,6 +352,28 @@ export class PnlService {
     const deviationBps = (difference * 10_000n) / previous.priceMarker;
     return { ready: deviationBps <= BigInt(this.config.maxTwapDeviationBps), deviationBps };
   }
+}
+
+function groupRange(group: PositionGroupRecord, currentTick: number, currentSqrtPrice: bigint): PositionRangeInfo {
+  if (currentTick >= group.outerTickUpper) {
+    const upperSqrt = sqrtRatioAtTick(group.outerTickUpper);
+    const denominator = upperSqrt * upperSqrt;
+    const aboveDistanceBps = denominator > 0n && currentSqrtPrice > upperSqrt
+      ? (currentSqrtPrice * currentSqrtPrice * 10_000n) / denominator - 10_000n
+      : 0n;
+    return {
+      tickLower: group.outerTickLower,
+      tickUpper: group.outerTickUpper,
+      currentTick,
+      currentSqrtPrice,
+      status: "above",
+      aboveDistanceBps,
+    };
+  }
+  if (currentTick < group.outerTickLower) {
+    return { tickLower: group.outerTickLower, tickUpper: group.outerTickUpper, currentTick, currentSqrtPrice, status: "below" };
+  }
+  return { tickLower: group.outerTickLower, tickUpper: group.outerTickUpper, currentTick, currentSqrtPrice, status: "in_range" };
 }
 
 function percentToBps(percent: number): bigint {

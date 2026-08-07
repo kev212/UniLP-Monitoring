@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { encodeAbiParameters, keccak256, pad, stringToHex, zeroAddress, type Address, type Hex } from "viem";
+import { decodeFunctionData, encodeAbiParameters, keccak256, pad, stringToHex, toFunctionSelector, toHex, zeroAddress, type Address, type Hex } from "viem";
 
+import { v3PositionManagerAbi, v4PositionManagerAbi } from "../src/abi.js";
 import type { RuntimeConfig } from "../src/config.js";
 import { bufferedGasLimit, Executor, effectiveRemoveSlippageBps, nextExitRetry, nextSwapRetry, receiptErc20NetReceived } from "../src/services/executor.js";
-import type { PositionRecord } from "../src/types.js";
+import type { PositionGroupBinRecord, PositionGroupRecord, PositionRecord } from "../src/types.js";
 
 const usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as const;
 const weth = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73" as const;
@@ -12,6 +13,9 @@ const nvda = "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec" as const;
 const owner = "0xeE924367213Ae3764b57d5b9a6214c8188d34060" as const;
 const sender = "0x0000000000000000000000000000000000000002" as const;
 const hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
+const groupId = "group";
+const groupManager = "0x0000000000000000000000000000000000000100" as Address;
+const groupPool = "0x0000000000000000000000000000000000000200" as Address;
 
 function transferLog(tokenAddress: Address, from: Address, to: Address, value: bigint) {
   return {
@@ -22,6 +26,19 @@ function transferLog(tokenAddress: Address, from: Address, to: Address, value: b
       pad(to, { size: 32 }),
     ] as Hex[],
     data: encodeAbiParameters([{ type: "uint256" }], [value]),
+  };
+}
+
+function nftBurnLog(tokenAddress: Address, from: Address, tokenId: bigint) {
+  return {
+    address: tokenAddress,
+    topics: [
+      keccak256(stringToHex("Transfer(address,address,uint256)")),
+      pad(from, { size: 32 }),
+      pad(zeroAddress, { size: 32 }),
+      pad(toHex(tokenId), { size: 32 }),
+    ] as Hex[],
+    data: "0x" as Hex,
   };
 }
 
@@ -40,6 +57,121 @@ const config = {
   removeLiquidityMaxSlippageBps: 500,
   confirmations: 1,
 } as RuntimeConfig;
+
+function groupRecord(protocol: "v3" | "v4" = "v3"): PositionGroupRecord {
+  return {
+    id: groupId,
+    chainId: 4663,
+    protocol,
+    positionManager: groupManager,
+    poolKey: groupPool,
+    owner,
+    token0: usdg,
+    token1: token,
+    quoteToken: usdg,
+    shape: "bid_ask",
+    shapeVersion: "delta-amount-linear-v1",
+    requestedBinCount: 2,
+    generatedBinCount: 2,
+    mintableBinCount: 2,
+    outerTickLower: -120,
+    outerTickUpper: 0,
+    anchorBinIndex: 0,
+    totalDeposit: 100n,
+    deployedCostQuote: 100n,
+    directCloseAmount0: 0n,
+    directCloseAmount1: 0n,
+    totalReceivedQuote: 0n,
+    status: "active",
+    planHash: "plan",
+    planJson: {},
+    referenceBlock: 100n,
+    referenceTick: -100,
+    referencePrice: 1n,
+    openTransactionHash: null,
+    closeTransactionHash: null,
+    pendingRawTransaction: null,
+    executionLeaseToken: null,
+    executionLeaseUntil: null,
+    finalPnlQuote: null,
+    finalPnlBps: null,
+    finalPnlUsd: null,
+    settledAt: null,
+    metadata: {},
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  };
+}
+
+function groupBin(index: number, tokenId: bigint, positionId: string, lower: number, upper: number): PositionGroupBinRecord {
+  return {
+    id: `bin-${index}`,
+    groupId,
+    chainId: 4663,
+    positionManager: groupManager,
+    binIndex: index,
+    tickLower: lower,
+    tickUpper: upper,
+    side: "token0",
+    weightMicros: 1,
+    allocatedAmount0: 50n,
+    allocatedAmount1: 0n,
+    expectedLiquidity: 10n,
+    expectedAmount0: 50n,
+    expectedAmount1: 0n,
+    tokenId,
+    positionId,
+    openingAmount0: 50n,
+    openingAmount1: 0n,
+    closeAmount0: 0n,
+    closeAmount1: 0n,
+    settlementQuote: 0n,
+    status: "minted",
+    dropReason: null,
+    openTransactionHash: null,
+    closeTransactionHash: null,
+    metadata: {},
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  };
+}
+
+function groupChild(id: string, tokenId: bigint): PositionRecord {
+  return {
+    id,
+    chainId: 4663,
+    protocol: "v3",
+    positionKey: tokenId.toString(),
+    owner,
+    poolAddress: groupPool,
+    token0: usdg,
+    token1: token,
+    quoteToken: usdg,
+    status: "armed",
+    liquidity: 10n,
+    openedAtBlock: 90n,
+    metadata: { positionGroupId: groupId },
+  };
+}
+
+function groupValue(lower: number, upper: number, liquidity = 10n) {
+  return {
+    protocol: "v3" as const,
+    poolKey: groupPool,
+    sourcePool: groupPool,
+    token0: { token: usdg, amount: 50n },
+    token1: { token, amount: 0n },
+    liquidity,
+    priceMarker: 1n,
+    v3Fee: 500,
+    minAmount0: 40n,
+    minAmount1: 0n,
+    range: { tickLower: lower, tickUpper: upper, currentTick: -200, currentSqrtPrice: 1n, status: "below" as const },
+    unclaimedFees0: 1n,
+    unclaimedFees1: 0n,
+    observedBlock: 100n,
+  };
+}
 
 describe("Executor pending settlement recovery", () => {
   it("unwraps only a WETH quote settlement and leaves USDG and native ETH unchanged", async () => {
@@ -805,5 +937,98 @@ describe("Executor pending settlement recovery", () => {
     }));
     expect(database.recordExecution).toHaveBeenCalledWith("position", "remove_liquidity", "confirmed", hash);
     expect(notifier.settled).toHaveBeenCalledWith(position);
+  });
+
+  it("closes every V3 Bid-Ask child in one outer multicall and accounts one parent receipt", async () => {
+    const group = groupRecord();
+    const children = [groupChild("child-7", 7n), groupChild("child-8", 8n)];
+    const bins = [groupBin(0, 7n, "child-7", -120, -60), groupBin(1, 8n, "child-8", -60, 0)];
+    const client = {
+      getBlockNumber: vi.fn().mockResolvedValue(100n),
+      readContract: vi.fn().mockResolvedValue(owner),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const receipt = {
+      status: "success" as const,
+      blockNumber: 101n,
+      logs: [
+        transferLog(usdg, sender, owner, 23n),
+        transferLog(token, sender, owner, 118n),
+        nftBurnLog(groupManager, owner, 7n),
+        nftBurnLog(groupManager, owner, 8n),
+      ],
+    };
+    const database = {
+      getPositionGroup: vi.fn().mockResolvedValue(group),
+      listPositionGroupBins: vi.fn().mockResolvedValue(bins),
+      listActivePositions: vi.fn().mockResolvedValue(children),
+      claimPositionGroupLease: vi.fn().mockResolvedValue(true),
+      releasePositionGroupLease: vi.fn().mockResolvedValue(undefined),
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      withExecutionLock: vi.fn(async (_chainId: number, _address: Address, work: () => Promise<unknown>) => work()),
+      recordPositionGroupExecution: vi.fn().mockResolvedValue(undefined),
+      addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const reader = {
+      read: vi.fn((position: PositionRecord) => Promise.resolve(position.positionKey === "7" ? groupValue(-120, -60) : groupValue(-60, 0))),
+    };
+    const executor = new Executor(database as never, chains as never, reader as never, {} as never, { transaction: vi.fn() } as never, config);
+    const closeReceiptAmounts = vi.spyOn(executor as any, "closeReceiptAmounts");
+    (executor as any).confirmedReceipts.set(hash, receipt);
+    const sendGroup = vi.spyOn(executor as any, "sendGroup").mockResolvedValue(hash);
+
+    await executor.executeGroup(groupId, "manual");
+
+    expect(reader.read).toHaveBeenNthCalledWith(1, children[0], 100n, 200);
+    expect(reader.read).toHaveBeenNthCalledWith(2, children[1], 100n, 200);
+    expect(sendGroup).toHaveBeenCalledTimes(1);
+    const plan = sendGroup.mock.calls[0]![2] as { data: Hex };
+    const outer = decodeFunctionData({ abi: v3PositionManagerAbi, data: plan.data });
+    expect(plan.data.slice(0, 10)).toBe(toFunctionSelector("multicall(bytes[])") as string);
+    expect(outer.args[0]).toHaveLength(6);
+    expect(database.addPositionGroupCashflow).toHaveBeenCalledTimes(1);
+    expect(database.addPositionGroupCashflow).toHaveBeenCalledWith(
+      groupId,
+      101n,
+      hash,
+      "close_receipt",
+      23n,
+      23n,
+      118n,
+      expect.objectContaining({ source: "atomic_group_close", childCount: 2 }),
+    );
+    expect(closeReceiptAmounts).not.toHaveBeenCalled();
+  });
+
+  it("keeps all Bid-Ask children active and the parent retryable when the batch reverts", async () => {
+    const group = groupRecord();
+    const children = [groupChild("child-7", 7n), groupChild("child-8", 8n)];
+    const bins = [groupBin(0, 7n, "child-7", -120, -60), groupBin(1, 8n, "child-8", -60, 0)];
+    const database = {
+      getPositionGroup: vi.fn().mockResolvedValue(group),
+      listPositionGroupBins: vi.fn().mockResolvedValue(bins),
+      listActivePositions: vi.fn().mockResolvedValue(children),
+      claimPositionGroupLease: vi.fn().mockResolvedValue(true),
+      releasePositionGroupLease: vi.fn().mockResolvedValue(undefined),
+      recordPositionGroupExecution: vi.fn().mockResolvedValue(undefined),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+    };
+    const client = {
+      getBlockNumber: vi.fn().mockResolvedValue(100n),
+      readContract: vi.fn().mockResolvedValue(owner),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const reader = { read: vi.fn((position: PositionRecord) => Promise.resolve(position.positionKey === "7" ? groupValue(-120, -60) : groupValue(-60, 0))) };
+    const executor = new Executor(database as never, chains as never, reader as never, {} as never, {} as never, config);
+    vi.spyOn(executor as any, "sendGroup").mockRejectedValue(new Error("close_batch transaction reverted"));
+
+    await expect(executor.executeGroup(groupId, "stop_loss")).rejects.toThrow("close_batch transaction reverted");
+
+    expect(database.setPositionGroupStatus).toHaveBeenLastCalledWith(groupId, "active", expect.objectContaining({ reason: "close_batch transaction reverted" }));
+    expect(database.recordPositionGroupExecution).toHaveBeenCalledWith(groupId, "close_batch", "failed", undefined, undefined, undefined, "close_batch transaction reverted");
+    expect(database).not.toHaveProperty("setPositionStatus");
   });
 });

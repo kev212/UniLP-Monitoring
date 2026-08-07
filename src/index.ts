@@ -41,7 +41,14 @@ async function main(): Promise<void> {
   const executor = new Executor(database, chains, reader, routes, notifier, config, tradingApi, kyberswapApi);
   const guardian = new Guardian(config, database, chains, alchemyBootstrapper, discovery, pnl, executor, notifier);
   const scanner = new PoolScanner(chains, database);
-  const positionOpener = new PositionOpener(config, chains, routes, tradingApi);
+  const positionOpener = new PositionOpener(
+    config,
+    chains,
+    routes,
+    tradingApi,
+    database,
+    (chain, groupId, transactionHash) => discovery.reconcileKnownGroupOpen(chain, groupId, transactionHash),
+  );
   const gemScanner = new GemScanner(chains, database, scanner, config.quoteTokens.robinhood);
   const portfolio = new PortfolioService(config, chains, database);
   notifier.setPositionOpener(positionOpener);

@@ -82,6 +82,37 @@ describe("loadConfig", () => {
     });
     expect(config.poolScanCandidatePages).toBe(3);
     expect(config.scanV2Enabled).toBe(false);
+    expect(config.bidAskLadderEnabled).toBe(false);
+    expect(config.bidAskLadderProtocols).toEqual(["v3", "v4"]);
+    expect(config.bidAskLadderMaxBins).toBe(16);
+    expect(config.bidAskLadderMaxPriceDeviationBps).toBe(100);
+    expect(config.bidAskLadderAtomicMaxBlockGasBps).toBe(8_000);
+    expect(config.bidAskLadderTransactionDeadlineSeconds).toBe(300);
+    expect(config.bidAskLadderMaxRetries).toBe(3);
+  });
+
+  it("strictly parses Bid-Ask ladder settings", () => {
+    const config = loadConfig(environment({
+      BIDASK_LADDER_ENABLED: "true",
+      BIDASK_LADDER_PROTOCOLS: "v4",
+      BIDASK_LADDER_MAX_BINS: "4",
+      BIDASK_LADDER_MAX_PRICE_DEVIATION_BPS: "125",
+      BIDASK_LADDER_ATOMIC_MAX_BLOCK_GAS_BPS: "7500",
+      BIDASK_LADDER_TRANSACTION_DEADLINE_SECONDS: "600",
+      BIDASK_LADDER_MAX_RETRIES: "0",
+    }));
+
+    expect(config.bidAskLadderEnabled).toBe(true);
+    expect(config.bidAskLadderProtocols).toEqual(["v4"]);
+    expect(config.bidAskLadderMaxBins).toBe(4);
+    expect(config.bidAskLadderMaxPriceDeviationBps).toBe(125);
+    expect(config.bidAskLadderAtomicMaxBlockGasBps).toBe(7_500);
+    expect(config.bidAskLadderTransactionDeadlineSeconds).toBe(600);
+    expect(config.bidAskLadderMaxRetries).toBe(0);
+
+    expect(() => loadConfig(environment({ BIDASK_LADDER_ENABLED: "yes" }))).toThrow("BIDASK_LADDER_ENABLED");
+    expect(() => loadConfig(environment({ BIDASK_LADDER_PROTOCOLS: "v2" }))).toThrow("BIDASK_LADDER_PROTOCOLS");
+    expect(() => loadConfig(environment({ BIDASK_LADDER_MAX_BINS: "4.5" }))).toThrow("BIDASK_LADDER_MAX_BINS");
   });
 
   it("enables scanv2 only when explicitly configured", () => {

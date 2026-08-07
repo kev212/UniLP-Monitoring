@@ -1,7 +1,29 @@
 import { Pool, type PoolClient } from "pg";
 import type { Address } from "viem";
 
-import type { CloseHistoryRecord, PnlCalendarMonth, PnlCardDetail, PnlSnapshot, PoolScanSettings, PositionRecord, PositionStatus, Protocol, RiskSettings, TrailingStopState } from "./types.js";
+import type {
+  CloseHistoryRecord,
+  PnlCalendarMonth,
+  PnlCardDetail,
+  PnlSnapshot,
+  PoolScanSettings,
+  PositionGroupBinRecord,
+  PositionGroupBinSide,
+  PositionGroupBinStatus,
+  PositionGroupCashflowTotals,
+  PositionGroupCashflowType,
+  PositionGroupExecutionStage,
+  PositionGroupExecutionStatus,
+  PositionGroupPnlSnapshot,
+  PositionGroupPnlSnapshotRecord,
+  PositionGroupRecord,
+  PositionGroupStatus,
+  PositionRecord,
+  PositionStatus,
+  Protocol,
+  RiskSettings,
+  TrailingStopState,
+} from "./types.js";
 
 const HISTORY_MIN_PNL_BPS = 50n;
 
@@ -19,6 +41,113 @@ interface PositionRow {
   liquidity: string | null;
   opened_at_block: string | null;
   metadata: Record<string, unknown>;
+}
+
+interface PositionGroupRow {
+  id: string;
+  chain_id: number;
+  protocol: Protocol;
+  position_manager: string;
+  pool_key: string;
+  owner: string;
+  token0: string;
+  token1: string;
+  quote_token: string;
+  shape: "bid_ask";
+  shape_version: "delta-amount-linear-v1";
+  requested_bin_count: number;
+  generated_bin_count: number;
+  mintable_bin_count: number;
+  outer_tick_lower: number;
+  outer_tick_upper: number;
+  anchor_bin_index: number;
+  total_deposit: string;
+  deployed_cost_quote: string;
+  direct_close_amount0: string;
+  direct_close_amount1: string;
+  total_received_quote: string;
+  status: PositionGroupStatus;
+  plan_hash: string;
+  plan_json: Record<string, unknown>;
+  reference_block: string | null;
+  reference_tick: number | null;
+  reference_price: string | null;
+  open_transaction_hash: string | null;
+  close_transaction_hash: string | null;
+  pending_raw_transaction: Record<string, unknown> | null;
+  execution_lease_token: string | null;
+  execution_lease_until: Date | string | null;
+  final_pnl_quote: string | null;
+  final_pnl_bps: string | null;
+  final_pnl_usd: string | null;
+  settled_at: Date | string | null;
+  metadata: Record<string, unknown>;
+  created_at: Date | string;
+  updated_at: Date | string;
+}
+
+interface PositionGroupBinRow {
+  id: string;
+  group_id: string;
+  chain_id: number;
+  position_manager: string;
+  bin_index: number;
+  tick_lower: number;
+  tick_upper: number;
+  side: PositionGroupBinSide;
+  weight_micros: number;
+  allocated_amount0: string;
+  allocated_amount1: string;
+  expected_liquidity: string;
+  expected_amount0: string;
+  expected_amount1: string;
+  token_id: string | null;
+  position_id: string | null;
+  opening_amount0: string;
+  opening_amount1: string;
+  close_amount0: string;
+  close_amount1: string;
+  settlement_quote: string;
+  status: PositionGroupBinStatus;
+  drop_reason: string | null;
+  open_transaction_hash: string | null;
+  close_transaction_hash: string | null;
+  metadata: Record<string, unknown>;
+  created_at: Date | string;
+  updated_at: Date | string;
+}
+
+export interface PositionGroupBinPatch {
+  tokenId?: bigint | null;
+  positionId?: string | null;
+  status?: PositionGroupBinStatus;
+  openTransactionHash?: string | null;
+  closeTransactionHash?: string | null;
+  openingAmount0?: bigint;
+  openingAmount1?: bigint;
+  closeAmount0?: bigint;
+  closeAmount1?: bigint;
+  settlementQuote?: bigint;
+}
+
+export interface PositionGroupChildRecord {
+  bin: PositionGroupBinRecord;
+  position: PositionRecord | null;
+}
+
+interface PositionGroupPnlSnapshotRow {
+  id: string;
+  group_id: string;
+  quote_token: string;
+  deposits_quote: string;
+  realized_quote: string;
+  liquidation_quote: string;
+  fee_quote: string;
+  pnl_quote: string;
+  pnl_bps: string;
+  block_number: string;
+  group_gas_quote: string;
+  created_at: Date | string;
 }
 
 export class Database {
@@ -82,6 +211,137 @@ export class Database {
           ALTER TABLE positions ADD CONSTRAINT positions_chain_id_protocol_dex_position_key_key UNIQUE(chain_id, protocol, dex, position_key);
         END IF;
       END $$;
+      CREATE TABLE IF NOT EXISTS position_groups (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        chain_id INTEGER NOT NULL,
+        protocol TEXT NOT NULL CHECK (protocol IN ('v3', 'v4')),
+        position_manager TEXT NOT NULL,
+        pool_key TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        token0 TEXT NOT NULL,
+        token1 TEXT NOT NULL,
+        quote_token TEXT NOT NULL,
+        shape TEXT NOT NULL CHECK (shape = 'bid_ask'),
+        shape_version TEXT NOT NULL CHECK (shape_version = 'delta-amount-linear-v1'),
+        requested_bin_count INTEGER NOT NULL,
+        generated_bin_count INTEGER NOT NULL,
+        mintable_bin_count INTEGER NOT NULL,
+        outer_tick_lower INTEGER NOT NULL,
+        outer_tick_upper INTEGER NOT NULL,
+        anchor_bin_index INTEGER NOT NULL,
+        total_deposit NUMERIC(78, 0) NOT NULL,
+        deployed_cost_quote NUMERIC(78, 0) NOT NULL,
+        direct_close_amount0 NUMERIC(78, 0) NOT NULL,
+        direct_close_amount1 NUMERIC(78, 0) NOT NULL,
+        total_received_quote NUMERIC(78, 0) NOT NULL DEFAULT 0,
+        status TEXT NOT NULL CHECK (status IN ('planned', 'preparing', 'opening', 'active', 'closing', 'settling', 'settled', 'needs_review', 'cancelled')),
+        plan_hash TEXT NOT NULL,
+        plan_json JSONB NOT NULL,
+        reference_block NUMERIC(78, 0),
+        reference_tick INTEGER,
+        reference_price NUMERIC(78, 0),
+        open_transaction_hash TEXT,
+        close_transaction_hash TEXT,
+        pending_raw_transaction JSONB,
+        execution_lease_token TEXT,
+        execution_lease_until TIMESTAMPTZ,
+        final_pnl_quote NUMERIC(78, 0),
+        final_pnl_bps NUMERIC(78, 0),
+        final_pnl_usd NUMERIC(78, 0),
+        settled_at TIMESTAMPTZ,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS position_groups_chain_status_updated_idx ON position_groups(chain_id, status, updated_at ASC);
+      CREATE INDEX IF NOT EXISTS position_groups_status_updated_idx ON position_groups(status, updated_at ASC);
+      CREATE TABLE IF NOT EXISTS position_group_bins (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        group_id UUID NOT NULL REFERENCES position_groups(id) ON DELETE CASCADE,
+        chain_id INTEGER NOT NULL,
+        position_manager TEXT NOT NULL,
+        bin_index INTEGER NOT NULL,
+        tick_lower INTEGER NOT NULL,
+        tick_upper INTEGER NOT NULL,
+        side TEXT NOT NULL CHECK (side IN ('token0', 'token1')),
+        weight_micros INTEGER NOT NULL,
+        allocated_amount0 NUMERIC(78, 0) NOT NULL,
+        allocated_amount1 NUMERIC(78, 0) NOT NULL,
+        expected_liquidity NUMERIC(78, 0) NOT NULL,
+        expected_amount0 NUMERIC(78, 0) NOT NULL,
+        expected_amount1 NUMERIC(78, 0) NOT NULL,
+        token_id NUMERIC(78, 0),
+        position_id UUID REFERENCES positions(id) ON DELETE SET NULL,
+        opening_amount0 NUMERIC(78, 0) NOT NULL DEFAULT 0,
+        opening_amount1 NUMERIC(78, 0) NOT NULL DEFAULT 0,
+        close_amount0 NUMERIC(78, 0) NOT NULL DEFAULT 0,
+        close_amount1 NUMERIC(78, 0) NOT NULL DEFAULT 0,
+        settlement_quote NUMERIC(78, 0) NOT NULL DEFAULT 0,
+        status TEXT NOT NULL CHECK (status IN ('planned', 'minted', 'closed', 'skipped', 'needs_review')),
+        drop_reason TEXT,
+        open_transaction_hash TEXT,
+        close_transaction_hash TEXT,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(group_id, bin_index)
+      );
+      CREATE INDEX IF NOT EXISTS position_group_bins_group_status_idx ON position_group_bins(group_id, status, bin_index);
+      CREATE UNIQUE INDEX IF NOT EXISTS position_group_bins_chain_manager_token_idx
+        ON position_group_bins(chain_id, position_manager, token_id) WHERE token_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS position_group_bins_position_idx
+        ON position_group_bins(position_id) WHERE position_id IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS position_group_execution_attempts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        group_id UUID NOT NULL REFERENCES position_groups(id) ON DELETE CASCADE,
+        stage TEXT NOT NULL CHECK (stage IN ('approve_quote', 'wrap_quote', 'approve_permit2', 'permit2_approve', 'open_batch', 'close_batch', 'settlement_swap', 'unwrap_quote')),
+        signed_raw_transaction TEXT,
+        nonce NUMERIC(78, 0),
+        transaction_hash TEXT,
+        status TEXT NOT NULL CHECK (status IN ('planned', 'submitted', 'confirmed', 'failed')),
+        all_or_nothing BOOLEAN NOT NULL DEFAULT FALSE,
+        error TEXT,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CHECK (stage NOT IN ('open_batch', 'close_batch') OR all_or_nothing)
+      );
+      CREATE INDEX IF NOT EXISTS position_group_execution_attempts_group_created_idx
+        ON position_group_execution_attempts(group_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS position_group_execution_attempts_group_stage_status_idx
+        ON position_group_execution_attempts(group_id, stage, status, created_at DESC);
+      CREATE TABLE IF NOT EXISTS position_group_cashflows (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        group_id UUID NOT NULL REFERENCES position_groups(id) ON DELETE CASCADE,
+        block_number NUMERIC(78, 0) NOT NULL,
+        transaction_hash TEXT NOT NULL,
+        flow_type TEXT NOT NULL CHECK (flow_type IN ('open_debit', 'close_receipt', 'settlement_swap', 'unwrap_quote')),
+        quote_value NUMERIC(78, 0) NOT NULL,
+        token0_amount NUMERIC(78, 0) NOT NULL DEFAULT 0,
+        token1_amount NUMERIC(78, 0) NOT NULL DEFAULT 0,
+        details JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(group_id, transaction_hash, flow_type)
+      );
+      CREATE INDEX IF NOT EXISTS position_group_cashflows_group_block_idx
+        ON position_group_cashflows(group_id, block_number, created_at DESC);
+      CREATE TABLE IF NOT EXISTS position_group_pnl_snapshots (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        group_id UUID NOT NULL REFERENCES position_groups(id) ON DELETE CASCADE,
+        quote_token TEXT NOT NULL,
+        deposits_quote NUMERIC(78, 0) NOT NULL,
+        realized_quote NUMERIC(78, 0) NOT NULL,
+        liquidation_quote NUMERIC(78, 0) NOT NULL,
+        fee_quote NUMERIC(78, 0) NOT NULL,
+        pnl_quote NUMERIC(78, 0) NOT NULL,
+        pnl_bps NUMERIC(78, 0) NOT NULL,
+        block_number NUMERIC(78, 0) NOT NULL,
+        group_gas_quote NUMERIC(78, 0) NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(group_id, block_number)
+      );
+      CREATE INDEX IF NOT EXISTS position_group_pnl_snapshots_group_created_idx
+        ON position_group_pnl_snapshots(group_id, created_at DESC);
       CREATE TABLE IF NOT EXISTS cashflows (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         position_id UUID NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
@@ -336,6 +596,584 @@ export class Database {
       chainId ? [chainId] : [],
     );
     return result.rows.map(mapPosition);
+  }
+
+  async getPositionById(positionId: string): Promise<PositionRecord | null> {
+    const result = await this.pool.query<PositionRow>(
+      "SELECT * FROM positions WHERE id = $1",
+      [positionId],
+    );
+    return result.rowCount ? mapPosition(result.rows[0]!) : null;
+  }
+
+  async createPositionGroup(group: Omit<PositionGroupRecord, "id" | "createdAt" | "updatedAt">): Promise<PositionGroupRecord> {
+    const result = await this.pool.query<PositionGroupRow>(
+      `INSERT INTO position_groups (
+         chain_id, protocol, position_manager, pool_key, owner, token0, token1, quote_token,
+         shape, shape_version, requested_bin_count, generated_bin_count, mintable_bin_count,
+         outer_tick_lower, outer_tick_upper, anchor_bin_index, total_deposit, deployed_cost_quote,
+         direct_close_amount0, direct_close_amount1, total_received_quote, status, plan_hash, plan_json,
+         reference_block, reference_tick, reference_price, open_transaction_hash, close_transaction_hash,
+         pending_raw_transaction, execution_lease_token, execution_lease_until, final_pnl_quote,
+         final_pnl_bps, final_pnl_usd, settled_at, metadata
+       ) VALUES (
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+         $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37
+       )
+       RETURNING *`,
+      [
+        group.chainId,
+        group.protocol,
+        group.positionManager.toLowerCase(),
+        group.poolKey,
+        group.owner.toLowerCase(),
+        group.token0.toLowerCase(),
+        group.token1.toLowerCase(),
+        group.quoteToken.toLowerCase(),
+        group.shape,
+        group.shapeVersion,
+        group.requestedBinCount,
+        group.generatedBinCount,
+        group.mintableBinCount,
+        group.outerTickLower,
+        group.outerTickUpper,
+        group.anchorBinIndex,
+        group.totalDeposit.toString(),
+        group.deployedCostQuote.toString(),
+        group.directCloseAmount0.toString(),
+        group.directCloseAmount1.toString(),
+        group.totalReceivedQuote.toString(),
+        group.status,
+        group.planHash,
+        stringifyJson(group.planJson),
+        group.referenceBlock?.toString() ?? null,
+        group.referenceTick,
+        group.referencePrice?.toString() ?? null,
+        group.openTransactionHash,
+        group.closeTransactionHash,
+        group.pendingRawTransaction === null ? null : stringifyJson(group.pendingRawTransaction),
+        group.executionLeaseToken,
+        group.executionLeaseUntil,
+        group.finalPnlQuote?.toString() ?? null,
+        group.finalPnlBps?.toString() ?? null,
+        group.finalPnlUsd?.toString() ?? null,
+        group.settledAt,
+        stringifyJson(group.metadata),
+      ],
+    );
+    return mapPositionGroup(result.rows[0]!);
+  }
+
+  async getPositionGroup(groupId: string): Promise<PositionGroupRecord | null> {
+    const result = await this.pool.query<PositionGroupRow>(
+      "SELECT * FROM position_groups WHERE id = $1",
+      [groupId],
+    );
+    return result.rowCount ? mapPositionGroup(result.rows[0]!) : null;
+  }
+
+  async listPositionGroups(chainId?: number, status?: PositionGroupStatus): Promise<PositionGroupRecord[]> {
+    const conditions: string[] = [];
+    const values: unknown[] = [];
+    if (chainId !== undefined) {
+      values.push(chainId);
+      conditions.push(`chain_id = $${values.length}`);
+    }
+    if (status !== undefined) {
+      values.push(status);
+      conditions.push(`status = $${values.length}`);
+    }
+    const result = await this.pool.query<PositionGroupRow>(
+      `SELECT * FROM position_groups${conditions.length ? ` WHERE ${conditions.join(" AND ")}` : ""} ORDER BY created_at ASC`,
+      values,
+    );
+    return result.rows.map(mapPositionGroup);
+  }
+
+  async setPositionGroupStatus(groupId: string, status: PositionGroupStatus, metadata: Record<string, unknown> = {}): Promise<void> {
+    await this.pool.query(
+      `WITH updated_group AS (
+        UPDATE position_groups
+         SET status = $2,
+             metadata = metadata || $3::jsonb,
+             open_transaction_hash = CASE
+               WHEN $3::jsonb ? 'openTransactionHash' THEN NULLIF($3::jsonb->>'openTransactionHash', '')
+               ELSE open_transaction_hash
+             END,
+             close_transaction_hash = CASE
+               WHEN $3::jsonb ? 'closeTransactionHash' THEN NULLIF($3::jsonb->>'closeTransactionHash', '')
+               ELSE close_transaction_hash
+             END,
+             total_received_quote = CASE
+               WHEN $3::jsonb ? 'totalReceivedQuote' AND $3::jsonb->>'totalReceivedQuote' IS NOT NULL
+                 THEN ($3::jsonb->>'totalReceivedQuote')::numeric
+               ELSE total_received_quote
+             END,
+             final_pnl_quote = CASE
+               WHEN $3::jsonb ? 'finalPnlQuote' THEN NULLIF($3::jsonb->>'finalPnlQuote', '')::numeric
+               ELSE final_pnl_quote
+             END,
+             final_pnl_bps = CASE
+               WHEN $3::jsonb ? 'finalPnlBps' THEN NULLIF($3::jsonb->>'finalPnlBps', '')::numeric
+               ELSE final_pnl_bps
+             END,
+             final_pnl_usd = CASE
+               WHEN $3::jsonb ? 'finalPnlUsd' THEN NULLIF($3::jsonb->>'finalPnlUsd', '')::numeric
+               ELSE final_pnl_usd
+             END,
+             settled_at = CASE
+               WHEN $3::jsonb ? 'settledAt' THEN NULLIF($3::jsonb->>'settledAt', '')::timestamptz
+               WHEN $2 = 'settled' THEN COALESCE(settled_at, NOW())
+               ELSE settled_at
+             END,
+             pending_raw_transaction = CASE
+               WHEN $3::jsonb ? 'pendingRawTransaction'
+                 AND $3::jsonb->'pendingRawTransaction' = 'null'::jsonb
+               THEN NULL
+               ELSE pending_raw_transaction
+             END,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING id
+      )
+      UPDATE positions
+         SET status = CASE
+               WHEN $2 = 'settled' THEN 'settled'
+               WHEN $2 IN ('closing', 'settling') AND positions.status <> 'settled' THEN 'closing'
+               ELSE positions.status
+             END,
+             metadata = metadata || jsonb_build_object('positionGroupStatus', $2::text, 'autoExitDisabled', true),
+             updated_at = NOW()
+       WHERE EXISTS (SELECT 1 FROM updated_group WHERE id = $1)
+         AND EXISTS (
+           SELECT 1 FROM position_group_bins
+            WHERE position_group_bins.group_id = $1
+              AND position_group_bins.position_id = positions.id
+         )`,
+      [groupId, status, stringifyJson(metadata)],
+    );
+  }
+
+  async finalizePositionGroup(
+    groupId: string,
+    closeTransactionHash: string,
+    totalReceivedQuote: bigint,
+    finalPnlQuote: bigint,
+    finalPnlBps: bigint,
+    trigger: string,
+  ): Promise<boolean> {
+    return this.transaction(async (client) => {
+      const parent = await client.query(
+        `UPDATE position_groups
+            SET status = 'settled',
+                close_transaction_hash = $2,
+                total_received_quote = $3,
+                final_pnl_quote = $4,
+                final_pnl_bps = $5,
+                settled_at = NOW(),
+                metadata = metadata || jsonb_build_object(
+                  'closeTransactionHash', $2::text,
+                  'totalReceivedQuote', $3::text,
+                  'finalPnlQuote', $4::text,
+                  'finalPnlBps', $5::text,
+                  'exitTrigger', $6::text,
+                  'settlementPhase', 'complete',
+                  'closeReceiptAccounted', true,
+                  'settledAt', NOW()::text
+                ),
+                pending_raw_transaction = NULL,
+                execution_lease_token = NULL,
+                execution_lease_until = NULL,
+                updated_at = NOW()
+          WHERE id = $1
+            AND status NOT IN ('cancelled')
+          RETURNING id`,
+        [groupId, closeTransactionHash, totalReceivedQuote.toString(), finalPnlQuote.toString(), finalPnlBps.toString(), trigger],
+      );
+      if (parent.rowCount !== 1) return false;
+
+      await client.query(
+        `UPDATE position_group_bins
+            SET status = CASE WHEN status = 'skipped' THEN status ELSE 'closed' END,
+                close_transaction_hash = COALESCE(close_transaction_hash, $2),
+                updated_at = NOW()
+          WHERE group_id = $1`,
+        [groupId, closeTransactionHash],
+      );
+      await client.query(
+        `UPDATE positions
+            SET status = 'settled',
+                metadata = metadata || jsonb_build_object(
+                  'positionGroupStatus', 'settled',
+                  'positionGroupSettledAt', NOW()::text,
+                  'positionGroupCloseTransactionHash', $2::text,
+                  'autoExitDisabled', true
+                ),
+                updated_at = NOW()
+          WHERE id IN (
+            SELECT position_id FROM position_group_bins
+             WHERE group_id = $1 AND position_id IS NOT NULL
+          )`,
+        [groupId, closeTransactionHash],
+      );
+      return true;
+    });
+  }
+
+  async renewPositionGroupLease(groupId: string, token: string, ttlMs = 300_000): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE position_groups
+       SET execution_lease_until = NOW() + ($3 * INTERVAL '1 millisecond'),
+           updated_at = NOW()
+       WHERE id = $1
+         AND execution_lease_token = $2
+         AND status NOT IN ('settled', 'cancelled')
+       RETURNING id`,
+      [groupId, token, ttlMs],
+    );
+    return result.rowCount === 1;
+  }
+
+  async createPositionGroupBin(bin: Omit<PositionGroupBinRecord, "id" | "createdAt" | "updatedAt">): Promise<PositionGroupBinRecord> {
+    const result = await this.pool.query<PositionGroupBinRow>(
+      `INSERT INTO position_group_bins (
+         group_id, chain_id, position_manager, bin_index, tick_lower, tick_upper, side, weight_micros,
+         allocated_amount0, allocated_amount1, expected_liquidity, expected_amount0, expected_amount1,
+         token_id, position_id, opening_amount0, opening_amount1, close_amount0, close_amount1,
+         settlement_quote, status, drop_reason, open_transaction_hash, close_transaction_hash, metadata
+       ) VALUES (
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+         $19, $20, $21, $22, $23, $24, $25
+       )
+       RETURNING *`,
+      [
+        bin.groupId,
+        bin.chainId,
+        bin.positionManager.toLowerCase(),
+        bin.binIndex,
+        bin.tickLower,
+        bin.tickUpper,
+        bin.side,
+        bin.weightMicros,
+        bin.allocatedAmount0.toString(),
+        bin.allocatedAmount1.toString(),
+        bin.expectedLiquidity.toString(),
+        bin.expectedAmount0.toString(),
+        bin.expectedAmount1.toString(),
+        bin.tokenId?.toString() ?? null,
+        bin.positionId,
+        bin.openingAmount0.toString(),
+        bin.openingAmount1.toString(),
+        bin.closeAmount0.toString(),
+        bin.closeAmount1.toString(),
+        bin.settlementQuote.toString(),
+        bin.status,
+        bin.dropReason,
+        bin.openTransactionHash,
+        bin.closeTransactionHash,
+        stringifyJson(bin.metadata),
+      ],
+    );
+    return mapPositionGroupBin(result.rows[0]!);
+  }
+
+  async getPositionGroupBin(groupIdOrBinId: string, binIndex?: number): Promise<PositionGroupBinRecord | null> {
+    const result = binIndex === undefined
+      ? await this.pool.query<PositionGroupBinRow>("SELECT * FROM position_group_bins WHERE id = $1", [groupIdOrBinId])
+      : await this.pool.query<PositionGroupBinRow>(
+        "SELECT * FROM position_group_bins WHERE group_id = $1 AND bin_index = $2",
+        [groupIdOrBinId, binIndex],
+      );
+    return result.rowCount ? mapPositionGroupBin(result.rows[0]!) : null;
+  }
+
+  async listPositionGroupBins(groupId: string): Promise<PositionGroupBinRecord[]> {
+    const result = await this.pool.query<PositionGroupBinRow>(
+      "SELECT * FROM position_group_bins WHERE group_id = $1 ORDER BY bin_index ASC",
+      [groupId],
+    );
+    return result.rows.map(mapPositionGroupBin);
+  }
+
+  async listPositionGroupChildren(groupId: string): Promise<PositionGroupChildRecord[]> {
+    const bins = await this.listPositionGroupBins(groupId);
+    const positionIds = bins.flatMap((bin) => bin.positionId === null ? [] : [bin.positionId]);
+    if (positionIds.length === 0) return bins.map((bin) => ({ bin, position: null }));
+
+    const result = await this.pool.query<PositionRow>(
+      `SELECT positions.*
+       FROM positions
+       INNER JOIN position_group_bins ON position_group_bins.position_id = positions.id
+       WHERE position_group_bins.group_id = $1
+         AND positions.id = ANY($2::uuid[])
+       ORDER BY position_group_bins.bin_index ASC`,
+      [groupId, positionIds],
+    );
+    const positions = new Map(result.rows.map((row) => [row.id, mapPosition(row)]));
+    return bins.map((bin) => ({ bin, position: bin.positionId === null ? null : positions.get(bin.positionId) ?? null }));
+  }
+
+  async updatePositionGroupBin(groupId: string, binIndex: number, patch: PositionGroupBinPatch): Promise<boolean> {
+    const assignments: string[] = [];
+    const values: unknown[] = [groupId, binIndex];
+    const add = (column: string, value: unknown): void => {
+      values.push(value);
+      assignments.push(`${column} = $${values.length}`);
+    };
+
+    if (Object.prototype.hasOwnProperty.call(patch, "tokenId")) add("token_id", patch.tokenId === null ? null : patch.tokenId?.toString());
+    if (Object.prototype.hasOwnProperty.call(patch, "positionId")) add("position_id", patch.positionId ?? null);
+    if (Object.prototype.hasOwnProperty.call(patch, "status")) add("status", patch.status);
+    if (Object.prototype.hasOwnProperty.call(patch, "openTransactionHash")) add("open_transaction_hash", patch.openTransactionHash ?? null);
+    if (Object.prototype.hasOwnProperty.call(patch, "closeTransactionHash")) add("close_transaction_hash", patch.closeTransactionHash ?? null);
+    if (Object.prototype.hasOwnProperty.call(patch, "openingAmount0")) add("opening_amount0", patch.openingAmount0?.toString());
+    if (Object.prototype.hasOwnProperty.call(patch, "openingAmount1")) add("opening_amount1", patch.openingAmount1?.toString());
+    if (Object.prototype.hasOwnProperty.call(patch, "closeAmount0")) add("close_amount0", patch.closeAmount0?.toString());
+    if (Object.prototype.hasOwnProperty.call(patch, "closeAmount1")) add("close_amount1", patch.closeAmount1?.toString());
+    if (Object.prototype.hasOwnProperty.call(patch, "settlementQuote")) add("settlement_quote", patch.settlementQuote?.toString());
+    if (assignments.length === 0) return false;
+
+    const result = await this.pool.query(
+      `UPDATE position_group_bins
+       SET ${assignments.join(", ")}, updated_at = NOW()
+       WHERE group_id = $1 AND bin_index = $2
+       RETURNING id`,
+      values,
+    );
+    return result.rowCount === 1;
+  }
+
+  async setPositionGroupOpenTransaction(groupId: string, hash: string, status: PositionGroupStatus): Promise<boolean> {
+    return this.transaction(async (client) => {
+      const parent = await client.query(
+        `UPDATE position_groups
+         SET open_transaction_hash = CASE
+               WHEN open_transaction_hash IS NULL THEN $2
+               ELSE open_transaction_hash
+             END,
+             status = $3,
+             updated_at = NOW()
+         WHERE id = $1
+           AND (open_transaction_hash IS NULL OR open_transaction_hash = $2)
+         RETURNING id`,
+        [groupId, hash, status],
+      );
+      if (parent.rowCount !== 1) return false;
+
+      await client.query(
+        `UPDATE position_group_bins
+         SET open_transaction_hash = CASE
+               WHEN open_transaction_hash IS NULL THEN $2
+               ELSE open_transaction_hash
+             END,
+             updated_at = NOW()
+         WHERE group_id = $1`,
+        [groupId, hash],
+      );
+      return true;
+    });
+  }
+
+  async claimPositionGroupLease(groupId: string, token: string, ttlMs = 300_000): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE position_groups
+       SET execution_lease_token = $2,
+           execution_lease_until = NOW() + ($3 * INTERVAL '1 millisecond'),
+           updated_at = NOW()
+       WHERE id = $1
+         AND status NOT IN ('settled', 'cancelled')
+         AND (execution_lease_until IS NULL OR execution_lease_until <= NOW())
+       RETURNING id`,
+      [groupId, token, ttlMs],
+    );
+    return result.rowCount === 1;
+  }
+
+  async releasePositionGroupLease(groupId: string, token: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE position_groups
+       SET execution_lease_token = NULL, execution_lease_until = NULL, updated_at = NOW()
+       WHERE id = $1 AND execution_lease_token = $2`,
+      [groupId, token],
+    );
+  }
+
+  async recordPositionGroupExecution(
+    groupId: string,
+    stage: PositionGroupExecutionStage,
+    status: PositionGroupExecutionStatus,
+    transactionHash?: string,
+    signedRawTransaction?: string,
+    nonce?: bigint,
+    error?: string,
+    metadata: Record<string, unknown> = {},
+  ): Promise<void> {
+    const pendingStatus = status === "planned" || status === "submitted";
+    const terminalStatus = status === "confirmed" || status === "failed";
+    await this.pool.query(
+      `WITH recorded AS (
+         INSERT INTO position_group_execution_attempts (
+           group_id, stage, signed_raw_transaction, nonce, transaction_hash, status,
+           all_or_nothing, error, metadata
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id
+       )
+       UPDATE position_groups
+       SET pending_raw_transaction = CASE
+             WHEN $10 AND $3 IS NOT NULL THEN jsonb_build_object(
+               'stage', $2::text,
+                'hash', $5::text,
+                'serializedTransaction', $3::text,
+                'nonce', $4::text,
+                'submittedAt', NOW()::text
+             )
+             WHEN $11 AND pending_raw_transaction IS NOT NULL
+               AND pending_raw_transaction->>'stage' = $2::text
+               AND ($5::text IS NULL OR pending_raw_transaction->>'hash' = $5::text)
+               THEN NULL
+             ELSE pending_raw_transaction
+           END,
+           updated_at = NOW()
+       FROM recorded
+       WHERE position_groups.id = $1`,
+      [
+        groupId,
+        stage,
+        signedRawTransaction ?? null,
+        nonce?.toString() ?? null,
+        transactionHash ?? null,
+        status,
+        stage === "open_batch" || stage === "close_batch",
+        error ?? null,
+        stringifyJson(metadata),
+        pendingStatus,
+        terminalStatus,
+      ],
+    );
+  }
+
+  async getLatestPositionGroupExecutionHash(
+    groupId: string,
+    stage: PositionGroupExecutionStage,
+    status: PositionGroupExecutionStatus = "confirmed",
+  ): Promise<string | null> {
+    const result = await this.pool.query<{ transaction_hash: string }>(
+      `SELECT transaction_hash
+         FROM position_group_execution_attempts
+        WHERE group_id = $1
+          AND stage = $2
+          AND status = $3
+          AND transaction_hash IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [groupId, stage, status],
+    );
+    return result.rowCount ? result.rows[0]!.transaction_hash : null;
+  }
+
+  async addPositionGroupCashflow(
+    groupId: string,
+    blockNumber: bigint,
+    transactionHash: string,
+    flowType: PositionGroupCashflowType,
+    quoteValue: bigint,
+    token0Amount = 0n,
+    token1Amount = 0n,
+    details: Record<string, unknown> = {},
+  ): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO position_group_cashflows
+        (group_id, block_number, transaction_hash, flow_type, quote_value, token0_amount, token1_amount, details)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (group_id, transaction_hash, flow_type) DO NOTHING`,
+      [
+        groupId,
+        blockNumber.toString(),
+        transactionHash,
+        flowType,
+        quoteValue.toString(),
+        token0Amount.toString(),
+        token1Amount.toString(),
+        stringifyJson(details),
+      ],
+    );
+  }
+
+  async getPositionGroupCashflowTotals(groupId: string, excludedTransactionHashes: string[] = []): Promise<PositionGroupCashflowTotals> {
+    const result = await this.pool.query<{ deposits: string; realized: string }>(
+      `SELECT
+         COALESCE(SUM(quote_value) FILTER (WHERE flow_type = 'open_debit'), 0) AS deposits,
+         COALESCE(SUM(quote_value) FILTER (WHERE flow_type IN ('close_receipt', 'settlement_swap', 'unwrap_quote')), 0) AS realized
+       FROM position_group_cashflows
+       WHERE group_id = $1
+         AND (cardinality($2::text[]) = 0 OR transaction_hash <> ALL($2::text[]))`,
+      [groupId, excludedTransactionHashes],
+    );
+    const row = result.rows[0]!;
+    return { deposits: BigInt(row.deposits), realized: BigInt(row.realized) };
+  }
+
+  async addPositionGroupPnlSnapshot(snapshot: PositionGroupPnlSnapshot): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO position_group_pnl_snapshots
+        (group_id, quote_token, deposits_quote, realized_quote, liquidation_quote, fee_quote, pnl_quote, pnl_bps, block_number, group_gas_quote)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (group_id, block_number) DO UPDATE SET
+         quote_token = EXCLUDED.quote_token,
+         deposits_quote = EXCLUDED.deposits_quote,
+         realized_quote = EXCLUDED.realized_quote,
+         liquidation_quote = EXCLUDED.liquidation_quote,
+         fee_quote = EXCLUDED.fee_quote,
+         pnl_quote = EXCLUDED.pnl_quote,
+         pnl_bps = EXCLUDED.pnl_bps,
+         group_gas_quote = EXCLUDED.group_gas_quote,
+         created_at = NOW()`,
+      [
+        snapshot.groupId,
+        snapshot.quoteToken.toLowerCase(),
+        snapshot.depositsQuote.toString(),
+        snapshot.realizedQuote.toString(),
+        snapshot.liquidationQuote.toString(),
+        snapshot.feeQuote.toString(),
+        snapshot.pnlQuote.toString(),
+        snapshot.pnlBps.toString(),
+        snapshot.blockNumber.toString(),
+        snapshot.groupGasQuote.toString(),
+      ],
+    );
+  }
+
+  async getLatestPositionGroupPnlSnapshot(groupId: string): Promise<PositionGroupPnlSnapshotRecord | null> {
+    const result = await this.pool.query<PositionGroupPnlSnapshotRow>(
+      `SELECT * FROM position_group_pnl_snapshots
+       WHERE group_id = $1
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1`,
+      [groupId],
+    );
+    return result.rowCount ? mapPositionGroupPnlSnapshot(result.rows[0]!) : null;
+  }
+
+  async linkPositionGroupBinPosition(groupId: string, binIndex: number, positionId: string, tokenId?: bigint): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE position_group_bins AS target
+       SET position_id = $3,
+           token_id = COALESCE($4, target.token_id),
+           updated_at = NOW()
+       WHERE target.group_id = $1
+         AND target.bin_index = $2
+         AND (target.position_id IS NULL OR target.position_id = $3)
+         AND NOT EXISTS (
+           SELECT 1
+           FROM position_group_bins conflicting
+           WHERE conflicting.id <> target.id
+             AND (conflicting.position_id = $3
+                  OR ($4::numeric IS NOT NULL AND conflicting.token_id = $4::numeric))
+         )
+       RETURNING id`,
+      [groupId, binIndex, positionId, tokenId?.toString() ?? null],
+    );
+    return result.rowCount === 1;
   }
 
   async getPoolScanSettings(chatId: string): Promise<PoolScanSettings | null> {
@@ -706,9 +1544,32 @@ export class Database {
       `SELECT 1
        FROM positions
        WHERE chain_id = $1
-         AND status <> 'settled'
-         AND metadata ? 'pendingRawTransaction'
-         AND metadata->'pendingRawTransaction' <> 'null'::jsonb
+          AND status <> 'settled'
+          AND metadata ? 'pendingRawTransaction'
+          AND metadata->'pendingRawTransaction' <> 'null'::jsonb
+       UNION ALL
+       SELECT 1
+       FROM position_groups
+       WHERE chain_id = $1
+         AND status NOT IN ('settled', 'cancelled')
+         AND pending_raw_transaction IS NOT NULL
+         AND pending_raw_transaction <> 'null'::jsonb
+       UNION ALL
+       SELECT 1
+       FROM position_group_execution_attempts attempt
+       JOIN position_groups group_record ON group_record.id = attempt.group_id
+       WHERE group_record.chain_id = $1
+         AND group_record.status NOT IN ('settled', 'cancelled')
+         AND attempt.status IN ('planned', 'submitted')
+         AND attempt.signed_raw_transaction IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1
+           FROM position_group_execution_attempts terminal
+           WHERE terminal.group_id = attempt.group_id
+             AND terminal.stage = attempt.stage
+             AND terminal.transaction_hash IS NOT DISTINCT FROM attempt.transaction_hash
+             AND terminal.status IN ('failed', 'confirmed')
+         )
        LIMIT 1`,
       [chainId],
     );
@@ -1111,6 +1972,109 @@ export class Database {
   async clearPnlCardBackground(chatId: string): Promise<void> {
     await this.pool.query("DELETE FROM telegram_pnl_card_bg WHERE chat_id = $1", [chatId]);
   }
+}
+
+function stringifyJson(value: unknown): string {
+  const json = JSON.stringify(value, (_key, nestedValue: unknown) => (
+    typeof nestedValue === "bigint" ? nestedValue.toString() : nestedValue
+  ));
+  if (json === undefined) throw new Error("Cannot persist undefined JSON");
+  return json;
+}
+
+function mapPositionGroup(row: PositionGroupRow): PositionGroupRecord {
+  return {
+    id: row.id,
+    chainId: row.chain_id,
+    protocol: row.protocol,
+    positionManager: row.position_manager as Address,
+    poolKey: row.pool_key,
+    owner: row.owner as Address,
+    token0: row.token0 as Address,
+    token1: row.token1 as Address,
+    quoteToken: row.quote_token as Address,
+    shape: row.shape,
+    shapeVersion: row.shape_version,
+    requestedBinCount: row.requested_bin_count,
+    generatedBinCount: row.generated_bin_count,
+    mintableBinCount: row.mintable_bin_count,
+    outerTickLower: row.outer_tick_lower,
+    outerTickUpper: row.outer_tick_upper,
+    anchorBinIndex: row.anchor_bin_index,
+    totalDeposit: BigInt(row.total_deposit),
+    deployedCostQuote: BigInt(row.deployed_cost_quote),
+    directCloseAmount0: BigInt(row.direct_close_amount0),
+    directCloseAmount1: BigInt(row.direct_close_amount1),
+    totalReceivedQuote: BigInt(row.total_received_quote),
+    status: row.status,
+    planHash: row.plan_hash,
+    planJson: row.plan_json,
+    referenceBlock: row.reference_block === null ? null : BigInt(row.reference_block),
+    referenceTick: row.reference_tick,
+    referencePrice: row.reference_price === null ? null : BigInt(row.reference_price),
+    openTransactionHash: row.open_transaction_hash,
+    closeTransactionHash: row.close_transaction_hash,
+    pendingRawTransaction: row.pending_raw_transaction,
+    executionLeaseToken: row.execution_lease_token,
+    executionLeaseUntil: row.execution_lease_until === null ? null : new Date(row.execution_lease_until),
+    finalPnlQuote: row.final_pnl_quote === null ? null : BigInt(row.final_pnl_quote),
+    finalPnlBps: row.final_pnl_bps === null ? null : BigInt(row.final_pnl_bps),
+    finalPnlUsd: row.final_pnl_usd === null ? null : BigInt(row.final_pnl_usd),
+    settledAt: row.settled_at === null ? null : new Date(row.settled_at),
+    metadata: row.metadata,
+    createdAt: new Date(row.created_at),
+    updatedAt: new Date(row.updated_at),
+  };
+}
+
+function mapPositionGroupBin(row: PositionGroupBinRow): PositionGroupBinRecord {
+  return {
+    id: row.id,
+    groupId: row.group_id,
+    chainId: row.chain_id,
+    positionManager: row.position_manager as Address,
+    binIndex: row.bin_index,
+    tickLower: row.tick_lower,
+    tickUpper: row.tick_upper,
+    side: row.side,
+    weightMicros: row.weight_micros,
+    allocatedAmount0: BigInt(row.allocated_amount0),
+    allocatedAmount1: BigInt(row.allocated_amount1),
+    expectedLiquidity: BigInt(row.expected_liquidity),
+    expectedAmount0: BigInt(row.expected_amount0),
+    expectedAmount1: BigInt(row.expected_amount1),
+    tokenId: row.token_id === null ? null : BigInt(row.token_id),
+    positionId: row.position_id,
+    openingAmount0: BigInt(row.opening_amount0),
+    openingAmount1: BigInt(row.opening_amount1),
+    closeAmount0: BigInt(row.close_amount0),
+    closeAmount1: BigInt(row.close_amount1),
+    settlementQuote: BigInt(row.settlement_quote),
+    status: row.status,
+    dropReason: row.drop_reason,
+    openTransactionHash: row.open_transaction_hash,
+    closeTransactionHash: row.close_transaction_hash,
+    metadata: row.metadata,
+    createdAt: new Date(row.created_at),
+    updatedAt: new Date(row.updated_at),
+  };
+}
+
+function mapPositionGroupPnlSnapshot(row: PositionGroupPnlSnapshotRow): PositionGroupPnlSnapshotRecord {
+  return {
+    id: row.id,
+    groupId: row.group_id,
+    quoteToken: row.quote_token as Address,
+    depositsQuote: BigInt(row.deposits_quote),
+    realizedQuote: BigInt(row.realized_quote),
+    liquidationQuote: BigInt(row.liquidation_quote),
+    feeQuote: BigInt(row.fee_quote),
+    pnlQuote: BigInt(row.pnl_quote),
+    pnlBps: BigInt(row.pnl_bps),
+    blockNumber: BigInt(row.block_number),
+    groupGasQuote: BigInt(row.group_gas_quote),
+    createdAt: new Date(row.created_at),
+  };
 }
 
 function mapPosition(row: PositionRow): PositionRecord {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { canRequestManualClose, clampDashboardPage, formatDashboardRangeStatus, formatRangePrices, isExpiredCallbackError, parseDashboardAction, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
+import { canRequestManualClose, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatRangePrices, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -35,6 +35,59 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseDashboardAction("lp:openmode:single")).toEqual({ type: "open_mode", mode: "single", page: 0 });
     expect(parseDashboardAction("lp:openmode:dual:2")).toEqual({ type: "open_mode", mode: "dual", page: 2 });
     expect(parseDashboardAction("lp:openmode:both")).toBeNull();
+  });
+
+  it("parses the enabled-only Bid-Ask ladder path", () => {
+    expect(parseDashboardAction("lp:open_ladder:2")).toEqual({ type: "open_ladder", page: 2 });
+    expect(parseDashboardAction("lp:open_ladder_chain:base:1")).toEqual({ type: "open_ladder_chain", chain: "base", page: 1 });
+    expect(parseDashboardAction("lp:open_ladder_chain:bsc:1")).toBeNull();
+    expect(parseBidAskPoolInput("https://app.uniswap.org/explore/pools/base/0x0000000000000000000000000000000000000000000000000000000000000001", "base")).toBe("0x0000000000000000000000000000000000000000000000000000000000000001");
+    expect(parseBidAskRangeInput("below 60")).toEqual({ direction: "below", rangePercent: 60 });
+    expect(parseBidAskRangeInput("+30%")).toEqual({ direction: "above", rangePercent: 30 });
+    expect(parseBidAskRangeInput("100")).toBeNull();
+  });
+
+  it("renders atomic semantics and per-bin allocations in the ladder review", () => {
+    const text = formatBidAskLadderReview({
+      protocol: "v3",
+      pair: "TOKEN/USDG",
+      poolAddress: "0x0000000000000000000000000000000000000001",
+      token0Symbol: "USDG",
+      token0Decimals: 6,
+      currentPrice: "1.00",
+      estimatedGas: 123_000n,
+      atomicBatchFeasible: true,
+      plan: {
+        requestedBinCount: 2,
+        generatedBinCount: 2,
+        mintableBinCount: 2,
+        outerTickLower: 100,
+        outerTickUpper: 300,
+        bins: [
+          { index: 0, tickLower: 100, tickUpper: 200, side: "token0", weightMicros: 20_000, allocatedAmount0: 20n, allocatedAmount1: 0n },
+          { index: 1, tickLower: 200, tickUpper: 300, side: "token0", weightMicros: 1_000_000, allocatedAmount0: 980n, allocatedAmount1: 0n },
+        ],
+      },
+    }, {
+      poolAddress: "0x0000000000000000000000000000000000000001",
+      chain: "base",
+      direction: "below",
+      rangePercent: 60,
+      binCount: 2,
+      depositAmount: 1_000n,
+      quoteToken: { symbol: "USDG", address: "0x0000000000000000000000000000000000000002" },
+      protocols: ["v3", "v4"],
+      maxBins: 16,
+      maxPriceDeviationBps: 100,
+      atomicMaxBlockGasBps: 8_000,
+      transactionDeadlineSeconds: 300,
+      maxRetries: 3,
+    });
+
+    expect(text).toContain("Atomic open: 123000");
+    expect(text).toContain("one failed batch reverts every NFT");
+    expect(text).toContain("bin 0: ticks 100 → 200");
+    expect(text).toContain("0.00002 USDG");
   });
 
   it("parses a position selection callback", () => {

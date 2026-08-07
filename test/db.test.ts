@@ -81,6 +81,113 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[0]![1]![12]).toBe("uniswap");
   });
 
+  it("loads a position by its durable ID", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({
+      rowCount: 1,
+      rows: [{
+        id: "position",
+        chain_id: 4663,
+        protocol: "v4",
+        position_key: "437787",
+        owner: "0x0000000000000000000000000000000000000001",
+        pool_address: null,
+        token0: "0x0000000000000000000000000000000000000002",
+        token1: "0x0000000000000000000000000000000000000003",
+        quote_token: "0x0000000000000000000000000000000000000003",
+        status: "minted",
+        liquidity: "9",
+        opened_at_block: "100",
+        metadata: { positionGroupId: "group" },
+      }],
+    });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.getPositionById("position")).resolves.toMatchObject({
+      id: "position",
+      liquidity: 9n,
+      openedAtBlock: 100n,
+      metadata: { positionGroupId: "group" },
+    });
+    expect(query.mock.calls[0]![1]).toEqual(["position"]);
+  });
+
+  it("merges group status metadata and clears a pending signed transaction when requested", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [] });
+    Object.defineProperty(database, "pool", { value: { query } });
+    const metadata = { pendingRawTransaction: null, settlementPhase: "accounting" };
+
+    await database.setPositionGroupStatus("group", "settling", metadata);
+
+    expect(query.mock.calls[0]![0]).toContain("metadata = metadata || $3::jsonb");
+    expect(query.mock.calls[0]![0]).toContain("pending_raw_transaction = CASE");
+    expect(query.mock.calls[0]![1]).toEqual(["group", "settling", JSON.stringify(metadata)]);
+  });
+
+  it("renews a group lease only while its token owns the parent", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ id: "group" }] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.renewPositionGroupLease("group", "worker", 45_000)).resolves.toBe(true);
+
+    expect(query.mock.calls[0]![0]).toContain("execution_lease_token = $2");
+    expect(query.mock.calls[0]![0]).toContain("status NOT IN ('settled', 'cancelled')");
+    expect(query.mock.calls[0]![1]).toEqual(["group", "worker", 45_000]);
+  });
+
+  it("updates only the supplied group-bin receipt fields", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ id: "bin" }] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.updatePositionGroupBin("group", 2, {
+      tokenId: 77n,
+      positionId: "position",
+      status: "minted",
+      openTransactionHash: "0xopen",
+      closeTransactionHash: null,
+      openingAmount0: 11n,
+      openingAmount1: 12n,
+      closeAmount0: 13n,
+      closeAmount1: 14n,
+      settlementQuote: 15n,
+    })).resolves.toBe(true);
+
+    expect(query.mock.calls[0]![0]).toContain("token_id = $3");
+    expect(query.mock.calls[0]![0]).toContain("opening_amount0 = $8");
+    expect(query.mock.calls[0]![0]).toContain("settlement_quote = $12");
+    expect(query.mock.calls[0]![1]).toEqual(["group", 2, "77", "position", "minted", "0xopen", null, "11", "12", "13", "14", "15"]);
+  });
+
+  it("links an open receipt to the parent and bins in one idempotent transaction", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "group" }] })
+      .mockResolvedValueOnce({ rowCount: 2, rows: [] });
+    const client = { query };
+    vi.spyOn(database, "transaction").mockImplementation(async (work) => work(client as never));
+
+    await expect(database.setPositionGroupOpenTransaction("group", "0xopen", "active")).resolves.toBe(true);
+
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls[0]![0]).toContain("open_transaction_hash = CASE");
+    expect(query.mock.calls[1]![0]).toContain("UPDATE position_group_bins");
+    expect(query.mock.calls[1]![1]).toEqual(["group", "0xopen"]);
+  });
+
+  it("does not link a bin to an already-linked position or token", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 0, rows: [] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.linkPositionGroupBinPosition("group", 2, "position", 77n)).resolves.toBe(false);
+
+    expect(query.mock.calls[0]![0]).toContain("NOT EXISTS");
+    expect(query.mock.calls[0]![0]).toContain("conflicting.token_id = $4::numeric");
+  });
+
   it("loads the global risk-settings override when present", async () => {
     const database = new Database("postgres://unused");
     const settings = {

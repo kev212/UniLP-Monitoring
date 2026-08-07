@@ -1,4 +1,4 @@
-import { decodeEventLog, encodeAbiParameters, keccak256, pad, toHex, zeroAddress, zeroHash, type Address, type Hex, type Log, type PublicClient } from "viem";
+import { decodeEventLog, encodeAbiParameters, isHex, keccak256, pad, toHex, zeroAddress, zeroHash, type Address, type Hex, type Log, type PublicClient } from "viem";
 
 import {
   erc20Abi,
@@ -21,7 +21,7 @@ import {
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, PositionRecord, PositionStatus, Protocol } from "../types.js";
+import type { ChainName, PositionGroupBinRecord, PositionGroupRecord, PositionRecord, PositionStatus, Protocol } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Notifier } from "./notifier.js";
 import { amountsForLiquidity } from "./uniswap-math.js";
@@ -47,8 +47,388 @@ export class DiscoveryService {
     private readonly notifier?: Notifier,
   ) {}
 
+  async reconcilePositionGroupOpen(
+    name: ChainName,
+    groupOrId: PositionGroupRecord | string,
+    transactionHash: Hex,
+  ): Promise<PositionRecord[]> {
+    const group = typeof groupOrId === "string" ? await this.database.getPositionGroup(groupOrId) : groupOrId;
+    if (!group) throw new Error(`Position group ${typeof groupOrId === "string" ? groupOrId : "unknown"} was not found`);
+
+    const { client, registry } = this.chains.get(name);
+    const bins = await this.database.listPositionGroupBins(group.id);
+    try {
+      if (group.chainId !== registry.chain.id) throw new Error("position group chain does not match the discovery chain");
+      if (group.protocol !== "v3" && group.protocol !== "v4") throw new Error(`unsupported position group protocol ${group.protocol}`);
+      if (group.positionManager.toLowerCase() !== expectedPositionManager(registry, group.protocol).toLowerCase()) {
+        throw new Error("position group manager does not match the configured manager");
+      }
+      if (group.shape !== "bid_ask" || group.shapeVersion !== "delta-amount-linear-v1") {
+        throw new Error("position group is not a Bid-Ask group");
+      }
+
+      const receipt = await client.getTransactionReceipt({ hash: transactionHash });
+      if (receipt.status !== undefined && receipt.status !== "success") throw new Error("position group open transaction reverted");
+      const plannedBins = plannedGroupBins(group, bins);
+      if (group.protocol === "v3") {
+        return await this.reconcileV3PositionGroupOpen(name, group, plannedBins, transactionHash, receipt);
+      }
+      return await this.reconcileV4PositionGroupOpen(name, group, plannedBins, transactionHash, receipt);
+    } catch (error) {
+      await this.markPositionGroupOpenNeedsReview(group, bins, transactionHash, errorMessage(error));
+      throw error;
+    }
+  }
+
+  async reconcileKnownGroupOpen(
+    name: ChainName,
+    groupOrId: PositionGroupRecord | string,
+    transactionHash: Hex,
+  ): Promise<PositionRecord[]> {
+    return this.reconcilePositionGroupOpen(name, groupOrId, transactionHash);
+  }
+
+  async reconcilePendingPositionGroupOpens(name: ChainName): Promise<void> {
+    const { client, registry } = this.chains.get(name);
+    const groups = await this.database.listPositionGroups(registry.chain.id);
+    for (const group of groups) {
+      if (group.status !== "opening" || !group.openTransactionHash || !isHex(group.openTransactionHash) || group.openTransactionHash.length !== 66) continue;
+      let receipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>;
+      try {
+        receipt = await client.getTransactionReceipt({ hash: group.openTransactionHash as Hex });
+      } catch {
+        // The signed transaction may still be pending. Keep the parent opening and let the next cycle retry.
+        continue;
+      }
+      try {
+        await this.reconcilePositionGroupOpen(name, group, group.openTransactionHash as Hex);
+        log.info({ chain: name, groupId: group.id, transactionHash: group.openTransactionHash, status: receipt.status }, "reconciled pending Bid-Ask open");
+      } catch (error) {
+        log.warn({ err: error, chain: name, groupId: group.id, transactionHash: group.openTransactionHash }, "pending Bid-Ask open requires review");
+      }
+    }
+  }
+
+  private async reconcileV3PositionGroupOpen(
+    name: ChainName,
+    group: PositionGroupRecord,
+    bins: PositionGroupBinRecord[],
+    transactionHash: Hex,
+    receipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>,
+  ): Promise<PositionRecord[]> {
+    const { client, registry } = this.chains.get(name);
+    const transfers = receipt.logs
+      .filter((entry) => entry.address.toLowerCase() === group.positionManager.toLowerCase())
+      .map((entry) => decodeErc721Transfer(entry))
+      .filter((entry): entry is Erc721Transfer => entry !== null);
+    const increases = receipt.logs
+      .filter((entry) => entry.address.toLowerCase() === group.positionManager.toLowerCase())
+      .map((entry) => decodeV3IncreaseLiquidity(entry))
+      .filter((entry): entry is V3IncreaseLiquidity => entry !== null);
+    const expectedTokenIds = exactMintTokenIds(transfers, bins.length, group.owner);
+    if (!sameBigIntSet(expectedTokenIds, increases.map((entry) => entry.tokenId))) {
+      throw new Error("V3 open receipt does not contain exactly one IncreaseLiquidity event per minted token");
+    }
+    const plannedFee = plannedV3Fee(group);
+    const reconciled: V3ReconciledChild[] = [];
+    const usedBins = new Set<number>();
+    for (const tokenId of expectedTokenIds) {
+      const increase = increases.find((entry) => entry.tokenId === tokenId);
+      if (!increase || increase.liquidity <= 0n) throw new Error(`V3 token ${tokenId} has no positive IncreaseLiquidity event`);
+      const owner = await client.readContract({
+        address: group.positionManager,
+        abi: v3PositionManagerAbi,
+        functionName: "ownerOf",
+        args: [tokenId],
+      });
+      if (owner.toLowerCase() !== group.owner.toLowerCase()) throw new Error(`V3 token ${tokenId} is not owned by the group owner`);
+      const details = (await client.readContract({
+        address: group.positionManager,
+        abi: v3PositionManagerAbi,
+        functionName: "positions",
+        args: [tokenId],
+      })) as readonly [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint];
+      const [, , token0, token1, fee, tickLower, tickUpper, liquidity] = details;
+      if (token0.toLowerCase() !== group.token0.toLowerCase()
+        || token1.toLowerCase() !== group.token1.toLowerCase()
+        || (plannedFee !== undefined && Number(fee) !== plannedFee)
+        || liquidity <= 0n) {
+        throw new Error(`V3 token ${tokenId} does not match the authoritative group position`);
+      }
+      const pool = await client.readContract({
+        address: registry.contracts.v3.factory,
+        abi: v3FactoryAbi,
+        functionName: "getPool",
+        args: [token0, token1, fee],
+      });
+      if (pool.toLowerCase() !== group.poolKey.toLowerCase()) throw new Error(`V3 token ${tokenId} resolves to a different pool`);
+      const bin = bins.find((candidate) => candidate.tickLower === Number(tickLower) && candidate.tickUpper === Number(tickUpper));
+      if (!bin || usedBins.has(bin.binIndex)) throw new Error(`V3 token ${tokenId} does not map to exactly one planned bin`);
+      usedBins.add(bin.binIndex);
+      reconciled.push({
+        bin,
+        tokenId,
+        token0,
+        token1,
+        fee: Number(fee),
+        tickLower: Number(tickLower),
+        tickUpper: Number(tickUpper),
+        liquidity,
+        openingAmount0: increase.amount0,
+        openingAmount1: increase.amount1,
+      });
+    }
+    if (usedBins.size !== bins.length) throw new Error("V3 open receipt does not cover the exact planned bin set");
+    return this.persistPositionGroupOpen(name, group, transactionHash, receipt.blockNumber ?? group.referenceBlock ?? 0n, reconciled.map((child) => ({
+      bin: child.bin,
+      tokenId: child.tokenId,
+      token0: child.token0,
+      token1: child.token1,
+      quoteToken: group.quoteToken,
+      poolAddress: group.poolKey as Address,
+      liquidity: child.liquidity,
+      openingAmount0: child.openingAmount0,
+      openingAmount1: child.openingAmount1,
+      metadata: {
+        fee: child.fee,
+        tickLower: child.tickLower,
+        tickUpper: child.tickUpper,
+         positionManager: registry.contracts.v3.positionManager,
+         positionGroupId: group.id,
+         managedBy: "position_group",
+         autoExitDisabled: true,
+         source: "position_group_open_receipt",
+        historyTrusted: true,
+        dex: registry.dex,
+      },
+    })));
+  }
+
+  private async reconcileV4PositionGroupOpen(
+    name: ChainName,
+    group: PositionGroupRecord,
+    bins: PositionGroupBinRecord[],
+    transactionHash: Hex,
+    receipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>,
+  ): Promise<PositionRecord[]> {
+    const { client, registry } = this.chains.get(name);
+    const transfers = receipt.logs
+      .filter((entry) => entry.address.toLowerCase() === group.positionManager.toLowerCase())
+      .map((entry) => decodeErc721Transfer(entry))
+      .filter((entry): entry is Erc721Transfer => entry !== null);
+    const expectedTokenIds = exactMintTokenIds(transfers, bins.length, group.owner);
+    const modifications = receipt.logs
+      .filter((entry) => entry.address.toLowerCase() === registry.contracts.v4.poolManager.toLowerCase())
+      .map((entry) => decodeV4LiquidityModification(entry))
+      .filter((entry): entry is V4LiquidityModification => entry !== null);
+    if (modifications.length !== expectedTokenIds.length) {
+      throw new Error("V4 open receipt does not contain the exact ModifyLiquidity event set");
+    }
+
+    const expectedPoolId = group.poolKey.toLowerCase();
+    const byTokenId = new Map<bigint, V4LiquidityModification>();
+    for (const modification of modifications) {
+      if (modification.id.toLowerCase() !== expectedPoolId
+        || modification.sender.toLowerCase() !== group.positionManager.toLowerCase()
+        || modification.liquidityDelta <= 0n) {
+        throw new Error("V4 ModifyLiquidity event does not match the group pool or manager");
+      }
+      const tokenId = expectedTokenIds.find((candidate) => derivedV4Salt(candidate).toLowerCase() === modification.salt.toLowerCase());
+      if (tokenId === undefined || byTokenId.has(tokenId)) {
+        throw new Error("V4 ModifyLiquidity salt does not map to the exact minted token set");
+      }
+      byTokenId.set(tokenId, modification);
+    }
+
+    const reconciled: V4ReconciledChild[] = [];
+    const usedBins = new Set<number>();
+    for (const tokenId of expectedTokenIds) {
+      const modification = byTokenId.get(tokenId);
+      if (!modification) throw new Error(`V4 token ${tokenId} has no matching ModifyLiquidity event`);
+      const owner = await client.readContract({
+        address: group.positionManager,
+        abi: v4PositionManagerAbi,
+        functionName: "ownerOf",
+        args: [tokenId],
+      });
+      if (owner.toLowerCase() !== group.owner.toLowerCase()) throw new Error(`V4 token ${tokenId} is not owned by the group owner`);
+      const poolAndPositionInfo = await client.readContract({
+        address: group.positionManager,
+        abi: v4PositionManagerAbi,
+        functionName: "getPoolAndPositionInfo",
+        args: [tokenId],
+      });
+      const { poolKey, positionInfo } = normalizeV4PoolAndPositionInfo(poolAndPositionInfo);
+      if (!sameV4GroupPoolKey(group, poolKey) || v4PoolId(poolKey.currency0, poolKey.currency1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks).toLowerCase() !== expectedPoolId) {
+        throw new Error(`V4 token ${tokenId} does not match the authoritative group pool`);
+      }
+      const { tickLower, tickUpper } = unpackV4PositionInfo(positionInfo);
+      if (tickLower !== modification.tickLower || tickUpper !== modification.tickUpper) {
+        throw new Error(`V4 token ${tokenId} has inconsistent ModifyLiquidity and position ticks`);
+      }
+      const bin = bins.find((candidate) => candidate.tickLower === tickLower && candidate.tickUpper === tickUpper);
+      if (!bin || usedBins.has(bin.binIndex)) throw new Error(`V4 token ${tokenId} does not map to exactly one planned bin`);
+      const liquidity = await client.readContract({
+        address: group.positionManager,
+        abi: v4PositionManagerAbi,
+        functionName: "getPositionLiquidity",
+        args: [tokenId],
+      });
+      if (liquidity <= 0n) throw new Error(`V4 token ${tokenId} has no positive position liquidity`);
+      usedBins.add(bin.binIndex);
+      reconciled.push({
+        bin,
+        tokenId,
+        poolKey,
+        tickLower,
+        tickUpper,
+        liquidity,
+        openingAmount0: bin.openingAmount0,
+        openingAmount1: bin.openingAmount1,
+      });
+    }
+    if (usedBins.size !== bins.length) throw new Error("V4 open receipt does not cover the exact planned bin set");
+    return this.persistPositionGroupOpen(name, group, transactionHash, receipt.blockNumber ?? group.referenceBlock ?? 0n, reconciled.map((child) => ({
+      bin: child.bin,
+      tokenId: child.tokenId,
+      token0: child.poolKey.currency0,
+      token1: child.poolKey.currency1,
+      quoteToken: group.quoteToken,
+      poolAddress: null,
+      liquidity: child.liquidity,
+      openingAmount0: child.openingAmount0,
+      openingAmount1: child.openingAmount1,
+      metadata: {
+        currency0: child.poolKey.currency0,
+        currency1: child.poolKey.currency1,
+        fee: child.poolKey.fee,
+        tickSpacing: child.poolKey.tickSpacing,
+        hooks: child.poolKey.hooks,
+        tickLower: child.tickLower,
+        tickUpper: child.tickUpper,
+        salt: derivedV4Salt(child.tokenId),
+         positionManager: registry.contracts.v4.positionManager,
+         positionGroupId: group.id,
+         managedBy: "position_group",
+         autoExitDisabled: true,
+         source: "position_group_open_receipt",
+        historyTrusted: true,
+        dex: registry.dex,
+      },
+    })));
+  }
+
+  private async persistPositionGroupOpen(
+    name: ChainName,
+    group: PositionGroupRecord,
+    transactionHash: Hex,
+    receiptBlockNumber: bigint,
+    children: readonly ReconciledPositionChild[],
+  ): Promise<PositionRecord[]> {
+    const positions: PositionRecord[] = [];
+    const newlyLinkedPositions: PositionRecord[] = [];
+    for (const child of children) {
+      const position = await this.database.upsertPosition({
+        chainId: group.chainId,
+        protocol: group.protocol,
+        positionKey: child.tokenId.toString(),
+        owner: group.owner,
+        poolAddress: child.poolAddress,
+        token0: child.token0,
+        token1: child.token1,
+        quoteToken: child.quoteToken,
+        status: "syncing",
+        liquidity: child.liquidity,
+        openedAtBlock: receiptBlockNumber,
+        metadata: child.metadata,
+      });
+      const current = child.bin;
+      const alreadyLinked = current.positionId === position.id && current.tokenId === child.tokenId;
+      if (current.positionId !== position.id || current.tokenId !== child.tokenId) {
+        const linked = await this.database.linkPositionGroupBinPosition(group.id, current.binIndex, position.id, child.tokenId);
+        if (linked === false) throw new Error(`could not link position group bin ${current.binIndex} to child ${position.id}`);
+      }
+      const updated = await this.database.updatePositionGroupBin(group.id, current.binIndex, {
+        tokenId: child.tokenId,
+        positionId: position.id,
+        status: "minted",
+        openTransactionHash: transactionHash,
+        openingAmount0: child.openingAmount0,
+        openingAmount1: child.openingAmount1,
+      });
+      if (updated === false) throw new Error(`could not update position group bin ${current.binIndex}`);
+      positions.push(position);
+      if (!alreadyLinked) newlyLinkedPositions.push(position);
+    }
+
+    const aggregateAmount0 = children.reduce((total, child) => total + child.openingAmount0, 0n);
+    const aggregateAmount1 = children.reduce((total, child) => total + child.openingAmount1, 0n);
+    const quoteAmount = group.quoteToken.toLowerCase() === group.token0.toLowerCase()
+      ? aggregateAmount0
+      : group.quoteToken.toLowerCase() === group.token1.toLowerCase()
+        ? aggregateAmount1
+        : 0n;
+    const addCashflow = (this.database as Database & {
+      addPositionGroupCashflow?: Database["addPositionGroupCashflow"];
+    }).addPositionGroupCashflow;
+    if (typeof addCashflow === "function") {
+      await addCashflow.call(
+        this.database,
+        group.id,
+        receiptBlockNumber,
+        transactionHash,
+        "open_debit",
+        quoteAmount,
+        aggregateAmount0,
+        aggregateAmount1,
+        { source: "atomic_group_open", childCount: children.length },
+      );
+    }
+
+    const linked = await this.database.setPositionGroupOpenTransaction(group.id, transactionHash, "active");
+    if (linked === false) throw new Error("position group already has a different open transaction hash");
+    const recordExecution = (this.database as Database & {
+      recordPositionGroupExecution?: Database["recordPositionGroupExecution"];
+    }).recordPositionGroupExecution;
+    if (typeof recordExecution === "function") {
+      await recordExecution.call(this.database, group.id, "open_batch", "confirmed", transactionHash, undefined, undefined, undefined, {
+        source: "position_group_open_receipt_reconciliation",
+      });
+    }
+    for (const position of newlyLinkedPositions) {
+      try {
+        await this.notifier?.positionDiscovered(position);
+      } catch (error) {
+        log.warn({ err: error, positionId: position.id, positionKey: position.positionKey }, "group child notification failed after open receipt reconciliation");
+      }
+    }
+    return positions;
+  }
+
+  private async markPositionGroupOpenNeedsReview(
+    group: PositionGroupRecord,
+    bins: readonly PositionGroupBinRecord[],
+    transactionHash: Hex,
+    reason: string,
+  ): Promise<void> {
+    try {
+      await this.database.setPositionGroupStatus(group.id, "needs_review", {
+        reason: "group_open_receipt_correlation_failed",
+        correlationError: reason,
+        openTransactionHash: transactionHash,
+        pendingRawTransaction: null,
+      });
+      for (const bin of bins.filter((candidate) => candidate.status !== "skipped")) {
+        await this.database.updatePositionGroupBin(group.id, bin.binIndex, { status: "needs_review" });
+      }
+    } catch (error) {
+      log.warn({ err: error, groupId: group.id, transactionHash }, "could not mark position group open receipt for review");
+    }
+  }
+
   async syncChain(name: ChainName): Promise<void> {
     const { client, registry } = this.chains.get(name);
+    await this.reconcilePendingPositionGroupOpens(name);
     const latest = await client.getBlockNumber();
     const cursor = await this.database.getCursor(registry.chain.id);
     const bootstrap = await this.database.getBootstrap(registry.chain.id);
@@ -428,7 +808,7 @@ export class DiscoveryService {
         });
         if (owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) continue;
         const receipt = await client.getTransactionReceipt({ hash: candidate.transactionHash });
-        const mintEvent = this.decodeV4MintLog(receipt.logs, registry.contracts.v4.poolManager);
+        const mintEvent = this.decodeV4MintLog(receipt.logs, registry.contracts.v4.poolManager, tokenId);
         if (!mintEvent) {
           const fallback = await this.upsertV4FromPositionManager(name, tokenId, candidate.blockNumber, candidate.historyTrusted, {
             source: "position_manager_fallback",
@@ -691,17 +1071,19 @@ export class DiscoveryService {
     await this.database.setPositionStatus(position.id, position.status, { openingCashflowHydrated: true });
   }
 
-  private decodeV4MintLog(logs: readonly { address: Address; data: Hex; topics: readonly Hex[] }[], poolManager: Address): { poolId: Hex; tickLower: number; tickUpper: number; liquidityDelta: bigint; salt: Hex } | null {
+  private decodeV4MintLog(logs: readonly { address: Address; data: Hex; topics: readonly Hex[] }[], poolManager: Address, tokenId?: bigint): { poolId: Hex; tickLower: number; tickUpper: number; liquidityDelta: bigint; salt: Hex } | null {
+    const matches: { poolId: Hex; tickLower: number; tickUpper: number; liquidityDelta: bigint; salt: Hex }[] = [];
     for (const logEntry of logs) {
       if (logEntry.address.toLowerCase() !== poolManager.toLowerCase()) continue;
       try {
         const decoded = decodeEventLog({ abi: [v4PoolManagerModifyLiquidityEvent], data: logEntry.data, topics: logEntry.topics as [Hex, ...Hex[]] });
         const args = decoded.args as { id?: Hex; tickLower?: number; tickUpper?: number; liquidityDelta?: bigint; salt?: Hex };
         if (args.id === undefined || args.tickLower === undefined || args.tickUpper === undefined || args.liquidityDelta === undefined || args.salt === undefined) continue;
-        return { poolId: args.id, tickLower: args.tickLower, tickUpper: args.tickUpper, liquidityDelta: args.liquidityDelta, salt: args.salt };
+        if (tokenId !== undefined && args.salt.toLowerCase() !== derivedV4Salt(tokenId).toLowerCase()) continue;
+        matches.push({ poolId: args.id, tickLower: args.tickLower, tickUpper: args.tickUpper, liquidityDelta: args.liquidityDelta, salt: args.salt });
       } catch { /* not the right log */ }
     }
-    return null;
+    return matches.length === 1 ? matches[0]! : null;
   }
 
   async hydrateV3History(name: ChainName, position: PositionRecord, fromBlock: bigint, toBlock: bigint): Promise<void> {
@@ -715,7 +1097,8 @@ export class DiscoveryService {
 
   private async syncV3Cashflows(name: ChainName, fromBlock: bigint, toBlock: bigint, selectedPositions?: PositionRecord[]): Promise<void> {
     const { registry } = this.chains.get(name);
-    const positions = (selectedPositions ?? await this.database.listOpenPositions(registry.chain.id)).filter((position) => position.protocol === "v3" && position.quoteToken);
+    const positions = (selectedPositions ?? await this.database.listOpenPositions(registry.chain.id))
+      .filter((position) => position.protocol === "v3" && position.quoteToken && !isManagedPosition(position));
     for (const position of positions) {
       const tokenId = BigInt(position.positionKey);
       try {
@@ -753,7 +1136,8 @@ export class DiscoveryService {
 
   private async syncV4Cashflows(name: ChainName, fromBlock: bigint, toBlock: bigint): Promise<void> {
     const { client, registry } = this.chains.get(name);
-    const positions = (await this.database.listOpenPositions(registry.chain.id)).filter((position) => position.protocol === "v4" && position.quoteToken);
+    const positions = (await this.database.listOpenPositions(registry.chain.id))
+      .filter((position) => position.protocol === "v4" && position.quoteToken && !isManagedPosition(position));
     if (positions.length === 0) return;
     const bySalt = new Map<Hex, PositionRecord>();
     const liquidityBySalt = new Map<Hex, bigint>();
@@ -828,7 +1212,7 @@ export class DiscoveryService {
 
   async reconcileV4Liquidity(name: ChainName): Promise<void> {
     const { client, registry } = this.chains.get(name);
-    const positions = (await this.database.listOpenPositions(registry.chain.id)).filter((position) => position.protocol === "v4");
+    const positions = (await this.database.listOpenPositions(registry.chain.id)).filter((position) => position.protocol === "v4" && !isManagedPosition(position));
     if (positions.length === 0) return;
     const bySalt = new Map<Hex, PositionRecord>();
     let oldestBlock: bigint | null = null;
@@ -1018,6 +1402,254 @@ function quoteValueFromPairAmounts(position: PositionRecord, amount0: bigint, am
     return amount1 === 0n ? amount0 : amount0 + (amount1 * amount0) / amount1;
   }
   return amount0 === 0n ? amount1 : amount1 + (amount0 * amount1) / amount0;
+}
+
+interface Erc721Transfer {
+  from: Address;
+  to: Address;
+  tokenId: bigint;
+}
+
+interface V3IncreaseLiquidity {
+  tokenId: bigint;
+  liquidity: bigint;
+  amount0: bigint;
+  amount1: bigint;
+}
+
+interface V4LiquidityModification {
+  id: Hex;
+  sender: Address;
+  tickLower: number;
+  tickUpper: number;
+  liquidityDelta: bigint;
+  salt: Hex;
+}
+
+interface V3ReconciledChild {
+  bin: PositionGroupBinRecord;
+  tokenId: bigint;
+  token0: Address;
+  token1: Address;
+  fee: number;
+  tickLower: number;
+  tickUpper: number;
+  liquidity: bigint;
+  openingAmount0: bigint;
+  openingAmount1: bigint;
+}
+
+interface V4ReconciledChild {
+  bin: PositionGroupBinRecord;
+  tokenId: bigint;
+  poolKey: V4PoolKey;
+  tickLower: number;
+  tickUpper: number;
+  liquidity: bigint;
+  openingAmount0: bigint;
+  openingAmount1: bigint;
+}
+
+interface ReconciledPositionChild {
+  bin: PositionGroupBinRecord;
+  tokenId: bigint;
+  token0: Address;
+  token1: Address;
+  quoteToken: Address;
+  poolAddress: Address | null;
+  liquidity: bigint;
+  openingAmount0: bigint;
+  openingAmount1: bigint;
+  metadata: Record<string, unknown>;
+}
+
+type V4PoolKey = {
+  currency0: Address;
+  currency1: Address;
+  fee: number;
+  tickSpacing: number;
+  hooks: Address;
+};
+
+function expectedPositionManager(
+  registry: { contracts: { v3: { positionManager: Address }; v4: { positionManager: Address } } },
+  protocol: "v3" | "v4",
+): Address {
+  return protocol === "v3" ? registry.contracts.v3.positionManager : registry.contracts.v4.positionManager;
+}
+
+function plannedGroupBins(group: PositionGroupRecord, bins: readonly PositionGroupBinRecord[]): PositionGroupBinRecord[] {
+  const planned = bins.filter((bin) => bin.status !== "skipped");
+  if (planned.length === 0 || planned.length !== group.mintableBinCount) {
+    throw new Error(`position group has ${planned.length} planned bins but expects ${group.mintableBinCount}`);
+  }
+  if (new Set(planned.map((bin) => bin.binIndex)).size !== planned.length) {
+    throw new Error("position group contains duplicate planned bin indexes");
+  }
+  if (new Set(planned.map((bin) => `${bin.tickLower}:${bin.tickUpper}`)).size !== planned.length) {
+    throw new Error("position group contains duplicate planned bin ticks");
+  }
+  return planned;
+}
+
+function isManagedPosition(position: PositionRecord): boolean {
+  return position.metadata.managedBy === "position_group"
+    && typeof position.metadata.positionGroupId === "string";
+}
+
+function exactMintTokenIds(transfers: readonly Erc721Transfer[], expectedCount: number, owner: Address): bigint[] {
+  if (transfers.length !== expectedCount) {
+    throw new Error(`open receipt contains ${transfers.length} ERC721 transfers; expected exactly ${expectedCount} mints`);
+  }
+  if (transfers.some((transfer) => transfer.from.toLowerCase() !== zeroAddress.toLowerCase() || transfer.to.toLowerCase() !== owner.toLowerCase())) {
+    throw new Error("open receipt contains a non-mint or incorrectly owned ERC721 transfer");
+  }
+  const tokenIds = transfers.map((transfer) => transfer.tokenId);
+  if (new Set(tokenIds.map((tokenId) => tokenId.toString())).size !== tokenIds.length) {
+    throw new Error("open receipt contains duplicate ERC721 token IDs");
+  }
+  return tokenIds;
+}
+
+function sameBigIntSet(left: readonly bigint[], right: readonly bigint[]): boolean {
+  if (left.length !== right.length) return false;
+  const expected = new Set(left.map((value) => value.toString()));
+  return expected.size === left.length && right.every((value) => expected.has(value.toString())) && new Set(right.map((value) => value.toString())).size === right.length;
+}
+
+function plannedV3Fee(group: PositionGroupRecord): number | undefined {
+  const configured = firstNumericValue(
+    group.metadata,
+    group.planJson,
+    recordValue(group.planJson, "plan"),
+    recordValue(group.planJson, "preview"),
+  );
+  return configured;
+}
+
+function firstNumericValue(...values: readonly (Record<string, unknown> | null | undefined)[]): number | undefined {
+  for (const value of values) {
+    if (!value) continue;
+    for (const key of ["feeTier", "fee"]) {
+      const candidate = value[key];
+      if (typeof candidate === "number" && Number.isSafeInteger(candidate)) return candidate;
+      if (typeof candidate === "string" && /^\d+$/.test(candidate)) return Number(candidate);
+    }
+  }
+  return undefined;
+}
+
+function plannedV4PoolKey(group: PositionGroupRecord): V4PoolKey | null {
+  const candidates = [
+    recordValue(group.planJson, "poolKey"),
+    recordValue(group.planJson, "v4PoolKey"),
+    recordValue(recordValue(group.planJson, "plan"), "poolKey"),
+    recordValue(recordValue(group.planJson, "plan"), "v4PoolKey"),
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const currency0 = candidate.currency0;
+    const currency1 = candidate.currency1;
+    const fee = candidate.fee;
+    const tickSpacing = candidate.tickSpacing;
+    const hooks = candidate.hooks;
+    if (typeof currency0 !== "string" || typeof currency1 !== "string" || typeof hooks !== "string") continue;
+    if (!Number.isSafeInteger(Number(fee)) || !Number.isSafeInteger(Number(tickSpacing))) continue;
+    return { currency0: currency0 as Address, currency1: currency1 as Address, fee: Number(fee), tickSpacing: Number(tickSpacing), hooks: hooks as Address };
+  }
+  return null;
+}
+
+function sameV4GroupPoolKey(group: PositionGroupRecord, poolKey: V4PoolKey): boolean {
+  if (poolKey.currency0.toLowerCase() !== group.token0.toLowerCase() || poolKey.currency1.toLowerCase() !== group.token1.toLowerCase()) return false;
+  const planned = plannedV4PoolKey(group);
+  return !planned || (
+    poolKey.currency0.toLowerCase() === planned.currency0.toLowerCase()
+    && poolKey.currency1.toLowerCase() === planned.currency1.toLowerCase()
+    && Number(poolKey.fee) === planned.fee
+    && Number(poolKey.tickSpacing) === planned.tickSpacing
+    && poolKey.hooks.toLowerCase() === planned.hooks.toLowerCase()
+  );
+}
+
+function recordValue(value: Record<string, unknown> | null | undefined, key: string): Record<string, unknown> | null {
+  const nested = value?.[key];
+  return nested && typeof nested === "object" && !Array.isArray(nested) ? nested as Record<string, unknown> : null;
+}
+
+function derivedV4Salt(tokenId: bigint): Hex {
+  return pad(toHex(tokenId), { size: 32 });
+}
+
+function normalizeV4PoolAndPositionInfo(value: unknown): { poolKey: V4PoolKey; positionInfo: bigint } {
+  const tuple = Array.isArray(value) ? value : null;
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : null;
+  const rawPoolKey = tuple?.[0] ?? record?.poolKey;
+  const rawPositionInfo = tuple?.[1] ?? record?.positionInfo;
+  if (!rawPoolKey || typeof rawPoolKey !== "object" || rawPositionInfo === undefined) throw new Error("V4 position manager returned incomplete pool position info");
+  const poolKey = rawPoolKey as Record<string, unknown>;
+  if (typeof poolKey.currency0 !== "string" || typeof poolKey.currency1 !== "string" || typeof poolKey.hooks !== "string") {
+    throw new Error("V4 position manager returned an invalid pool key");
+  }
+  const positionInfo = typeof rawPositionInfo === "bigint" ? rawPositionInfo : BigInt(rawPositionInfo as string | number);
+  return {
+    poolKey: {
+      currency0: poolKey.currency0 as Address,
+      currency1: poolKey.currency1 as Address,
+      fee: Number(poolKey.fee),
+      tickSpacing: Number(poolKey.tickSpacing),
+      hooks: poolKey.hooks as Address,
+    },
+    positionInfo,
+  };
+}
+
+function decodeErc721Transfer(logEntry: { data: Hex; topics: readonly Hex[] }): Erc721Transfer | null {
+  try {
+    const decoded = decodeEventLog({ abi: [erc721TransferEvent], data: logEntry.data, topics: logEntry.topics as [Hex, ...Hex[]] });
+    const args = decoded.args as { from?: unknown; to?: unknown; tokenId?: unknown };
+    return typeof args.from === "string" && typeof args.to === "string" && typeof args.tokenId === "bigint"
+      ? { from: args.from as Address, to: args.to as Address, tokenId: args.tokenId }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function decodeV3IncreaseLiquidity(logEntry: { data: Hex; topics: readonly Hex[] }): V3IncreaseLiquidity | null {
+  try {
+    const decoded = decodeEventLog({ abi: [v3IncreaseLiquidityEvent], data: logEntry.data, topics: logEntry.topics as [Hex, ...Hex[]] });
+    const args = decoded.args as { tokenId?: unknown; liquidity?: unknown; amount0?: unknown; amount1?: unknown };
+    return typeof args.tokenId === "bigint" && typeof args.liquidity === "bigint" && typeof args.amount0 === "bigint" && typeof args.amount1 === "bigint"
+      ? { tokenId: args.tokenId, liquidity: args.liquidity, amount0: args.amount0, amount1: args.amount1 }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function decodeV4LiquidityModification(logEntry: { data: Hex; topics: readonly Hex[] }): V4LiquidityModification | null {
+  try {
+    const decoded = decodeEventLog({ abi: [v4PoolManagerModifyLiquidityEvent], data: logEntry.data, topics: logEntry.topics as [Hex, ...Hex[]] });
+    const args = decoded.args as { id?: unknown; sender?: unknown; tickLower?: unknown; tickUpper?: unknown; liquidityDelta?: unknown; salt?: unknown };
+    return typeof args.id === "string" && typeof args.sender === "string" && typeof args.liquidityDelta === "bigint" && typeof args.salt === "string"
+      && Number.isSafeInteger(Number(args.tickLower)) && Number.isSafeInteger(Number(args.tickUpper))
+      ? {
+        id: args.id as Hex,
+        sender: args.sender as Address,
+        tickLower: Number(args.tickLower),
+        tickUpper: Number(args.tickUpper),
+        liquidityDelta: args.liquidityDelta,
+        salt: args.salt as Hex,
+      }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function unpackV4PositionInfo(value: bigint): { tickLower: number; tickUpper: number } {

@@ -8,7 +8,6 @@ import type { ChainClients } from "./chain-client.js";
 
 const REFRESH_INTERVAL_MS = 3 * 60_000;
 const DEXSCREENER_BASE = "https://api.dexscreener.com";
-const PORTFOLIO_CHAIN: ChainName = "robinhood";
 const ROBINHOOD_USDG_WETH_PAIR = "0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca";
 
 export interface PortfolioSnapshot {
@@ -73,7 +72,11 @@ export class PortfolioService {
     if (this.refreshRunning) return;
     this.refreshRunning = true;
     try {
-      const { walletUsd, activeLpUsd } = await this.refreshChain(PORTFOLIO_CHAIN);
+      const totals = await Promise.all(this.config.chains
+        .filter((chain): chain is ChainName => chain === "base" || chain === "robinhood")
+        .map((chain) => this.refreshChain(chain)));
+      const walletUsd = totals.reduce((total, current) => total + current.walletUsd, 0);
+      const activeLpUsd = totals.reduce((total, current) => total + current.activeLpUsd, 0);
       this.snapshot = {
         totalUsd: walletUsd + activeLpUsd,
         walletUsd,
@@ -89,8 +92,16 @@ export class PortfolioService {
   }
 
   private async refreshChain(chain: ChainName): Promise<{ walletUsd: number; activeLpUsd: number }> {
-    const positions = (await this.database.listActivePositions(this.chains.get(chain).registry.chain.id))
-      .filter((position) => position.status === "armed" && position.owner.toLowerCase() === this.config.executorAddress.toLowerCase());
+    const chainId = this.chains.get(chain).registry.chain.id;
+    const [allPositions, groups] = await Promise.all([
+      this.database.listActivePositions(chainId),
+      this.database.listPositionGroups(chainId),
+    ]);
+    const positions = allPositions
+      .filter((position) => position.status === "armed"
+        && position.owner.toLowerCase() === this.config.executorAddress.toLowerCase()
+        && !isManagedGroupChild(position));
+    const activeGroups = groups.filter((group) => group.status === "active");
     const excludedWalletTokens = new Set(
       positions
         .filter((position) => position.protocol === "v2" && position.poolAddress)
@@ -101,6 +112,7 @@ export class PortfolioService {
     const addresses = [...new Set([
       ...balances.map((balance) => balance.address.toLowerCase()),
       ...positions.flatMap((position) => position.quoteToken ? [position.quoteToken] : []),
+      ...activeGroups.map((group) => group.quoteToken),
       ...this.config.quoteTokens[chain].map((token) => token.address),
     ])] as Address[];
     const prices = await this.tokenPrices(chain, addresses);
@@ -125,6 +137,14 @@ export class PortfolioService {
       const decimals = await this.tokenDecimals(chain, position.quoteToken);
       activeLpUsd += Number(snapshot.liquidationQuote) / 10 ** decimals * quotePrice;
       activeLpUsd += Number(snapshot.feeQuoteUsdg) / 10 ** stableDecimals;
+    }
+    for (const group of activeGroups) {
+      const snapshot = await this.database.getLatestPositionGroupPnlSnapshot(group.id);
+      if (!snapshot) continue;
+      const quotePrice = this.usdPrice(chain, group.quoteToken, prices);
+      if (quotePrice === null) continue;
+      const decimals = await this.tokenDecimals(chain, group.quoteToken);
+      activeLpUsd += Number(snapshot.liquidationQuote + snapshot.feeQuote) / 10 ** decimals * quotePrice;
     }
     return { walletUsd, activeLpUsd };
   }
@@ -232,4 +252,9 @@ export class PortfolioService {
     if (!address) return null;
     return prices.get(address.toLowerCase()) ?? null;
   }
+}
+
+function isManagedGroupChild(position: { metadata: Record<string, unknown> }): boolean {
+  return position.metadata.managedBy === "position_group"
+    && typeof position.metadata.positionGroupId === "string";
 }

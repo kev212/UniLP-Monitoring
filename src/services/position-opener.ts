@@ -1,11 +1,25 @@
 import { createRequire } from "node:module";
-import { createPublicClient, createWalletClient, encodeFunctionData, http, type Address, type Hex, type PublicClient, zeroAddress } from "viem";
+import { createPublicClient, createWalletClient, encodeAbiParameters, encodeFunctionData, http, keccak256, type Address, type Hex, type PublicClient, zeroAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
-import { erc20Abi, permit2Abi, v3PoolAbi, v4PoolKeysAbi, v4StateViewAbi, wethAbi } from "../abi.js";
+import { erc20Abi, permit2Abi, v3FactoryAbi, v3PoolAbi, v4PoolKeysAbi, v4StateViewAbi, wethAbi } from "../abi.js";
 import type { RuntimeConfig } from "../config.js";
+import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, PositionRecord, QuoteToken } from "../types.js";
+import type { ChainName, PositionGroupBinRecord, PositionGroupRecord, PositionRecord, QuoteToken, TransactionPlan } from "../types.js";
+import {
+  buildV3BidAskOpenPlan,
+  buildV4BidAskOpenPlan,
+  type V4PoolKey as BidAskV4PoolKey,
+} from "./bid-ask-batch.js";
+import {
+  hashBidAskPlan,
+  planBidAsk,
+  validateBidAskRange,
+  type BidAskAllocatedBin,
+  type BidAskBinGeometry,
+  type BidAskPlan,
+} from "./bid-ask-planner.js";
 import type { ChainClients } from "./chain-client.js";
 import type { RoutePlanner } from "./route-planner.js";
 import { buildSwapPlan } from "./swap-builder.js";
@@ -59,6 +73,59 @@ export interface OpenPositionPreview {
   expectedBaseFromSwap?: bigint;
 }
 
+export interface BidAskOpenPreview {
+  protocol: "v3" | "v4";
+  chain: ChainName;
+  poolAddress: Hex;
+  poolKey?: V4PoolKey;
+  v4PoolKey?: V4PoolKey;
+  positionManager: Address;
+  pair: string;
+  feeTier: number;
+  feeLabel: string;
+  quoteToken: Address;
+  quoteTokenSymbol: string;
+  quoteIsToken0: boolean;
+  token0: Address;
+  token1: Address;
+  token0Decimals: number;
+  token1Decimals: number;
+  currentTick: number;
+  tickSpacing: number;
+  sqrtPriceX96: bigint;
+  poolLiquidity: bigint;
+  hooks: Address;
+  rangePercent: number;
+  dropPercent: number;
+  depositAmount: bigint;
+  requestedBinCount: number;
+  generatedBinCount: number;
+  mintableBinCount: number;
+  outerTickLower: number;
+  outerTickUpper: number;
+  anchorBinIndex: number;
+  totalAmount0: bigint;
+  totalAmount1: bigint;
+  plan: BidAskPlan;
+  bins: BidAskPlan["bins"];
+  planHash: Hex;
+  batchPlan: TransactionPlan;
+  transactionPlan: TransactionPlan;
+  deadline: bigint;
+  estimatedGas: bigint | null;
+  blockGasLimit: bigint | null;
+  atomicBatchFeasible: boolean;
+  groupId?: string;
+}
+
+export interface BidAskOpenExecution {
+  hash: Hex | null;
+  groupId?: string;
+  plan: TransactionPlan;
+  estimatedGas: bigint;
+  blockGasLimit: bigint | null;
+}
+
 const Q192 = 1n << 192n;
 const V3_SUPPORTED_FEES = new Set<number>([FeeAmount.LOWEST, FeeAmount.LOW, FeeAmount.MEDIUM, FeeAmount.HIGH]);
 
@@ -70,6 +137,48 @@ type V4PoolKey = {
   hooks: Address;
 };
 
+type BidAskDatabase = Pick<
+  Database,
+  | "createPositionGroup"
+  | "createPositionGroupBin"
+  | "setPositionGroupStatus"
+  | "setPositionGroupOpenTransaction"
+  | "recordPositionGroupExecution"
+  | "withExecutionLock"
+>;
+
+export type BidAskOpenReconciler = (chain: ChainName, groupId: string, transactionHash: Hex) => Promise<PositionRecord[]>;
+
+interface BidAskPoolState {
+  protocol: "v3" | "v4";
+  poolAddress: Hex;
+  token0: Address;
+  token1: Address;
+  fee: number;
+  tickSpacing: number;
+  hooks: Address;
+  currentTick: number;
+  sqrtPriceX96: bigint;
+  poolLiquidity: bigint;
+  poolKey?: V4PoolKey;
+}
+
+interface BidAskGasResult {
+  estimatedGas: bigint;
+  blockGasLimit: bigint | null;
+}
+
+type BidAskRuntimeConfig = RuntimeConfig & {
+  bidAskLadderEnabled?: boolean | string;
+  bidAskLadderProtocols?: readonly ("v3" | "v4")[] | string;
+  bidAskLadderMaxBins?: number;
+  bidAskLadderAtomicMaxBlockGasBps?: number;
+  bidAskLadderTransactionDeadlineSeconds?: number;
+  bidAskLadderMaxPriceDeviationBps?: number;
+  bidAskLadderOpenSlippageBps?: number;
+  bidAskLadderMaxGas?: bigint | number;
+};
+
 export class PositionOpener {
   private readonly account;
 
@@ -78,6 +187,8 @@ export class PositionOpener {
     private readonly chains: ChainClients,
     private readonly routes?: RoutePlanner,
     private readonly tradingApi?: UniswapTradingApi,
+    private readonly database?: BidAskDatabase,
+    private readonly reconcileBidAskOpen?: BidAskOpenReconciler,
   ) {
     this.account = config.executorPrivateKey ? privateKeyToAccount(config.executorPrivateKey) : undefined;
   }
@@ -104,6 +215,107 @@ export class PositionOpener {
 
     if (protocol === "v3") return this.prepareV3(normalized, chain, rangePercent, depositAmount, quoteToken, mode);
     return this.prepareV4(normalized, chain, rangePercent, depositAmount, quoteToken, mode);
+  }
+
+  async prepareBidAskOpen(
+    poolAddress: string,
+    chain: ChainName,
+    rangePercent: number,
+    depositAmount: bigint,
+    quoteToken: QuoteToken,
+    requestedBinCount: number,
+  ): Promise<BidAskOpenPreview> {
+    if (chain !== "base" && chain !== "robinhood") throw new Error("Bid-Ask ladders are supported on Base and Robinhood only");
+    const normalized = poolAddress.toLowerCase() as Hex;
+    const protocol = normalized.length === 66 && normalized.startsWith("0x") ? "v4" : "v3";
+    this.assertBidAskEnabled(protocol, requestedBinCount);
+
+    const state = await this.readBidAskPool(normalized, chain);
+    this.assertBidAskPoolSupported(state);
+    const quoteAddress = openPoolQuoteAddress(protocol, this.chains.get(chain).registry.chain.id, quoteToken).toLowerCase();
+    const quoteIsToken0 = quoteAddress === state.token0.toLowerCase();
+    if (!quoteIsToken0 && quoteAddress !== state.token1.toLowerCase()) {
+      throw new Error("Quote token is neither token0 nor token1 of this pool");
+    }
+
+    const outer = bidAskOuterTicks(state.currentTick, state.tickSpacing, quoteIsToken0, rangePercent);
+    const [token0Decimals, token1Decimals] = await Promise.all([
+      this.tokenDecimals(this.client(chain), state.token0),
+      this.tokenDecimals(this.client(chain), state.token1),
+    ]);
+    const baseToken = quoteIsToken0 ? state.token1 : state.token0;
+    const baseSymbol = await this.tokenSymbol(this.client(chain), baseToken);
+    const plan = this.makeBidAskPlan(state, chain, quoteIsToken0, token0Decimals, token1Decimals, outer, depositAmount, requestedBinCount);
+    const deadline = this.bidAskDeadline();
+    const batchPlan = this.buildBidAskBatch(state, chain, plan, quoteIsToken0, quoteToken, deadline);
+    const planHash = hashBidAskPlan(plan);
+    const pair = quoteIsToken0 ? `${baseSymbol}/${quoteToken.symbol}` : `${quoteToken.symbol}/${baseSymbol}`;
+
+    return {
+      protocol,
+      chain,
+      poolAddress: normalized,
+      ...(state.poolKey ? { poolKey: state.poolKey } : {}),
+      ...(state.poolKey ? { v4PoolKey: state.poolKey } : {}),
+      positionManager: this.positionManager(chain, protocol),
+      pair,
+      feeTier: state.fee,
+      feeLabel: `${(state.fee / 10_000).toFixed(2)}%`,
+      quoteToken: quoteToken.address,
+      quoteTokenSymbol: quoteToken.symbol,
+      quoteIsToken0,
+      token0: state.token0,
+      token1: state.token1,
+      token0Decimals,
+      token1Decimals,
+      currentTick: state.currentTick,
+      tickSpacing: state.tickSpacing,
+      sqrtPriceX96: state.sqrtPriceX96,
+      poolLiquidity: state.poolLiquidity,
+      hooks: state.hooks,
+      rangePercent,
+      dropPercent: rangePercent,
+      depositAmount,
+      requestedBinCount,
+      generatedBinCount: plan.generatedBinCount,
+      mintableBinCount: plan.mintableBinCount,
+      outerTickLower: plan.outerTickLower,
+      outerTickUpper: plan.outerTickUpper,
+      anchorBinIndex: plan.anchorIndex,
+      totalAmount0: plan.totalAmount0,
+      totalAmount1: plan.totalAmount1,
+      plan,
+      bins: plan.bins,
+      planHash,
+      batchPlan,
+      transactionPlan: batchPlan,
+      deadline,
+      estimatedGas: null,
+      blockGasLimit: null,
+      atomicBatchFeasible: true,
+    };
+  }
+
+  async prepareBidAsk(
+    poolAddress: string,
+    chain: ChainName,
+    rangePercent: number,
+    depositAmount: bigint,
+    quoteToken: QuoteToken,
+    requestedBinCount: number,
+  ): Promise<BidAskOpenPreview> {
+    return this.prepareBidAskOpen(poolAddress, chain, rangePercent, depositAmount, quoteToken, requestedBinCount);
+  }
+
+  async prepareBidAskLadder(
+    poolAddress: string,
+    chain: ChainName,
+    rangePercent: number,
+    depositAmount: bigint,
+    quoteToken: QuoteToken,
+    requestedBinCount: number,
+  ): Promise<BidAskOpenPreview> {
+    return this.prepareBidAskOpen(poolAddress, chain, rangePercent, depositAmount, quoteToken, requestedBinCount);
   }
 
   async detectQuoteToken(poolAddress: string, chain: ChainName): Promise<QuoteToken> {
@@ -277,6 +489,673 @@ export class PositionOpener {
       return { ...(await this.executeV3Dual(merged, deadline, quoteSideAmount, baseAmount)), swapHash: swapResult.hash };
     }
     return { ...(await this.executeV4Dual(merged, deadline, quoteSideAmount, baseAmount)), swapHash: swapResult.hash };
+  }
+
+  async executeBidAskOpen(preview: BidAskOpenPreview): Promise<BidAskOpenExecution> {
+    if (preview.chain !== "base" && preview.chain !== "robinhood") throw new Error("Bid-Ask ladders are supported on Base and Robinhood only");
+    this.assertBidAskEnabled(preview.protocol, preview.requestedBinCount);
+    if (!this.database || !this.reconcileBidAskOpen) {
+      throw new Error("Bid-Ask open requires durable group persistence and receipt reconciliation");
+    }
+    const client = this.client(preview.chain);
+    const firstState = await this.readBidAskPool(preview.poolAddress, preview.chain);
+    this.assertBidAskPoolSupported(firstState);
+    this.assertBidAskStateMatches(preview, firstState);
+    this.assertBidAskOrientation(preview, firstState.currentTick);
+    this.assertBidAskPriceGuard(preview, firstState.sqrtPriceX96);
+
+    const quoteAmount = preview.quoteIsToken0 ? preview.plan.totalAmount0 : preview.plan.totalAmount1;
+    const executor = this.config.executorAddress;
+    if (quoteAmount <= 0n) throw new Error("Bid-Ask quote allocation is zero");
+
+    if (preview.protocol === "v3") {
+      if (isBidAskNativeFunding(preview.protocol, preview.quoteToken, preview.quoteTokenSymbol)) {
+        await this.ensureNativeBalance(client, executor, quoteAmount);
+      } else {
+        await this.ensureApproval(client, preview.quoteToken, this.chains.get(preview.chain).registry.contracts.v3.positionManager, quoteAmount, executor, preview.chain);
+      }
+    } else if (preview.quoteToken.toLowerCase() === zeroAddress.toLowerCase()) {
+      await this.ensureNativeBalance(client, executor, quoteAmount);
+    } else {
+      const { registry } = this.chains.get(preview.chain);
+      await this.ensureWrappedNativeFunding(client, preview.chain, preview.quoteToken, quoteAmount, executor);
+      await this.ensureApproval(client, preview.quoteToken, registry.contracts.v4.permit2, quoteAmount, executor, preview.chain);
+      await this.ensurePermit2Approval(client, preview.quoteToken, registry.contracts.v4.positionManager, quoteAmount, executor, preview.chain);
+    }
+
+    const state = await this.readBidAskPool(preview.poolAddress, preview.chain);
+    this.assertBidAskPoolSupported(state);
+    this.assertBidAskStateMatches(preview, state);
+    this.assertBidAskOrientation(preview, state.currentTick);
+    this.assertBidAskPriceGuard(preview, state.sqrtPriceX96);
+    const plan = this.makeBidAskPlan(
+      state,
+      preview.chain,
+      preview.quoteIsToken0,
+      preview.token0Decimals,
+      preview.token1Decimals,
+      { lowerTick: preview.outerTickLower, upperTick: preview.outerTickUpper },
+      preview.depositAmount,
+      preview.requestedBinCount,
+    );
+    const deadline = this.bidAskDeadline();
+    const batchPlan = this.buildBidAskBatch(
+      state,
+      preview.chain,
+      plan,
+      preview.quoteIsToken0,
+      { address: preview.quoteToken, symbol: preview.quoteTokenSymbol },
+      deadline,
+    );
+    const gas = await this.simulateAndEstimateBidAsk(preview.chain, batchPlan, plan.generatedBinCount);
+    const planHash = hashBidAskPlan(plan);
+    const finalPreview: BidAskOpenPreview = {
+      ...preview,
+      currentTick: state.currentTick,
+      sqrtPriceX96: state.sqrtPriceX96,
+      poolLiquidity: state.poolLiquidity,
+      ...(state.poolKey ? { poolKey: state.poolKey } : {}),
+      ...(state.poolKey ? { v4PoolKey: state.poolKey } : {}),
+      generatedBinCount: plan.generatedBinCount,
+      mintableBinCount: plan.mintableBinCount,
+      outerTickLower: plan.outerTickLower,
+      outerTickUpper: plan.outerTickUpper,
+      anchorBinIndex: plan.anchorIndex,
+      totalAmount0: plan.totalAmount0,
+      totalAmount1: plan.totalAmount1,
+      plan,
+      bins: plan.bins,
+      planHash,
+      batchPlan,
+      transactionPlan: batchPlan,
+      deadline,
+      estimatedGas: gas.estimatedGas,
+      blockGasLimit: gas.blockGasLimit,
+      atomicBatchFeasible: true,
+    };
+    const groupId = await this.persistBidAskPlan(finalPreview);
+    if (!groupId) throw new Error("Bid-Ask open group was not persisted");
+    await this.database.setPositionGroupStatus(groupId, "opening", {
+      planHash,
+      atomicBatch: true,
+      noOpeningSwap: true,
+    });
+    const result = await this.broadcastBidAsk(preview.chain, groupId, batchPlan.to, batchPlan.data, batchPlan.value ?? 0n);
+    if (result.hash) {
+      await this.reconcileBidAskOpen(preview.chain, groupId, result.hash);
+    }
+    return {
+      hash: result.hash,
+      groupId,
+      plan: batchPlan,
+      estimatedGas: gas.estimatedGas,
+      blockGasLimit: gas.blockGasLimit,
+    };
+  }
+
+  async executeBidAsk(preview: BidAskOpenPreview): Promise<BidAskOpenExecution> {
+    return this.executeBidAskOpen(preview);
+  }
+
+  async executeBidAskLadder(preview: BidAskOpenPreview): Promise<BidAskOpenExecution> {
+    return this.executeBidAskOpen(preview);
+  }
+
+  private assertBidAskEnabled(protocol: "v3" | "v4", requestedBinCount: number): void {
+    const config = this.config as BidAskRuntimeConfig;
+    const enabled = config.bidAskLadderEnabled;
+    if (enabled === false || String(enabled).toLowerCase() === "false") throw new Error("Bid-Ask ladder is disabled");
+
+    const configuredProtocols = config.bidAskLadderProtocols;
+    if (configuredProtocols !== undefined) {
+      const protocols: readonly string[] = typeof configuredProtocols === "string"
+        ? configuredProtocols.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean)
+        : configuredProtocols;
+      if (!protocols.includes(protocol)) throw new Error(`Bid-Ask protocol ${protocol} is disabled`);
+    }
+
+    const maxBins = config.bidAskLadderMaxBins;
+    if (maxBins !== undefined && Number.isSafeInteger(maxBins) && (requestedBinCount > maxBins || maxBins < 1)) {
+      throw atomicBatchInfeasible(`requested bin count ${requestedBinCount} exceeds the configured maximum`);
+    }
+  }
+
+  private async readBidAskPool(poolAddress: Hex, chain: ChainName): Promise<BidAskPoolState> {
+    const client = this.client(chain);
+    const { registry } = this.chains.get(chain);
+    const isV4 = poolAddress.length === 66 && poolAddress.startsWith("0x");
+
+    if (!isV4) {
+      const [token0, token1, fee, slot0, tickSpacing, poolLiquidity] = await Promise.all([
+        client.readContract({ address: poolAddress, abi: v3PoolAbi, functionName: "token0" }) as Promise<Address>,
+        client.readContract({ address: poolAddress, abi: v3PoolAbi, functionName: "token1" }) as Promise<Address>,
+        client.readContract({ address: poolAddress, abi: v3PoolAbi, functionName: "fee" }) as Promise<number>,
+        client.readContract({ address: poolAddress, abi: v3PoolAbi, functionName: "slot0" }),
+        client.readContract({ address: poolAddress, abi: v3PoolAbi, functionName: "tickSpacing" }) as Promise<number>,
+        client.readContract({ address: poolAddress, abi: v3PoolAbi, functionName: "liquidity" }) as Promise<bigint>,
+      ]);
+      const factoryPool = await client.readContract({
+        address: registry.contracts.v3.factory,
+        abi: v3FactoryAbi,
+        functionName: "getPool",
+        args: [token0, token1, Number(fee)],
+      }) as Address;
+      if (factoryPool.toLowerCase() !== poolAddress.toLowerCase()) {
+        throw new Error("Bid-Ask V3 pool does not match the configured factory");
+      }
+      const typedSlot0 = slot0 as readonly [bigint, number, ...unknown[]];
+      return {
+        protocol: "v3",
+        poolAddress,
+        token0,
+        token1,
+        fee: Number(fee),
+        tickSpacing: Number(tickSpacing),
+        hooks: zeroAddress,
+        currentTick: Number(typedSlot0[1]),
+        sqrtPriceX96: BigInt(typedSlot0[0]),
+        poolLiquidity: BigInt(poolLiquidity),
+      };
+    }
+
+    const bytes25 = poolAddress.slice(0, 2 + 25 * 2) as Hex;
+    const [slot0, poolLiquidity, poolKeyResult] = await Promise.all([
+      client.readContract({ address: registry.contracts.v4.stateView, abi: v4StateViewAbi, functionName: "getSlot0", args: [poolAddress] }),
+      client.readContract({ address: registry.contracts.v4.stateView, abi: v4StateViewAbi, functionName: "getLiquidity", args: [poolAddress] }) as Promise<bigint>,
+      client.readContract({ address: registry.contracts.v4.positionManager, abi: v4PoolKeysAbi, functionName: "poolKeys", args: [bytes25] }),
+    ]);
+    const poolKey = poolKeyResult as unknown as V4PoolKey;
+    const derivedPoolId = bidAskPoolId(poolKey);
+    if (derivedPoolId.toLowerCase() !== poolAddress.toLowerCase()) {
+      throw new Error("Bid-Ask V4 pool key does not match the pool id");
+    }
+    const typedSlot0 = slot0 as readonly [bigint, number, ...unknown[]];
+    return {
+      protocol: "v4",
+      poolAddress,
+      token0: poolKey.currency0,
+      token1: poolKey.currency1,
+      fee: Number(poolKey.fee),
+      tickSpacing: Number(poolKey.tickSpacing),
+      hooks: poolKey.hooks,
+      currentTick: Number(typedSlot0[1]),
+      sqrtPriceX96: BigInt(typedSlot0[0]),
+      poolLiquidity: BigInt(poolLiquidity),
+      poolKey,
+    };
+  }
+
+  private assertBidAskPoolSupported(state: BidAskPoolState): void {
+    if (state.protocol === "v3") {
+      if (!V3_SUPPORTED_FEES.has(state.fee)) throw new Error(`V3 fee tier ${state.fee} is unsupported by the official SDK`);
+      return;
+    }
+    if (state.hooks.toLowerCase() !== zeroAddress.toLowerCase()) {
+      throw new Error("Bid-Ask opening supports plain/no-hook V4 pools only");
+    }
+  }
+
+  private assertBidAskStateMatches(preview: BidAskOpenPreview, state: BidAskPoolState): void {
+    if (preview.protocol !== state.protocol || preview.poolAddress.toLowerCase() !== state.poolAddress.toLowerCase()) {
+      throw new Error("Bid-Ask pool identity changed; review and confirm again");
+    }
+    if (preview.token0.toLowerCase() !== state.token0.toLowerCase()
+      || preview.token1.toLowerCase() !== state.token1.toLowerCase()
+      || preview.feeTier !== state.fee
+      || preview.tickSpacing !== state.tickSpacing
+      || preview.hooks.toLowerCase() !== state.hooks.toLowerCase()) {
+      throw new Error("Bid-Ask pool parameters changed; review and confirm again");
+    }
+    if (preview.protocol === "v4") {
+      if (!preview.poolKey || !state.poolKey || !sameV4PoolKey(preview.poolKey, state.poolKey)) {
+        throw new Error("Bid-Ask V4 pool key changed; review and confirm again");
+      }
+    }
+  }
+
+  private assertBidAskOrientation(preview: BidAskOpenPreview, currentTick: number): void {
+    const range = validateBidAskRange({
+      currentTick,
+      rawTickLower: preview.outerTickLower,
+      rawTickUpper: preview.outerTickUpper,
+      tickSpacing: preview.tickSpacing,
+      quoteIsToken0: preview.quoteIsToken0,
+    });
+    if (range.lowerTick !== preview.outerTickLower || range.upperTick !== preview.outerTickUpper) {
+      throw new Error("Bid-Ask outer range changed; review and confirm again");
+    }
+  }
+
+  private assertBidAskPriceGuard(preview: BidAskOpenPreview, sqrtPriceX96: bigint): void {
+    const maxDeviationBps = (this.config as BidAskRuntimeConfig).bidAskLadderMaxPriceDeviationBps;
+    if (maxDeviationBps === undefined) return;
+    if (!Number.isFinite(maxDeviationBps) || maxDeviationBps < 0) throw new Error("Invalid Bid-Ask price deviation configuration");
+    if (preview.sqrtPriceX96 <= 0n || sqrtPriceX96 <= 0n) throw new Error("Bid-Ask pool price is invalid");
+    const previousPrice = preview.sqrtPriceX96 * preview.sqrtPriceX96;
+    const currentPrice = sqrtPriceX96 * sqrtPriceX96;
+    const difference = currentPrice >= previousPrice ? currentPrice - previousPrice : previousPrice - currentPrice;
+    const deviationBps = (difference * 10_000n) / previousPrice;
+    if (deviationBps > BigInt(Math.floor(maxDeviationBps))) {
+      throw new Error("Bid-Ask pool price moved beyond the configured guard");
+    }
+  }
+
+  private makeBidAskPlan(
+    state: BidAskPoolState,
+    chain: ChainName,
+    quoteIsToken0: boolean,
+    token0Decimals: number,
+    token1Decimals: number,
+    outer: { lowerTick: number; upperTick: number },
+    depositAmount: bigint,
+    requestedBinCount: number,
+  ): BidAskPlan {
+    return planBidAsk({
+      currentTick: state.currentTick,
+      rawTickLower: outer.lowerTick,
+      rawTickUpper: outer.upperTick,
+      tickSpacing: state.tickSpacing,
+      quoteIsToken0,
+      requestedBinCount,
+      totalAmount: depositAmount,
+      liquidityForBin: (bin, allocatedAmount0, allocatedAmount1) => {
+        const position = this.bidAskSdkPosition(
+          state,
+          chain,
+          token0Decimals,
+          token1Decimals,
+          bin,
+          allocatedAmount0,
+          allocatedAmount1,
+        );
+        const amount0 = BigInt(position.mintAmounts.amount0.toString());
+        const amount1 = BigInt(position.mintAmounts.amount1.toString());
+        const selectedAmount = quoteIsToken0 ? allocatedAmount0 : allocatedAmount1;
+        const selectedMintAmount = quoteIsToken0 ? amount0 : amount1;
+        const nonQuoteMintAmount = quoteIsToken0 ? amount1 : amount0;
+        if (nonQuoteMintAmount !== 0n || selectedMintAmount > selectedAmount) {
+          throw new Error(`Bid-Ask bin ${bin.index} is not a valid one-sided mint`);
+        }
+        return {
+          expectedLiquidity: BigInt(position.liquidity.toString()),
+          expectedAmount0: amount0,
+          expectedAmount1: amount1,
+        };
+      },
+    });
+  }
+
+  private bidAskSdkPosition(
+    state: BidAskPoolState,
+    chain: ChainName,
+    token0Decimals: number,
+    token1Decimals: number,
+    bin: BidAskBinGeometry,
+    amount0: bigint,
+    amount1: bigint,
+  ): V3Position | V4Position {
+    const chainId = this.chains.get(chain).registry.chain.id;
+    if (state.protocol === "v3") {
+      const pool = new V3SdkPool(
+        new Token(chainId, state.token0, token0Decimals),
+        new Token(chainId, state.token1, token1Decimals),
+        state.fee as V3FeeAmount,
+        state.sqrtPriceX96.toString(),
+        state.poolLiquidity.toString(),
+        state.currentTick,
+      );
+      return V3SdkPosition.fromAmounts({
+        pool,
+        tickLower: bin.tickLower,
+        tickUpper: bin.tickUpper,
+        amount0: amount0.toString(),
+        amount1: amount1.toString(),
+        useFullPrecision: true,
+      });
+    }
+
+    const currency0 = state.token0.toLowerCase() === zeroAddress.toLowerCase()
+      ? Ether.onChain(chainId)
+      : new Token(chainId, state.token0, token0Decimals);
+    const currency1 = state.token1.toLowerCase() === zeroAddress.toLowerCase()
+      ? Ether.onChain(chainId)
+      : new Token(chainId, state.token1, token1Decimals);
+    const pool = new V4SdkPool(
+      currency0,
+      currency1,
+      state.fee,
+      state.tickSpacing,
+      state.hooks,
+      state.sqrtPriceX96.toString(),
+      state.poolLiquidity.toString(),
+      state.currentTick,
+    );
+    return V4SdkPosition.fromAmounts({
+      pool,
+      tickLower: bin.tickLower,
+      tickUpper: bin.tickUpper,
+      amount0: amount0.toString(),
+      amount1: amount1.toString(),
+      useFullPrecision: true,
+    });
+  }
+
+  private buildBidAskBatch(
+    state: BidAskPoolState,
+    chain: ChainName,
+    plan: BidAskPlan,
+    quoteIsToken0: boolean,
+    quoteToken: QuoteToken,
+    deadline: bigint,
+  ): TransactionPlan {
+    const positionManager = this.positionManager(chain, state.protocol);
+    const recipient = this.config.executorAddress;
+    const slippageBps = this.bidAskOpenSlippage();
+    const nativeAmount = this.bidAskNativeAmount(state, plan, quoteToken, quoteIsToken0);
+
+    if (state.protocol === "v3") {
+      return buildV3BidAskOpenPlan({
+        chainId: this.chains.get(chain).registry.chain.id,
+        positionManager,
+        token0: state.token0,
+        token1: state.token1,
+        fee: state.fee,
+        recipient,
+        deadline,
+        value: nativeAmount,
+        refundETH: isBidAskNativeFunding(state.protocol, quoteToken.address, quoteToken.symbol),
+        mints: plan.bins.map((bin) => {
+          const expectedAmount0 = bin.expectedAmount0 ?? bin.allocatedAmount0;
+          const expectedAmount1 = bin.expectedAmount1 ?? bin.allocatedAmount1;
+          this.assertBidAskAmounts(bin, quoteIsToken0, expectedAmount0, expectedAmount1);
+          return {
+            tickLower: bin.tickLower,
+            tickUpper: bin.tickUpper,
+            amount0Desired: bin.allocatedAmount0,
+            amount1Desired: bin.allocatedAmount1,
+            amount0Min: applySlippage(expectedAmount0, slippageBps),
+            amount1Min: applySlippage(expectedAmount1, slippageBps),
+          };
+        }),
+      });
+    }
+
+    if (!state.poolKey) throw new Error("Bid-Ask V4 pool key is unavailable");
+    const mints = plan.bins.map((bin) => {
+      const expectedAmount0 = bin.expectedAmount0 ?? bin.allocatedAmount0;
+      const expectedAmount1 = bin.expectedAmount1 ?? bin.allocatedAmount1;
+      this.assertBidAskAmounts(bin, quoteIsToken0, expectedAmount0, expectedAmount1);
+      if (bin.expectedLiquidity === undefined || bin.expectedLiquidity === 0n) {
+        throw new Error(`Bid-Ask bin ${bin.index} has no mintable liquidity`);
+      }
+      return {
+        tickLower: bin.tickLower,
+        tickUpper: bin.tickUpper,
+        liquidity: bin.expectedLiquidity,
+        amount0Max: toUint128(bin.allocatedAmount0, `Bid-Ask bin ${bin.index} amount0`),
+        amount1Max: toUint128(bin.allocatedAmount1, `Bid-Ask bin ${bin.index} amount1`),
+        hookData: "0x" as Hex,
+      };
+    });
+    const nativeSweep = nativeAmount > 0n
+      ? { currency: zeroAddress, recipient }
+      : undefined;
+    return buildV4BidAskOpenPlan({
+      chainId: this.chains.get(chain).registry.chain.id,
+      positionManager,
+      poolKey: state.poolKey as BidAskV4PoolKey,
+      recipient,
+      deadline,
+      value: nativeAmount,
+      ...(nativeSweep ? { nativeSweep } : {}),
+      mints,
+    });
+  }
+
+  private assertBidAskAmounts(bin: BidAskAllocatedBin, quoteIsToken0: boolean, amount0: bigint, amount1: bigint): void {
+    const selectedAllocation = quoteIsToken0 ? bin.allocatedAmount0 : bin.allocatedAmount1;
+    const selectedAmount = quoteIsToken0 ? amount0 : amount1;
+    const nonQuoteAmount = quoteIsToken0 ? amount1 : amount0;
+    if (selectedAllocation <= 0n || selectedAmount <= 0n || selectedAmount > selectedAllocation || nonQuoteAmount !== 0n) {
+      throw new Error(`Bid-Ask bin ${bin.index} is not a valid one-sided mint`);
+    }
+  }
+
+  private bidAskNativeAmount(state: BidAskPoolState, plan: BidAskPlan, quoteToken: QuoteToken, quoteIsToken0: boolean): bigint {
+    if (isBidAskNativeFunding(state.protocol, quoteToken.address, quoteToken.symbol)) {
+      return quoteIsToken0 ? plan.totalAmount0 : plan.totalAmount1;
+    }
+    if (state.protocol === "v4") {
+      if (state.token0.toLowerCase() === zeroAddress.toLowerCase()) return plan.totalAmount0;
+      if (state.token1.toLowerCase() === zeroAddress.toLowerCase()) return plan.totalAmount1;
+    }
+    return 0n;
+  }
+
+  private positionManager(chain: ChainName, protocol: "v3" | "v4"): Address {
+    const { registry } = this.chains.get(chain);
+    return protocol === "v3" ? registry.contracts.v3.positionManager : registry.contracts.v4.positionManager;
+  }
+
+  private bidAskDeadline(): bigint {
+    const configured = (this.config as BidAskRuntimeConfig).bidAskLadderTransactionDeadlineSeconds;
+    const seconds = configured !== undefined && Number.isFinite(configured) && configured > 0
+      ? Math.floor(configured)
+      : 300;
+    return BigInt(Math.floor(Date.now() / 1_000) + seconds);
+  }
+
+  private bidAskOpenSlippage(): number {
+    const configured = (this.config as BidAskRuntimeConfig).bidAskLadderOpenSlippageBps;
+    if (configured === undefined) return 0;
+    if (!Number.isInteger(configured) || configured < 0 || configured > 10_000) {
+      throw new Error("Invalid Bid-Ask opening slippage configuration");
+    }
+    return configured;
+  }
+
+  private async simulateAndEstimateBidAsk(chain: ChainName, plan: TransactionPlan, binCount: number): Promise<BidAskGasResult> {
+    const client = this.client(chain);
+    try {
+      await client.call({ account: this.config.executorAddress, to: plan.to, data: plan.data, value: plan.value ?? 0n });
+      const estimatedGas = BigInt(await client.estimateGas({ account: this.config.executorAddress, to: plan.to, data: plan.data, value: plan.value ?? 0n }));
+      if (estimatedGas <= 0n) throw new Error("atomic batch returned a zero gas estimate");
+
+      let blockGasLimit: bigint | null = null;
+      if (typeof client.getBlock === "function") {
+        try {
+          const block = await client.getBlock();
+          blockGasLimit = typeof block.gasLimit === "bigint" ? block.gasLimit : null;
+        } catch {
+          blockGasLimit = null;
+        }
+      }
+
+      const config = this.config as BidAskRuntimeConfig;
+      const explicitMaxGas = config.bidAskLadderMaxGas;
+      if (explicitMaxGas !== undefined && estimatedGas > BigInt(explicitMaxGas)) {
+        throw atomicBatchInfeasible(`estimated gas ${estimatedGas} exceeds the configured limit`);
+      }
+      if (blockGasLimit !== null) {
+        const maxBlockGasBps = config.bidAskLadderAtomicMaxBlockGasBps ?? 8_000;
+        if (!Number.isInteger(maxBlockGasBps) || maxBlockGasBps <= 0 || maxBlockGasBps > 10_000) {
+          throw new Error("Invalid Bid-Ask atomic gas configuration");
+        }
+        if (estimatedGas * 10_000n > blockGasLimit * BigInt(maxBlockGasBps)) {
+          throw atomicBatchInfeasible(`estimated gas ${estimatedGas} exceeds the block gas budget for ${binCount} bins`);
+        }
+      }
+      return { estimatedGas, blockGasLimit };
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("atomic_batch_infeasible")) throw error;
+      throw atomicBatchInfeasible(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private async persistBidAskPlan(preview: BidAskOpenPreview): Promise<string | undefined> {
+    if (!this.database) return undefined;
+    const chainId = this.chains.get(preview.chain).registry.chain.id;
+    const positionManager = preview.positionManager;
+    const expectedAmounts = preview.plan.bins.reduce(
+      (totals, bin) => ({
+        amount0: totals.amount0 + (bin.expectedAmount0 ?? bin.allocatedAmount0),
+        amount1: totals.amount1 + (bin.expectedAmount1 ?? bin.allocatedAmount1),
+      }),
+      { amount0: 0n, amount1: 0n },
+    );
+    const group = await this.database.createPositionGroup({
+      chainId,
+      protocol: preview.protocol,
+      positionManager,
+      poolKey: preview.poolAddress.toLowerCase(),
+      owner: this.config.executorAddress,
+      token0: preview.token0,
+      token1: preview.token1,
+      quoteToken: preview.quoteToken,
+      shape: "bid_ask",
+      shapeVersion: preview.plan.shapeVersion,
+      requestedBinCount: preview.plan.requestedBinCount,
+      generatedBinCount: preview.plan.generatedBinCount,
+      mintableBinCount: preview.plan.mintableBinCount,
+      outerTickLower: preview.plan.outerTickLower,
+      outerTickUpper: preview.plan.outerTickUpper,
+      anchorBinIndex: preview.plan.anchorIndex,
+      totalDeposit: preview.depositAmount,
+      deployedCostQuote: preview.quoteIsToken0 ? expectedAmounts.amount0 : expectedAmounts.amount1,
+      directCloseAmount0: expectedAmounts.amount0,
+      directCloseAmount1: expectedAmounts.amount1,
+      totalReceivedQuote: 0n,
+      status: "planned",
+      planHash: preview.planHash,
+      planJson: jsonSafe({
+        plan: preview.plan,
+        transaction: preview.batchPlan,
+        poolAddress: preview.poolAddress,
+        poolKey: preview.poolKey,
+        atomicOpenGasEstimate: preview.estimatedGas,
+        blockGasLimit: preview.blockGasLimit,
+        atomicBatchFeasible: preview.atomicBatchFeasible,
+        noOpeningSwap: true,
+      }),
+      referenceBlock: await this.referenceBlock(preview.chain),
+      referenceTick: preview.currentTick,
+      referencePrice: preview.sqrtPriceX96,
+      openTransactionHash: null,
+      closeTransactionHash: null,
+      pendingRawTransaction: null,
+      executionLeaseToken: null,
+      executionLeaseUntil: null,
+      finalPnlQuote: null,
+      finalPnlBps: null,
+      finalPnlUsd: null,
+      settledAt: null,
+      metadata: {
+        managedBy: "position_group",
+        strategy: "bid_ask",
+        shapeVersion: preview.plan.shapeVersion,
+        atomicBatch: true,
+        noOpeningSwap: true,
+        poolAddress: preview.poolAddress,
+        quoteTokenSymbol: preview.quoteTokenSymbol,
+      },
+    } satisfies Omit<PositionGroupRecord, "id" | "createdAt" | "updatedAt">);
+
+    for (const bin of preview.plan.bins) {
+      const expectedAmount0 = bin.expectedAmount0 ?? bin.allocatedAmount0;
+      const expectedAmount1 = bin.expectedAmount1 ?? bin.allocatedAmount1;
+      await this.database.createPositionGroupBin({
+        groupId: group.id,
+        chainId,
+        positionManager,
+        binIndex: bin.index,
+        tickLower: bin.tickLower,
+        tickUpper: bin.tickUpper,
+        side: bin.side,
+        weightMicros: bin.weightMicros,
+        allocatedAmount0: bin.allocatedAmount0,
+        allocatedAmount1: bin.allocatedAmount1,
+        expectedLiquidity: bin.expectedLiquidity ?? 0n,
+        expectedAmount0,
+        expectedAmount1,
+        tokenId: null,
+        positionId: null,
+        openingAmount0: expectedAmount0,
+        openingAmount1: expectedAmount1,
+        closeAmount0: 0n,
+        closeAmount1: 0n,
+        settlementQuote: 0n,
+        status: "planned",
+        dropReason: null,
+        openTransactionHash: null,
+        closeTransactionHash: null,
+        metadata: { shape: "bid_ask", shapeVersion: preview.plan.shapeVersion },
+      } satisfies Omit<PositionGroupBinRecord, "id" | "createdAt" | "updatedAt">);
+    }
+    return group.id;
+  }
+
+  private async broadcastBidAsk(chain: ChainName, groupId: string, to: Address, data: Hex, value = 0n): Promise<{ hash: Hex | null }> {
+    if (!this.database) throw new Error("Bid-Ask group database is not configured");
+    const chainId = this.chains.get(chain).registry.chain.id;
+    const run = async (): Promise<{ hash: Hex | null }> => {
+      const client = this.client(chain);
+      const executor = this.config.executorAddress;
+      await client.call({ account: executor, to, data, value });
+      await this.database!.recordPositionGroupExecution(groupId, "open_batch", "planned", undefined, undefined, undefined, undefined, {
+        description: "atomic_bid_ask_open",
+      });
+
+      if (this.config.dryRun) {
+        await this.database!.setPositionGroupStatus(groupId, "planned", { dryRunPlan: "atomic_bid_ask_open", pendingRawTransaction: null });
+        log.info({ groupId, to, data: data.slice(0, 100) }, "dry-run Bid-Ask open batch simulated");
+        return { hash: null };
+      }
+
+      const wallet = this.walletClient(chain);
+      const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account!, to, data, value });
+      const serializedTransaction = await wallet.signTransaction(preparedRequest);
+      const hash = keccak256(serializedTransaction);
+      const nonce = preparedRequest.nonce === undefined ? undefined : BigInt(preparedRequest.nonce);
+
+      await this.database!.recordPositionGroupExecution(groupId, "open_batch", "submitted", hash, serializedTransaction, nonce, undefined, {
+        description: "atomic_bid_ask_open",
+      });
+      const linked = await this.database!.setPositionGroupOpenTransaction(groupId, hash, "opening");
+      if (!linked) throw new Error("Bid-Ask open transaction could not be linked to its parent group");
+
+      try {
+        const broadcastHash = await wallet.sendRawTransaction({ serializedTransaction });
+        if (broadcastHash.toLowerCase() !== hash.toLowerCase()) throw new Error("Bid-Ask open broadcast returned an unexpected transaction hash");
+        const receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
+        if (receipt.status !== "success") {
+          await this.database!.recordPositionGroupExecution(groupId, "open_batch", "failed", hash, undefined, undefined, "transaction reverted");
+          await this.database!.setPositionGroupStatus(groupId, "needs_review", {
+            reason: "bid_ask_open_transaction_reverted",
+            openTransactionHash: hash,
+            lastExecutionError: `open_batch transaction reverted: ${hash}`,
+          });
+          throw new Error(`Bid-Ask open transaction reverted: ${hash}`);
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("reverted")) throw error;
+        throw new Error(`open_batch transaction ${hash} is pending reconciliation: ${error instanceof Error ? error.message : String(error)}`);
+      }
+
+      await this.database!.recordPositionGroupExecution(groupId, "open_batch", "confirmed", hash);
+      return { hash };
+    };
+
+    return this.database.withExecutionLock(chainId, this.config.executorAddress, run);
+  }
+
+  private async referenceBlock(chain: ChainName): Promise<bigint | null> {
+    const client = this.client(chain);
+    if (typeof client.getBlockNumber !== "function") return null;
+    try {
+      return await client.getBlockNumber();
+    } catch {
+      return null;
+    }
   }
 
   private async executeV3(preview: OpenPositionPreview, deadline: bigint): Promise<{ hash: Hex | null }> {
@@ -779,6 +1658,57 @@ export class PositionOpener {
     const frac = (raw % scale).toString().padStart(18, "0").slice(0, 4);
     return `${whole}.${frac}`;
   }
+}
+
+function bidAskOuterTicks(currentTick: number, tickSpacing: number, quoteIsToken0: boolean, rangePercent: number): { lowerTick: number; upperTick: number } {
+  const distance = ticksForDropPercent(rangePercent);
+  if (!Number.isFinite(distance) || distance <= 0) throw new Error("Bid-Ask rangePercent must produce a positive outer range");
+  if (quoteIsToken0) {
+    const lowerTick = tickToCeilSpacing(currentTick + tickSpacing, tickSpacing);
+    return { lowerTick, upperTick: tickToCeilSpacing(lowerTick + distance, tickSpacing) };
+  }
+  const upperTick = tickToFloorSpacing(currentTick - tickSpacing, tickSpacing);
+  return { lowerTick: tickToFloorSpacing(upperTick - distance, tickSpacing), upperTick };
+}
+
+function isBidAskNativeFunding(protocol: "v3" | "v4", token: Address, symbol: string): boolean {
+  return token.toLowerCase() === zeroAddress.toLowerCase() || (protocol === "v3" && symbol === "ETH");
+}
+
+function bidAskPoolId(poolKey: V4PoolKey): Hex {
+  return keccak256(encodeAbiParameters(
+    [
+      { type: "address" },
+      { type: "address" },
+      { type: "uint24" },
+      { type: "int24" },
+      { type: "address" },
+    ],
+    [poolKey.currency0, poolKey.currency1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks],
+  ));
+}
+
+function sameV4PoolKey(a: V4PoolKey, b: V4PoolKey): boolean {
+  return a.currency0.toLowerCase() === b.currency0.toLowerCase()
+    && a.currency1.toLowerCase() === b.currency1.toLowerCase()
+    && a.fee === b.fee
+    && a.tickSpacing === b.tickSpacing
+    && a.hooks.toLowerCase() === b.hooks.toLowerCase();
+}
+
+function toUint128(value: bigint, label: string): bigint {
+  if (value < 0n || value > (1n << 128n) - 1n) throw atomicBatchInfeasible(`${label} exceeds uint128`);
+  return value;
+}
+
+function atomicBatchInfeasible(reason: string): Error {
+  return new Error(`atomic_batch_infeasible: ${reason}`);
+}
+
+function jsonSafe(value: unknown): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(value, (_key, nestedValue: unknown) => (
+    typeof nestedValue === "bigint" ? nestedValue.toString() : nestedValue
+  ))) as Record<string, unknown>;
 }
 
 export function selectOpenQuoteToken(allowed: readonly QuoteToken[], token0: Address, token1: Address): QuoteToken | null {

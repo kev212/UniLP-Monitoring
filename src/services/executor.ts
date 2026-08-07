@@ -11,7 +11,9 @@ import {
   isAddress,
   isHex,
   keccak256,
+  pad,
   parseTransaction,
+  toHex,
   zeroAddress,
   type Address,
   type Hex,
@@ -22,6 +24,7 @@ import {
 import {
   erc20Abi,
   erc20TransferEvent,
+  erc721TransferEvent,
   permit2Abi,
   wethAbi,
   v2RouterAbi,
@@ -39,15 +42,24 @@ import {
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ExitTrigger, PositionRecord, TransactionPlan } from "../types.js";
+import type {
+  ExitTrigger,
+  PositionGroupBinRecord,
+  PositionGroupExecutionStage,
+  PositionGroupRecord,
+  PositionGroupStatus,
+  PositionRecord,
+  TransactionPlan,
+} from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { Notifier } from "./notifier.js";
-import type { PositionReader } from "./position-reader.js";
+import type { PositionReader, PositionValue } from "./position-reader.js";
 import type { RoutePlanner, SwapRoute } from "./route-planner.js";
 import { UNISWAP_API_ROUTER, type TradingApiQuote, type UniswapTradingApi } from "./uniswap-trading-api.js";
 import type { KyberSwapAggregatorApi, KyberSwapQuote } from "./kyberswap-aggregator-api.js";
 import { hasPendingSettlement } from "./pending-settlement.js";
 import { buildSwapPlan } from "./swap-builder.js";
+import { buildV3BidAskClosePlan, buildV4BidAskClosePlan, type V4PoolKey } from "./bid-ask-batch.js";
 import { receiptTokenTransfers } from "./discovery.js";
 import { applySlippage } from "./uniswap-math.js";
 
@@ -105,6 +117,34 @@ class RevertedExecutionError extends Error {
   }
 }
 
+class GroupIntegrityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GroupIntegrityError";
+  }
+}
+
+interface GroupDatabaseExtensions {
+  getPositionById?: (positionId: string) => Promise<PositionRecord | null>;
+  renewPositionGroupLease?: (groupId: string, token: string, ttlMs?: number) => Promise<boolean>;
+  setPositionGroupStatus?: (groupId: string, status: PositionGroupStatus, metadata?: Record<string, unknown>) => Promise<void>;
+  finalizePositionGroup?: (
+    groupId: string,
+    closeTransactionHash: string,
+    totalReceivedQuote: bigint,
+    finalPnlQuote: bigint,
+    finalPnlBps: bigint,
+    trigger: string,
+  ) => Promise<boolean>;
+  getLatestPositionGroupExecutionHash?: (groupId: string, stage: PositionGroupExecutionStage, status?: "confirmed" | "submitted") => Promise<string | null>;
+}
+
+interface GroupChild {
+  bin: PositionGroupBinRecord;
+  position: PositionRecord;
+  value: PositionValue;
+}
+
 export class Executor {
   private readonly account;
   private readonly executorClientCache = new Map<string, PublicClient>();
@@ -112,6 +152,11 @@ export class Executor {
   private readonly settlementJobs = new Map<string, Promise<void>>();
   private readonly settlementRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly activeSettlementLeases = new Map<string, string>();
+  private readonly groupSettlementJobs = new Map<string, Promise<void>>();
+  private readonly activeGroupLeases = new Map<string, string>();
+  private readonly confirmedGroupCloses = new Map<string, Hex>();
+  private readonly accountedGroupCloses = new Set<string>();
+  private readonly reportedGroupDbGaps = new Set<string>();
   private transactionTail: Promise<unknown> = Promise.resolve();
 
   constructor(
@@ -136,6 +181,10 @@ export class Executor {
   async execute(position: PositionRecord, trigger?: ExitTrigger): Promise<void> {
     if (position.metadata.detectionOnly === true) throw new Error("Detection-only positions cannot be executed");
     return this.runSettlementExclusive(position.id, () => this.executeUnlocked(position, trigger));
+  }
+
+  async executeGroup(groupId: string, trigger?: ExitTrigger): Promise<void> {
+    return this.runGroupExclusive(groupId, () => this.executeGroupUnlocked(groupId, trigger));
   }
 
   private async executeUnlocked(position: PositionRecord, trigger?: ExitTrigger): Promise<void> {
@@ -248,6 +297,99 @@ export class Executor {
         });
         await this.notifier.failure(position, message);
       }
+      throw error;
+    }
+  }
+
+  private async executeGroupUnlocked(groupId: string, trigger?: ExitTrigger): Promise<void> {
+    let group = await this.database.getPositionGroup(groupId);
+    if (!group) throw new Error(`Position group ${groupId} was not found`);
+    if (group.status === "settled" || group.status === "cancelled") return;
+
+    let groupFailureRecorded = false;
+    try {
+      if (await this.recoverPendingGroupExecution(group, trigger)) return;
+      group = await this.database.getPositionGroup(groupId) ?? group;
+      if (this.accountedGroupCloses.has(group.id)) return;
+
+      let storedCloseHash = this.groupCloseHash(group);
+      if (!storedCloseHash) {
+        const getExecutionHash = this.groupDatabase().getLatestPositionGroupExecutionHash;
+        if (typeof getExecutionHash === "function") {
+          const confirmed = await getExecutionHash.call(this.database, group.id, "close_batch", "confirmed");
+          if (confirmed && isHex(confirmed) && confirmed.length === 66) storedCloseHash = confirmed as Hex;
+        }
+      }
+      if (storedCloseHash) {
+        if (group.status === "settled" || group.metadata.settlementPhase === "complete" || this.accountedGroupCloses.has(group.id) && group.metadata.settlementPhase === "complete") return;
+        if (group.metadata.closeReceiptAccounted === true) {
+          await this.resumeGroupSettlement(group, storedCloseHash, trigger);
+          return;
+        }
+        await this.reconcileGroupClose(group, storedCloseHash, trigger);
+        return;
+      }
+      if (group.status === "needs_review") throw new GroupIntegrityError(`Position group ${groupId} requires review before close`);
+      if (group.status === "settling") {
+        throw new Error(`Position group ${groupId} is settling without a durable close transaction`);
+      }
+
+      const children = await this.loadGroupChildren(group);
+      const plan = this.groupClosePlan(group, children);
+      try {
+        await this.simulatePlan(children[0]!.position, plan);
+      } catch (error) {
+        await this.recordGroupExecutionFailure(group.id, "close_batch", errorMessage(error));
+        groupFailureRecorded = true;
+        await this.markGroupRetryable(group, trigger, errorMessage(error));
+        throw error;
+      }
+
+      await this.setGroupStatus(group.id, "closing", {
+        exitTrigger: trigger ?? "manual",
+        settlementPhase: "group_close",
+      });
+      const hash = await this.sendGroup(group, "close_batch", plan);
+      if (!hash) {
+        await this.setGroupStatus(group.id, "active", { dryRunPlan: plan.description, settlementPhase: null });
+        return;
+      }
+
+      await this.markGroupCloseConfirmed(group, hash, trigger);
+      try {
+        await this.accountGroupCloseReceipt(group, hash, children.length, trigger);
+      } catch (error) {
+        if (error instanceof GroupIntegrityError) {
+          await this.markGroupNeedsReview(group, error.message);
+          throw error;
+        }
+        await this.setGroupStatus(group.id, "settling", {
+          closeTransactionHash: hash,
+          settlementPhase: "accounting",
+          closeReceiptAccounted: null,
+          lastExecutionError: errorMessage(error),
+        });
+        log.warn({ error: errorMessage(error), groupId: group.id, closeHash: hash }, "group close receipt accounting deferred");
+      }
+    } catch (error) {
+      if (error instanceof PendingExecutionError) {
+        await this.setGroupStatus(group.id, "closing", {
+          closeTransactionHash: error.transactionHash,
+          settlementPhase: "group_close",
+          lastExecutionError: error.message,
+        });
+        return;
+      }
+      if (error instanceof RevertedExecutionError) {
+        await this.markGroupRetryable(group, trigger, error.message);
+        throw error;
+      }
+      if (error instanceof GroupIntegrityError) {
+        await this.markGroupNeedsReview(group, error.message);
+        throw error;
+      }
+      if (!groupFailureRecorded) await this.recordGroupExecutionFailure(group.id, "close_batch", errorMessage(error));
+      await this.markGroupRetryable(group, trigger, errorMessage(error));
       throw error;
     }
   }
@@ -471,6 +613,699 @@ export class Executor {
     });
     this.settlementJobs.set(positionId, tracked);
     return tracked;
+  }
+
+  private runGroupExclusive(groupId: string, work: () => Promise<void>): Promise<void> {
+    const existing = this.groupSettlementJobs.get(groupId);
+    if (existing) return existing;
+    const leaseToken = randomUUID();
+    const run = (async () => {
+      const claimed = await this.database.claimPositionGroupLease(groupId, leaseToken);
+      if (!claimed) {
+        log.info({ groupId }, "position group settlement already claimed by another worker");
+        return;
+      }
+      this.activeGroupLeases.set(groupId, leaseToken);
+      const renew = (this.groupDatabase() as GroupDatabaseExtensions).renewPositionGroupLease;
+      const heartbeat = renew
+        ? setInterval(() => {
+          void renew.call(this.database, groupId, leaseToken).then((renewed) => {
+            if (!renewed) {
+              if (this.activeGroupLeases.get(groupId) === leaseToken) this.activeGroupLeases.delete(groupId);
+              log.error({ groupId }, "position group lease heartbeat lost ownership");
+            }
+          }).catch((error) => log.warn({ error: errorMessage(error), groupId }, "position group lease heartbeat failed"));
+        }, 60_000)
+        : undefined;
+      heartbeat?.unref();
+      try {
+        await work();
+      } finally {
+        if (heartbeat) clearInterval(heartbeat);
+        if (this.activeGroupLeases.get(groupId) === leaseToken) this.activeGroupLeases.delete(groupId);
+        try {
+          await this.database.releasePositionGroupLease(groupId, leaseToken);
+        } catch (error) {
+          log.warn({ error: errorMessage(error), groupId }, "could not release position group lease");
+        }
+      }
+    })();
+    const tracked = run.finally(() => {
+      if (this.groupSettlementJobs.get(groupId) === tracked) this.groupSettlementJobs.delete(groupId);
+    });
+    this.groupSettlementJobs.set(groupId, tracked);
+    return tracked;
+  }
+
+  private async loadGroupChildren(group: PositionGroupRecord): Promise<GroupChild[]> {
+    if (group.protocol !== "v3" && group.protocol !== "v4") {
+      throw new GroupIntegrityError(`Unsupported group protocol ${group.protocol}`);
+    }
+    if (group.shape !== "bid_ask" || group.shapeVersion !== "delta-amount-linear-v1") {
+      throw new GroupIntegrityError(`Position group ${group.id} is not a supported Bid-Ask group`);
+    }
+    if (group.owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) {
+      throw new GroupIntegrityError("Position group owner does not match the executor account");
+    }
+
+    const bins = await this.database.listPositionGroupBins(group.id);
+    const linkedNonActiveBins = bins.filter((bin) => bin.positionId !== null && bin.tokenId !== null && !["minted", "closed", "skipped"].includes(bin.status));
+    if (linkedNonActiveBins.length > 0) {
+      throw new GroupIntegrityError(`Position group contains a linked child bin that is not active: ${linkedNonActiveBins[0]!.binIndex}`);
+    }
+    const activeBins = bins.filter((bin) => bin.status === "minted");
+    if (activeBins.length === 0) throw new GroupIntegrityError("Position group has no active minted children");
+    const positionIds = activeBins.map((bin) => {
+      if (!bin.positionId || bin.tokenId === null) throw new GroupIntegrityError(`Bid-Ask bin ${bin.binIndex} is missing its child position or token ID`);
+      return bin.positionId;
+    });
+    if (new Set(positionIds).size !== positionIds.length) throw new GroupIntegrityError("Position group contains duplicate child position links");
+    const tokenIds = activeBins.map((bin) => bin.tokenId!.toString());
+    if (new Set(tokenIds).size !== tokenIds.length) throw new GroupIntegrityError("Position group contains duplicate child token IDs");
+
+    const db = this.groupDatabase();
+    const positions = typeof db.getPositionById === "function"
+      ? await Promise.all(positionIds.map((positionId) => db.getPositionById!.call(this.database, positionId)))
+      : await db.listActivePositions(group.chainId).then((items) => positionIds.map((positionId) => items.find((item) => item.id === positionId) ?? null));
+    const byId = new Map(positions.filter((position): position is PositionRecord => position !== null).map((position) => [position.id, position]));
+    const missingPositionId = positionIds.find((positionId) => !byId.has(positionId));
+    if (missingPositionId) throw new GroupIntegrityError(`Active child position ${missingPositionId} is unavailable`);
+
+    const { client } = this.chains.getById(group.chainId);
+    const blockNumber = await client.getBlockNumber();
+    const removeSlippageBps = effectiveRemoveSlippageBps(
+      this.config.removeLiquiditySlippageBps,
+      this.config.removeLiquidityMaxSlippageBps,
+      exitRetryAttempts(group.metadata),
+    );
+    let values: PositionValue[];
+    try {
+      values = await Promise.all(activeBins.map((bin) => this.reader.read(byId.get(bin.positionId!)!, blockNumber, removeSlippageBps)));
+    } catch (error) {
+      throw new GroupIntegrityError(`Could not validate active child state at block ${blockNumber}: ${errorMessage(error)}`);
+    }
+
+    const children: GroupChild[] = [];
+    let commonV3Fee: number | undefined;
+    let commonV4PoolKey: V4PoolKey | undefined;
+    for (let index = 0; index < activeBins.length; index += 1) {
+      const bin = activeBins[index]!;
+      const position = byId.get(bin.positionId!)!;
+      const value = values[index]!;
+      this.validateGroupChild(group, bin, position, value);
+      if (group.protocol === "v3") {
+        if (value.v3Fee === undefined) throw new GroupIntegrityError(`V3 child ${position.positionKey} has no fee tier`);
+        if (commonV3Fee === undefined) commonV3Fee = value.v3Fee;
+        if (commonV3Fee !== value.v3Fee) throw new GroupIntegrityError("Bid-Ask V3 children do not share one fee tier");
+      } else {
+        if (!value.v4PoolKey) throw new GroupIntegrityError(`V4 child ${position.positionKey} has no pool key`);
+        if (!commonV4PoolKey) commonV4PoolKey = value.v4PoolKey;
+        if (!sameV4PoolKey(commonV4PoolKey, value.v4PoolKey)) throw new GroupIntegrityError("Bid-Ask V4 children do not share one pool key");
+      }
+      try {
+        const owner = await client.readContract({
+          address: group.positionManager,
+          abi: group.protocol === "v3" ? v3PositionManagerAbi : v4PositionManagerAbi,
+          functionName: "ownerOf",
+          args: [bin.tokenId!],
+          blockNumber,
+        });
+        if (owner.toLowerCase() !== group.owner.toLowerCase()) {
+          throw new Error(`on-chain owner is ${owner}`);
+        }
+      } catch (error) {
+        throw new GroupIntegrityError(`Child ${position.positionKey} is no longer owned by the group owner: ${errorMessage(error)}`);
+      }
+      children.push({ bin, position, value });
+    }
+    return children;
+  }
+
+  private validateGroupChild(group: PositionGroupRecord, bin: PositionGroupBinRecord, position: PositionRecord, value: PositionValue): void {
+    const lower = (address: string) => address.toLowerCase();
+    if (bin.chainId !== group.chainId || bin.positionManager.toLowerCase() !== group.positionManager.toLowerCase()) {
+      throw new GroupIntegrityError(`Bid-Ask bin ${bin.binIndex} does not use the parent chain or position manager`);
+    }
+    if (position.status === "settled") throw new GroupIntegrityError(`Child ${position.positionKey} is already settled`);
+    if (position.protocol !== group.protocol) throw new GroupIntegrityError(`Child ${position.positionKey} uses protocol ${position.protocol}, not ${group.protocol}`);
+    if (position.owner.toLowerCase() !== group.owner.toLowerCase()) throw new GroupIntegrityError(`Child ${position.positionKey} owner differs from the group owner`);
+    if (lower(position.token0) !== lower(group.token0) || lower(position.token1) !== lower(group.token1)) {
+      throw new GroupIntegrityError(`Child ${position.positionKey} token pair differs from the parent group`);
+    }
+    if (!position.quoteToken || lower(position.quoteToken) !== lower(group.quoteToken)) {
+      throw new GroupIntegrityError(`Child ${position.positionKey} quote token differs from the parent group`);
+    }
+    if (position.positionKey !== bin.tokenId!.toString()) throw new GroupIntegrityError(`Child ${position.positionKey} does not match bin ${bin.binIndex}`);
+    const linkedGroupId = position.metadata.positionGroupId;
+    if (typeof linkedGroupId === "string" && linkedGroupId !== group.id) {
+      throw new GroupIntegrityError(`Child ${position.positionKey} belongs to another position group`);
+    }
+    if (value.poolKey.toLowerCase() !== group.poolKey.toLowerCase()) {
+      throw new GroupIntegrityError(`Child ${position.positionKey} resolved to a different pool`);
+    }
+    if (group.protocol === "v3") {
+      if (!position.poolAddress || position.poolAddress.toLowerCase() !== group.poolKey.toLowerCase()) {
+        throw new GroupIntegrityError(`V3 child ${position.positionKey} is not in the parent pool`);
+      }
+      if (value.sourcePool === null || value.sourcePool.toLowerCase() !== group.poolKey.toLowerCase()) {
+        throw new GroupIntegrityError(`V3 child ${position.positionKey} resolved to a different pool`);
+      }
+    }
+    if (value.protocol !== group.protocol || value.liquidity <= 0n) {
+      throw new GroupIntegrityError(`Child ${position.positionKey} has invalid live liquidity state`);
+    }
+    if (value.token0.token.toLowerCase() !== group.token0.toLowerCase() || value.token1.token.toLowerCase() !== group.token1.toLowerCase()) {
+      throw new GroupIntegrityError(`Child ${position.positionKey} resolved to a different token pair`);
+    }
+    if (!value.range || value.range.tickLower !== bin.tickLower || value.range.tickUpper !== bin.tickUpper) {
+      throw new GroupIntegrityError(`Child ${position.positionKey} ticks differ from bin ${bin.binIndex}`);
+    }
+  }
+
+  private groupClosePlan(group: PositionGroupRecord, children: readonly GroupChild[]): TransactionPlan {
+    const deadline = BigInt(Math.floor(Date.now() / 1_000) + 300);
+    if (group.protocol === "v3") {
+      return buildV3BidAskClosePlan({
+        chainId: group.chainId,
+        positionManager: group.positionManager,
+        recipient: group.owner,
+        deadline,
+        value: 0n,
+        positions: children.map(({ bin, value }) => ({
+          tokenId: bin.tokenId!,
+          liquidity: value.liquidity,
+          amount0Min: value.minAmount0,
+          amount1Min: value.minAmount1,
+        })),
+      });
+    }
+    const firstPoolKey = children[0]!.value.v4PoolKey;
+    if (!firstPoolKey) throw new GroupIntegrityError("V4 group pool key is unavailable");
+    return buildV4BidAskClosePlan({
+      chainId: group.chainId,
+      positionManager: group.positionManager,
+      poolKey: firstPoolKey,
+      recipient: group.owner,
+      deadline,
+      value: 0n,
+      positions: children.map(({ bin, value, position }) => ({
+        tokenId: bin.tokenId!,
+        amount0Min: value.minAmount0,
+        amount1Min: value.minAmount1,
+        ...(typeof position.metadata.hookData === "string" && isHex(position.metadata.hookData) ? { hookData: position.metadata.hookData } : {}),
+      })),
+    });
+  }
+
+  private async recoverPendingGroupExecution(group: PositionGroupRecord, trigger?: ExitTrigger): Promise<boolean> {
+    if (group.pendingRawTransaction === null) return false;
+    const pending = parsePendingRawTransaction(group.pendingRawTransaction);
+    if (!pending) throw new GroupIntegrityError(`Position group ${group.id} has an invalid pending signed transaction`);
+
+    let receipt: TransactionReceipt;
+    try {
+      receipt = await this.getConfirmedReceipt(group.chainId, pending.hash);
+    } catch {
+      await this.rebroadcastGroupPendingTransaction(group, pending);
+      return true;
+    }
+    if (receipt.status !== "success") {
+      await this.recordGroupExecutionFailure(group.id, pending.stage, "transaction reverted", pending.hash);
+      if (pending.stage === "close_batch") await this.markGroupRetryable(group, trigger, `close_batch transaction reverted: ${pending.hash}`);
+      throw new RevertedExecutionError(pending.stage, `${pending.stage} transaction reverted: ${pending.hash}`);
+    }
+
+    try {
+      await this.database.recordPositionGroupExecution(group.id, pending.stage as "close_batch", "confirmed", pending.hash);
+    } catch (error) {
+      throw new PendingExecutionError(pending.stage, pending.hash, error);
+    }
+    if (pending.stage === "close_batch") {
+      await this.reconcileGroupClose(group, pending.hash, trigger);
+    } else if (pending.stage === "settlement_swap") {
+      await this.reconcileGroupSettlementSwap(group, pending.hash, trigger);
+    }
+    return true;
+  }
+
+  private async reconcileGroupClose(group: PositionGroupRecord, hash: Hex, trigger?: ExitTrigger): Promise<void> {
+    let receipt: TransactionReceipt;
+    try {
+      receipt = await this.getConfirmedReceipt(group.chainId, hash);
+    } catch (error) {
+      await this.setGroupStatus(group.id, "settling", {
+        closeTransactionHash: hash,
+        settlementPhase: "accounting",
+        lastExecutionError: errorMessage(error),
+      });
+      log.warn({ error: errorMessage(error), groupId: group.id, closeHash: hash }, "group close receipt is not yet available");
+      return;
+    }
+    if (receipt.status !== "success") {
+      await this.recordGroupExecutionFailure(group.id, "close_batch", "transaction reverted", hash);
+      await this.markGroupRetryable(group, trigger, `close_batch transaction reverted: ${hash}`);
+      throw new RevertedExecutionError("close_batch", `close_batch transaction reverted: ${hash}`);
+    }
+    await this.markGroupCloseConfirmed(group, hash, trigger);
+    try {
+      await this.accountGroupCloseReceipt(group, hash, undefined, trigger);
+    } catch (error) {
+      if (error instanceof GroupIntegrityError) {
+        await this.markGroupNeedsReview(group, error.message);
+        throw error;
+      }
+      await this.setGroupStatus(group.id, "settling", {
+        closeTransactionHash: hash,
+        settlementPhase: "accounting",
+        closeReceiptAccounted: null,
+        lastExecutionError: errorMessage(error),
+      });
+      log.warn({ error: errorMessage(error), groupId: group.id, closeHash: hash }, "recovered group close receipt accounting deferred");
+    }
+  }
+
+  private groupCloseHash(group: PositionGroupRecord): Hex | null {
+    const inMemory = this.confirmedGroupCloses.get(group.id);
+    if (inMemory) return inMemory;
+    const metadataHash = group.metadata.closeTransactionHash;
+    const stored = group.closeTransactionHash ?? (typeof metadataHash === "string" ? metadataHash : null);
+    return typeof stored === "string" && isHex(stored) && stored.length === 66 ? stored as Hex : null;
+  }
+
+  private async markGroupCloseConfirmed(group: PositionGroupRecord, hash: Hex, trigger?: ExitTrigger): Promise<void> {
+    this.confirmedGroupCloses.set(group.id, hash);
+    await this.setGroupStatus(group.id, "settling", {
+      closeTransactionHash: hash,
+      exitTrigger: trigger ?? "manual",
+      settlementPhase: "accounting",
+      closeReceiptAccounted: false,
+    });
+  }
+
+  private async accountGroupCloseReceipt(group: PositionGroupRecord, hash: Hex, childCount?: number, trigger?: ExitTrigger): Promise<void> {
+    if (this.accountedGroupCloses.has(group.id)) return;
+    const receipt = await this.getConfirmedReceipt(group.chainId, hash);
+    if (receipt.status !== "success") throw new Error(`Close receipt is not successful: ${hash}`);
+    await this.assertGroupCloseReceipt(group, receipt);
+    const [amount0, amount1] = await Promise.all([
+      this.assetReceivedFromReceipt(group.chainId, group.token0, group.owner, hash, receipt),
+      this.assetReceivedFromReceipt(group.chainId, group.token1, group.owner, hash, receipt),
+    ]);
+    const quoteIsToken0 = group.quoteToken.toLowerCase() === group.token0.toLowerCase();
+    if (!quoteIsToken0 && group.quoteToken.toLowerCase() !== group.token1.toLowerCase()) {
+      throw new GroupIntegrityError("Position group quote token is not part of the child pair");
+    }
+    const quoteAmount = quoteIsToken0 ? amount0 : amount1;
+    await this.database.addPositionGroupCashflow(
+      group.id,
+      receipt.blockNumber,
+      hash,
+      "close_receipt",
+      quoteAmount,
+      amount0,
+      amount1,
+      {
+        protocol: group.protocol,
+        childCount: childCount ?? null,
+        trigger: trigger ?? "manual",
+        source: "atomic_group_close",
+      },
+    );
+    const nonQuoteToken = quoteIsToken0 ? group.token1 : group.token0;
+    const nonQuoteAmountValue = quoteIsToken0 ? amount1 : amount0;
+    const settlementPhase = nonQuoteAmountValue > 0n ? "pending_swap" : "complete";
+    if (settlementPhase === "complete") {
+      const totals = await this.database.getPositionGroupCashflowTotals(group.id);
+      const deposits = totals.deposits > 0n ? totals.deposits : group.deployedCostQuote;
+      const realized = totals.realized;
+      const finalPnlQuote = realized - deposits;
+      const finalPnlBps = deposits > 0n ? (finalPnlQuote * 10_000n) / deposits : 0n;
+      const finalize = this.groupDatabase().finalizePositionGroup;
+      if (typeof finalize === "function") {
+        const settled = await finalize.call(this.database, group.id, hash, quoteAmount, finalPnlQuote, finalPnlBps, trigger ?? "manual");
+        if (!settled) throw new Error("position group could not be finalized after close receipt");
+        this.accountedGroupCloses.add(group.id);
+        this.confirmedReceipts.delete(hash);
+        return;
+      }
+    }
+    this.accountedGroupCloses.add(group.id);
+    await this.setGroupStatus(group.id, "settling", {
+      closeTransactionHash: hash,
+      totalReceivedQuote: quoteAmount.toString(),
+      closeReceiptAccounted: true,
+      settlementPhase,
+      ...(settlementPhase === "pending_swap" ? {
+        pendingSwap: { token: nonQuoteToken, amount: nonQuoteAmountValue.toString() },
+      } : {}),
+      childCount: childCount ?? null,
+    });
+    this.confirmedReceipts.delete(hash);
+  }
+
+  private async assertGroupCloseReceipt(group: PositionGroupRecord, receipt: TransactionReceipt): Promise<void> {
+    const bins = await this.database.listPositionGroupBins(group.id);
+    const expected = bins
+      .filter((bin) => bin.status === "minted" && bin.tokenId !== null)
+      .map((bin) => bin.tokenId!.toString());
+    if (expected.length === 0) throw new GroupIntegrityError("Position group close receipt has no expected active token IDs");
+    const burns = receipt.logs
+      .filter((entry) => entry.address.toLowerCase() === group.positionManager.toLowerCase())
+      .map((entry) => {
+        try {
+          const decoded = decodeEventLog({ abi: [erc721TransferEvent], data: entry.data, topics: entry.topics as [Hex, ...Hex[]] });
+          const args = decoded.args as { from?: Address; to?: Address; tokenId?: bigint };
+          return args.from && args.to && args.tokenId !== undefined ? args : null;
+        } catch {
+          return null;
+        }
+      })
+      .filter((value): value is { from: Address; to: Address; tokenId: bigint } => value !== null)
+      .filter((value) => value.from.toLowerCase() === group.owner.toLowerCase() && value.to.toLowerCase() === zeroAddress.toLowerCase())
+      .map((value) => value.tokenId.toString());
+    if (burns.length !== expected.length || new Set(burns).size !== expected.length || burns.some((tokenId) => !expected.includes(tokenId))) {
+      throw new GroupIntegrityError("group close receipt does not burn the exact expected NFT set");
+    }
+    if (group.protocol !== "v4") return;
+    const { registry } = this.chains.getById(group.chainId);
+    const modifications = receipt.logs
+      .filter((entry) => entry.address.toLowerCase() === registry.contracts.v4.poolManager.toLowerCase())
+      .map((entry) => {
+        try {
+          const decoded = decodeEventLog({ abi: [v4PoolManagerModifyLiquidityEvent], data: entry.data, topics: entry.topics as [Hex, ...Hex[]] });
+          const args = decoded.args as { sender?: Address; liquidityDelta?: bigint; salt?: Hex };
+          return args.sender && args.liquidityDelta !== undefined && args.salt ? args : null;
+        } catch {
+          return null;
+        }
+      })
+      .filter((value): value is { sender: Address; liquidityDelta: bigint; salt: Hex } => value !== null)
+      .filter((value) => value.sender.toLowerCase() === group.positionManager.toLowerCase() && value.liquidityDelta < 0n);
+    if (modifications.length !== expected.length) throw new GroupIntegrityError("V4 group close receipt does not contain one negative liquidity event per child");
+    const salts = new Set(modifications.map((modification) => modification.salt.toLowerCase()));
+    for (const tokenId of expected) {
+      const salt = pad(toHex(BigInt(tokenId)), { size: 32 }).toLowerCase();
+      if (!salts.has(salt)) throw new GroupIntegrityError(`V4 group close receipt is missing token-ID salt ${tokenId}`);
+    }
+  }
+
+  private async resumeGroupSettlement(group: PositionGroupRecord, hash: Hex, trigger?: ExitTrigger): Promise<void> {
+    const getConfirmed = this.groupDatabase().getLatestPositionGroupExecutionHash;
+    if (typeof getConfirmed === "function") {
+      const confirmedSwap = await getConfirmed.call(this.database, group.id, "settlement_swap", "confirmed");
+      if (confirmedSwap && isHex(confirmedSwap) && confirmedSwap.length === 66) {
+        await this.reconcileGroupSettlementSwap(group, confirmedSwap as Hex, trigger);
+        return;
+      }
+    }
+    const pending = parsePendingGroupSwap(group.metadata.pendingSwap);
+    if (!pending || pending.amount === 0n) {
+      const quoteAmount = typeof group.metadata.totalReceivedQuote === "string"
+        ? BigInt(group.metadata.totalReceivedQuote)
+        : group.totalReceivedQuote;
+      const totals = await this.database.getPositionGroupCashflowTotals(group.id);
+      const deposits = totals.deposits > 0n ? totals.deposits : group.deployedCostQuote;
+      const finalPnlQuote = totals.realized - deposits;
+      const finalPnlBps = deposits > 0n ? (finalPnlQuote * 10_000n) / deposits : 0n;
+      const finalize = this.groupDatabase().finalizePositionGroup;
+      if (typeof finalize !== "function") throw new GroupIntegrityError("Position group settlement finalizer is unavailable");
+      const exitTrigger = typeof group.metadata.exitTrigger === "string" ? group.metadata.exitTrigger : "manual";
+      const settled = await finalize.call(this.database, group.id, hash, quoteAmount, finalPnlQuote, finalPnlBps, trigger ?? exitTrigger);
+      if (!settled) throw new Error("position group settlement finalization failed");
+      return;
+    }
+    if (pending.token.toLowerCase() === zeroAddress.toLowerCase()) {
+      throw new GroupIntegrityError("Aggregate native-token settlement requires a supported native swap route");
+    }
+    const synthetic = groupSettlementPosition(group);
+    const prepared = await this.prepareGroupSettlementSwap(group, synthetic, pending);
+    if (!prepared) throw new Error("No safe route is available for aggregate position group settlement");
+    await this.setGroupStatus(group.id, "settling", {
+      closeTransactionHash: hash,
+      settlementPhase: "pending_swap",
+      lastExecutionError: "aggregate group settlement requires a quote conversion",
+      pendingSwap: { token: pending.token, amount: pending.amount.toString() },
+    });
+    const swapHash = await this.sendGroup(group, "settlement_swap", prepared);
+    if (!swapHash) {
+      await this.setGroupStatus(group.id, "settling", { dryRunPlan: prepared.description });
+      return;
+    }
+    await this.reconcileGroupSettlementSwap(group, swapHash, trigger);
+  }
+
+  private async prepareGroupSettlementSwap(
+    group: PositionGroupRecord,
+    position: PositionRecord,
+    pending: { token: Address; amount: bigint },
+  ): Promise<TransactionPlan | null> {
+    const route = await this.routes.quoteDirect(position, pending.token, pending.amount, group.quoteToken);
+    if (!route) return null;
+    const minimumOut = applySlippage(route.expectedOut, this.config.settlementSwapSlippageBps);
+    await this.ensureGroupSettlementApproval(group, position, route.protocol, route.router, pending.token, pending.amount);
+    return buildSwapPlan(
+      group.chainId,
+      group.owner,
+      { ...route, minimumOut },
+      BigInt(Math.floor(Date.now() / 1_000) + 300),
+    );
+  }
+
+  private async ensureGroupSettlementApproval(
+    group: PositionGroupRecord,
+    position: PositionRecord,
+    protocol: "v2" | "v3" | "v4",
+    router: Address,
+    token: Address,
+    amount: bigint,
+  ): Promise<void> {
+    if (token.toLowerCase() === zeroAddress.toLowerCase()) return;
+    const { client, registry } = this.chains.getById(group.chainId);
+    const spender = protocol === "v4" ? registry.contracts.v4.permit2 : router;
+    const allowance = await client.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [group.owner, spender] });
+    if (allowance < amount) {
+      const approvalHash = await this.sendGroup(group, "approve_quote", {
+        chainId: group.chainId,
+        to: token,
+        data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [spender, MAX_UINT256] }),
+        description: "approve aggregate settlement input",
+      });
+      if (!approvalHash && !this.config.dryRun) throw new Error("Aggregate settlement approval was not confirmed");
+    }
+    if (protocol !== "v4") return;
+    if (amount > MAX_UINT160) throw new Error("Aggregate settlement amount overflows Permit2 uint160");
+    const permitAllowance = await client.readContract({
+      address: registry.contracts.v4.permit2,
+      abi: permit2Abi,
+      functionName: "allowance",
+      args: [group.owner, token, router],
+    });
+    const expiration = Math.floor(Date.now() / 1_000) + 300;
+    if (permitAllowance[0] >= amount && Number(permitAllowance[1]) >= expiration) return;
+    const permitHash = await this.sendGroup(group, "permit2_approve", {
+      chainId: group.chainId,
+      to: registry.contracts.v4.permit2,
+      data: encodeFunctionData({ abi: permit2Abi, functionName: "approve", args: [token, router, amount, expiration] }),
+      description: "approve aggregate settlement input through Permit2",
+    });
+    if (!permitHash && !this.config.dryRun) throw new Error("Aggregate Permit2 approval was not confirmed");
+  }
+
+  private async reconcileGroupSettlementSwap(group: PositionGroupRecord, hash: Hex, trigger?: ExitTrigger): Promise<void> {
+    const receipt = await this.getConfirmedReceipt(group.chainId, hash);
+    if (receipt.status !== "success") throw new RevertedExecutionError("settlement_swap", `settlement_swap transaction reverted: ${hash}`);
+    const output = await this.assetReceivedFromReceipt(group.chainId, group.quoteToken, group.owner, hash, receipt);
+    if (output <= 0n) throw new Error(`Aggregate settlement swap produced no quote-token output: ${hash}`);
+    await this.database.addPositionGroupCashflow(group.id, receipt.blockNumber, hash, "settlement_swap", output, 0n, 0n, {
+      source: "aggregate_group_settlement",
+      trigger: trigger ?? group.metadata.exitTrigger ?? "manual",
+    });
+    const closeQuote = group.totalReceivedQuote > 0n
+      ? group.totalReceivedQuote
+      : typeof group.metadata.totalReceivedQuote === "string" && /^\d+$/.test(group.metadata.totalReceivedQuote)
+        ? BigInt(group.metadata.totalReceivedQuote)
+        : 0n;
+    const totals = await this.database.getPositionGroupCashflowTotals(group.id);
+    const deposits = totals.deposits > 0n ? totals.deposits : group.deployedCostQuote;
+    const totalReceivedQuote = closeQuote + output;
+    const finalPnlQuote = totals.realized - deposits;
+    const finalPnlBps = deposits > 0n ? (finalPnlQuote * 10_000n) / deposits : 0n;
+    const finalize = this.groupDatabase().finalizePositionGroup;
+    if (typeof finalize !== "function") throw new GroupIntegrityError("Position group settlement finalizer is unavailable");
+    const storedCloseHash = group.closeTransactionHash
+      ?? (typeof group.metadata.closeTransactionHash === "string" ? group.metadata.closeTransactionHash : hash);
+    const settled = await finalize.call(this.database, group.id, storedCloseHash, totalReceivedQuote, finalPnlQuote, finalPnlBps, trigger ?? "manual");
+    if (!settled) throw new Error("position group settlement finalization failed");
+    this.accountedGroupCloses.add(group.id);
+    this.confirmedReceipts.delete(hash);
+  }
+
+  private async markGroupRetryable(group: PositionGroupRecord, trigger: ExitTrigger | undefined, reason: string): Promise<void> {
+    const hash = this.confirmedGroupCloses.get(group.id);
+    if (hash) this.confirmedGroupCloses.delete(group.id);
+    const retry = nextExitRetry(group.metadata, trigger);
+    const maxRetries = this.config.bidAskLadderMaxRetries;
+    const exhausted = maxRetries !== undefined && typeof retry.attempts === "number" && retry.attempts >= maxRetries;
+    await this.setGroupStatus(group.id, exhausted ? "needs_review" : "active", {
+      closeTransactionHash: null,
+      closeReceiptAccounted: null,
+      settlementPhase: null,
+      reason,
+      exitRetry: retry,
+      ...(exhausted ? { settlementRetryDisabled: true } : {}),
+    });
+  }
+
+  private async markGroupNeedsReview(group: PositionGroupRecord, reason: string): Promise<void> {
+    await this.setGroupStatus(group.id, "needs_review", {
+      reason,
+      settlementRetryDisabled: true,
+    });
+  }
+
+  private async sendGroup(group: PositionGroupRecord, stage: "approve_quote" | "permit2_approve" | "close_batch" | "settlement_swap" | "unwrap_quote", plan: TransactionPlan): Promise<Hex | null> {
+    const run = this.transactionTail.then(() => this.database.withExecutionLock(
+      plan.chainId,
+      this.config.executorAddress,
+      async () => {
+        const hasPending = await this.database.hasPendingRawTransaction(plan.chainId);
+        if (hasPending) throw new Error(`Chain ${plan.chainId} has an unresolved signed transaction`);
+        return this.sendGroupUnlocked(group, stage, plan);
+      },
+    ));
+    this.transactionTail = run.catch(() => undefined);
+    return run;
+  }
+
+  private async sendGroupUnlocked(group: PositionGroupRecord, stage: "approve_quote" | "permit2_approve" | "close_batch" | "settlement_swap" | "unwrap_quote", plan: TransactionPlan): Promise<Hex | null> {
+    const { registry } = this.chains.getById(plan.chainId);
+    const client = this.executorClient(plan.chainId);
+    await client.call({ account: group.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n });
+    await this.database.recordPositionGroupExecution(group.id, stage, "planned");
+    if (this.config.dryRun) {
+      log.info({ groupId: group.id, stage, to: plan.to, description: plan.description }, "dry-run group transaction simulated");
+      return null;
+    }
+    if (!this.account) throw new Error("No executor account is configured");
+    const leaseToken = this.activeGroupLeases.get(group.id);
+    if (!leaseToken) throw new Error("Position group lease is required before broadcast");
+    const renew = this.groupDatabase().renewPositionGroupLease;
+    if (renew && !(await renew.call(this.database, group.id, leaseToken))) throw new Error("Position group lease ownership was lost before broadcast");
+    const alchemyUrl = this.config.alchemyHttp[registry.name];
+    const transport = alchemyUrl ? http(alchemyUrl) : http(this.config.rpcHttp[registry.name]);
+    const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport });
+    const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account, to: plan.to, data: plan.data, value: plan.value ?? 0n });
+    const serializedTransaction = await wallet.signTransaction(preparedRequest);
+    const hash = keccak256(serializedTransaction);
+    const nonce = preparedRequest.nonce === undefined ? undefined : BigInt(preparedRequest.nonce);
+    await this.database.recordPositionGroupExecution(group.id, stage, "submitted", hash, serializedTransaction, nonce);
+
+    let receipt: TransactionReceipt;
+    try {
+      const broadcastHash = await wallet.sendRawTransaction({ serializedTransaction });
+      if (broadcastHash.toLowerCase() !== hash.toLowerCase()) throw new Error(`${stage} broadcast returned an unexpected transaction hash`);
+      receipt = await waitForReceipt(client, hash, this.config.confirmations);
+    } catch (error) {
+      throw new PendingExecutionError(stage, hash, error);
+    }
+    if (receipt.status !== "success") {
+      await this.database.recordPositionGroupExecution(group.id, stage, "failed", hash, undefined, undefined, "transaction reverted");
+      throw new RevertedExecutionError(stage, `${stage} transaction reverted: ${hash}`);
+    }
+    this.confirmedReceipts.set(hash, receipt);
+    try {
+      await this.database.recordPositionGroupExecution(group.id, stage, "confirmed", hash);
+    } catch (error) {
+      throw new PendingExecutionError(stage, hash, error);
+    }
+    if (stage === "close_batch") {
+      this.confirmedGroupCloses.set(group.id, hash);
+      await this.setGroupStatus(group.id, "settling", {
+        closeTransactionHash: hash,
+        settlementPhase: "accounting",
+        closeReceiptAccounted: false,
+      });
+    }
+    try {
+      if (typeof this.notifier.transaction === "function") await this.notifier.transaction({
+        id: group.id,
+        chainId: group.chainId,
+        protocol: group.protocol,
+        positionKey: `group:${group.id}`,
+        owner: group.owner,
+        poolAddress: group.protocol === "v3" ? group.poolKey as Address : null,
+        token0: group.token0,
+        token1: group.token1,
+        quoteToken: group.quoteToken,
+        status: "closing",
+        liquidity: null,
+        openedAtBlock: group.referenceBlock,
+        metadata: group.metadata,
+      }, stage, hash);
+    } catch (error) {
+      log.warn({ error: errorMessage(error), groupId: group.id, stage, hash }, "group transaction notification failed after confirmation");
+    }
+    return hash;
+  }
+
+  private async rebroadcastGroupPendingTransaction(group: PositionGroupRecord, pending: PendingRawTransaction): Promise<void> {
+    if (!this.account) return;
+    const run = this.transactionTail.then(() => this.database.withExecutionLock(
+      group.chainId,
+      this.config.executorAddress,
+      async () => {
+        const { registry } = this.chains.getById(group.chainId);
+        const alchemyUrl = this.config.alchemyHttp[registry.name];
+        const wallet = createWalletClient({
+          account: this.account!,
+          chain: registry.chain,
+          transport: alchemyUrl ? http(alchemyUrl) : http(this.config.rpcHttp[registry.name]),
+        });
+        try {
+          const hash = await wallet.sendRawTransaction({ serializedTransaction: pending.serializedTransaction });
+          if (hash.toLowerCase() !== pending.hash.toLowerCase()) throw new Error("Rebroadcast returned an unexpected transaction hash");
+          log.info({ groupId: group.id, stage: pending.stage, hash }, "rebroadcast pending group signed transaction");
+        } catch (error) {
+          const reason = errorMessage(error);
+          if (!/already known|known transaction|nonce too low/i.test(reason)) {
+            log.warn({ groupId: group.id, stage: pending.stage, hash: pending.hash, reason }, "pending group signed transaction rebroadcast deferred");
+          }
+        }
+      },
+    ));
+    this.transactionTail = run.catch(() => undefined);
+    await run;
+  }
+
+  private async recordGroupExecutionFailure(groupId: string, stage: string, reason: string, transactionHash?: Hex): Promise<void> {
+    const record = this.groupDatabase().recordPositionGroupExecution;
+    if (typeof record !== "function") return;
+    try {
+      await record.call(this.database, groupId, stage as "close_batch", "failed", transactionHash, undefined, undefined, reason);
+    } catch (error) {
+      log.warn({ error: errorMessage(error), groupId, stage }, "could not record group execution failure");
+    }
+  }
+
+  private async setGroupStatus(groupId: string, status: PositionGroupStatus, metadata: Record<string, unknown>): Promise<void> {
+    const setter = this.groupDatabase().setPositionGroupStatus;
+    if (typeof setter !== "function") {
+      if (!this.reportedGroupDbGaps.has("setPositionGroupStatus")) {
+        this.reportedGroupDbGaps.add("setPositionGroupStatus");
+        log.warn({ groupId }, "group parent status updates are unavailable in Database; close execution remains durable but parent status needs a DB API");
+      }
+      return;
+    }
+    try {
+      await setter.call(this.database, groupId, status, metadata);
+    } catch (error) {
+      log.warn({ error: errorMessage(error), groupId, status }, "group parent status update failed");
+      throw error;
+    }
+  }
+
+  private groupDatabase(): Database & GroupDatabaseExtensions {
+    return this.database as Database & GroupDatabaseExtensions;
   }
 
   private async recoverConfirmedClose(position: PositionRecord): Promise<PositionRecord | null> {
@@ -1678,6 +2513,52 @@ function parsePendingSwap(value: unknown): { token: Address; amount: bigint } | 
   return { token: candidate.token as Address, amount: BigInt(candidate.amount) };
 }
 
+function parsePendingGroupSwap(value: unknown): { token: Address; amount: bigint } | null {
+  return parsePendingSwap(value);
+}
+
+function groupSettlementPosition(group: PositionGroupRecord): PositionRecord {
+  const plan = group.planJson as Record<string, unknown>;
+  const nestedPlan = isRecord(plan.plan) ? plan.plan : plan;
+  const poolKey = firstRecord(nestedPlan.poolKey, nestedPlan.v4PoolKey, plan.poolKey, plan.v4PoolKey);
+  const metadata: Record<string, unknown> = {
+    managedBy: "position_group",
+    positionGroupId: group.id,
+  };
+  if (poolKey) {
+    Object.assign(metadata, {
+      currency0: poolKey.currency0,
+      currency1: poolKey.currency1,
+      fee: poolKey.fee,
+      tickSpacing: poolKey.tickSpacing,
+      hooks: poolKey.hooks,
+    });
+  }
+  return {
+    id: group.id,
+    chainId: group.chainId,
+    protocol: group.protocol,
+    positionKey: `group:${group.id}`,
+    owner: group.owner,
+    poolAddress: group.protocol === "v3" ? group.poolKey as Address : null,
+    token0: group.token0,
+    token1: group.token1,
+    quoteToken: group.quoteToken,
+    status: "closing",
+    liquidity: null,
+    openedAtBlock: group.referenceBlock,
+    metadata,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function firstRecord(...values: unknown[]): Record<string, unknown> | null {
+  return values.find(isRecord) ?? null;
+}
+
 export function receiptErc20NetReceived(
   logs: readonly { address: Address; data: Hex; topics: readonly Hex[] }[],
   token: Address,
@@ -1708,6 +2589,14 @@ function settlementGasWei(metadata: Record<string, unknown>): bigint {
   const value = metadata.settlementGasWei;
   if (typeof value !== "string" || !/^\d+$/.test(value)) return 0n;
   return BigInt(value);
+}
+
+function sameV4PoolKey(left: V4PoolKey, right: V4PoolKey): boolean {
+  return left.currency0.toLowerCase() === right.currency0.toLowerCase()
+    && left.currency1.toLowerCase() === right.currency1.toLowerCase()
+    && left.fee === right.fee
+    && left.tickSpacing === right.tickSpacing
+    && left.hooks.toLowerCase() === right.hooks.toLowerCase();
 }
 
 function errorMessage(error: unknown): string {

@@ -12,6 +12,36 @@ export type PositionStatus =
   | "failed"
   | "paused";
 
+export type PositionGroupStatus =
+  | "planned"
+  | "preparing"
+  | "opening"
+  | "active"
+  | "closing"
+  | "settling"
+  | "settled"
+  | "needs_review"
+  | "cancelled";
+
+export type PositionGroupBinStatus = "planned" | "minted" | "closed" | "skipped" | "needs_review";
+export type PositionGroupBinSide = "token0" | "token1";
+export type PositionGroupShape = "bid_ask";
+export type PositionGroupShapeVersion = "delta-amount-linear-v1";
+
+export type PositionGroupExecutionStage =
+  | "approve_quote"
+  | "wrap_quote"
+  | "approve_permit2"
+  | "permit2_approve"
+  | "open_batch"
+  | "close_batch"
+  | "settlement_swap"
+  | "unwrap_quote";
+
+export type PositionGroupExecutionStatus = "planned" | "submitted" | "confirmed" | "failed";
+
+export type PositionGroupCashflowType = "open_debit" | "close_receipt" | "settlement_swap" | "unwrap_quote";
+
 export type ExitTrigger = "stop_loss" | "take_profit" | "trailing_take_profit" | "profit_oor_above" | "out_of_range_above" | "manual";
 
 export interface PositionRangeInfo {
@@ -77,6 +107,131 @@ export interface PositionRecord {
   liquidity: bigint | null;
   openedAtBlock: bigint | null;
   metadata: Record<string, unknown>;
+}
+
+export interface PositionGroupRecord {
+  id: string;
+  chainId: number;
+  protocol: Protocol;
+  positionManager: Address;
+  poolKey: string;
+  owner: Address;
+  token0: Address;
+  token1: Address;
+  quoteToken: Address;
+  shape: PositionGroupShape;
+  shapeVersion: PositionGroupShapeVersion;
+  requestedBinCount: number;
+  generatedBinCount: number;
+  mintableBinCount: number;
+  outerTickLower: number;
+  outerTickUpper: number;
+  anchorBinIndex: number;
+  totalDeposit: bigint;
+  deployedCostQuote: bigint;
+  directCloseAmount0: bigint;
+  directCloseAmount1: bigint;
+  totalReceivedQuote: bigint;
+  status: PositionGroupStatus;
+  planHash: string;
+  planJson: Record<string, unknown>;
+  referenceBlock: bigint | null;
+  referenceTick: number | null;
+  referencePrice: bigint | null;
+  openTransactionHash: string | null;
+  closeTransactionHash: string | null;
+  pendingRawTransaction: Record<string, unknown> | null;
+  executionLeaseToken: string | null;
+  executionLeaseUntil: Date | null;
+  finalPnlQuote: bigint | null;
+  finalPnlBps: bigint | null;
+  finalPnlUsd: bigint | null;
+  settledAt: Date | null;
+  metadata: Record<string, unknown>;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface PositionGroupBinRecord {
+  id: string;
+  groupId: string;
+  chainId: number;
+  positionManager: Address;
+  binIndex: number;
+  tickLower: number;
+  tickUpper: number;
+  side: PositionGroupBinSide;
+  weightMicros: number;
+  allocatedAmount0: bigint;
+  allocatedAmount1: bigint;
+  expectedLiquidity: bigint;
+  expectedAmount0: bigint;
+  expectedAmount1: bigint;
+  tokenId: bigint | null;
+  positionId: string | null;
+  openingAmount0: bigint;
+  openingAmount1: bigint;
+  closeAmount0: bigint;
+  closeAmount1: bigint;
+  settlementQuote: bigint;
+  status: PositionGroupBinStatus;
+  dropReason: string | null;
+  openTransactionHash: string | null;
+  closeTransactionHash: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface PositionGroupExecutionAttemptRecord {
+  id: string;
+  groupId: string;
+  stage: PositionGroupExecutionStage;
+  signedRawTransaction: string | null;
+  nonce: bigint | null;
+  transactionHash: string | null;
+  status: PositionGroupExecutionStatus;
+  allOrNothing: boolean;
+  error: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface PositionGroupCashflowRecord {
+  id: string;
+  groupId: string;
+  blockNumber: bigint;
+  transactionHash: string;
+  flowType: PositionGroupCashflowType;
+  quoteValue: bigint;
+  token0Amount: bigint;
+  token1Amount: bigint;
+  details: Record<string, unknown>;
+  createdAt: Date;
+}
+
+export interface PositionGroupCashflowTotals {
+  deposits: bigint;
+  realized: bigint;
+}
+
+export interface PositionGroupPnlSnapshot {
+  groupId: string;
+  quoteToken: Address;
+  depositsQuote: bigint;
+  realizedQuote: bigint;
+  liquidationQuote: bigint;
+  feeQuote: bigint;
+  pnlQuote: bigint;
+  pnlBps: bigint;
+  blockNumber: bigint;
+  groupGasQuote: bigint;
+}
+
+export interface PositionGroupPnlSnapshotRecord extends PositionGroupPnlSnapshot {
+  id: string;
+  createdAt: Date;
 }
 
 export interface TokenAmount {
