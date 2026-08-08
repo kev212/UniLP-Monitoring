@@ -429,18 +429,42 @@ export class Executor {
       }
 
       const children = await this.loadGroupChildren(group);
-      const plan = this.groupClosePlan(group, children);
+      let plan = this.groupClosePlan(group, children);
       try {
         await this.simulatePlan(children[0]!.position, plan);
       } catch (error) {
-        await this.recordGroupExecutionFailure(group.id, "close_batch", errorMessage(error));
-        groupFailureRecorded = true;
         if (isTransientRpcError(error)) {
+          await this.recordGroupExecutionFailure(group.id, "close_batch", errorMessage(error));
+          groupFailureRecorded = true;
           await this.markGroupRetryable(group, trigger, errorMessage(error), true);
           return;
         }
-        await this.markGroupRetryable(group, trigger, errorMessage(error));
-        throw error;
+        if (group.protocol !== "v4") {
+          await this.recordGroupExecutionFailure(group.id, "close_batch", errorMessage(error));
+          groupFailureRecorded = true;
+          await this.markGroupRetryable(group, trigger, errorMessage(error));
+          throw error;
+        }
+        const fallbackPlan = this.groupClosePlan(group, children, true);
+        try {
+          await this.simulatePlan(children[0]!.position, fallbackPlan);
+          plan = fallbackPlan;
+          log.warn({
+            groupId: group.id,
+            reason: errorMessage(error),
+            fallback: fallbackPlan.description,
+          }, "V4 Bid-Ask close minimums rejected; using zero-minimum atomic fallback");
+        } catch (fallbackError) {
+          const reason = `${errorMessage(error)}; zero-minimum fallback: ${errorMessage(fallbackError)}`;
+          await this.recordGroupExecutionFailure(group.id, "close_batch", reason);
+          groupFailureRecorded = true;
+          if (isTransientRpcError(fallbackError)) {
+            await this.markGroupRetryable(group, trigger, reason, true);
+            return;
+          }
+          await this.markGroupRetryable(group, trigger, reason);
+          throw fallbackError;
+        }
       }
 
       await this.setGroupStatus(group.id, "closing", {
@@ -884,7 +908,7 @@ export class Executor {
     }
   }
 
-  private groupClosePlan(group: PositionGroupRecord, children: readonly GroupChild[]): TransactionPlan {
+  private groupClosePlan(group: PositionGroupRecord, children: readonly GroupChild[], zeroMinimums = false): TransactionPlan {
     const deadline = BigInt(Math.floor(Date.now() / 1_000) + 300);
     if (group.protocol === "v3") {
       return buildV3BidAskClosePlan({
@@ -912,8 +936,8 @@ export class Executor {
       value: 0n,
       positions: children.map(({ bin, value, position }) => ({
         tokenId: bin.tokenId!,
-        amount0Min: value.minAmount0,
-        amount1Min: value.minAmount1,
+        amount0Min: zeroMinimums ? 0n : value.minAmount0,
+        amount1Min: zeroMinimums ? 0n : value.minAmount1,
         ...(typeof position.metadata.hookData === "string" && isHex(position.metadata.hookData) ? { hookData: position.metadata.hookData } : {}),
       })),
     });

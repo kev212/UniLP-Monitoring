@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { decodeFunctionData, encodeAbiParameters, keccak256, pad, stringToHex, toFunctionSelector, toHex, zeroAddress, type Address, type Hex } from "viem";
+import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, keccak256, pad, stringToHex, toFunctionSelector, toHex, zeroAddress, type Address, type Hex } from "viem";
 
 import { v3PositionManagerAbi, v4PositionManagerAbi } from "../src/abi.js";
 import type { RuntimeConfig } from "../src/config.js";
@@ -160,6 +160,15 @@ function groupChild(id: string, tokenId: bigint): PositionRecord {
   };
 }
 
+function v4GroupChild(id: string, tokenId: bigint): PositionRecord {
+  return {
+    ...groupChild(id, tokenId),
+    protocol: "v4",
+    poolAddress: null,
+    metadata: { positionGroupId: groupId },
+  };
+}
+
 function relatedPosition(
   id: string,
   token0: Address = usdg,
@@ -197,6 +206,25 @@ function groupValue(lower: number, upper: number, liquidity = 10n) {
     v3Fee: 500,
     minAmount0: 40n,
     minAmount1: 0n,
+    range: { tickLower: lower, tickUpper: upper, currentTick: -200, currentSqrtPrice: 1n, status: "below" as const },
+    unclaimedFees0: 1n,
+    unclaimedFees1: 0n,
+    observedBlock: 100n,
+  };
+}
+
+function v4GroupValue(lower: number, upper: number, liquidity = 10n) {
+  return {
+    protocol: "v4" as const,
+    poolKey: groupPool,
+    sourcePool: null,
+    token0: { token: usdg, amount: 50n },
+    token1: { token, amount: 0n },
+    liquidity,
+    priceMarker: 1n,
+    minAmount0: 40n,
+    minAmount1: 30n,
+    v4PoolKey: { currency0: usdg, currency1: token, fee: 500, tickSpacing: 10, hooks: zeroAddress },
     range: { tickLower: lower, tickUpper: upper, currentTick: -200, currentSqrtPrice: 1n, status: "below" as const },
     unclaimedFees0: 1n,
     unclaimedFees1: 0n,
@@ -1052,6 +1080,54 @@ describe("Executor pending settlement recovery", () => {
       expect.objectContaining({ source: "atomic_group_close", childCount: 2 }),
     );
     expect(closeReceiptAmounts).not.toHaveBeenCalled();
+  });
+
+  it("falls back to zero minimums for a reverting V4 Bid-Ask close simulation", async () => {
+    const group = groupRecord("v4");
+    const children = [v4GroupChild("child-7", 7n), v4GroupChild("child-8", 8n)];
+    const bins = [groupBin(0, 7n, "child-7", -120, -60), groupBin(1, 8n, "child-8", -60, 0)];
+    const client = {
+      getBlockNumber: vi.fn().mockResolvedValue(100n),
+      readContract: vi.fn().mockResolvedValue(owner),
+      call: vi.fn()
+        .mockRejectedValueOnce(new Error("execution reverted"))
+        .mockResolvedValueOnce({ data: "0x" }),
+    };
+    const database = {
+      getPositionGroup: vi.fn().mockResolvedValue(group),
+      listPositionGroupBins: vi.fn().mockResolvedValue(bins),
+      getPositionById: vi.fn((id: string) => Promise.resolve(children.find((child) => child.id === id) ?? null)),
+      claimPositionGroupLease: vi.fn().mockResolvedValue(true),
+      releasePositionGroupLease: vi.fn().mockResolvedValue(undefined),
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      withExecutionLock: vi.fn(async (_chainId: number, _address: Address, work: () => Promise<unknown>) => work()),
+      recordPositionGroupExecution: vi.fn().mockResolvedValue(undefined),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const reader = {
+      read: vi.fn((position: PositionRecord) => Promise.resolve(position.positionKey === "7" ? v4GroupValue(-120, -60) : v4GroupValue(-60, 0))),
+    };
+    const executor = new Executor(database as never, chains as never, reader as never, {} as never, {} as never, config);
+    const sendGroup = vi.spyOn(executor as any, "sendGroup").mockResolvedValue(null);
+
+    await executor.executeGroup(groupId, "manual");
+
+    expect(client.call).toHaveBeenCalledTimes(2);
+    expect(sendGroup).toHaveBeenCalledTimes(1);
+    const plan = sendGroup.mock.calls[0]![2] as { data: Hex };
+    const outer = decodeFunctionData({ abi: v4PositionManagerAbi, data: plan.data });
+    const [actions, params] = decodeAbiParameters([{ type: "bytes" }, { type: "bytes[]" }], outer.args[0]);
+    expect(actions).toBe("0x030311");
+    const burnTypes = [{ type: "uint256" }, { type: "uint128" }, { type: "uint128" }, { type: "bytes" }] as const;
+    for (const param of params.slice(0, 2)) {
+      const [, amount0Min, amount1Min] = decodeAbiParameters(burnTypes, param);
+      expect(amount0Min).toBe(0n);
+      expect(amount1Min).toBe(0n);
+    }
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith(groupId, "active", expect.objectContaining({
+      dryRunPlan: "batch V4 bid-ask close",
+    }));
   });
 
   it("resumes the aggregate settlement swap after the close receipt was accounted in the same process", async () => {
