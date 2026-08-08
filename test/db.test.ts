@@ -132,6 +132,7 @@ describe("Database native USD backfill", () => {
       .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "group" }] })
       .mockResolvedValueOnce({})
       .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "history" }] })
       .mockResolvedValueOnce({});
     const connect = vi.fn().mockResolvedValue({ query: clientQuery, release: vi.fn() });
     Object.defineProperty(database, "pool", { value: { connect } });
@@ -143,6 +144,8 @@ describe("Database native USD backfill", () => {
     expect(parentQuery).toContain("'totalReceivedQuote', ($3::numeric)::text");
     expect(parentQuery).toContain("'finalPnlQuote', ($4::numeric)::text");
     expect(parentQuery).toContain("'finalPnlBps', ($5::numeric)::text");
+    expect(clientQuery.mock.calls[4]![0]).toContain("INSERT INTO close_history");
+    expect(clientQuery.mock.calls[4]![0]).toContain("position_group_id");
   });
 
   it("renews a group lease only while its token owns the parent", async () => {
@@ -332,6 +335,73 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[0]![0]).toContain("LIMIT $1 OFFSET $2");
     expect(query.mock.calls[0]![0]).toContain("ABS(final_pnl_bps) >= 50");
     expect(query.mock.calls[0]![1]).toEqual([6, 12]);
+  });
+
+  it("maps parent-level Bid-Ask history without a child position", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({
+      rows: [{
+        id: "history",
+        position_id: null,
+        position_group_id: "group",
+        chain_id: 4663,
+        protocol: "v4",
+        position_key: "group",
+        token0: "0x0000000000000000000000000000000000000001",
+        token1: "0x0000000000000000000000000000000000000002",
+        quote_token: "0x0000000000000000000000000000000000000002",
+        final_pnl_bps: "228",
+        final_pnl_quote: "4562148",
+        final_pnl_usd: "4562148",
+        trigger: "manual",
+        close_transaction_hash: "0xclose",
+        swap_transaction_hash: "0xswap",
+        settled_at: "2026-08-08T02:58:45.195Z",
+        opened_at_block: "100",
+      }],
+    });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.listCloseHistoryPage(20, 0)).resolves.toMatchObject([{
+      positionId: null,
+      positionGroupId: "group",
+      positionKey: "group",
+      finalPnlBps: 228n,
+    }]);
+  });
+
+  it("selects only settled Bid-Ask groups missing threshold history", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({
+      rows: [{ id: "group", chain_id: 4663, protocol: "v4", final_pnl_bps: "50", settled_at: "2026-08-08T00:00:00Z" }],
+    });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.listPositionGroupHistoryBackfillCandidates("group")).resolves.toEqual([{
+      id: "group",
+      chainId: 4663,
+      protocol: "v4",
+      finalPnlBps: 50n,
+      settledAt: new Date("2026-08-08T00:00:00Z"),
+    }]);
+    expect(query.mock.calls[0]![0]).toContain("ABS(g.final_pnl_bps) >= $1");
+    expect(query.mock.calls[0]![0]).toContain("h.position_group_id = g.id");
+    expect(query.mock.calls[0]![1]).toEqual(["50", "group", 1_000]);
+  });
+
+  it("backfills group history atomically and idempotently by group ID", async () => {
+    const database = new Database("postgres://unused");
+    const clientQuery = vi.fn()
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ rows: [{ id: "group" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "history" }] })
+      .mockResolvedValueOnce({});
+    const connect = vi.fn().mockResolvedValue({ query: clientQuery, release: vi.fn() });
+    Object.defineProperty(database, "pool", { value: { connect } });
+
+    await expect(database.backfillPositionGroupHistory(["group"])).resolves.toBe(1);
+    expect(clientQuery.mock.calls[2]![0]).toContain("ON CONFLICT (position_group_id)");
+    expect(clientQuery.mock.calls[2]![1]).toEqual(["group", "50"]);
   });
 
   it("includes accrued snapshot fees in PnL card details", async () => {

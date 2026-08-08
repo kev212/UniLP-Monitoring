@@ -276,7 +276,8 @@ export interface TransactionPlan {
 
 export interface CloseHistoryRecord {
   id: string;
-  positionId: string;
+  positionId: string | null;
+  positionGroupId: string | null;
   chainId: number;
   protocol: Protocol;
   positionKey: string;

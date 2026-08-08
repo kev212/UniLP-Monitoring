@@ -4,7 +4,7 @@ import { renderPnlCard } from "../src/services/pnl-card.js";
 import type { CloseHistoryRecord } from "../src/types.js";
 
 const record: CloseHistoryRecord = {
-  id: "history", positionId: "position", chainId: 4663, protocol: "v4", positionKey: "128754",
+  id: "history", positionId: "position", positionGroupId: null, chainId: 4663, protocol: "v4", positionKey: "128754",
   token0: "0x5fc5360d0400a0fd4f2af552add042d716f1d168", token1: "0x75c8258eaa6d0f94b82951194191ca3efb0bcbe2",
   quoteToken: "0x5fc5360d0400a0fd4f2af552add042d716f1d168", finalPnlBps: 483n,
   finalPnlQuote: 2_903_561n, finalPnlUsd: 5_211_865n, trigger: "manual",

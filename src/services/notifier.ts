@@ -1835,7 +1835,10 @@ export class Notifier {
       const isProfit = item.finalPnlBps >= 0n;
       const prefix = isProfit ? "📈" : "📉";
       const sign = isProfit ? "+" : "";
-      lines.push(`${prefix} ${item.protocol.toUpperCase()} #${item.positionKey} ${pair}`);
+      const identity = item.positionGroupId
+        ? `BA ${shortHash(item.positionGroupId)}`
+        : `${item.protocol.toUpperCase()} #${item.positionKey}`;
+      lines.push(`${prefix} ${identity} ${pair}`);
       const qtDec = await this.decimals(item.quoteToken, item.chainId);
       const qtSymbol = this.quoteSymbol(item.quoteToken);
       const ethDec = (qtSymbol === "ETH" || qtSymbol === "WETH") ? 4 : undefined;
@@ -1873,7 +1876,10 @@ export class Notifier {
       const isProfit = item.finalPnlBps >= 0n;
       const sign = isProfit ? "+" : "";
       keyboard.text(`${isProfit ? "📈" : "📉"} ${item.protocol.toUpperCase()} ${pair}`, `lp:pnl_cs:${p}:${start + i}`).row();
-      lines.push(`${isProfit ? "📈" : "📉"} ${item.protocol.toUpperCase()} #${item.positionKey} ${pair} | ${sign}${formatBps(item.finalPnlBps)}%`);
+      const identity = item.positionGroupId
+        ? `BA ${shortHash(item.positionGroupId)}`
+        : `${item.protocol.toUpperCase()} #${item.positionKey}`;
+      lines.push(`${isProfit ? "📈" : "📉"} ${identity} ${pair} | ${sign}${formatBps(item.finalPnlBps)}%`);
     }
     keyboard.text("← Back", dashboardAction("status", 0));
     await this.replyTemp(ctx, lines.join("\n"), { reply_markup: keyboard as any });
@@ -1913,7 +1919,7 @@ export class Notifier {
         }
       } catch { /* skip duration if block lookup fails */ }
     }
-    const detail = await database.getPnlCardDetail(record.positionId);
+    const detail = record.positionId ? await database.getPnlCardDetail(record.positionId) : null;
     const png = await renderPnlCard(record, pair, qtDec, qtSymbol, detail, bg, durationStr);
     const sent = await ctx.replyWithPhoto(new InputFile(png, "pnl-card.png"));
     if (sent && "message_id" in sent) {

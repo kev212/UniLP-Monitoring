@@ -153,6 +153,22 @@ interface PositionGroupPnlSnapshotRow {
   created_at: Date | string;
 }
 
+interface PositionGroupHistoryCandidateRow {
+  id: string;
+  chain_id: number;
+  protocol: Protocol;
+  final_pnl_bps: string;
+  settled_at: string;
+}
+
+export interface PositionGroupHistoryBackfillCandidate {
+  id: string;
+  chainId: number;
+  protocol: Protocol;
+  finalPnlBps: bigint;
+  settledAt: Date;
+}
+
 export class Database {
   private readonly pool: Pool;
 
@@ -449,7 +465,8 @@ export class Database {
       CREATE INDEX IF NOT EXISTS pool_scan_candidates_updated_idx ON pool_scan_candidates(updated_at DESC);
       CREATE TABLE IF NOT EXISTS close_history (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        position_id UUID NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
+        position_id UUID REFERENCES positions(id) ON DELETE CASCADE,
+        position_group_id UUID REFERENCES position_groups(id) ON DELETE CASCADE,
         chain_id INTEGER NOT NULL,
         protocol TEXT NOT NULL CHECK (protocol IN ('v2', 'v3', 'v4')),
         position_key TEXT NOT NULL,
@@ -462,8 +479,21 @@ export class Database {
         trigger TEXT NOT NULL,
         close_transaction_hash TEXT,
         swap_transaction_hash TEXT,
-        settled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        settled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT close_history_owner_check CHECK (num_nonnulls(position_id, position_group_id) = 1)
       );
+      ALTER TABLE close_history ADD COLUMN IF NOT EXISTS position_group_id UUID REFERENCES position_groups(id) ON DELETE CASCADE;
+      ALTER TABLE close_history ALTER COLUMN position_id DROP NOT NULL;
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'close_history_owner_check'
+        ) THEN
+          ALTER TABLE close_history
+            ADD CONSTRAINT close_history_owner_check CHECK (num_nonnulls(position_id, position_group_id) = 1);
+        END IF;
+      END $$;
+      CREATE UNIQUE INDEX IF NOT EXISTS close_history_position_group_idx ON close_history(position_group_id);
       CREATE INDEX IF NOT EXISTS close_history_settled_at_idx ON close_history(settled_at DESC);
       ALTER TABLE close_history ADD COLUMN IF NOT EXISTS final_pnl_usd NUMERIC(78, 0) NOT NULL DEFAULT 0;
       ALTER TABLE close_history ADD COLUMN IF NOT EXISTS opened_at_block NUMERIC(78, 0);
@@ -829,11 +859,178 @@ export class Database {
           )`,
         [groupId, closeTransactionHash],
       );
+      await this.insertPositionGroupCloseHistory(client, groupId);
       return true;
     });
   }
 
-  async renewPositionGroupLease(groupId: string, token: string, ttlMs = 300_000): Promise<boolean> {
+  async listPositionGroupHistoryBackfillCandidates(
+    groupId?: string,
+    limit = 1_000,
+  ): Promise<PositionGroupHistoryBackfillCandidate[]> {
+    const values: unknown[] = [HISTORY_MIN_PNL_BPS.toString()];
+    const conditions = [
+       "g.shape = 'bid_ask'",
+       "g.status = 'settled'",
+       "g.final_pnl_bps IS NOT NULL",
+       "ABS(g.final_pnl_bps) >= $1",
+       "g.final_pnl_quote IS NOT NULL",
+       "g.close_transaction_hash IS NOT NULL",
+       "g.settled_at IS NOT NULL",
+       "EXISTS (SELECT 1 FROM position_group_bins b WHERE b.group_id = g.id AND b.position_id IS NOT NULL)",
+       `NOT EXISTS (
+          SELECT 1
+            FROM position_group_bins b
+            LEFT JOIN positions p ON p.id = b.position_id
+           WHERE b.group_id = g.id
+             AND b.position_id IS NOT NULL
+             AND (p.id IS NULL OR p.status <> 'settled')
+       )`,
+       "NOT EXISTS (SELECT 1 FROM close_history h WHERE h.position_group_id = g.id)",
+     ];
+     if (groupId) {
+       values.push(groupId);
+       conditions.push(`g.id = $${values.length}`);
+     }
+     values.push(Math.max(1, Math.min(limit, 1_000)));
+     const result = await this.pool.query<PositionGroupHistoryCandidateRow>(
+       `SELECT g.id, g.chain_id, g.protocol, g.final_pnl_bps, g.settled_at
+          FROM position_groups g
+         WHERE ${conditions.join(" AND ")}
+         ORDER BY g.settled_at ASC
+         LIMIT $${values.length}`,
+       values,
+     );
+     return result.rows.map((row) => ({
+       id: row.id,
+       chainId: row.chain_id,
+       protocol: row.protocol,
+       finalPnlBps: BigInt(row.final_pnl_bps),
+       settledAt: new Date(row.settled_at),
+     }));
+   }
+
+   async backfillPositionGroupHistory(groupIds?: string[]): Promise<number> {
+     if (groupIds && groupIds.length === 0) return 0;
+     return this.transaction(async (client) => {
+       const values: unknown[] = [HISTORY_MIN_PNL_BPS.toString()];
+       const conditions = [
+         "g.shape = 'bid_ask'",
+         "g.status = 'settled'",
+         "g.final_pnl_bps IS NOT NULL",
+         "ABS(g.final_pnl_bps) >= $1",
+         "g.final_pnl_quote IS NOT NULL",
+         "g.close_transaction_hash IS NOT NULL",
+         "g.settled_at IS NOT NULL",
+         "EXISTS (SELECT 1 FROM position_group_bins b WHERE b.group_id = g.id AND b.position_id IS NOT NULL)",
+         `NOT EXISTS (
+            SELECT 1
+              FROM position_group_bins b
+              LEFT JOIN positions p ON p.id = b.position_id
+             WHERE b.group_id = g.id
+               AND b.position_id IS NOT NULL
+               AND (p.id IS NULL OR p.status <> 'settled')
+         )`,
+         "NOT EXISTS (SELECT 1 FROM close_history h WHERE h.position_group_id = g.id)",
+       ];
+       if (groupIds) {
+         values.push(groupIds);
+         conditions.push(`g.id = ANY($${values.length}::uuid[])`);
+       }
+       const candidates = await client.query<{ id: string }>(
+         `SELECT g.id
+            FROM position_groups g
+           WHERE ${conditions.join(" AND ")}
+           ORDER BY g.settled_at ASC`,
+         values,
+       );
+       let inserted = 0;
+       for (const candidate of candidates.rows) {
+         if (await this.insertPositionGroupCloseHistory(client, candidate.id)) inserted++;
+       }
+       return inserted;
+     });
+   }
+
+   private async insertPositionGroupCloseHistory(client: PoolClient, groupId: string): Promise<boolean> {
+     const result = await client.query(
+       `INSERT INTO close_history (
+          position_id, position_group_id, chain_id, protocol, position_key, token0, token1, quote_token,
+          final_pnl_bps, final_pnl_quote, final_pnl_usd, trigger, close_transaction_hash, swap_transaction_hash,
+          settled_at, opened_at_block
+        )
+        SELECT NULL, g.id, g.chain_id, g.protocol, g.id, g.token0, g.token1, g.quote_token,
+               g.final_pnl_bps, g.final_pnl_quote,
+               COALESCE(
+                 g.final_pnl_usd,
+                 CASE
+                   WHEN LOWER(g.quote_token) IN (
+                     '0x5fc5360d0400a0fd4f2af552add042d716f1d168',
+                     '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
+                   ) THEN g.final_pnl_quote
+                   ELSE 0
+                 END
+               ),
+               COALESCE(NULLIF(g.metadata->>'exitTrigger', ''), 'settled'),
+               g.close_transaction_hash,
+               (
+                 SELECT cf.transaction_hash
+                   FROM position_group_cashflows cf
+                  WHERE cf.group_id = g.id AND cf.flow_type = 'settlement_swap'
+                  ORDER BY cf.created_at DESC
+                  LIMIT 1
+               ),
+               g.settled_at,
+               (
+                 SELECT MIN(p.opened_at_block)
+                   FROM position_group_bins b
+                   JOIN positions p ON p.id = b.position_id
+                  WHERE b.group_id = g.id AND b.position_id IS NOT NULL
+               )
+          FROM position_groups g
+         WHERE g.id = $1
+           AND g.shape = 'bid_ask'
+           AND g.status = 'settled'
+           AND g.final_pnl_bps IS NOT NULL
+           AND ABS(g.final_pnl_bps) >= $2
+           AND g.final_pnl_quote IS NOT NULL
+           AND g.close_transaction_hash IS NOT NULL
+           AND g.settled_at IS NOT NULL
+           AND EXISTS (
+             SELECT 1 FROM position_group_bins b
+              WHERE b.group_id = g.id AND b.position_id IS NOT NULL
+           )
+           AND NOT EXISTS (
+             SELECT 1
+               FROM position_group_bins b
+               LEFT JOIN positions p ON p.id = b.position_id
+              WHERE b.group_id = g.id
+                AND b.position_id IS NOT NULL
+                AND (p.id IS NULL OR p.status <> 'settled')
+           )
+        ON CONFLICT (position_group_id) DO UPDATE SET
+          position_id = EXCLUDED.position_id,
+          chain_id = EXCLUDED.chain_id,
+          protocol = EXCLUDED.protocol,
+          position_key = EXCLUDED.position_key,
+          token0 = EXCLUDED.token0,
+          token1 = EXCLUDED.token1,
+          quote_token = EXCLUDED.quote_token,
+          final_pnl_bps = EXCLUDED.final_pnl_bps,
+          final_pnl_quote = EXCLUDED.final_pnl_quote,
+          final_pnl_usd = EXCLUDED.final_pnl_usd,
+          trigger = EXCLUDED.trigger,
+          close_transaction_hash = EXCLUDED.close_transaction_hash,
+          swap_transaction_hash = EXCLUDED.swap_transaction_hash,
+          settled_at = EXCLUDED.settled_at,
+          opened_at_block = EXCLUDED.opened_at_block
+        RETURNING id`,
+       [groupId, HISTORY_MIN_PNL_BPS.toString()],
+     );
+     return result.rowCount === 1;
+   }
+
+   async renewPositionGroupLease(groupId: string, token: string, ttlMs = 300_000): Promise<boolean> {
     const result = await this.pool.query(
       `UPDATE position_groups
        SET execution_lease_until = NOW() + ($3 * INTERVAL '1 millisecond'),
@@ -1944,8 +2141,8 @@ export class Database {
               h.quote_token,
               COALESCE(NULLIF(p.metadata->>'closeTransactionHash', ''), h.close_transaction_hash) AS close_transaction_hash,
               COALESCE(NULLIF(p.metadata->>'swapTransactionHash', ''), h.swap_transaction_hash) AS swap_transaction_hash
-        FROM close_history h
-       JOIN positions p ON p.id = h.position_id
+         FROM close_history h
+        LEFT JOIN positions p ON p.id = h.position_id
         WHERE h.final_pnl_usd = 0
           AND (h.quote_token = '0x0000000000000000000000000000000000000000'
                OR h.quote_token = '0x0bd7d308f8e1639fab988df18a8011f41eacad73'
@@ -2120,7 +2317,8 @@ function mapPosition(row: PositionRow): PositionRecord {
 
 interface CloseHistoryRow {
   id: string;
-  position_id: string;
+  position_id: string | null;
+  position_group_id: string | null;
   chain_id: number;
   protocol: Protocol;
   position_key: string;
@@ -2141,6 +2339,7 @@ function mapCloseHistory(row: CloseHistoryRow): CloseHistoryRecord {
   return {
     id: row.id,
     positionId: row.position_id,
+    positionGroupId: row.position_group_id,
     chainId: row.chain_id,
     protocol: row.protocol,
     positionKey: row.position_key,
