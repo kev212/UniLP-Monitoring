@@ -1919,7 +1919,11 @@ export class Notifier {
         }
       } catch { /* skip duration if block lookup fails */ }
     }
-    const detail = record.positionId ? await database.getPnlCardDetail(record.positionId) : null;
+    const detail = record.positionGroupId
+      ? await database.getPositionGroupPnlCardDetail(record.positionGroupId)
+      : record.positionId
+        ? await database.getPnlCardDetail(record.positionId)
+        : null;
     const png = await renderPnlCard(record, pair, qtDec, qtSymbol, detail, bg, durationStr);
     const sent = await ctx.replyWithPhoto(new InputFile(png, "pnl-card.png"));
     if (sent && "message_id" in sent) {

@@ -2018,6 +2018,64 @@ export class Database {
     };
   }
 
+  async getPositionGroupPnlCardDetail(groupId: string): Promise<PnlCardDetail | null> {
+    const result = await this.pool.query<{
+      deposits: string;
+      deployed_cost_quote: string;
+      settlement: string;
+      fees: string;
+      fee: string | null;
+    }>(
+      `SELECT
+          CASE
+            WHEN COALESCE(SUM(cf.quote_value) FILTER (WHERE cf.flow_type = 'open_debit'), 0) > 0
+              THEN COALESCE(SUM(cf.quote_value) FILTER (WHERE cf.flow_type = 'open_debit'), 0)
+            ELSE g.deployed_cost_quote
+          END AS deposits,
+          g.deployed_cost_quote,
+          CASE
+            WHEN g.total_received_quote > 0 THEN g.total_received_quote
+            ELSE COALESCE(SUM(cf.quote_value) FILTER (WHERE cf.flow_type IN ('close_receipt', 'settlement_swap')), 0)
+          END AS settlement,
+          COALESCE(snapshot.fee_quote, 0) AS fees,
+          COALESCE(
+            CASE WHEN g.metadata->>'feeTier' ~ '^\\d+$' THEN g.metadata->>'feeTier' END,
+            CASE WHEN g.metadata->>'fee' ~ '^\\d+$' THEN g.metadata->>'fee' END,
+            CASE WHEN g.plan_json->>'feeTier' ~ '^\\d+$' THEN g.plan_json->>'feeTier' END,
+            CASE WHEN g.plan_json->>'fee' ~ '^\\d+$' THEN g.plan_json->>'fee' END,
+            CASE WHEN g.plan_json->'plan'->>'feeTier' ~ '^\\d+$' THEN g.plan_json->'plan'->>'feeTier' END,
+            CASE WHEN g.plan_json->'plan'->>'fee' ~ '^\\d+$' THEN g.plan_json->'plan'->>'fee' END,
+            CASE WHEN g.plan_json->'preview'->>'feeTier' ~ '^\\d+$' THEN g.plan_json->'preview'->>'feeTier' END,
+            CASE WHEN g.plan_json->'preview'->>'fee' ~ '^\\d+$' THEN g.plan_json->'preview'->>'fee' END,
+            CASE WHEN g.plan_json->'poolKey'->>'feeTier' ~ '^\\d+$' THEN g.plan_json->'poolKey'->>'feeTier' END,
+            CASE WHEN g.plan_json->'poolKey'->>'fee' ~ '^\\d+$' THEN g.plan_json->'poolKey'->>'fee' END,
+            CASE WHEN g.plan_json->'v4PoolKey'->>'feeTier' ~ '^\\d+$' THEN g.plan_json->'v4PoolKey'->>'feeTier' END,
+            CASE WHEN g.plan_json->'v4PoolKey'->>'fee' ~ '^\\d+$' THEN g.plan_json->'v4PoolKey'->>'fee' END
+          ) AS fee
+       FROM position_groups g
+       LEFT JOIN position_group_cashflows cf ON cf.group_id = g.id
+       LEFT JOIN LATERAL (
+         SELECT fee_quote
+           FROM position_group_pnl_snapshots
+          WHERE group_id = g.id
+            AND (g.settled_at IS NULL OR created_at <= g.settled_at)
+          ORDER BY created_at DESC, id DESC
+          LIMIT 1
+       ) snapshot ON TRUE
+      WHERE g.id = $1
+      GROUP BY g.id, snapshot.fee_quote`,
+      [groupId],
+    );
+    if (!result.rowCount) return null;
+    const row = result.rows[0]!;
+    return {
+      depositsQuote: BigInt(row.deposits),
+      settlementQuote: BigInt(row.settlement),
+      feesQuote: BigInt(row.fees),
+      feePips: row.fee && /^\d+$/.test(row.fee) ? Number(row.fee) : null,
+    };
+  }
+
   async getPnlCalendarMonth(year: number, month: number): Promise<PnlCalendarMonth> {
     if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) throw new Error("Invalid calendar month");
     const start = new Date(Date.UTC(year, month - 1, 1));

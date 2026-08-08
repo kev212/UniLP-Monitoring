@@ -424,6 +424,32 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[0]![0]).toContain("snapshot.realized_quote");
   });
 
+  it("loads parent-level Bid-Ask PnL card details from group accounting", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({
+      rowCount: 1,
+      rows: [{
+        deposits: "125000000000000000",
+        deployed_cost_quote: "125000000000000000",
+        settlement: "135288195878780614",
+        fees: "10312489586487282",
+        fee: "50000",
+      }],
+    });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.getPositionGroupPnlCardDetail("group")).resolves.toEqual({
+      depositsQuote: 125000000000000000n,
+      settlementQuote: 135288195878780614n,
+      feesQuote: 10312489586487282n,
+      feePips: 50000,
+    });
+    expect(query.mock.calls[0]![0]).toContain("position_group_cashflows");
+    expect(query.mock.calls[0]![0]).toContain("position_group_pnl_snapshots");
+    expect(query.mock.calls[0]![0]).toContain("g.total_received_quote");
+    expect(query.mock.calls[0]![1]).toEqual(["group"]);
+  });
+
   it("uses close-history transaction hashes when position metadata has none", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn().mockResolvedValue({
