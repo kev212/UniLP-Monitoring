@@ -57,7 +57,6 @@ const DASHBOARD_PAGE_SIZE = 6;
 const DASHBOARD_VALUE_CONCURRENCY = 3;
 const HISTORY_IDLE_TTL_MS = 30_000;
 const CALENDAR_IDLE_TTL_MS = 60_000;
-const POOL_SCAN_RESULT_TTL_MS = 5 * 60_000;
 
 type DashboardAction =
   | { type: "refresh"; page: number }
@@ -110,17 +109,10 @@ interface DashboardView {
   pageCount: number;
 }
 
-interface PoolScanResultCache {
-  scan: PoolMarketScan;
-  filters: PoolScanFilters;
-  expiresAt: number;
-}
-
 export class Notifier {
   private readonly bot?: Bot;
   private readonly database?: Database;
   private readonly lastStatusCache = new Map<string, PositionRecord[]>();
-  private readonly poolScanResults = new Map<string, PoolScanResultCache>();
   private readonly dashboardCloseInFlight = new Set<string>();
   private readonly pendingInput = new Map<string, PendingInput>();
   private readonly pendingBgUpload = new Set<string>();
@@ -507,7 +499,7 @@ export class Notifier {
         return;
       }
       if (action.type === "scan_pools") {
-        await this.handleScanPools(ctx as ChatContext, database, scanner, action.page);
+        await this.handleScanPools(ctx as ChatContext, database, scanner);
         return;
       }
       if (action.type === "config") {
@@ -1188,25 +1180,9 @@ export class Notifier {
     }
   }
 
-  private async handleScanPools(ctx: Context, database: Database, scanner: PoolScanner, page = 0): Promise<void> {
+  private async handleScanPools(ctx: Context, database: Database, scanner: PoolScanner): Promise<void> {
     const chatId = ctx.chat?.id.toString();
     if (!chatId || !this.authorized(chatId, ctx.from?.id.toString())) return;
-    const cached = this.poolScanResults.get(chatId);
-    if (cached && cached.expiresAt > Date.now()) {
-      const text = formatPoolMarketScan(cached.scan, cached.filters, page);
-      const keyboard = poolScanKeyboard(cached.scan, cached.filters, page);
-      const callbackMessage = ctx.callbackQuery?.message;
-      if (callbackMessage && "message_id" in callbackMessage && this.bot) {
-        await this.bot.api.editMessageText(chatId, callbackMessage.message_id, text, { reply_markup: keyboard as any });
-      } else {
-        await ctx.reply(text, { reply_markup: keyboard as any });
-      }
-      return;
-    }
-    if (page > 0) {
-      await this.replyTemp(ctx, "Hasil scan pools sudah kedaluwarsa. Jalankan /scan_pools lagi.");
-      return;
-    }
     if (this.poolScanRunning) {
       await this.replyTemp(ctx, "🏆 Scan pools masih berjalan. Tunggu hasil sebelumnya.");
       return;
@@ -1227,12 +1203,10 @@ export class Notifier {
     try {
       const filters = await this.poolScanFilters(database, chatId);
       const scan = await scanner.scanPools(filters, (nextStage) => { stage = nextStage; });
-      this.poolScanResults.set(chatId, { scan, filters, expiresAt: Date.now() + POOL_SCAN_RESULT_TTL_MS });
-      const text = formatPoolMarketScan(scan, filters, 0);
-      const keyboard = poolScanKeyboard(scan, filters, 0);
+      const text = formatPoolMarketScan(scan, filters);
       if (!this.bot) return;
       try {
-        await this.bot.api.editMessageText(chatId, messageId, text, { reply_markup: keyboard as any });
+        await this.bot.api.editMessageText(chatId, messageId, text);
       } catch (editError) {
         const details = errorMessage(editError);
         if (!details.includes("message is not modified")) {
@@ -1730,7 +1704,7 @@ export class Notifier {
       if (!quote) throw new Error(`Quote token ${symbol} tidak ada di QUOTE_TOKEN_ALLOWLIST_ROBINHOOD`);
       return quote.address;
     });
-    return { ...settings, allowedQuoteAddresses };
+    return { ...settings, allowedQuoteAddresses, candidatePages: this.config.poolScanCandidatePages };
   }
 
   private async showPoolScanConfig(database: Database, chatId: string, messageId: number, notice?: string): Promise<void> {
@@ -2856,18 +2830,13 @@ function riskInputPrompt(key: RiskSettingKey): string {
   return "Kirim Trailing drawdown dalam persen positif, contoh: 1.5.";
 }
 
-function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters, requestedPage = 0): string {
-  const pageCount = Math.max(1, Math.ceil(scan.pools.length / Math.max(1, filters.maxResults)));
-  const page = Math.max(0, Math.min(requestedPage, pageCount - 1));
-  const start = page * Math.max(1, filters.maxResults);
-  const visiblePools = scan.pools.slice(start, start + Math.max(1, filters.maxResults));
+function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters): string {
   const lines = [
     "🏆 TOP POOL YIELD 1H",
     "Chain: Robinhood (4663) | Uniswap V3/V4",
-    `Kandidat token: ${scan.candidateTokens} | Dievaluasi: ${scan.evaluatedTokens} | Token lolos: ${scan.qualifiedTokens} | Pool lolos: ${scan.pools.length}`,
+    `Kandidat cache: ${scan.candidateTokens} | Dievaluasi DexScreener: ${scan.evaluatedTokens} | Lolos filter + on-chain: ${scan.qualifiedTokens}`,
     `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | Pool TVL > $${fmtUsd(filters.minPoolTvlUsd)} | Total TVL aktif > $${fmtUsd(filters.minTotalActiveTvlUsd)} | Usia > ${fmtDuration(filters.minPoolAgeSeconds)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
     `Quote: ${filters.allowedQuotes.join(", ")}`,
-    `Halaman ${page + 1}/${pageCount} | Yield 1h menjadi ranking utama; yield rata-rata 6h hanya indikator persistensi.`,
     "",
   ];
   if (scan.warming) {
@@ -2878,30 +2847,17 @@ function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters, re
     lines.push("Tidak ada kandidat yang lolos semua filter.");
     return lines.join("\n");
   }
-  for (let index = 0; index < visiblePools.length; index++) {
-    const pool = visiblePools[index]!;
+  for (let index = 0; index < scan.pools.length; index++) {
+    const pool = scan.pools[index]!;
     const effectiveFee = pool.currentLpFee ?? pool.feeTier;
-    lines.push(`${start + index + 1}. ${pool.protocol.toUpperCase()} ${pool.pair} | ${(effectiveFee / 10_000).toFixed(2)}%${pool.dynamicFee ? " dynamic" : ""}`);
+    lines.push(`${index + 1}. ${pool.protocol.toUpperCase()} ${pool.pair} | ${(effectiveFee / 10_000).toFixed(2)}%${pool.dynamicFee ? " dynamic" : ""}`);
     lines.push(`   Yield/h: ${fmtPercent(pool.estimatedPoolYield1hPercent)} | Vol 1h: $${fmtUsd(pool.volume1hUsd)} | Est. fees 1h: $${fmtUsd(pool.estimatedPoolFees1hUsd)}`);
     const valuationLabel = pool.tokenValuationSource === "fdv" ? "FDV fallback" : "MC";
     lines.push(`   ${valuationLabel}: $${fmtUsd(pool.tokenMarketCapUsd ?? 0)} | Total active TVL V3/V4: $${fmtUsd(pool.tokenTotalActiveTvlUsd ?? 0)} | Usia: ${fmtDuration(pool.tokenOldestPoolAgeSeconds ?? 0)}`);
-    lines.push(`   Pool TVL: $${fmtUsd(pool.tvlUsd)} | 6h avg yield/h: ${fmtPercent(pool.estimatedPoolYieldHourlyPercent)}${pool.warnings.length > 0 ? ` | ${pool.warnings.join(", ")}` : ""}`);
-    lines.push(`   Uniswap: ${pool.uniswapUrl}`);
+    lines.push(`   Pool TVL: $${fmtUsd(pool.tvlUsd)} | Uniswap: ${pool.uniswapUrl}`);
   }
   lines.push("", "Yield adalah estimasi gross pool, bukan hasil personal LP.");
   return lines.join("\n");
-}
-
-function poolScanKeyboard(scan: PoolMarketScan, filters: PoolScanFilters, requestedPage: number): InlineKeyboard {
-  const pageCount = Math.max(1, Math.ceil(scan.pools.length / Math.max(1, filters.maxResults)));
-  const page = Math.max(0, Math.min(requestedPage, pageCount - 1));
-  const keyboard = new InlineKeyboard();
-  if (page > 0) keyboard.text("←", dashboardAction("scan_pools", page - 1));
-  if (pageCount > 1) keyboard.text(`${page + 1}/${pageCount}`, dashboardAction("scan_pools", page));
-  if (page + 1 < pageCount) keyboard.text("→", dashboardAction("scan_pools", page + 1));
-  if (pageCount > 1) keyboard.row();
-  keyboard.text("↻ Tampilkan halaman 1", dashboardAction("scan_pools", 0));
-  return keyboard;
 }
 
 function formatStockScan(scan: PoolMarketScan): string {

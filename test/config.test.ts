@@ -80,6 +80,7 @@ describe("loadConfig", () => {
       maxResults: 10,
       allowedQuotes: ["USDG", "WETH", "ETH"],
     });
+    expect(config.poolScanCandidatePages).toBe(3);
     expect(config.scanV2Enabled).toBe(false);
     expect(config.bidAskLadderEnabled).toBe(false);
     expect(config.bidAskLadderProtocols).toEqual(["v3", "v4"]);

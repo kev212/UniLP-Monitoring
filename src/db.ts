@@ -1933,12 +1933,10 @@ export class Database {
     });
   }
 
-  async listPoolScanCandidates(limit?: number): Promise<{ tokenAddress: string; seedScore: number; updatedAt: Date }[]> {
+  async listPoolScanCandidates(limit: number): Promise<{ tokenAddress: string; seedScore: number; updatedAt: Date }[]> {
     const result = await this.pool.query<{ token_address: string; seed_score: number; updated_at: string }>(
-      limit === undefined
-        ? "SELECT token_address, seed_score, updated_at FROM pool_scan_candidates ORDER BY seed_score DESC"
-        : "SELECT token_address, seed_score, updated_at FROM pool_scan_candidates ORDER BY seed_score DESC LIMIT $1",
-      limit === undefined ? [] : [limit],
+      "SELECT token_address, seed_score, updated_at FROM pool_scan_candidates ORDER BY seed_score DESC LIMIT $1",
+      [limit],
     );
     return result.rows.map((row) => ({ tokenAddress: row.token_address, seedScore: row.seed_score, updatedAt: new Date(row.updated_at) }));
   }
