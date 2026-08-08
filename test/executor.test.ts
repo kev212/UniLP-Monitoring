@@ -3,7 +3,7 @@ import { decodeFunctionData, encodeAbiParameters, keccak256, pad, stringToHex, t
 
 import { v3PositionManagerAbi, v4PositionManagerAbi } from "../src/abi.js";
 import type { RuntimeConfig } from "../src/config.js";
-import { bufferedGasLimit, Executor, effectiveRemoveSlippageBps, nextExitRetry, nextSwapRetry, receiptErc20NetReceived } from "../src/services/executor.js";
+import { bufferedGasLimit, Executor, effectiveRemoveSlippageBps, isTransientRpcError, nextExitRetry, nextSwapRetry, receiptErc20NetReceived } from "../src/services/executor.js";
 import type { PositionGroupBinRecord, PositionGroupRecord, PositionRecord } from "../src/types.js";
 
 const usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as const;
@@ -438,6 +438,27 @@ describe("Executor pending settlement recovery", () => {
 
     expect(found).toBe(event);
     expect(scanClient.getLogs).toHaveBeenCalledWith(expect.objectContaining({ fromBlock: 1_001n, toBlock: 3_000n }));
+  });
+
+  it("uses the chain client's failover client for executor calls", () => {
+    const primaryClient = {};
+    const failoverClient = {};
+    const chains = {
+      getById: vi.fn(() => ({ client: primaryClient, registry: { name: "robinhood" } })),
+      getForScan: vi.fn(() => ({ client: failoverClient })),
+    };
+    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
+
+    const selected = (executor as any).executorClient(4663);
+
+    expect(selected).toBe(failoverClient);
+    expect(chains.getForScan).toHaveBeenCalledWith("robinhood");
+  });
+
+  it("classifies provider rate limits and timeouts as transient RPC errors", () => {
+    expect(isTransientRpcError(new Error("HTTP request failed: Status: 429 Too Many Requests"))).toBe(true);
+    expect(isTransientRpcError(new Error("The operation was aborted due to timeout"))).toBe(true);
+    expect(isTransientRpcError(new Error("Execution reverted for an unknown reason"))).toBe(false);
   });
 
   it("quotes providers in parallel and selects the best simulated output", async () => {
@@ -1666,6 +1687,29 @@ describe("Executor pending settlement recovery", () => {
     expect(database.setPositionGroupStatus).toHaveBeenLastCalledWith(groupId, "active", expect.objectContaining({ reason: "close_batch transaction reverted" }));
     expect(database.recordPositionGroupExecution).toHaveBeenCalledWith(groupId, "close_batch", "failed", undefined, undefined, undefined, "close_batch transaction reverted");
     expect(database).not.toHaveProperty("setPositionStatus");
+  });
+
+  it("keeps a group active when a transient RPC failure reaches the retry limit", async () => {
+    vi.useFakeTimers();
+    try {
+      const group = {
+        ...groupRecord(),
+        metadata: { exitRetry: { attempts: 2 } },
+      };
+      const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+      const executor = new Executor(database as never, {} as never, {} as never, {} as never, {} as never, config);
+
+      await (executor as any).markGroupRetryable(group, "manual", "HTTP 429 Too Many Requests", true);
+
+      expect(database.setPositionGroupStatus).toHaveBeenCalledWith(groupId, "active", expect.objectContaining({
+        reason: "HTTP 429 Too Many Requests",
+        settlementRetryDisabled: null,
+        exitRetry: expect.objectContaining({ attempts: 3 }),
+      }));
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
   });
 
   it("cascades a normal-position trigger to the matching Bid-Ask group and normal siblings", async () => {

@@ -156,6 +156,7 @@ export class Executor {
   private readonly settlementJobs = new Map<string, Promise<void>>();
   private readonly settlementRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly groupSettlementRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly groupExitRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly activeSettlementLeases = new Map<string, string>();
   private readonly groupSettlementJobs = new Map<string, Promise<void>>();
   private readonly activeGroupLeases = new Map<string, string>();
@@ -190,10 +191,15 @@ export class Executor {
   }
 
   async executeGroup(groupId: string, trigger?: ExitTrigger): Promise<void> {
-    const scheduled = this.groupSettlementRetryTimers.get(groupId);
-    if (scheduled) {
-      clearTimeout(scheduled);
+    const scheduledSettlement = this.groupSettlementRetryTimers.get(groupId);
+    if (scheduledSettlement) {
+      clearTimeout(scheduledSettlement);
       this.groupSettlementRetryTimers.delete(groupId);
+    }
+    const scheduledExit = this.groupExitRetryTimers.get(groupId);
+    if (scheduledExit) {
+      clearTimeout(scheduledExit);
+      this.groupExitRetryTimers.delete(groupId);
     }
     return this.runGroupExclusive(groupId, () => this.executeGroupUnlocked(groupId, trigger));
   }
@@ -429,6 +435,10 @@ export class Executor {
       } catch (error) {
         await this.recordGroupExecutionFailure(group.id, "close_batch", errorMessage(error));
         groupFailureRecorded = true;
+        if (isTransientRpcError(error)) {
+          await this.markGroupRetryable(group, trigger, errorMessage(error), true);
+          return;
+        }
         await this.markGroupRetryable(group, trigger, errorMessage(error));
         throw error;
       }
@@ -476,8 +486,12 @@ export class Executor {
         await this.markGroupNeedsReview(group, error.message);
         throw error;
       }
+      if (isTransientRpcError(error)) {
+        await this.markGroupRetryable(group, trigger, errorMessage(error), true);
+        return;
+      }
       if (!groupFailureRecorded) await this.recordGroupExecutionFailure(group.id, "close_batch", errorMessage(error));
-      await this.markGroupRetryable(group, trigger, errorMessage(error));
+      if (!groupFailureRecorded) await this.markGroupRetryable(group, trigger, errorMessage(error));
       throw error;
     }
   }
@@ -1543,20 +1557,36 @@ export class Executor {
     this.confirmedReceipts.delete(hash);
   }
 
-  private async markGroupRetryable(group: PositionGroupRecord, trigger: ExitTrigger | undefined, reason: string): Promise<void> {
+  private async markGroupRetryable(group: PositionGroupRecord, trigger: ExitTrigger | undefined, reason: string, transient = false): Promise<void> {
     const hash = this.confirmedGroupCloses.get(group.id);
     if (hash) this.confirmedGroupCloses.delete(group.id);
     const retry = nextExitRetry(group.metadata, trigger);
     const maxRetries = this.config.bidAskLadderMaxRetries;
-    const exhausted = maxRetries !== undefined && typeof retry.attempts === "number" && retry.attempts >= maxRetries;
+    const exhausted = !transient && maxRetries !== undefined && typeof retry.attempts === "number" && retry.attempts >= maxRetries;
     await this.setGroupStatus(group.id, exhausted ? "needs_review" : "active", {
       closeTransactionHash: null,
       closeReceiptAccounted: null,
       settlementPhase: null,
       reason,
       exitRetry: retry,
+      ...(transient ? { settlementRetryDisabled: null } : {}),
       ...(exhausted ? { settlementRetryDisabled: true } : {}),
     });
+    if (transient) this.scheduleGroupExitRetry(group.id, retry, trigger);
+  }
+
+  private scheduleGroupExitRetry(groupId: string, retry: Record<string, unknown>, trigger?: ExitTrigger): void {
+    const retryAt = typeof retry.nextAttemptAt === "string" ? Date.parse(retry.nextAttemptAt) : Date.now();
+    const existing = this.groupExitRetryTimers.get(groupId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.groupExitRetryTimers.delete(groupId);
+      void this.executeGroup(groupId, trigger).catch((error) => {
+        log.warn({ err: error, groupId }, "scheduled group close retry deferred");
+      });
+    }, Math.max(0, retryAt - Date.now()));
+    timer.unref?.();
+    this.groupExitRetryTimers.set(groupId, timer);
   }
 
   private async markGroupNeedsReview(group: PositionGroupRecord, reason: string): Promise<void> {
@@ -2431,17 +2461,11 @@ export class Executor {
     const name = registry.name;
     const existing = this.executorClientCache.get(name);
     if (existing) return existing;
-    const alchemyUrl = this.config.alchemyHttp[name];
-    if (!alchemyUrl) {
-      this.executorClientCache.set(name, client);
-      return client;
-    }
-    const alchemyClient = createPublicClient({
-      chain: registry.chain,
-      transport: http(alchemyUrl, { retryCount: 3, timeout: 20_000 }),
-    });
-    this.executorClientCache.set(name, alchemyClient);
-    return alchemyClient;
+    const executionClient = typeof this.chains.getForScan === "function"
+      ? this.chains.getForScan(name).client
+      : client;
+    this.executorClientCache.set(name, executionClient);
+    return executionClient;
   }
 
   private send(position: PositionRecord, stage: string, plan: TransactionPlan): Promise<Hex | null> {
@@ -3024,6 +3048,11 @@ function sameV4PoolKey(left: V4PoolKey, right: V4PoolKey): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+export function isTransientRpcError(error: unknown): boolean {
+  const message = errorMessage(error);
+  return /\b(?:408|425|429|500|502|503|504)\b|too many requests|rate limit|timed out|timeout|aborted|econnreset|econnrefused|enotfound|network|fetch failed/i.test(message);
 }
 
 async function waitForReceipt(client: PublicClient, hash: Hex, confirmations: number) {
