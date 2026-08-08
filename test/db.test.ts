@@ -137,13 +137,16 @@ describe("Database native USD backfill", () => {
     const connect = vi.fn().mockResolvedValue({ query: clientQuery, release: vi.fn() });
     Object.defineProperty(database, "pool", { value: { connect } });
 
-    await expect(database.finalizePositionGroup("group", "0xclose", 100n, 2n, 200n, "manual")).resolves.toBe(true);
+    await expect(database.finalizePositionGroup("group", "0xclose", 100n, 2n, 200n, "manual", 123n)).resolves.toBe(true);
 
     const parentQuery = clientQuery.mock.calls[1]![0] as string;
     expect(parentQuery).toContain("total_received_quote = $3::numeric");
     expect(parentQuery).toContain("'totalReceivedQuote', ($3::numeric)::text");
     expect(parentQuery).toContain("'finalPnlQuote', ($4::numeric)::text");
     expect(parentQuery).toContain("'finalPnlBps', ($5::numeric)::text");
+    expect(parentQuery).toContain("final_pnl_usd = $7::numeric");
+    expect(parentQuery).toContain("'finalPnlUsd', ($7::numeric)::text");
+    expect(clientQuery.mock.calls[1]![1]).toEqual(["group", "0xclose", "100", "2", "200", "manual", "123"]);
     expect(clientQuery.mock.calls[4]![0]).toContain("INSERT INTO close_history");
     expect(clientQuery.mock.calls[4]![0]).toContain("position_group_id");
   });
@@ -467,6 +470,7 @@ describe("Database native USD backfill", () => {
 
     await expect(database.listStaleCloseHistoryUsd()).resolves.toEqual([{
       id: "history",
+      positionGroupId: null,
       chainId: 4663,
       positionKey: "101616",
       finalPnlQuote: "1",
@@ -475,7 +479,7 @@ describe("Database native USD backfill", () => {
       closeTransactionHash: "0xclose",
       swapTransactionHash: "0xswap",
     }]);
-    expect(query.mock.calls[0]![0]).toContain("COALESCE(NULLIF(p.metadata->>'swapTransactionHash', ''), h.swap_transaction_hash)");
+    expect(query.mock.calls[0]![0]).toContain("NULLIF(p.metadata->>'swapTransactionHash', '')");
   });
 
   it("does not finalize close history while settlement is still closing", async () => {

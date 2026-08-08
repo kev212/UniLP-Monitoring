@@ -135,6 +135,7 @@ interface GroupDatabaseExtensions {
     finalPnlQuote: bigint,
     finalPnlBps: bigint,
     trigger: string,
+    finalPnlUsd?: bigint | null,
   ) => Promise<boolean>;
   getLatestPositionGroupExecutionHash?: (groupId: string, stage: PositionGroupExecutionStage, status?: "confirmed" | "submitted") => Promise<string | null>;
 }
@@ -1093,7 +1094,8 @@ export class Executor {
       if (!(await this.unwrapGroupQuote(group, quoteAmount, hash, trigger ?? "manual"))) return;
       const finalize = this.groupDatabase().finalizePositionGroup;
       if (typeof finalize === "function") {
-        const settled = await finalize.call(this.database, group.id, hash, quoteAmount, finalPnlQuote, finalPnlBps, trigger ?? "manual");
+        const finalPnlUsd = await this.computeGroupFinalPnlUsd(group, quoteAmount, finalPnlQuote);
+        const settled = await finalize.call(this.database, group.id, hash, quoteAmount, finalPnlQuote, finalPnlBps, trigger ?? "manual", finalPnlUsd);
         if (!settled) throw new Error("position group could not be finalized after close receipt");
         this.accountedGroupCloses.add(group.id);
         this.confirmedReceipts.delete(hash);
@@ -1246,12 +1248,13 @@ export class Executor {
     const finalPnlQuote = totals.realized - deposits;
     const finalPnlBps = deposits > 0n ? (finalPnlQuote * 10_000n) / deposits : 0n;
     if (!(await this.unwrapGroupQuote(group, quoteAmount, closeHash, trigger))) return;
-    const finalize = this.groupDatabase().finalizePositionGroup;
-    if (typeof finalize !== "function") throw new GroupIntegrityError("Position group settlement finalizer is unavailable");
-    const exitTrigger = typeof group.metadata.exitTrigger === "string" ? group.metadata.exitTrigger : "manual";
-    const settled = await finalize.call(this.database, group.id, closeHash, quoteAmount, finalPnlQuote, finalPnlBps, trigger ?? exitTrigger);
-    if (!settled) throw new Error("position group settlement finalization failed");
-  }
+     const finalize = this.groupDatabase().finalizePositionGroup;
+     if (typeof finalize !== "function") throw new GroupIntegrityError("Position group settlement finalizer is unavailable");
+     const exitTrigger = typeof group.metadata.exitTrigger === "string" ? group.metadata.exitTrigger : "manual";
+     const finalPnlUsd = await this.computeGroupFinalPnlUsd(group, quoteAmount, finalPnlQuote);
+     const settled = await finalize.call(this.database, group.id, closeHash, quoteAmount, finalPnlQuote, finalPnlBps, trigger ?? exitTrigger, finalPnlUsd);
+     if (!settled) throw new Error("position group settlement finalization failed");
+   }
 
   private async unwrapGroupQuote(group: PositionGroupRecord, amount: bigint, closeHash: string, trigger?: ExitTrigger): Promise<boolean> {
     const { registry } = this.chains.getById(group.chainId);
@@ -1344,6 +1347,13 @@ export class Executor {
       unwrapQuoteTransactionHash: hash,
       pendingRawTransaction: null,
     });
+    const closeHash = this.groupCloseHash(group) ?? hash;
+    await this.finalizeGroupFromCloseProceeds(
+      { ...group, metadata: { ...group.metadata, settlementPhase: "complete", unwrapQuoteConfirmed: true, unwrapQuoteAmount: totalAmount.toString(), unwrapQuoteDelta: null } },
+      closeHash,
+      trigger,
+      "reconciled unwrap",
+    );
   }
 
   private async deferGroupSettlementSwap(
@@ -1572,13 +1582,14 @@ export class Executor {
     const totalReceivedQuote = closeQuote + output;
     const finalPnlQuote = totals.realized - deposits;
     const finalPnlBps = deposits > 0n ? (finalPnlQuote * 10_000n) / deposits : 0n;
-    const finalize = this.groupDatabase().finalizePositionGroup;
-    if (typeof finalize !== "function") throw new GroupIntegrityError("Position group settlement finalizer is unavailable");
+     const finalize = this.groupDatabase().finalizePositionGroup;
+     if (typeof finalize !== "function") throw new GroupIntegrityError("Position group settlement finalizer is unavailable");
     const storedCloseHash = group.closeTransactionHash
       ?? (typeof group.metadata.closeTransactionHash === "string" ? group.metadata.closeTransactionHash : hash);
-    if (!(await this.unwrapGroupQuote(group, totalReceivedQuote, storedCloseHash, trigger))) return;
-    const settled = await finalize.call(this.database, group.id, storedCloseHash, totalReceivedQuote, finalPnlQuote, finalPnlBps, trigger ?? "manual");
-    if (!settled) throw new Error("position group settlement finalization failed");
+     if (!(await this.unwrapGroupQuote(group, totalReceivedQuote, storedCloseHash, trigger))) return;
+     const finalPnlUsd = await this.computeGroupFinalPnlUsd(group, totalReceivedQuote, finalPnlQuote);
+     const settled = await finalize.call(this.database, group.id, storedCloseHash, totalReceivedQuote, finalPnlQuote, finalPnlBps, trigger ?? "manual", finalPnlUsd);
+     if (!settled) throw new Error("position group settlement finalization failed");
     this.accountedGroupCloses.add(group.id);
     this.confirmedReceipts.delete(hash);
   }
@@ -2030,9 +2041,10 @@ export class Executor {
   private async computeEthUsd(chainId: number, ethWei: bigint): Promise<bigint> {
     try {
       const { registry } = this.chains.getById(chainId);
-      const stable = this.config.quoteTokens[registry.name]?.[0];
+      const quoteTokens = this.config.quoteTokens[registry.name] ?? [];
+      const stable = quoteTokens.find((quote) => quote.symbol === "USDG" || quote.symbol === "USDC") ?? quoteTokens[0];
       if (!stable) return 0n;
-      const weth = this.config.quoteTokens[registry.name]?.find(q => q.symbol === "WETH") ?? this.config.quoteTokens[registry.name]?.find(q => q.symbol === "ETH");
+      const weth = quoteTokens.find(q => q.symbol === "WETH") ?? quoteTokens.find(q => q.symbol === "ETH");
       const tokenIn = weth ? weth.address : zeroAddress;
       const route = await this.routes.quoteDirect(
         { chainId } as PositionRecord,
@@ -2044,6 +2056,35 @@ export class Executor {
       return (ethWei * route.expectedOut) / (10n ** 18n);
     } catch {
       return 0n;
+    }
+  }
+
+  private async computeGroupFinalPnlUsd(
+    group: PositionGroupRecord,
+    totalReceivedQuote: bigint,
+    finalPnlQuote: bigint,
+  ): Promise<bigint | null> {
+    if (finalPnlQuote === 0n) return 0n;
+    if (totalReceivedQuote <= 0n) return null;
+
+    try {
+      const { registry } = this.chains.getById(group.chainId);
+      const quoteTokens = this.config.quoteTokens[registry.name] ?? [];
+      const stable = quoteTokens.find((quote) => quote.symbol === "USDG" || quote.symbol === "USDC");
+      if (!stable) return null;
+      const quoteToken = group.quoteToken.toLowerCase();
+      if (quoteToken === stable.address.toLowerCase()) return finalPnlQuote;
+
+      const weth = quoteTokens.find((quote) => quote.symbol === "WETH") ?? quoteTokens.find((quote) => quote.symbol === "ETH");
+      const isEthQuote = quoteToken === zeroAddress || (weth && quoteToken === weth.address.toLowerCase());
+      const settlementUsd = isEthQuote
+        ? await this.computeEthUsd(group.chainId, totalReceivedQuote)
+        : (await this.routes.quoteDirect({ chainId: group.chainId } as PositionRecord, group.quoteToken, totalReceivedQuote, stable.address))?.expectedOut ?? 0n;
+      if (settlementUsd <= 0n) return null;
+      return (finalPnlQuote * settlementUsd) / totalReceivedQuote;
+    } catch (error) {
+      log.warn({ error: errorMessage(error), groupId: group.id }, "could not value position group PnL in USD");
+      return null;
     }
   }
 
@@ -2722,47 +2763,91 @@ export class Executor {
   }
 
   async backfillStaleCloseHistoryUsd(): Promise<void> {
-    const stale = await this.database.listStaleCloseHistoryUsd();
-    if (stale.length === 0) return;
-    log.info({ count: stale.length }, "backfilling stale close-history USD values");
-    for (const item of stale) {
+    const [staleHistory, staleGroups] = await Promise.all([
+      this.database.listStaleCloseHistoryUsd(),
+      this.database.listStalePositionGroupUsd(),
+    ]);
+    if (staleHistory.length === 0 && staleGroups.length === 0) return;
+    log.info({ historyCount: staleHistory.length, groupCount: staleGroups.length }, "backfilling stale USD values");
+    const items = [
+      ...staleGroups.map((item) => ({ ...item, groupId: item.groupId, historyId: null as string | null })),
+      ...staleHistory.map((item) => ({ ...item, groupId: item.positionGroupId, historyId: item.id })),
+    ];
+    const valuations = new Map<string, bigint>();
+    for (const item of items) {
       try {
         const hashStr = (item.swapTransactionHash || item.closeTransactionHash) as `0x${string}` | null;
         if (!hashStr) continue;
+        const valuationKey = item.groupId ?? `history:${item.historyId}`;
+        const cached = valuations.get(valuationKey);
+        if (cached !== undefined) {
+          if (item.groupId) await this.database.updatePositionGroupUsd(item.groupId, cached);
+          if (item.historyId) await this.database.updateCloseHistoryUsd(item.historyId, cached);
+          continue;
+        }
         const swapHash = hashStr as `0x${string}`;
         const { client, registry } = this.chains.getById(item.chainId);
         const receipt = await client.getTransactionReceipt({ hash: swapHash });
         if (!receipt) continue;
         const blockNum = receipt.blockNumber;
-        const block = await client.getBlock({ blockNumber: blockNum });
         const wethAddr = (item.isNativeQuote
           ? (this.config.quoteTokens[registry.name]?.find(q => q.symbol === "WETH" || q.symbol === "ETH")?.address ?? item.quoteToken)
           : item.quoteToken) as Address;
-        const stableAddr = (this.config.quoteTokens[registry.name]?.[0]?.address) as Address;
+        const stableAddr = (this.config.quoteTokens[registry.name]?.find(q => q.symbol === "USDG" || q.symbol === "USDC")?.address
+          ?? this.config.quoteTokens[registry.name]?.[0]?.address) as Address;
         if (!stableAddr) continue;
-        let pool: Address | null = null;
-        for (const fee of [100, 500, 3000, 10000] as const) {
-          pool = await client.readContract({
-            address: registry.contracts.v3.factory,
-            abi: v3FactoryAbi,
-            functionName: "getPool",
-            args: [wethAddr, stableAddr, fee],
-          }) as Address;
-          if (pool && pool !== zeroAddress) break;
+        let usdPerEthMicro = 0n;
+        try {
+          let pool: Address | null = null;
+          for (const fee of [100, 500, 3000, 10000] as const) {
+            pool = await client.readContract({
+              address: registry.contracts.v3.factory,
+              abi: v3FactoryAbi,
+              functionName: "getPool",
+              args: [wethAddr, stableAddr, fee],
+            }) as Address;
+            if (pool && pool !== zeroAddress) break;
+          }
+          if (!pool || pool === zeroAddress) throw new Error("no historical V3 WETH/stable pool");
+          const [token0, slot0] = await Promise.all([
+            client.readContract({
+              address: pool,
+              abi: v3PoolAbi,
+              functionName: "token0",
+              blockNumber: blockNum,
+            }),
+            client.readContract({
+              address: pool,
+              abi: v3PoolAbi,
+              functionName: "slot0",
+              blockNumber: blockNum,
+            }),
+          ]);
+          const [sqrtPriceX96] = slot0 as readonly [bigint, ...unknown[]];
+          if (sqrtPriceX96 <= 0n) throw new Error("historical V3 pool has no price");
+          // usdPerEth in six-decimal stable units, accounting for token ordering.
+          const square = sqrtPriceX96 * sqrtPriceX96;
+          usdPerEthMicro = (token0 as string).toLowerCase() === wethAddr.toLowerCase()
+            ? (square * 10n ** 18n) / (1n << 192n)
+            : ((1n << 192n) * 10n ** 18n) / square;
+        } catch (historicalError) {
+          const route = await this.routes.quoteDirect(
+            { chainId: item.chainId } as PositionRecord,
+            wethAddr,
+            10n ** 18n,
+            stableAddr,
+          );
+          usdPerEthMicro = route?.expectedOut ?? 0n;
+          if (usdPerEthMicro > 0n) {
+            log.warn({ positionKey: item.positionKey, error: errorMessage(historicalError) }, "historical USD mark unavailable; using current settlement route");
+          }
         }
-        if (!pool || pool === zeroAddress) continue;
-        const [sqrtPriceX96] = await client.readContract({
-          address: pool,
-          abi: v3PoolAbi,
-          functionName: "slot0",
-          blockNumber: blockNum,
-        }) as readonly [bigint, ...unknown[]];
-        // usdPerEth in micro-USDG (6 dec): (sqrtPriceX96^2 / 2^192) * 10^18_weth / 10^6_usdg * 10^6_micro
-        // simplifies to: sqrtPriceX96^2 * 10^18 / 2^192
-        const usdPerEthMicro = (sqrtPriceX96 * sqrtPriceX96 * 10n ** 18n) / (1n << 192n);
+        if (usdPerEthMicro <= 0n) continue;
         const usdValue = (BigInt(item.finalPnlQuote) * usdPerEthMicro) / (10n ** 18n);
-        await this.database.updateCloseHistoryUsd(item.id, usdValue, new Date(Number(block.timestamp) * 1_000));
-        log.info({ positionKey: item.positionKey, usd: usdValue.toString(), usdPerEthMicro: usdPerEthMicro.toString() }, "backfilled close-history USD");
+        valuations.set(valuationKey, usdValue);
+        if (item.groupId) await this.database.updatePositionGroupUsd(item.groupId, usdValue);
+        if (item.historyId) await this.database.updateCloseHistoryUsd(item.historyId, usdValue);
+        log.info({ positionKey: item.positionKey, usd: usdValue.toString(), usdPerEthMicro: usdPerEthMicro.toString() }, "backfilled USD PnL");
       } catch (err) {
         log.warn({ err, positionKey: item.positionKey }, "failed to backfill close-history USD");
       }

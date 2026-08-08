@@ -67,7 +67,7 @@ async function main(): Promise<void> {
     log.warn("invalid global risk settings ignored; using ENV defaults");
   }
   await guardian.validateNetworks();
-  scanner.startCandidateRefresh([...config.quoteTokens.robinhood.map(({ address }) => address), zeroAddress], config.poolScanCandidatePages);
+  scanner.startCandidateRefresh([...config.quoteTokens.robinhood.map(({ address }) => address), zeroAddress]);
   void executor.backfillStaleCloseHistoryUsd().catch(() => {});
   log.info({ chains: config.chains, dryRun: config.dryRun }, "UniLP Guardian started");
 

@@ -1193,7 +1193,7 @@ describe("Executor pending settlement recovery", () => {
     expect(routes.quoteDirect).toHaveBeenCalledWith(expect.anything(), token, 500n, usdg);
     expect(sendGroup).toHaveBeenCalledWith(group, "settlement_swap", expect.anything());
     expect(database.addPositionGroupCashflow).toHaveBeenCalledWith(groupId, 102n, hash, "settlement_swap", 200n, 0n, 0n, expect.any(Object));
-    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 300n, 200n, 20000n, "manual");
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 300n, 200n, 20000n, "manual", 200n);
   });
 
   it("keeps a Bid-Ask group pending when the aggregate swap is unquotable", async () => {
@@ -1373,7 +1373,7 @@ describe("Executor pending settlement recovery", () => {
     expect(kyberswap.quote).toHaveBeenCalledWith(expect.anything(), token, 500n, usdg, 200);
     expect(kyberswap.createSwap).toHaveBeenCalledWith(expect.anything(), kyberQuote);
     expect(sendGroup).toHaveBeenCalledWith(group, "settlement_swap", expect.objectContaining({ to: router }));
-    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 220n, 200n, 20000n, "manual");
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 220n, 200n, 20000n, "manual", 200n);
   });
 
   it("falls through to the local route when an API group settlement simulation reverts", async () => {
@@ -1450,7 +1450,7 @@ describe("Executor pending settlement recovery", () => {
     await executor.executeGroup(groupId, "manual");
 
     expect(sendGroup).toHaveBeenCalledWith(group, "settlement_swap", expect.objectContaining({ to: groupPool }));
-    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 200n, 100n, 10000n, "manual");
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 200n, 100n, 10000n, "manual", 100n);
   });
 
   it("unwraps WETH quote proceeds to native ETH before finalizing a Bid-Ask group without a settlement swap", async () => {
@@ -1489,7 +1489,7 @@ describe("Executor pending settlement recovery", () => {
 
     expect(sendGroup).toHaveBeenCalledWith(group, "unwrap_quote", expect.objectContaining({ to: weth, description: "unwrap_quote" }));
     expect(database.addPositionGroupCashflow).toHaveBeenCalledWith(groupId, 102n, unwrapHash, "unwrap_quote", 100n, 0n, 0n, expect.objectContaining({ source: "group_quote_unwrap" }));
-    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 100n, 200n, 20000n, "manual");
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 100n, 200n, 20000n, "manual", null);
   });
 
   it("unwraps the combined WETH proceeds after the aggregate settlement swap of a Bid-Ask group", async () => {
@@ -1546,7 +1546,7 @@ describe("Executor pending settlement recovery", () => {
     expect(sendGroup).toHaveBeenCalledWith(group, "settlement_swap", expect.anything());
     expect(sendGroup).toHaveBeenCalledWith(group, "unwrap_quote", expect.objectContaining({ to: weth, description: "unwrap_quote" }));
     expect(database.addPositionGroupCashflow).toHaveBeenCalledWith(groupId, 102n, unwrapHash, "unwrap_quote", 300n, 0n, 0n, expect.anything());
-    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 300n, 200n, 20000n, "manual");
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 300n, 200n, 20000n, "manual", null);
   });
 
   it("unwraps only the incremental WETH output when a settled group is recovered", async () => {
@@ -1611,7 +1611,7 @@ describe("Executor pending settlement recovery", () => {
       data: expect.any(String),
     }));
     expect(database.addPositionGroupCashflow).toHaveBeenCalledWith(groupId, 103n, unwrapHash, "unwrap_quote", 120n, 0n, 0n, expect.anything());
-    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 220n, 120n, 12000n, "manual");
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 220n, 120n, 12000n, "manual", null);
   });
 
   it("finalizes a WETH-quoted Bid-Ask group without unwrap when the unwrap transaction reverts", async () => {
@@ -1648,7 +1648,7 @@ describe("Executor pending settlement recovery", () => {
     await executor.executeGroup(groupId, "manual");
 
     expect(database.setPositionGroupStatus).toHaveBeenLastCalledWith(groupId, "settling", expect.objectContaining({ unwrapQuoteFailed: true }));
-    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 100n, 200n, 20000n, "manual");
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 100n, 200n, 20000n, "manual", null);
   });
 
   it("skips a confirmed group unwrap on resume and finalizes the WETH-quoted Bid-Ask group", async () => {
@@ -1687,7 +1687,7 @@ describe("Executor pending settlement recovery", () => {
     await executor.executeGroup(groupId, "manual");
 
     expect(sendGroup).not.toHaveBeenCalled();
-    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 100n, 200n, 20000n, "manual");
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 100n, 200n, 20000n, "manual", null);
   });
 
   it("reconciles a confirmed pending group unwrap transaction on recovery", async () => {
@@ -1735,6 +1735,19 @@ describe("Executor pending settlement recovery", () => {
     expect(database.recordPositionGroupExecution).toHaveBeenCalledWith(groupId, "unwrap_quote", "confirmed", pendingHash);
     expect(database.addPositionGroupCashflow).toHaveBeenCalledWith(groupId, 102n, pendingHash, "unwrap_quote", 100n, 0n, 0n, expect.anything());
     expect(database.setPositionGroupStatus).toHaveBeenLastCalledWith(groupId, "settling", expect.objectContaining({ unwrapQuoteConfirmed: true }));
+    expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 0n, 200n, 20000n, "manual", null);
+  });
+
+  it("converts WETH and native ETH Bid-Ask PnL using the settlement quote rate", async () => {
+    const routes = { quoteDirect: vi.fn().mockResolvedValue({ expectedOut: 3_000_000_000n }) };
+    const chains = { getById: vi.fn(() => ({ registry: { name: "robinhood" } })) };
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, wethConfig);
+    const wethGroup = { ...groupRecord(), quoteToken: weth };
+    const nativeGroup = { ...groupRecord(), quoteToken: zeroAddress };
+
+    await expect((executor as any).computeGroupFinalPnlUsd(wethGroup, 10n ** 18n, 2n * 10n ** 17n)).resolves.toBe(600_000_000n);
+    await expect((executor as any).computeGroupFinalPnlUsd(nativeGroup, 10n ** 18n, 2n * 10n ** 17n)).resolves.toBe(600_000_000n);
+    expect(routes.quoteDirect).toHaveBeenCalledTimes(2);
   });
 
   it("keeps all Bid-Ask children active and the parent retryable when the batch reverts", async () => {

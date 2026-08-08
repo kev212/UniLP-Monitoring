@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, limitQualifiedPoolsPerToken, MIN_VOLUME_6H_USD, PoolScanner, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
+import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, MIN_VOLUME_6H_USD, PoolScanner, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
 import { calibrateOhlcvPrices, normalizeOhlcvPrices, overlapFraction, snapRange } from "../src/services/concentrated-yield.js";
 
 describe("pool scoring formula", () => {
@@ -119,15 +119,15 @@ describe("concentrated yield range math", () => {
 });
 
 describe("scan pool eligibility", () => {
-  it("keeps only the best qualified pool for one token", () => {
+  it("keeps every qualified pool for one token", () => {
     const pool = (pair: string, quoteToken: string, estimatedPoolYield1hPercent: number, tvlUsd: number) => ({ pair, quoteToken, estimatedPoolYield1hPercent, tvlUsd }) as ScoredPool;
 
-    expect(limitQualifiedPoolsPerToken([
+    expect([
       pool("TOKEN/WETH 1%", "0x0bd7d308f8e1639fab988df18a8011f41eacad73", 4, 100_000),
       pool("TOKEN/ETH 2%", "0x0000000000000000000000000000000000000000", 8, 50_000),
       pool("TOKEN/USDG 3%", "0x5fc5360d0400a0fd4f2af552add042d716f1d168", 8, 200_000),
       pool("TOKEN/USDG 4%", "0x5fc5360d0400a0fd4f2af552add042d716f1d168", 4, 300_000),
-    ]).map((item) => item.pair)).toEqual(["TOKEN/USDG 3%"]);
+    ].map((item) => item.pair)).toEqual(["TOKEN/WETH 1%", "TOKEN/ETH 2%", "TOKEN/USDG 3%", "TOKEN/USDG 4%"]);
   });
 
   it("excludes pools with less than $100 of cumulative 6h volume", () => {
@@ -223,5 +223,65 @@ describe("Gecko request scheduling", () => {
     await Promise.all([first, second, interactive]);
 
     expect(calls).toEqual(["background-1", "interactive", "background-2"]);
+  });
+});
+
+describe("market pool coverage", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("uses DexScreener Trending 1H metas as a discovery seed", async () => {
+    const pair = {
+      chainId: "robinhood",
+      dexId: "uniswap",
+      pairAddress: "0x0000000000000000000000000000000000000010",
+      labels: ["v3"],
+      baseToken: { address: "0x0000000000000000000000000000000000000001", symbol: "TOKEN" },
+      quoteToken: { address: "0x0000000000000000000000000000000000000003", symbol: "USDG" },
+    };
+    vi.stubGlobal("fetch", vi.fn((input: string) => {
+      if (input.endsWith("/metas/trending/v1")) return Promise.resolve(new Response(JSON.stringify([{ slug: "rising", marketCapChange: { h1: 12 } }])));
+      if (input.endsWith("/metas/meta/v1/rising")) return Promise.resolve(new Response(JSON.stringify({ pairs: [pair] })));
+      return Promise.resolve(new Response(JSON.stringify({ pairs: [] }), { status: 404 }));
+    }));
+    const scanner = new PoolScanner({} as any, {} as any, 0);
+
+    const pairs = await (scanner as any).fetchDexScreenerTrendingPairs();
+
+    expect(pairs).toEqual([pair]);
+  });
+
+  it("evaluates every cached token and retains every qualified pool for pagination", async () => {
+    const pool = (pair: string, yieldHourly: number) => ({
+      pair,
+      estimatedPoolYield1hPercent: yieldHourly,
+      tvlUsd: 10_000,
+    }) as ScoredPool;
+    const database = {
+      listPoolScanCandidates: vi.fn().mockResolvedValue([
+        { tokenAddress: "0x0000000000000000000000000000000000000001", seedScore: 1, updatedAt: new Date() },
+        { tokenAddress: "0x0000000000000000000000000000000000000002", seedScore: 2, updatedAt: new Date() },
+      ]),
+    };
+    const scanner = new PoolScanner({} as any, database as any, 0);
+    vi.spyOn(scanner as any, "enrichDexScreenerToken")
+      .mockResolvedValueOnce([pool("A/USDG", 3), pool("A/WETH", 2)])
+      .mockResolvedValueOnce([]);
+    vi.spyOn(scanner as any, "enrichToken").mockResolvedValue([pool("B/USDG", 1)]);
+
+    const result = await scanner.scanPools({
+      minMarketCapUsd: 0,
+      minPoolTvlUsd: 0,
+      minTotalActiveTvlUsd: 0,
+      minPoolAgeSeconds: 0,
+      minYieldHourlyPercent: 0,
+      maxResults: 1,
+      allowedQuotes: ["USDG"],
+      allowedQuoteAddresses: ["0x0000000000000000000000000000000000000003"],
+    });
+
+    expect(database.listPoolScanCandidates).toHaveBeenCalledWith();
+    expect(result.evaluatedTokens).toBe(2);
+    expect(result.qualifiedTokens).toBe(2);
+    expect(result.pools.map(({ pair }) => pair)).toEqual(["A/USDG", "A/WETH", "B/USDG"]);
   });
 });

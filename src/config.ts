@@ -66,7 +66,6 @@ const envSchema = z.object({
   POOL_SCAN_MIN_YIELD_HOURLY_PERCENT: z.coerce.number().nonnegative().default(1),
   POOL_SCAN_MAX_RESULTS: z.coerce.number().int().min(1).max(20).default(10),
   POOL_SCAN_ALLOWED_QUOTES: z.string().default("USDG,WETH,ETH"),
-  POOL_SCAN_CANDIDATE_PAGES: z.coerce.number().int().min(1).max(10).default(3),
   SCANV2_ENABLED: z.string().default("false"),
   UNISWAP_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
   KYBERSWAP_ENABLED: z.string().default("true"),
@@ -131,7 +130,6 @@ export interface RuntimeConfig {
   oorAboveProfitDurationMs: number;
   dryRun: boolean;
   poolScanDefaults: PoolScanSettings;
-  poolScanCandidatePages: number;
   scanV2Enabled: boolean;
   uniswapApiKey?: string;
   kyberswapEnabled: boolean;
@@ -334,7 +332,6 @@ export function loadConfig(environment = process.env): RuntimeConfig {
       maxResults: env.POOL_SCAN_MAX_RESULTS,
       allowedQuotes: parseSymbols(env.POOL_SCAN_ALLOWED_QUOTES, "POOL_SCAN_ALLOWED_QUOTES"),
     },
-    poolScanCandidatePages: env.POOL_SCAN_CANDIDATE_PAGES,
     scanV2Enabled: parseBoolean(env.SCANV2_ENABLED, "SCANV2_ENABLED"),
     uniswapApiKey: env.UNISWAP_API_KEY,
     kyberswapEnabled: parseBoolean(env.KYBERSWAP_ENABLED, "KYBERSWAP_ENABLED"),

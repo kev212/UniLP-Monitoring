@@ -800,21 +800,24 @@ export class Database {
     finalPnlQuote: bigint,
     finalPnlBps: bigint,
     trigger: string,
+    finalPnlUsd: bigint | null = null,
   ): Promise<boolean> {
     return this.transaction(async (client) => {
       const parent = await client.query(
         `UPDATE position_groups
             SET status = 'settled',
                 close_transaction_hash = $2,
-                total_received_quote = $3::numeric,
-                final_pnl_quote = $4::numeric,
-                final_pnl_bps = $5::numeric,
-                settled_at = NOW(),
+                 total_received_quote = $3::numeric,
+                 final_pnl_quote = $4::numeric,
+                 final_pnl_bps = $5::numeric,
+                 final_pnl_usd = $7::numeric,
+                 settled_at = NOW(),
                 metadata = metadata || jsonb_build_object(
                   'closeTransactionHash', $2::text,
                   'totalReceivedQuote', ($3::numeric)::text,
-                  'finalPnlQuote', ($4::numeric)::text,
-                   'finalPnlBps', ($5::numeric)::text,
+                    'finalPnlQuote', ($4::numeric)::text,
+                    'finalPnlBps', ($5::numeric)::text,
+                    'finalPnlUsd', ($7::numeric)::text,
                    'exitTrigger', $6::text,
                    'settlementPhase', 'complete',
                    'closeReceiptAccounted', true,
@@ -831,8 +834,8 @@ export class Database {
           WHERE id = $1
             AND status NOT IN ('cancelled')
           RETURNING id`,
-        [groupId, closeTransactionHash, totalReceivedQuote.toString(), finalPnlQuote.toString(), finalPnlBps.toString(), trigger],
-      );
+         [groupId, closeTransactionHash, totalReceivedQuote.toString(), finalPnlQuote.toString(), finalPnlBps.toString(), trigger, finalPnlUsd?.toString() ?? null],
+       );
       if (parent.rowCount !== 1) return false;
 
       await client.query(
@@ -1930,10 +1933,12 @@ export class Database {
     });
   }
 
-  async listPoolScanCandidates(limit: number): Promise<{ tokenAddress: string; seedScore: number; updatedAt: Date }[]> {
+  async listPoolScanCandidates(limit?: number): Promise<{ tokenAddress: string; seedScore: number; updatedAt: Date }[]> {
     const result = await this.pool.query<{ token_address: string; seed_score: number; updated_at: string }>(
-      "SELECT token_address, seed_score, updated_at FROM pool_scan_candidates ORDER BY seed_score DESC LIMIT $1",
-      [limit],
+      limit === undefined
+        ? "SELECT token_address, seed_score, updated_at FROM pool_scan_candidates ORDER BY seed_score DESC"
+        : "SELECT token_address, seed_score, updated_at FROM pool_scan_candidates ORDER BY seed_score DESC LIMIT $1",
+      limit === undefined ? [] : [limit],
     );
     return result.rows.map((row) => ({ tokenAddress: row.token_address, seedScore: row.seed_score, updatedAt: new Date(row.updated_at) }));
   }
@@ -2190,26 +2195,45 @@ export class Database {
     );
   }
 
-  async listStaleCloseHistoryUsd(): Promise<{ id: string; chainId: number; positionKey: string; finalPnlQuote: string; quoteToken: string; isNativeQuote: boolean; closeTransactionHash: string | null; swapTransactionHash: string | null }[]> {
+  async listStaleCloseHistoryUsd(): Promise<{ id: string; positionGroupId: string | null; chainId: number; positionKey: string; finalPnlQuote: string; quoteToken: string; isNativeQuote: boolean; closeTransactionHash: string | null; swapTransactionHash: string | null }[]> {
     const result = await this.pool.query<{
       id: string; chain_id: number; position_key: string; final_pnl_quote: string;
-      quote_token: string; close_transaction_hash: string | null; swap_transaction_hash: string | null;
+      position_group_id: string | null; quote_token: string; close_transaction_hash: string | null; swap_transaction_hash: string | null;
     }>(
-      `SELECT h.id, h.chain_id, h.position_key, h.final_pnl_quote,
-              h.quote_token,
-              COALESCE(NULLIF(p.metadata->>'closeTransactionHash', ''), h.close_transaction_hash) AS close_transaction_hash,
-              COALESCE(NULLIF(p.metadata->>'swapTransactionHash', ''), h.swap_transaction_hash) AS swap_transaction_hash
-         FROM close_history h
-        LEFT JOIN positions p ON p.id = h.position_id
-        WHERE h.final_pnl_usd = 0
-          AND (h.quote_token = '0x0000000000000000000000000000000000000000'
-               OR h.quote_token = '0x0bd7d308f8e1639fab988df18a8011f41eacad73'
-               OR h.quote_token = '0x4200000000000000000000000000000000000006')
-        ORDER BY h.settled_at DESC
-       LIMIT 50`,
+      `SELECT h.id, h.position_group_id, h.chain_id, h.position_key, h.final_pnl_quote,
+               h.quote_token,
+               COALESCE(
+                 NULLIF(p.metadata->>'closeTransactionHash', ''),
+                 NULLIF(g.metadata->>'closeTransactionHash', ''),
+                 h.close_transaction_hash,
+                 g.close_transaction_hash
+               ) AS close_transaction_hash,
+               COALESCE(
+                 NULLIF(p.metadata->>'swapTransactionHash', ''),
+                 h.swap_transaction_hash,
+                 (
+                   SELECT cf.transaction_hash
+                     FROM position_group_cashflows cf
+                    WHERE cf.group_id = h.position_group_id AND cf.flow_type = 'settlement_swap'
+                    ORDER BY cf.created_at DESC
+                    LIMIT 1
+                 )
+               ) AS swap_transaction_hash
+          FROM close_history h
+         LEFT JOIN positions p ON p.id = h.position_id
+         LEFT JOIN position_groups g ON g.id = h.position_group_id
+         WHERE h.final_pnl_usd = 0
+           AND LOWER(h.quote_token) IN (
+             '0x0000000000000000000000000000000000000000',
+             '0x0bd7d308f8e1639fab988df18a8011f41eacad73',
+             '0x4200000000000000000000000000000000000006'
+           )
+         ORDER BY h.settled_at DESC
+        LIMIT 50`,
     );
     return result.rows.map(row => ({
       id: row.id,
+      positionGroupId: row.position_group_id ?? null,
       chainId: row.chain_id,
       positionKey: row.position_key,
       finalPnlQuote: row.final_pnl_quote,
@@ -2220,10 +2244,57 @@ export class Database {
     }));
   }
 
+  async listStalePositionGroupUsd(): Promise<{ groupId: string; chainId: number; positionKey: string; finalPnlQuote: string; quoteToken: string; isNativeQuote: boolean; closeTransactionHash: string; swapTransactionHash: string | null }[]> {
+    const result = await this.pool.query<{
+      group_id: string; chain_id: number; final_pnl_quote: string; quote_token: string;
+      close_transaction_hash: string; swap_transaction_hash: string | null;
+    }>(
+      `SELECT g.id AS group_id, g.chain_id, g.id::text AS position_key, g.final_pnl_quote,
+              g.quote_token, g.close_transaction_hash,
+              (
+                SELECT cf.transaction_hash
+                  FROM position_group_cashflows cf
+                 WHERE cf.group_id = g.id AND cf.flow_type = 'settlement_swap'
+                 ORDER BY cf.created_at DESC
+                 LIMIT 1
+              ) AS swap_transaction_hash
+         FROM position_groups g
+        WHERE g.shape = 'bid_ask'
+          AND g.status = 'settled'
+          AND g.final_pnl_usd IS NULL
+          AND g.final_pnl_quote IS NOT NULL
+          AND g.close_transaction_hash IS NOT NULL
+          AND LOWER(g.quote_token) IN (
+            '0x0000000000000000000000000000000000000000',
+            '0x0bd7d308f8e1639fab988df18a8011f41eacad73',
+            '0x4200000000000000000000000000000000000006'
+          )
+        ORDER BY g.settled_at DESC
+        LIMIT 100`,
+    );
+    return result.rows.map((row) => ({
+      groupId: row.group_id,
+      chainId: row.chain_id,
+      positionKey: row.group_id,
+      finalPnlQuote: row.final_pnl_quote,
+      quoteToken: row.quote_token,
+      isNativeQuote: row.quote_token.toLowerCase() === "0x0000000000000000000000000000000000000000",
+      closeTransactionHash: row.close_transaction_hash,
+      swapTransactionHash: row.swap_transaction_hash,
+    }));
+  }
+
   async updateCloseHistoryUsd(id: string, finalPnlUsd: bigint, settledAt?: Date): Promise<void> {
     await this.pool.query(
       "UPDATE close_history SET final_pnl_usd = $2, settled_at = COALESCE($3, settled_at) WHERE id = $1",
       [id, finalPnlUsd.toString(), settledAt?.toISOString() ?? null],
+    );
+  }
+
+  async updatePositionGroupUsd(groupId: string, finalPnlUsd: bigint): Promise<void> {
+    await this.pool.query(
+      "UPDATE position_groups SET final_pnl_usd = $2::numeric, updated_at = NOW() WHERE id = $1 AND final_pnl_usd IS NULL",
+      [groupId, finalPnlUsd.toString()],
     );
   }
 
