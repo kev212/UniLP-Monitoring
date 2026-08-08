@@ -193,6 +193,7 @@ describe("Database native USD backfill", () => {
 
     expect(query).toHaveBeenCalledTimes(2);
     expect(query.mock.calls[0]![0]).toContain("open_transaction_hash = CASE");
+    expect(query.mock.calls[0]![1]).toEqual(["group", "0xopen", "active", "{}"]);
     expect(query.mock.calls[1]![0]).toContain("UPDATE position_group_bins");
     expect(query.mock.calls[1]![1]).toEqual(["group", "0xopen"]);
   });

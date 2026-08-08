@@ -61,7 +61,8 @@ export class DiscoveryService {
     const group = typeof groupOrId === "string" ? await this.database.getPositionGroup(groupOrId) : groupOrId;
     if (!group) throw new Error(`Position group ${typeof groupOrId === "string" ? groupOrId : "unknown"} was not found`);
 
-    const { client, registry } = this.chains.get(name);
+    const { registry } = this.chains.get(name);
+    const client = this.reconciliationClient(name);
     const bins = await this.database.listPositionGroupBins(group.id);
     try {
       if (group.chainId !== registry.chain.id) throw new Error("position group chain does not match the discovery chain");
@@ -96,7 +97,8 @@ export class DiscoveryService {
   }
 
   async reconcilePendingPositionGroupOpens(name: ChainName): Promise<void> {
-    const { client, registry } = this.chains.get(name);
+    const { registry } = this.chains.get(name);
+    const client = this.reconciliationClient(name);
     const groups = await this.database.listPositionGroups(registry.chain.id);
     for (const group of groups) {
       if (group.status !== "opening") {
@@ -130,7 +132,8 @@ export class DiscoveryService {
     transactionHash: Hex,
     receipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>,
   ): Promise<PositionRecord[]> {
-    const { client, registry } = this.chains.get(name);
+    const { registry } = this.chains.get(name);
+    const client = this.reconciliationClient(name);
     const transfers = receipt.logs
       .filter((entry) => entry.address.toLowerCase() === group.positionManager.toLowerCase())
       .map((entry) => decodeErc721Transfer(entry))
@@ -225,7 +228,8 @@ export class DiscoveryService {
     transactionHash: Hex,
     receipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>,
   ): Promise<PositionRecord[]> {
-    const { client, registry } = this.chains.get(name);
+    const { registry } = this.chains.get(name);
+    const client = this.reconciliationClient(name);
     const transfers = receipt.logs
       .filter((entry) => entry.address.toLowerCase() === group.positionManager.toLowerCase())
       .map((entry) => decodeErc721Transfer(entry))
@@ -402,7 +406,17 @@ export class DiscoveryService {
       );
     }
 
-    const linked = await this.database.setPositionGroupOpenTransaction(group.id, transactionHash, "active");
+    const reviewCleanup = group.metadata.reason === OPEN_RECEIPT_CORRELATION_FAILED
+      ? {
+          reason: null,
+          correlationError: null,
+          openReceiptRetriedAt: null,
+          pendingRawTransaction: null,
+        }
+      : undefined;
+    const linked = reviewCleanup
+      ? await this.database.setPositionGroupOpenTransaction(group.id, transactionHash, "active", reviewCleanup)
+      : await this.database.setPositionGroupOpenTransaction(group.id, transactionHash, "active");
     if (linked === false) throw new Error("position group already has a different open transaction hash");
     const recordExecution = (this.database as Database & {
       recordPositionGroupExecution?: Database["recordPositionGroupExecution"];
@@ -442,6 +456,11 @@ export class DiscoveryService {
     } catch (error) {
       log.warn({ err: error, groupId: group.id, transactionHash }, "could not mark position group open receipt for review");
     }
+  }
+
+  private reconciliationClient(name: ChainName): PublicClient {
+    const regular = this.chains.get(name).client;
+    return typeof this.chains.getForScan === "function" ? this.chains.getForScan(name).client : regular;
   }
 
   async syncChain(name: ChainName): Promise<void> {

@@ -956,20 +956,21 @@ export class Database {
     return result.rowCount === 1;
   }
 
-  async setPositionGroupOpenTransaction(groupId: string, hash: string, status: PositionGroupStatus): Promise<boolean> {
+  async setPositionGroupOpenTransaction(groupId: string, hash: string, status: PositionGroupStatus, metadata: Record<string, unknown> = {}): Promise<boolean> {
     return this.transaction(async (client) => {
       const parent = await client.query(
         `UPDATE position_groups
          SET open_transaction_hash = CASE
-               WHEN open_transaction_hash IS NULL THEN $2
-               ELSE open_transaction_hash
-             END,
-             status = $3,
-             updated_at = NOW()
-         WHERE id = $1
-           AND (open_transaction_hash IS NULL OR open_transaction_hash = $2)
-         RETURNING id`,
-        [groupId, hash, status],
+                WHEN open_transaction_hash IS NULL THEN $2
+                ELSE open_transaction_hash
+              END,
+              status = $3,
+              metadata = metadata || $4::jsonb,
+              updated_at = NOW()
+          WHERE id = $1
+            AND (open_transaction_hash IS NULL OR open_transaction_hash = $2)
+          RETURNING id`,
+        [groupId, hash, status, stringifyJson(metadata)],
       );
       if (parent.rowCount !== 1) return false;
 

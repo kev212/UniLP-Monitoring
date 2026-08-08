@@ -206,9 +206,13 @@ describe("known Bid-Ask open receipt correlation", () => {
     };
     const bins = [bin("v3-group", 0, -200, -100), bin("v3-group", 1, -100, 0)];
     const database = groupDatabase(bins);
+    const regularClient = { getTransactionReceipt: vi.fn(), readContract: vi.fn() };
     const discovery = new DiscoveryService(
       database as never,
-      { get: vi.fn(() => ({ client, registry: chainRegistry.base })) } as never,
+      {
+        get: vi.fn(() => ({ client: regularClient, registry: chainRegistry.base })),
+        getForScan: vi.fn(() => ({ client, registry: chainRegistry.base })),
+      } as never,
       { executorAddress: owner } as never,
     );
 
@@ -218,6 +222,8 @@ describe("known Bid-Ask open receipt correlation", () => {
     expect(database.updatePositionGroupBin).toHaveBeenCalledWith("v3-group", 0, expect.objectContaining({ tokenId: 101n, openingAmount0: 7n, status: "minted" }));
     expect(database.updatePositionGroupBin).toHaveBeenCalledWith("v3-group", 1, expect.objectContaining({ tokenId: 205n, openingAmount0: 13n, status: "minted" }));
     expect(database.setPositionGroupOpenTransaction).toHaveBeenCalledWith("v3-group", openHash, "active");
+    expect((discovery as unknown as { chains: { getForScan: ReturnType<typeof vi.fn> } }).chains.getForScan).toHaveBeenCalledWith("base");
+    expect(regularClient.readContract).not.toHaveBeenCalled();
   });
 
   it("correlates V4 salts and interleaved ModifyLiquidity events and is replay-safe", async () => {
@@ -379,7 +385,12 @@ describe("pending Bid-Ask open reconciliation retries", () => {
 
     await discovery.reconcilePendingPositionGroupOpens("base");
 
-    expect(database.setPositionGroupOpenTransaction).toHaveBeenCalledWith("v4-group", openHash, "active");
+    expect(database.setPositionGroupOpenTransaction).toHaveBeenCalledWith("v4-group", openHash, "active", {
+      reason: null,
+      correlationError: null,
+      openReceiptRetriedAt: null,
+      pendingRawTransaction: null,
+    });
     expect(database.updatePositionGroupBin).toHaveBeenCalledWith("v4-group", 0, expect.objectContaining({ tokenId: 7n, status: "minted" }));
     expect(database.findPositionByKey).toHaveBeenCalledWith(chainRegistry.base.chain.id, "v4", "7");
   });
