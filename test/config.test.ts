@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { loadConfig } from "../src/config.js";
+import { loadConfig, PUBLIC_ROBINHOOD_RPC_HTTP } from "../src/config.js";
 
 function environment(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
@@ -166,7 +166,7 @@ describe("loadConfig", () => {
     expect(() => loadConfig(environment({ QUOTE_TOKEN_ALLOWLIST_BASE: "USDC:0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913,FAKE:0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913" }))).toThrow("duplicate");
   });
 
-  it("keeps native RPC for log scans and uses Alchemy only for bootstrap", () => {
+  it("configures Alchemy before the public Robinhood RPC fallback", () => {
     const config = loadConfig(environment({
       BASE_RPC_HTTP: "https://mainnet.base.org",
       ROBINHOOD_RPC_HTTP: "https://rpc.mainnet.chain.robinhood.com",
@@ -176,8 +176,15 @@ describe("loadConfig", () => {
 
     expect(config.rpcHttp.base).toBe("https://mainnet.base.org");
     expect(config.rpcHttp.robinhood).toBe("https://rpc.mainnet.chain.robinhood.com");
+    expect(config.rpcHttpFallback.robinhood).toBe(PUBLIC_ROBINHOOD_RPC_HTTP);
     expect(config.alchemyHttp.base).toContain("alchemy.com");
     expect(config.alchemyHttp.robinhood).toContain("alchemy.com");
+  });
+
+  it("allows an explicit Robinhood fallback override", () => {
+    const config = loadConfig(environment({ ROBINHOOD_RPC_HTTP_FALLBACK: "https://public-fallback.example/rpc" }));
+
+    expect(config.rpcHttpFallback.robinhood).toBe("https://public-fallback.example/rpc");
   });
 
   it("rejects remove-liquidity max slippage below base", () => {

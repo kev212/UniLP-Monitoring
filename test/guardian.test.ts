@@ -359,9 +359,11 @@ describe("position monitor timeouts", () => {
       const first = evaluate("robinhood", position, 10n);
       await vi.advanceTimersByTimeAsync(60_000);
 
-      await expect(first).resolves.toBe(true);
-      await expect(evaluate("robinhood", position, 11n)).resolves.toBe(true);
-      expect(pnl.value).toHaveBeenCalledTimes(1);
+      await expect(first).resolves.toBe(false);
+      const second = evaluate("robinhood", position, 11n);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await expect(second).resolves.toBe(false);
+      expect(pnl.value).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }

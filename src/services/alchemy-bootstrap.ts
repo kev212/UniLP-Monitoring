@@ -4,6 +4,7 @@ import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
 import type { ChainName } from "../types.js";
+import { isTransientRpcError } from "../rpc.js";
 import type { ChainClients } from "./chain-client.js";
 import type { DiscoveryService, NftActivity, WalletActivity } from "./discovery.js";
 
@@ -119,16 +120,36 @@ export class AlchemyBootstrapper {
   }
 
   private async request<T>(endpoint: string, method: string, params: unknown[]): Promise<T> {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: crypto.randomUUID(), method, params }),
-    });
-    if (!response.ok) throw new Error(`Alchemy request failed with HTTP ${response.status}`);
-    const body = await response.json() as { result?: T; error?: { code?: number; message?: string } };
-    if (body.error) throw new Error(`Alchemy ${body.error.code ?? "error"}: ${body.error.message ?? "unknown error"}`);
-    if (!body.result) throw new Error("Alchemy returned an empty result");
-    return body.result;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      let retryAfterMs: number | undefined;
+      try {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: crypto.randomUUID(), method, params }),
+          signal: AbortSignal.timeout(20_000),
+        });
+        const retryAfter = response.headers.get("retry-after");
+        if (retryAfter && /^\d+$/.test(retryAfter)) retryAfterMs = Math.min(Number(retryAfter) * 1_000, 10_000);
+        if (!response.ok) {
+          const error = Object.assign(new Error(`Alchemy request failed with HTTP ${response.status}`), { status: response.status });
+          throw error;
+        }
+        const body = await response.json() as { result?: T; error?: { code?: number; message?: string } };
+        if (body.error) {
+          const error = Object.assign(new Error(`Alchemy ${body.error.code ?? "error"}: ${body.error.message ?? "unknown error"}`), { code: body.error.code });
+          throw error;
+        }
+        if (!body.result) throw new Error("Alchemy returned an empty result");
+        return body.result;
+      } catch (error) {
+        lastError = error;
+        if (!isTransientRpcError(error) || attempt === 4) throw error;
+        await sleep(retryAfterMs ?? Math.min(500 * 2 ** attempt, 5_000));
+      }
+    }
+    throw lastError;
   }
 
   private nftCandidates(activities: IndexedActivity[], manager: Address): NftActivity[] {
@@ -151,6 +172,10 @@ export class AlchemyBootstrapper {
     }
     return [...candidates.values()];
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export function parseAssetTransfer(transfer: AlchemyTransfer): IndexedActivity | null {

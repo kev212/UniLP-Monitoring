@@ -166,7 +166,9 @@ export class Guardian {
       return await withTimeout(evaluation, POSITION_EVALUATION_TIMEOUT_MS);
     } catch (error) {
       log.warn({ err: error, groupId: group.id, timeoutMs: POSITION_EVALUATION_TIMEOUT_MS }, "position group valuation timed out; continuing monitor cycle");
-      return true;
+      // Do not advance the chain cursor after an incomplete valuation. The
+      // next cycle must retry the position once the provider recovers.
+      return false;
     }
   }
 
@@ -238,7 +240,10 @@ export class Guardian {
       return await withTimeout(evaluation, POSITION_EVALUATION_TIMEOUT_MS);
     } catch (error) {
       log.warn({ err: error, positionId: position.id, positionKey: position.positionKey, timeoutMs: POSITION_EVALUATION_TIMEOUT_MS }, "position valuation timed out; continuing monitor cycle");
-      return true;
+      this.positionEvaluations.delete(position.id);
+      // A timed-out RPC read is not a successful evaluation. Retrying is safer
+      // than marking the block complete and leaving the position unmonitored.
+      return false;
     }
   }
 

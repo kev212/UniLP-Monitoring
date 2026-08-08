@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { createPublicClient, createWalletClient, encodeAbiParameters, encodeFunctionData, http, keccak256, type Address, type Hex, type PublicClient, zeroAddress } from "viem";
+import { createWalletClient, encodeAbiParameters, encodeFunctionData, keccak256, type Address, type Hex, type PublicClient, zeroAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
 import { erc20Abi, permit2Abi, v3FactoryAbi, v3PoolAbi, v4PoolKeysAbi, v4StateViewAbi, wethAbi } from "../abi.js";
@@ -199,18 +199,13 @@ export class PositionOpener {
   }
 
   private client(chain: ChainName): PublicClient {
-    const { registry } = this.chains.get(chain);
-    const alchemyUrl = this.config.alchemyHttp[chain];
-    if (!alchemyUrl) throw new Error(`ALCHEMY RPC is required for opening positions`);
-    return createPublicClient({ chain: registry.chain, transport: http(alchemyUrl, { retryCount: 3, timeout: 20_000 }) });
+    return this.chains.getForScan(chain).client;
   }
 
   private walletClient(chain: ChainName) {
     if (!this.account) throw new Error("Executor private key is not configured");
-    const { registry } = this.chains.get(chain);
-    const alchemyUrl = this.config.alchemyHttp[chain];
-    if (!alchemyUrl) throw new Error(`ALCHEMY RPC is required for opening positions`);
-    return createWalletClient({ chain: registry.chain, transport: http(alchemyUrl, { retryCount: 3, timeout: 20_000 }), account: this.account });
+    const { registry, transport } = this.chains.getForScan(chain);
+    return createWalletClient({ chain: registry.chain, transport, account: this.account });
   }
 
   async prepareOpen(poolAddress: string, chain: ChainName, rangePercent: number, depositAmount: bigint, quoteToken: QuoteToken, mode: OpenMode = "single"): Promise<OpenPositionPreview> {

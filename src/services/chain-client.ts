@@ -1,4 +1,4 @@
-import { createPublicClient, fallback, http, webSocket, type Address, type PublicClient } from "viem";
+import { createPublicClient, fallback, http, type Address, type PublicClient, type Transport } from "viem";
 
 import { chainRegistry, type ChainRegistry } from "../chains.js";
 import type { RuntimeConfig } from "../config.js";
@@ -7,6 +7,26 @@ import type { ChainName } from "../types.js";
 export interface ChainClient {
   registry: ChainRegistry;
   client: PublicClient;
+  transport: Transport;
+}
+
+const RPC_TIMEOUT_MS = 20_000;
+
+function uniqueUrls(urls: readonly (string | undefined)[]): string[] {
+  return [...new Set(urls.filter((url): url is string => Boolean(url)))];
+}
+
+/**
+ * Keep RPC failover request-local and deterministic. A failed primary request
+ * must reach the next provider immediately instead of retrying the same
+ * throttled endpoint before fallback gets a chance.
+ */
+export function createRpcTransport(urls: readonly string[]): Transport {
+  const endpoints = uniqueUrls(urls);
+  if (endpoints.length === 0) throw new Error("At least one RPC endpoint is required");
+  const transports = endpoints.map((url) => http(url, { retryCount: 0, timeout: RPC_TIMEOUT_MS }));
+  if (transports.length === 1) return transports[0]!;
+  return fallback(transports as [Transport, ...Transport[]], { retryCount: 0 });
 }
 
 export class ChainClients {
@@ -19,34 +39,30 @@ export class ChainClients {
     this.enabledChains = new Set(config.chains);
     for (const name of ["base", "robinhood", "bsc"] as const) {
       const registry = chainRegistry[name];
-      const wsUrl = config.rpcWss[name];
-      const primary = config.rpcHttp[name];
-      const fallbackUrl = config.rpcHttpFallback[name];
-      const fallbackUrls = fallbackUrl ? [fallbackUrl] : [];
+      const endpoints = uniqueUrls([
+        config.alchemyHttp[name],
+        config.rpcHttp[name],
+        config.rpcHttpFallback[name],
+      ]);
+      // Critical reads and writes must share HTTP failover. A configured WSS
+      // endpoint cannot be allowed to bypass the public Robinhood fallback.
+      const transport = createRpcTransport(endpoints);
       this.clients.set(name, {
         registry,
+        transport,
         client: createPublicClient({
           chain: registry.chain,
-          transport: wsUrl
-            ? webSocket(wsUrl, { retryCount: 3, retryDelay: 250, timeout: 20_000 })
-            : fallbackUrls.length > 0
-              ? fallback([http(primary, { retryCount: 3, timeout: 20_000 }), http(fallbackUrl, { retryCount: 3, timeout: 20_000 })], { retryCount: 1 })
-              : http(primary, { retryCount: 3, timeout: 20_000 }),
+          transport,
           pollingInterval: 4_000,
         }),
       });
-      const alchemy = config.alchemyHttp[name];
-      const scanFallbacks = [
-        ...(alchemy ? [config.rpcHttp[name]] : []),
-        ...(config.rpcHttpFallback[name] ? [config.rpcHttpFallback[name]!] : []),
-      ];
+      const scanTransport = createRpcTransport(endpoints);
       this.scanClients.set(name, {
         registry,
+        transport: scanTransport,
         client: createPublicClient({
           chain: registry.chain,
-          transport: scanFallbacks.length > 0
-            ? fallback([http(alchemy ?? config.rpcHttp[name], { retryCount: 3, timeout: 20_000 }), ...scanFallbacks.map((url) => http(url, { retryCount: 3, timeout: 20_000 }))], { retryCount: 1 })
-            : http(alchemy ?? config.rpcHttp[name], { retryCount: 3, timeout: 20_000 }),
+          transport: scanTransport,
           pollingInterval: 4_000,
         }),
       });

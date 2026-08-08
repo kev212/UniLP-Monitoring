@@ -23,6 +23,7 @@ import type { Database } from "../db.js";
 import { log } from "../log.js";
 import type { ChainName, PositionGroupBinRecord, PositionGroupRecord, PositionRecord, PositionStatus, Protocol } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
+import { isTransientRpcError } from "../rpc.js";
 import type { Notifier } from "./notifier.js";
 import { amountsForLiquidity } from "./uniswap-math.js";
 
@@ -577,7 +578,8 @@ export class DiscoveryService {
         await this.reconstructV2Cashflows(position, relevant);
         positions.push(position);
         await this.notifier?.positionDiscovered(position);
-      } catch {
+      } catch (error) {
+        if (isTransientRpcError(error)) throw error;
         // Arbitrary ERC-20 transfer candidates are expected to fail the pair interface probe.
       }
     }
@@ -618,6 +620,7 @@ export class DiscoveryService {
           });
         }
       } catch (error) {
+        if (isTransientRpcError(error)) throw error;
         log.warn({ err: error, positionId: position.id, transactionHash: transfer.transactionHash }, "could not reconstruct V2 cashflow");
       }
     }
@@ -712,7 +715,8 @@ export class DiscoveryService {
         });
         positions.push(position);
         await this.notifier?.positionDiscovered(position);
-      } catch {
+      } catch (error) {
+        if (isTransientRpcError(error)) throw error;
         // An NFT may have been burned or transferred away between the observed log and this read.
       }
     }
@@ -821,11 +825,13 @@ export class DiscoveryService {
             tokenId: BigInt(args.salt),
             historyTrusted: true,
           });
-        } catch {
+        } catch (error) {
+          if (isTransientRpcError(error)) throw error;
           // NOT_MINTED or other error — skip this salt.
         }
       }
     } catch (error) {
+      if (isTransientRpcError(error)) throw error;
       log.warn({ err: error, chain: name }, "could not discover V4 positions from liquidity events");
     }
     return candidates;
@@ -895,6 +901,7 @@ export class DiscoveryService {
         positions.push(position);
         await this.notifier?.positionDiscovered(position);
       } catch (error) {
+        if (isTransientRpcError(error)) throw error;
         const message = error instanceof Error ? error.message : String(error);
         const burned = message.includes("NOT_MINTED");
         log[burned ? "info" : "warn"](
@@ -1806,17 +1813,6 @@ async function getLogsWithRetry(client: PublicClient, params: Parameters<PublicC
     }
   }
   throw lastError;
-}
-
-function isTransientRpcError(error: unknown): boolean {
-  const value = error as { code?: unknown; status?: unknown; message?: unknown; cause?: { code?: unknown; status?: unknown; message?: unknown } };
-  const code = value?.code ?? value?.cause?.code;
-  const status = value?.status ?? value?.cause?.status;
-  if (code === 429 || status === 429) return true;
-  if (typeof status === "number" && status >= 500) return true;
-  if (typeof code === "number" && [-32000, -32005, -32603].includes(code)) return true;
-  const message = `${value?.message ?? ""} ${value?.cause?.message ?? ""}`.toLowerCase();
-  return /timeout|timed out|fetch failed|network|socket|econnreset|econnrefused|rate limit|too many requests|service unavailable|gateway/.test(message);
 }
 
 function sleep(ms: number): Promise<void> {

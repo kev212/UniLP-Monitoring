@@ -6,6 +6,8 @@ import { z } from "zod";
 
 import type { ChainName, PoolScanSettings, QuoteToken } from "./types.js";
 
+export const PUBLIC_ROBINHOOD_RPC_HTTP = "https://rpc.mainnet.chain.robinhood.com";
+
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
   CHAINS: z.string().default("base,robinhood"),
@@ -244,7 +246,14 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     throw new Error("TELEGRAM_USER_ID is required when TELEGRAM_CHAT_ID is a group");
   }
 
-  const rpcUsesAlchemy = Boolean(detectAlchemyEndpoint(env.BASE_RPC_HTTP) || detectAlchemyEndpoint(env.ROBINHOOD_RPC_HTTP) || detectAlchemyEndpoint(env.BSC_RPC_HTTP));
+  const rpcUsesAlchemy = [
+    env.BASE_RPC_HTTP,
+    env.ROBINHOOD_RPC_HTTP,
+    env.BSC_RPC_HTTP,
+    env.ALCHEMY_BASE_HTTP,
+    env.ALCHEMY_ROBINHOOD_HTTP,
+    env.ALCHEMY_BSC_HTTP,
+  ].filter((value): value is string => Boolean(value)).some((value) => Boolean(detectAlchemyEndpoint(value)));
   if (env.SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS < env.SETTLEMENT_SWAP_SLIPPAGE_BPS) {
     throw new Error("SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS must be at least SETTLEMENT_SWAP_SLIPPAGE_BPS");
   }
@@ -272,7 +281,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     },
     rpcHttpFallback: {
       ...(env.BASE_RPC_HTTP_FALLBACK ? { base: env.BASE_RPC_HTTP_FALLBACK } : {}),
-      ...(env.ROBINHOOD_RPC_HTTP_FALLBACK ? { robinhood: env.ROBINHOOD_RPC_HTTP_FALLBACK } : {}),
+    robinhood: env.ROBINHOOD_RPC_HTTP_FALLBACK || PUBLIC_ROBINHOOD_RPC_HTTP,
       ...(env.BSC_RPC_HTTP_FALLBACK ? { bsc: env.BSC_RPC_HTTP_FALLBACK } : {}),
     },
     alchemyHttp: {

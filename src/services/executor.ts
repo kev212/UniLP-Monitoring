@@ -2,12 +2,10 @@ import { randomUUID } from "node:crypto";
 
 import { privateKeyToAccount } from "viem/accounts";
 import {
-  createPublicClient,
   createWalletClient,
   decodeEventLog,
   encodeAbiParameters,
   encodeFunctionData,
-  http,
   isAddress,
   isHex,
   keccak256,
@@ -55,6 +53,7 @@ import type { ChainClients } from "./chain-client.js";
 import type { Notifier } from "./notifier.js";
 import type { PositionReader, PositionValue } from "./position-reader.js";
 import type { RoutePlanner, SwapRoute } from "./route-planner.js";
+import { isTransientRpcError } from "../rpc.js";
 import { UNISWAP_API_ROUTER, type TradingApiQuote, type UniswapTradingApi } from "./uniswap-trading-api.js";
 import type { KyberSwapAggregatorApi, KyberSwapQuote } from "./kyberswap-aggregator-api.js";
 import { hasPendingSettlement } from "./pending-settlement.js";
@@ -62,6 +61,8 @@ import { buildSwapPlan } from "./swap-builder.js";
 import { buildV3BidAskClosePlan, buildV4BidAskClosePlan, type V4PoolKey } from "./bid-ask-batch.js";
 import { receiptTokenTransfers } from "./discovery.js";
 import { applySlippage } from "./uniswap-math.js";
+
+export { isTransientRpcError } from "../rpc.js";
 
 interface PendingSwap {
   token: Address;
@@ -100,7 +101,6 @@ const API_SETTLEMENT_MINIMUM_FLOOR_BPS = 200;
 const MAX_UINT256 = (1n << 256n) - 1n;
 const MAX_UINT160 = (1n << 160n) - 1n;
 const PERMIT2_MAX_EXPIRATION_SECONDS = 2_592_000;
-const PENDING_APPROVAL_MAX_AGE_MS = 5 * 60_000;
 const V4_WITHDRAWAL_LOG_BLOCK_RANGE = 2_000n;
 
 class PendingExecutionError extends Error {
@@ -828,6 +828,7 @@ export class Executor {
     try {
       values = await Promise.all(activeBins.map((bin) => this.reader.read(byId.get(bin.positionId!)!, blockNumber, removeSlippageBps)));
     } catch (error) {
+      if (isTransientRpcError(error)) throw error;
       throw new GroupIntegrityError(`Could not validate active child state at block ${blockNumber}: ${errorMessage(error)}`);
     }
 
@@ -860,6 +861,7 @@ export class Executor {
           throw new Error(`on-chain owner is ${owner}`);
         }
       } catch (error) {
+        if (isTransientRpcError(error)) throw error;
         throw new GroupIntegrityError(`Child ${position.positionKey} is no longer owned by the group owner: ${errorMessage(error)}`);
       }
       children.push({ bin, position, value });
@@ -1648,9 +1650,7 @@ export class Executor {
     if (!leaseToken) throw new Error("Position group lease is required before broadcast");
     const renew = this.groupDatabase().renewPositionGroupLease;
     if (renew && !(await renew.call(this.database, group.id, leaseToken))) throw new Error("Position group lease ownership was lost before broadcast");
-    const alchemyUrl = this.config.alchemyHttp[registry.name];
-    const transport = alchemyUrl ? http(alchemyUrl) : http(this.config.rpcHttp[registry.name]);
-    const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport });
+    const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport: this.chains.getForScan(registry.name).transport });
     const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account, to: plan.to, data: plan.data, value: plan.value ?? 0n });
     const serializedTransaction = await wallet.signTransaction(preparedRequest);
     const hash = keccak256(serializedTransaction);
@@ -1712,11 +1712,10 @@ export class Executor {
       this.config.executorAddress,
       async () => {
         const { registry } = this.chains.getById(group.chainId);
-        const alchemyUrl = this.config.alchemyHttp[registry.name];
         const wallet = createWalletClient({
           account: this.account!,
           chain: registry.chain,
-          transport: alchemyUrl ? http(alchemyUrl) : http(this.config.rpcHttp[registry.name]),
+          transport: this.chains.getForScan(registry.name).transport,
         });
         try {
           const hash = await wallet.sendRawTransaction({ serializedTransaction: pending.serializedTransaction });
@@ -2522,9 +2521,7 @@ export class Executor {
     if (!(await this.database.renewSettlementLease(position.id, leaseToken))) {
       throw new Error("Settlement lease ownership was lost before broadcast");
     }
-    const alchemyUrl = this.config.alchemyHttp[registry.name];
-    const transport = alchemyUrl ? http(alchemyUrl) : http(this.config.rpcHttp[registry.name]);
-    const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport });
+    const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport: this.chains.getForScan(registry.name).transport });
     const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account, to: plan.to, data: plan.data, value: plan.value ?? 0n });
     const request = stage === "swap_to_quote"
       ? { ...preparedRequest, gas: bufferedGasLimit(preparedRequest.gas, this.config.swapGasLimitMultiplierPercent) }
@@ -2608,10 +2605,14 @@ export class Executor {
       return false;
     }
     const { client } = this.chains.getById(position.chainId);
-    const pendingNonce = await client.getTransactionCount({ address: position.owner, blockTag: "pending" }).catch(() => null);
-    if (pendingNonce !== null && pendingNonce > nonce) return true;
-    if (!pending.submittedAt) return false;
-    return Date.now() - Date.parse(pending.submittedAt) >= PENDING_APPROVAL_MAX_AGE_MS;
+    try {
+      const pendingNonce = await client.getTransactionCount({ address: position.owner, blockTag: "pending" });
+      // A nonce advance is proof that this exact transaction was replaced or
+      // consumed. Age alone is not proof while an RPC provider is degraded.
+      return pendingNonce > nonce;
+    } catch {
+      return false;
+    }
   }
 
   private async recoverPendingUnwrap(position: PositionRecord): Promise<boolean> {
@@ -2647,11 +2648,10 @@ export class Executor {
     if (!pending || pending.hash.toLowerCase() !== expectedHash.toLowerCase()) return;
     if (!this.account) return;
     const { registry } = this.chains.getById(position.chainId);
-    const alchemyUrl = this.config.alchemyHttp[registry.name];
     const wallet = createWalletClient({
       account: this.account,
       chain: registry.chain,
-      transport: alchemyUrl ? http(alchemyUrl) : http(this.config.rpcHttp[registry.name]),
+      transport: this.chains.getForScan(registry.name).transport,
     });
     try {
       const hash = await wallet.sendRawTransaction({ serializedTransaction: pending.serializedTransaction });
@@ -3072,11 +3072,6 @@ function sameV4PoolKey(left: V4PoolKey, right: V4PoolKey): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-export function isTransientRpcError(error: unknown): boolean {
-  const message = errorMessage(error);
-  return /\b(?:408|425|429|500|502|503|504)\b|too many requests|rate limit|timed out|timeout|aborted|econnreset|econnrefused|enotfound|network|fetch failed/i.test(message);
 }
 
 async function waitForReceipt(client: PublicClient, hash: Hex, confirmations: number) {

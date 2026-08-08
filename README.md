@@ -44,9 +44,10 @@ Mulai dengan `DRY_RUN=true`. Ubah ke `false` hanya setelah cashflow, PnL, dan si
 | `PROFIT_OOR_ABOVE_THRESHOLD_PERCENT` | PnL minimum untuk memulai timer profit + OOR above. Default 3%. |
 | `SWAP_GAS_LIMIT_MULTIPLIER_PERCENT` | Multiplier gas limit swap untuk menghindari RPC underestimation. Default 300%. |
 | `OOR_AUTO_CLOSE_ENABLED` | Aktifkan auto-exit saat quote token cukup jauh above range. |
-| `BASE_RPC_HTTP`, `ROBINHOOD_RPC_HTTP` | Endpoint RPC untuk monitoring dan discovery. |
+| `BASE_RPC_HTTP`, `ROBINHOOD_RPC_HTTP` | Endpoint RPC primary untuk monitoring, discovery, dan transaksi. |
+| `ROBINHOOD_RPC_HTTP_FALLBACK` | Fallback public Robinhood RPC saat primary timeout, throttled, atau error transient. |
 | `BSC_RPC_HTTP` | Endpoint BSC untuk discovery PancakeSwap V3. |
-| `ALCHEMY_BASE_HTTP`, `ALCHEMY_ROBINHOOD_HTTP` | Endpoint archive/bootstrap opsional. |
+| `ALCHEMY_BASE_HTTP`, `ALCHEMY_ROBINHOOD_HTTP` | Endpoint RPC private/archive opsional yang diprioritaskan sebelum fallback. |
 | `TELEGRAM_CHAT_ID`, `TELEGRAM_USER_ID` | Chat dan user yang diizinkan mengakses bot. |
 
 Lihat `.env.example` untuk seluruh variable dan nilai default.
