@@ -204,6 +204,15 @@ describe("Telegram dashboard callbacks", () => {
     expect(positionRangeLine(0n, 100n, 50n)).toEqual({ bar: "━━━━━│━━━━", percent: 50 });
   });
 
+  it("keeps a 90% marker visibly distinct from the upper endpoint", () => {
+    expect(positionRangeLine(0n, 100n, 90n)).toEqual({ bar: "━━━━━━━━│━", percent: 90 });
+    expect(positionRangeLine(0n, 100n, 100n)).toEqual({ bar: "━━━━━━━━━│", percent: 100 });
+  });
+
+  it("rounds fractional progress instead of truncating bigint division", () => {
+    expect(positionRangeLine(0n, 1_000n, 907n)).toEqual({ bar: "━━━━━━━━│━", percent: 91 });
+  });
+
   it("shows textual range status only outside the range", () => {
     const now = Date.now();
     expect(formatDashboardRangeStatus("in_range", {})).toBe("");

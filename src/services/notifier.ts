@@ -2670,8 +2670,10 @@ export function positionRangeLine(minimum: bigint, maximum: bigint, current: big
   if (maximum <= minimum) return { bar: "│" + "━".repeat(LEN - 1), percent: null };
   if (current <= minimum) return { bar: "│" + "━".repeat(LEN - 1), percent: 0 };
   if (current >= maximum) return { bar: "━".repeat(LEN - 1) + "│", percent: 100 };
-  const pct = Math.round(Number(((current - minimum) * 100n) / (maximum - minimum)));
-  const idx = Math.max(0, Math.min(LEN - 1, Math.floor((pct / 100) * LEN)));
+  const denominator = maximum - minimum;
+  const numerator = (current - minimum) * 100n;
+  const pct = Number((numerator + denominator / 2n) / denominator);
+  const idx = Math.max(0, Math.min(LEN - 1, Math.round((pct / 100) * (LEN - 1))));
   return { bar: "━".repeat(idx) + "│" + "━".repeat(LEN - 1 - idx), percent: pct };
 }
 
