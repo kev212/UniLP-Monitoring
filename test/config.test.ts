@@ -58,6 +58,8 @@ describe("loadConfig", () => {
     expect(config.trailingTwapGuardMaxWaitMs).toBe(15_000);
     expect(config.positionMonitorIntervalMs).toBe(5_000);
     expect(config.discoveryIntervalMs).toBe(30_000);
+    expect(config.maxLogBlockRange).toBe(2_000n);
+    expect(config.rpcRequestDelayMs).toBe(0);
     expect(config.oorAboveMinDistancePercent).toBe(10);
     expect(config.oorAboveMinDurationMs).toBe(3_600_000);
     expect(config.oorAboveProfitDurationMs).toBe(300_000);
@@ -89,6 +91,13 @@ describe("loadConfig", () => {
     expect(config.bidAskLadderAtomicMaxBlockGasBps).toBe(8_000);
     expect(config.bidAskLadderTransactionDeadlineSeconds).toBe(300);
     expect(config.bidAskLadderMaxRetries).toBe(3);
+  });
+
+  it("keeps discovery log defaults bounded when Alchemy archive access is configured", () => {
+    const config = loadConfig(environment({ ALCHEMY_ROBINHOOD_HTTP: "https://robinhood-mainnet.g.alchemy.com/v2/test" }));
+
+    expect(config.maxLogBlockRange).toBe(2_000n);
+    expect(config.rpcRequestDelayMs).toBe(0);
   });
 
   it("strictly parses Bid-Ask ladder settings", () => {

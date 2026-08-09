@@ -246,14 +246,6 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     throw new Error("TELEGRAM_USER_ID is required when TELEGRAM_CHAT_ID is a group");
   }
 
-  const rpcUsesAlchemy = [
-    env.BASE_RPC_HTTP,
-    env.ROBINHOOD_RPC_HTTP,
-    env.BSC_RPC_HTTP,
-    env.ALCHEMY_BASE_HTTP,
-    env.ALCHEMY_ROBINHOOD_HTTP,
-    env.ALCHEMY_BSC_HTTP,
-  ].filter((value): value is string => Boolean(value)).some((value) => Boolean(detectAlchemyEndpoint(value)));
   if (env.SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS < env.SETTLEMENT_SWAP_SLIPPAGE_BPS) {
     throw new Error("SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS must be at least SETTLEMENT_SWAP_SLIPPAGE_BPS");
   }
@@ -352,16 +344,12 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     scanBlockRange: BigInt(env.SCAN_BLOCK_RANGE),
     maxLogBlockRange: env.MAX_LOG_BLOCK_RANGE !== undefined
       ? BigInt(env.MAX_LOG_BLOCK_RANGE)
-      : (rpcUsesAlchemy ? 10n : 2_000n),
+      : 2_000n,
     rpcRequestDelayMs: env.RPC_REQUEST_DELAY_MS !== undefined
       ? env.RPC_REQUEST_DELAY_MS
-      : (rpcUsesAlchemy ? 25 : 0),
+      : 0,
     rpcBootstrapLookbackBlocks: BigInt(env.RPC_BOOTSTRAP_LOOKBACK_BLOCKS),
     startBlocks: { base: env.START_BLOCK_BASE, robinhood: env.START_BLOCK_ROBINHOOD, bsc: env.START_BLOCK_BSC },
     telegram,
   };
-}
-
-function detectAlchemyEndpoint(value: string): string | undefined {
-  return new URL(value).hostname.endsWith("alchemy.com") ? value : undefined;
 }

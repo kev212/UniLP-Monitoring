@@ -2907,6 +2907,7 @@ export class Executor {
   private async findV4WithdrawalEvent(position: PositionRecord, salt: Hex) {
     const { registry } = this.chains.getById(position.chainId);
     const { client } = this.chains.getForScan(registry.name);
+    const { client: logClient } = this.chains.getForLogs(registry.name);
     const fromBlock = position.openedAtBlock ?? 0n;
     let toBlock = await client.getBlockNumber();
     while (toBlock >= fromBlock) {
@@ -2914,7 +2915,7 @@ export class Executor {
         ? toBlock - V4_WITHDRAWAL_LOG_BLOCK_RANGE + 1n
         : fromBlock;
       // Robinhood RPC rejects the indexed sender topic on this event. Filter it locally.
-      const events = await client.getLogs({
+      const events = await logClient.getLogs({
         address: registry.contracts.v4.poolManager,
         event: v4PoolManagerModifyLiquidityEvent,
         fromBlock: chunkFrom,
@@ -2938,6 +2939,7 @@ export class Executor {
     if (position.protocol !== "v3" || !position.quoteToken) return false;
     const tokenId = BigInt(position.positionKey);
     const { client, registry } = this.chains.getById(position.chainId);
+    const { client: logClient } = this.chains.getForLogs(registry.name);
     try {
       const state = await client.readContract({
         address: registry.contracts.v3.positionManager,
@@ -2948,14 +2950,14 @@ export class Executor {
       if (state[7] !== 0n) return false;
 
       const [decreases, collects] = await Promise.all([
-        client.getLogs({
+        logClient.getLogs({
           address: registry.contracts.v3.positionManager,
           event: v3DecreaseLiquidityEvent,
           args: { tokenId },
           fromBlock: position.openedAtBlock ?? 0n,
           toBlock: "latest" as never,
         }),
-        client.getLogs({
+        logClient.getLogs({
           address: registry.contracts.v3.positionManager,
           event: v3CollectEvent,
           args: { tokenId },

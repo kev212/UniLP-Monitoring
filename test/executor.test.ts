@@ -448,11 +448,14 @@ describe("Executor pending settlement recovery", () => {
     };
     const scanClient = {
       getBlockNumber: vi.fn().mockResolvedValue(3_000n),
+    };
+    const logClient = {
       getLogs: vi.fn().mockResolvedValue([event]),
     };
     const chains = {
       getById: vi.fn(() => ({ registry: { name: "robinhood", contracts: { v4: { poolManager, positionManager } } } })),
       getForScan: vi.fn(() => ({ client: scanClient })),
+      getForLogs: vi.fn(() => ({ client: logClient })),
     };
     const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
     const position = {
@@ -465,7 +468,7 @@ describe("Executor pending settlement recovery", () => {
       .findV4WithdrawalEvent(position, salt);
 
     expect(found).toBe(event);
-    expect(scanClient.getLogs).toHaveBeenCalledWith(expect.objectContaining({ fromBlock: 1_001n, toBlock: 3_000n }));
+    expect(logClient.getLogs).toHaveBeenCalledWith(expect.objectContaining({ fromBlock: 1_001n, toBlock: 3_000n }));
   });
 
   it("uses the chain client's failover client for executor calls", () => {
@@ -1001,8 +1004,9 @@ describe("Executor pending settlement recovery", () => {
     const chains = {
       getById: vi.fn(() => ({
         client,
-        registry: { contracts: { v3: { positionManager: "0x0000000000000000000000000000000000000001" } } },
+        registry: { name: "robinhood", contracts: { v3: { positionManager: "0x0000000000000000000000000000000000000001" } } },
       })),
+      getForLogs: vi.fn(() => ({ client })),
     };
     const notifier = { settled: vi.fn() };
     const executor = new Executor(database as never, chains as never, {} as never, {} as never, notifier as never, config);

@@ -519,7 +519,7 @@ export class DiscoveryService {
     name: ChainName,
     params: { fromBlock: bigint; toBlock: bigint; [key: string]: unknown },
   ): Promise<Log[]> {
-    const { client } = this.chains.get(name);
+    const { client } = this.chains.getForLogs(name);
     const chunk = this.config.maxLogBlockRange;
     const all: Log[] = [];
     let start = params.fromBlock;
@@ -1255,7 +1255,8 @@ export class DiscoveryService {
   }
 
   async reconcileV4Liquidity(name: ChainName): Promise<void> {
-    const { client, registry } = this.chains.get(name);
+    const { registry } = this.chains.get(name);
+    const { client } = this.chains.getForLogs(name);
     const positions = (await this.database.listOpenPositions(registry.chain.id)).filter((position) => position.protocol === "v4" && !isManagedPosition(position));
     if (positions.length === 0) return;
     const bySalt = new Map<Hex, PositionRecord>();

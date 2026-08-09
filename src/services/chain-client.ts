@@ -32,6 +32,7 @@ export function createRpcTransport(urls: readonly string[]): Transport {
 export class ChainClients {
   private readonly clients = new Map<ChainName, ChainClient>();
   private readonly scanClients = new Map<ChainName, ChainClient>();
+  private readonly logClients = new Map<ChainName, ChainClient>();
   private readonly enabledChains: Set<ChainName>;
   private readonly tokenMetadata = new Map<string, { decimals: number; symbol: string }>();
 
@@ -66,6 +67,19 @@ export class ChainClients {
           pollingInterval: 4_000,
         }),
       });
+      const logTransport = createRpcTransport(uniqueUrls([
+        config.rpcHttp[name],
+        config.rpcHttpFallback[name],
+      ]));
+      this.logClients.set(name, {
+        registry,
+        transport: logTransport,
+        client: createPublicClient({
+          chain: registry.chain,
+          transport: logTransport,
+          pollingInterval: 4_000,
+        }),
+      });
     }
   }
 
@@ -78,6 +92,12 @@ export class ChainClients {
   getForScan(name: ChainName): ChainClient {
     const item = this.scanClients.get(name);
     if (!item) throw new Error(`Chain ${name} is not configured for scanning`);
+    return item;
+  }
+
+  getForLogs(name: ChainName): ChainClient {
+    const item = this.logClients.get(name);
+    if (!item) throw new Error(`Chain ${name} is not configured for log queries`);
     return item;
   }
 

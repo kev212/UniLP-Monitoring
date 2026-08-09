@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPublicClient } from "viem";
 
 import { chainRegistry } from "../src/chains.js";
-import { createRpcTransport } from "../src/services/chain-client.js";
+import type { RuntimeConfig } from "../src/config.js";
+import { ChainClients, createRpcTransport } from "../src/services/chain-client.js";
 
 describe("RPC failover transport", () => {
   afterEach(() => {
@@ -88,5 +89,43 @@ describe("RPC failover transport", () => {
       params: ["0x1234"],
     } as never)).resolves.toBe(transactionHash);
     expect(urls).toHaveLength(2);
+  });
+
+  it("keeps log queries off the configured Alchemy archive endpoint", async () => {
+    const urls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      if (urls.length === 1) return new Response("rate limited", { status: 429 });
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x1237" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const clients = new ChainClients({
+      chains: ["robinhood"],
+      alchemyHttp: {
+        base: undefined,
+        robinhood: "https://robinhood-mainnet.g.alchemy.com/v2/test",
+        bsc: undefined,
+      },
+      rpcHttp: {
+        base: "https://base.example/rpc",
+        robinhood: "https://public.example/rpc",
+        bsc: "https://bsc.example/rpc",
+      },
+      rpcHttpFallback: {
+        base: "https://base-fallback.example/rpc",
+        robinhood: "https://fallback.example/rpc",
+        bsc: "https://bsc-fallback.example/rpc",
+      },
+    } as RuntimeConfig);
+
+    await expect(clients.getForLogs("robinhood").client.getChainId()).resolves.toBe(4663);
+    expect(urls).toEqual([
+      "https://public.example/rpc",
+      "https://fallback.example/rpc",
+    ]);
   });
 });
