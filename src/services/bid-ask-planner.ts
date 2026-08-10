@@ -9,15 +9,16 @@ import {
   tickToFloorSpacing,
 } from "./uniswap-math.js";
 
-export type BidAskShapeVersion = "delta-amount-linear-v1" | "delta-amount-linear-v2";
+export type BidAskShapeVersion = "delta-amount-linear-v1" | "delta-amount-linear-v2" | "delta-amount-linear-v3";
 export type BidAskBinSide = "token0" | "token1";
 export type BidAskRangeOrientation = "below" | "above";
 
-export const BID_ASK_SHAPE_VERSION: BidAskShapeVersion = "delta-amount-linear-v2";
+export const BID_ASK_SHAPE_VERSION: BidAskShapeVersion = "delta-amount-linear-v3";
 
 const BID_ASK_TOTAL_WEIGHT_MICROS = 1_000_000;
 const BID_ASK_ANCHOR_WEIGHT_MICROS = 100_000;
 const BID_ASK_NON_ANCHOR_WEIGHT_MICROS = BID_ASK_TOTAL_WEIGHT_MICROS - BID_ASK_ANCHOR_WEIGHT_MICROS;
+const BID_ASK_V3_MAX_BIN_COUNT = 10;
 
 export interface BidAskRangeInput {
   currentTick: number;
@@ -109,6 +110,7 @@ export interface BidAskGeometryInput {
   requestedBinCount: number;
   anchorIndex: number;
   side: BidAskBinSide;
+  shapeVersion?: BidAskShapeVersion;
 }
 
 /** Snap the lower bound down and the upper bound up, matching existing range construction. */
@@ -150,11 +152,17 @@ export function validateBidAskRange(input: BidAskRangeInput): BidAskValidatedRan
   };
 }
 
-/** Calculate Delta weights for indexes ordered from the lower to the upper edge. */
+/** Select the latest monotonic shape where a ten-percent anchor is mathematically possible. */
+export function bidAskShapeVersionForBinCount(binCount: number): BidAskShapeVersion {
+  assertPositiveInteger("binCount", binCount);
+  return binCount <= BID_ASK_V3_MAX_BIN_COUNT ? BID_ASK_SHAPE_VERSION : "delta-amount-linear-v2";
+}
+
+/** Calculate Bid-Ask weights for indexes ordered from the lower to the upper edge. */
 export function calculateBidAskWeights(
   binCount: number,
   anchorIndex: number,
-  shapeVersion: BidAskShapeVersion = BID_ASK_SHAPE_VERSION,
+  shapeVersion: BidAskShapeVersion = bidAskShapeVersionForBinCount(binCount),
 ): BidAskWeight[] {
   assertPositiveInteger("binCount", binCount);
   assertInteger("anchorIndex", anchorIndex);
@@ -173,22 +181,53 @@ export function calculateBidAskWeights(
     });
   }
 
-  if (binCount === 1) return [{ distance: 0, weightMicros: BID_ASK_TOTAL_WEIGHT_MICROS }];
-  const distanceSum = Array.from({ length: binCount }, (_, index) => Math.abs(index - anchorIndex))
-    .reduce((sum, distance) => sum + distance, 0);
-  if (distanceSum <= 0) throw new Error("Bid-Ask non-anchor distance sum must be positive");
+  if (shapeVersion === "delta-amount-linear-v2") {
+    if (binCount === 1) return [{ distance: 0, weightMicros: BID_ASK_TOTAL_WEIGHT_MICROS }];
+    const distanceSum = Array.from({ length: binCount }, (_, index) => Math.abs(index - anchorIndex))
+      .reduce((sum, distance) => sum + distance, 0);
+    if (distanceSum <= 0) throw new Error("Bid-Ask non-anchor distance sum must be positive");
 
-  let allocatedNonAnchor = 0;
-  const nonAnchorIndexes = Array.from({ length: binCount }, (_, index) => index).filter((index) => index !== anchorIndex);
-  const lastNonAnchorIndex = nonAnchorIndexes.at(-1)!;
+    let allocatedNonAnchor = 0;
+    const nonAnchorIndexes = Array.from({ length: binCount }, (_, index) => index).filter((index) => index !== anchorIndex);
+    const lastNonAnchorIndex = nonAnchorIndexes.at(-1)!;
+    return Array.from({ length: binCount }, (_, index) => {
+      const distance = Math.abs(index - anchorIndex);
+      if (index === anchorIndex) return { distance, weightMicros: BID_ASK_ANCHOR_WEIGHT_MICROS };
+      const weightMicros = index === lastNonAnchorIndex
+        ? BID_ASK_TOTAL_WEIGHT_MICROS - BID_ASK_ANCHOR_WEIGHT_MICROS - allocatedNonAnchor
+        : Math.floor((BID_ASK_NON_ANCHOR_WEIGHT_MICROS * distance) / distanceSum);
+      allocatedNonAnchor += weightMicros;
+      return { distance, weightMicros };
+    });
+  }
+
+  if (binCount > BID_ASK_V3_MAX_BIN_COUNT) {
+    throw new Error(`Bid-Ask v3 supports at most ${BID_ASK_V3_MAX_BIN_COUNT} bins with a fixed ten-percent anchor`);
+  }
+  if (binCount === 1) return [{ distance: 0, weightMicros: BID_ASK_TOTAL_WEIGHT_MICROS }];
+
+  const tailTerms = Array.from({ length: binCount }, (_, index) => Math.abs(index - anchorIndex) ** 2 + 2 * Math.abs(index - anchorIndex));
+  const tailTermSum = tailTerms.reduce((sum, term) => sum + term, 0);
+  if (tailTermSum <= 0) throw new Error("Bid-Ask v3 tail-term sum must be positive");
+  const remainingTailWeight = BID_ASK_TOTAL_WEIGHT_MICROS - BID_ASK_ANCHOR_WEIGHT_MICROS * binCount;
+  let farthestIndex = 0;
+  for (let index = 1; index < binCount; index += 1) {
+    if (Math.abs(index - anchorIndex) > Math.abs(farthestIndex - anchorIndex)) farthestIndex = index;
+  }
+  let allocatedTailWeight = 0;
+  const tailWeights = Array<number>(binCount).fill(0);
+  for (let index = 0; index < binCount; index += 1) {
+    if (index === anchorIndex || index === farthestIndex) continue;
+    const weightMicros = Math.floor((remainingTailWeight * tailTerms[index]!) / tailTermSum);
+    tailWeights[index] = weightMicros;
+    allocatedTailWeight += weightMicros;
+  }
+  tailWeights[farthestIndex] = remainingTailWeight - allocatedTailWeight;
+
   return Array.from({ length: binCount }, (_, index) => {
     const distance = Math.abs(index - anchorIndex);
     if (index === anchorIndex) return { distance, weightMicros: BID_ASK_ANCHOR_WEIGHT_MICROS };
-    const weightMicros = index === lastNonAnchorIndex
-      ? BID_ASK_TOTAL_WEIGHT_MICROS - BID_ASK_ANCHOR_WEIGHT_MICROS - allocatedNonAnchor
-      : Math.floor((BID_ASK_NON_ANCHOR_WEIGHT_MICROS * distance) / distanceSum);
-    allocatedNonAnchor += weightMicros;
-    return { distance, weightMicros };
+    return { distance, weightMicros: BID_ASK_ANCHOR_WEIGHT_MICROS + tailWeights[index]! };
   });
 }
 
@@ -214,7 +253,11 @@ export function generateBidAskBinGeometry(input: BidAskGeometryInput): BidAskBin
   if (binCount < 1) throw new Error("Bid-Ask range has no spacing slots");
   if (input.anchorIndex < 0 || input.anchorIndex >= binCount) throw new Error("Bid-Ask anchor index is outside the generated bins");
 
-  const weights = calculateBidAskWeights(binCount, input.anchorIndex);
+  const weights = calculateBidAskWeights(
+    binCount,
+    input.anchorIndex,
+    input.shapeVersion ?? bidAskShapeVersionForBinCount(binCount),
+  );
   const binCountBig = BigInt(binCount);
   const bins: BidAskBinGeometry[] = [];
   for (let index = 0; index < binCount; index += 1) {
@@ -284,6 +327,7 @@ export function planBidAsk(input: BidAskPlannerInput): BidAskPlan {
 
   const range = validateBidAskRange(input);
   const provisionalBinCount = Math.min(input.requestedBinCount, spacingSlots(range.lowerTick, range.upperTick, input.tickSpacing));
+  const shapeVersion = bidAskShapeVersionForBinCount(provisionalBinCount);
   const bins = generateBidAskBinGeometry({
     lowerTick: range.lowerTick,
     upperTick: range.upperTick,
@@ -291,6 +335,7 @@ export function planBidAsk(input: BidAskPlannerInput): BidAskPlan {
     requestedBinCount: input.requestedBinCount,
     anchorIndex: range.orientation === "below" ? 0 : provisionalBinCount - 1,
     side: range.side,
+    shapeVersion,
   });
   const allocatedBins = allocateBidAskAmounts(bins, input.totalAmount, input.quoteIsToken0);
   const liquidityEstimator = input.liquidityForBin;
@@ -316,7 +361,7 @@ export function planBidAsk(input: BidAskPlannerInput): BidAskPlan {
   const totalAmount1 = finalBins.reduce((sum, bin) => sum + bin.allocatedAmount1, 0n);
   const generatedBinCount = finalBins.length;
   return {
-    shapeVersion: BID_ASK_SHAPE_VERSION,
+    shapeVersion,
     currentTick: input.currentTick,
     tickSpacing: input.tickSpacing,
     requestedBinCount: input.requestedBinCount,

@@ -89,7 +89,7 @@ The planner should expose pure functions for:
 Suggested types:
 
 ```ts
-type BidAskShapeVersion = "delta-amount-linear-v1";
+type BidAskShapeVersion = "delta-amount-linear-v1" | "delta-amount-linear-v2" | "delta-amount-linear-v3";
 
 type BidAskBinSide = "token0" | "token1";
 
@@ -157,27 +157,30 @@ For a one-sided range, the anchor is the bin adjacent to the current price:
 - Current price below the range: anchor is the first bin.
 - Current price above the range: anchor is the last bin.
 
-Let:
+For new ladders with up to ten generated bins, v3 uses:
 
 ```text
 d = abs(binIndex - anchorIndex)
-b = max(anchorIndex, lastIndex - anchorIndex, 1)
+S = sum(d * (d + 2)) for every bin
+k = (1_000_000 - 100_000 * binCount) / S
+weightMicros = 100_000 + k * d * (d + 2)
 ```
 
-Use the Delta Bid-Ask formula:
+The anchor is always exactly 10%, and the weight increases toward the
+farthest edge. Integer rounding is deterministic; the farthest bin receives
+the final remainder so the weight sum is exactly 1,000,000.
+
+For more than ten generated bins, v3 falls back to the persisted v2 Delta
+formula because a monotonic distribution with a fixed 10% anchor cannot sum
+to 100% once there are more than ten bins.
 
 ```text
-floatingWeight = max(0.02, d / b)
-weightMicros = max(1, round(floatingWeight * 1_000_000))
+3 bins: 10% | 29.09% | 60.91%
+4 bins: 10% | 16.92% | 28.46% | 44.62%
+5 bins: 10% | 13% | 18% | 25% | 34%
 ```
 
-Persist `weightMicros`. Do not normalize it to a different version and do not reinterpret it as a direct liquidity multiplier.
-
-Example, ordered from nearest to farthest:
-
-```text
-floating weights: 0.02 | 0.3333 | 0.6667 | 1.0
-```
+Persist `weightMicros`. Do not normalize it to a different version and do not reinterpret it as a direct liquidity multiplier. Existing v1 and v2 plans keep their stored weights and remain executable.
 
 ### Amount allocation
 

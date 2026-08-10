@@ -789,7 +789,7 @@ export class Executor {
     if (group.protocol !== "v3" && group.protocol !== "v4") {
       throw new GroupIntegrityError(`Unsupported group protocol ${group.protocol}`);
     }
-    if (group.shape !== "bid_ask" || (group.shapeVersion !== "delta-amount-linear-v1" && group.shapeVersion !== "delta-amount-linear-v2")) {
+    if (group.shape !== "bid_ask" || !["delta-amount-linear-v1", "delta-amount-linear-v2", "delta-amount-linear-v3"].includes(group.shapeVersion)) {
       throw new GroupIntegrityError(`Position group ${group.id} is not a supported Bid-Ask group`);
     }
     if (group.owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) {

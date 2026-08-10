@@ -258,7 +258,7 @@ export class Database {
         token1 TEXT NOT NULL,
         quote_token TEXT NOT NULL,
         shape TEXT NOT NULL CHECK (shape = 'bid_ask'),
-         shape_version TEXT NOT NULL CHECK (shape_version IN ('delta-amount-linear-v1', 'delta-amount-linear-v2')),
+         shape_version TEXT NOT NULL CHECK (shape_version IN ('delta-amount-linear-v1', 'delta-amount-linear-v2', 'delta-amount-linear-v3')),
         requested_bin_count INTEGER NOT NULL,
         generated_bin_count INTEGER NOT NULL,
         mintable_bin_count INTEGER NOT NULL,
@@ -296,7 +296,7 @@ export class Database {
            SELECT 1 FROM pg_constraint WHERE conname = 'position_groups_shape_version_check'
          ) THEN
            ALTER TABLE position_groups ADD CONSTRAINT position_groups_shape_version_check
-             CHECK (shape_version IN ('delta-amount-linear-v1', 'delta-amount-linear-v2'));
+             CHECK (shape_version IN ('delta-amount-linear-v1', 'delta-amount-linear-v2', 'delta-amount-linear-v3'));
          END IF;
        END $$;
        CREATE INDEX IF NOT EXISTS position_groups_chain_status_updated_idx ON position_groups(chain_id, status, updated_at ASC);
