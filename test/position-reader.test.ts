@@ -20,7 +20,7 @@ describe("PositionReader block consistency", () => {
         throw new Error(`Unexpected function ${request.functionName}`);
       },
     };
-    const chains = { getById: () => ({ client }) } as never;
+    const chains = { getById: () => ({ registry: { name: "base" }, client }), getForScan: () => ({ client }) } as never;
     const reader = new PositionReader(chains, 100);
     const position: PositionRecord = {
       id: "position",
@@ -57,7 +57,7 @@ describe("PositionReader block consistency", () => {
         throw new Error();
       },
     };
-    const chains = { getById: () => ({ client }) } as never;
+    const chains = { getById: () => ({ registry: { name: "base" }, client }), getForScan: () => ({ client }) } as never;
     const reader = new PositionReader(chains, 100);
     const position: PositionRecord = {
       id: "position", chainId: 8453, protocol: "v2", positionKey: pair, owner,

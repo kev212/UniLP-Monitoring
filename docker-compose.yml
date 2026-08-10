@@ -11,6 +11,19 @@ services:
     secrets:
       - executor_private_key
 
+  blink-rescue:
+    build: .
+    command: ["node", "dist/commands/blink-rescue.js"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:?set POSTGRES_USER}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    secrets:
+      - executor_private_key
+
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped

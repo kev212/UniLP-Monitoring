@@ -71,7 +71,7 @@ export class DiscoveryService {
       if (group.positionManager.toLowerCase() !== expectedPositionManager(registry, group.protocol).toLowerCase()) {
         throw new Error("position group manager does not match the configured manager");
       }
-      if (group.shape !== "bid_ask" || group.shapeVersion !== "delta-amount-linear-v1") {
+      if (group.shape !== "bid_ask" || (group.shapeVersion !== "delta-amount-linear-v1" && group.shapeVersion !== "delta-amount-linear-v2")) {
         throw new Error("position group is not a Bid-Ask group");
       }
 

@@ -43,7 +43,7 @@ export class PositionReader {
   constructor(private readonly chains: ChainClients, private readonly slippageBps: number) {}
 
   async read(position: PositionRecord, blockNumber?: bigint, removeSlippageBps?: number): Promise<PositionValue> {
-    const observedBlock = blockNumber ?? await this.chains.getById(position.chainId).client.getBlockNumber();
+    const observedBlock = blockNumber ?? await this.scanClient(position.chainId).getBlockNumber();
     const effective = removeSlippageBps ?? this.slippageBps;
     if (position.protocol === "v2") return this.readV2(position, observedBlock, effective);
     if (position.protocol === "v3") return this.readV3(position, observedBlock, effective);
@@ -52,7 +52,7 @@ export class PositionReader {
 
   private async readV2(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number): Promise<PositionValue> {
     if (!position.poolAddress) throw new Error("V2 position has no pair address");
-    const { client } = this.chains.getById(position.chainId);
+    const client = this.scanClient(position.chainId);
     const [balance, totalSupply, reserves] = await Promise.all([
       client.readContract({ address: position.poolAddress, abi: erc20Abi, functionName: "balanceOf", args: [position.owner], blockNumber }),
       client.readContract({ address: position.poolAddress, abi: v2PairAbi, functionName: "totalSupply", blockNumber }),
@@ -82,7 +82,8 @@ export class PositionReader {
   }
 
   private async readV3(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number): Promise<PositionValue> {
-    const { client, registry } = this.chains.getById(position.chainId);
+    const registry = this.chains.getById(position.chainId).registry;
+    const client = this.scanClient(position.chainId);
     const details = (await client.readContract({
       address: registry.contracts.v3.positionManager,
       abi: v3PositionManagerAbi,
@@ -136,7 +137,8 @@ export class PositionReader {
   }
 
   private async readV4(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number): Promise<PositionValue> {
-    const { client, registry } = this.chains.getById(position.chainId);
+    const registry = this.chains.getById(position.chainId).registry;
+    const client = this.scanClient(position.chainId);
     const tokenId = BigInt(position.positionKey);
     const metadata = position.metadata as Record<string, unknown>;
     const poolKey = { currency0: metadata.currency0 as Address, currency1: metadata.currency1 as Address, fee: metadata.fee as number, tickSpacing: metadata.tickSpacing as number, hooks: metadata.hooks as Address };
@@ -188,6 +190,11 @@ export class PositionReader {
       range: rangeInfo(slot0[1], tickLower, tickUpper, slot0[0]),
       observedBlock: blockNumber,
     };
+  }
+
+  private scanClient(chainId: number) {
+    const { registry } = this.chains.getById(chainId);
+    return this.chains.getForScan(registry.name).client;
   }
 
 }

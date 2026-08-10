@@ -19,5 +19,5 @@ export function isTransientRpcError(error: unknown): boolean {
   }
 
   const message = values.map((value) => String(value.message ?? "")).join(" ");
-  return /\b(?:408|425|429|500|502|503|504)\b|too many requests|rate limit|timed out|timeout|aborted|econnreset|econnrefused|enotfound|network|fetch failed|service unavailable|gateway/i.test(message);
+  return /\b(?:408|425|429|500|502|503|504)\b|too many requests|rate limit|timed out|timeout|aborted|econnreset|econnrefused|enotfound|network|fetch failed|service unavailable|gateway|unsupported block number|header not found|block(?:\s+number)?\s+(?:is\s+)?(?:not found|unavailable)|missing trie node/i.test(message);
 }

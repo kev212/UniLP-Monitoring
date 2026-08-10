@@ -4,11 +4,12 @@ import { v2FactoryAbi, v2RouterAbi, v3FactoryAbi, v3QuoterAbi, v4QuoterAbi } fro
 import { log } from "../log.js";
 import type { ChainName, PositionRecord, QuoteToken } from "../types.js";
 import { applySlippage } from "./uniswap-math.js";
-import type { ChainClients } from "./chain-client.js";
+import type { ChainClient, ChainClients } from "./chain-client.js";
 
 const V3_FEES = [100, 500, 3_000, 10_000] as const;
 const MAX_CONCURRENT_ROUTE_QUOTES = 4;
 const V4_QUOTE_ATTEMPTS = 3;
+const MISSING_POOL_CACHE_MS = 300_000;
 
 export interface V4PoolKey {
   currency0: Address;
@@ -41,6 +42,8 @@ interface QuoteOptions {
 
 export class RoutePlanner {
   private readonly quoteLimiter = new AsyncLimiter(MAX_CONCURRENT_ROUTE_QUOTES);
+  private readonly poolCache = new Map<string, { pool: Address; expiresAt: number }>();
+  private readonly poolLookups = new Map<string, Promise<Address>>();
 
   constructor(
     private readonly chains: ChainClients,
@@ -74,16 +77,11 @@ export class RoutePlanner {
   }
 
   private async quoteV2(position: PositionRecord, paths: Address[][], amountIn: bigint, excludedPool?: Address | null): Promise<SwapRoute[]> {
-    const { client, registry } = this.chains.getById(position.chainId);
+    const { client, registry } = this.scanChain(position);
     const excluded = excludedPool?.toLowerCase();
     const quotes = await Promise.all(paths.map(async (path) => {
       try {
-        const pools = await Promise.all(path.slice(1).map((token, index) => client.readContract({
-          address: registry.contracts.v2.factory,
-          abi: v2FactoryAbi,
-          functionName: "getPair",
-          args: [path[index]!, token],
-        })));
+        const pools = await Promise.all(path.slice(1).map((token, index) => this.getV2Pair(position, path[index]!, token)));
         if (pools.some((pool) => pool === zeroAddress || pool.toLowerCase() === excluded)) return null;
         const amounts = await client.readContract({
           address: registry.contracts.v2.router,
@@ -113,17 +111,12 @@ export class RoutePlanner {
   }
 
   private async quoteV3(position: PositionRecord, paths: Address[][], amountIn: bigint, excludedPool?: Address | null): Promise<SwapRoute[]> {
-    const { client, registry } = this.chains.getById(position.chainId);
+    const { client, registry } = this.scanChain(position);
     const excluded = excludedPool?.toLowerCase();
     const candidates = paths.flatMap((path) => feeCombinations(path.length - 1).map((fees) => ({ path, fees })));
     const quotes = await Promise.all(candidates.map(({ path, fees }) => this.quoteLimiter.run(async () => {
         try {
-          const pools = await Promise.all(fees.map((fee, index) => client.readContract({
-            address: registry.contracts.v3.factory,
-            abi: v3FactoryAbi,
-            functionName: "getPool",
-            args: [path[index]!, path[index + 1]!, fee],
-          })));
+          const pools = await Promise.all(fees.map((fee, index) => this.getV3Pool(position, path[index]!, path[index + 1]!, fee)));
           if (pools.some((pool) => pool === zeroAddress || pool.toLowerCase() === excluded)) return null;
           const encodedPath = encodeV3Path(path, fees);
           const simulation = await client.simulateContract({
@@ -155,6 +148,58 @@ export class RoutePlanner {
     return quotes.filter((quote) => quote !== null) as SwapRoute[];
   }
 
+  private async getV3Pool(position: PositionRecord, tokenA: Address, tokenB: Address, fee: number): Promise<Address> {
+    const tokens = [tokenA.toLowerCase(), tokenB.toLowerCase()].sort();
+    const key = `v3:${position.chainId}:${tokens[0]}:${tokens[1]}:${fee}`;
+    return this.getCachedPool(key, async () => {
+      const { client, registry } = this.scanChain(position);
+      return client.readContract({
+        address: registry.contracts.v3.factory,
+        abi: v3FactoryAbi,
+        functionName: "getPool",
+        args: [tokenA, tokenB, fee],
+      });
+    });
+  }
+
+  private async getV2Pair(position: PositionRecord, tokenA: Address, tokenB: Address): Promise<Address> {
+    const tokens = [tokenA.toLowerCase(), tokenB.toLowerCase()].sort();
+    const key = `v2:${position.chainId}:${tokens[0]}:${tokens[1]}`;
+    return this.getCachedPool(key, async () => {
+      const { client, registry } = this.scanChain(position);
+      return client.readContract({
+        address: registry.contracts.v2.factory,
+        abi: v2FactoryAbi,
+        functionName: "getPair",
+        args: [tokenA, tokenB],
+      });
+    });
+  }
+
+  private async getCachedPool(key: string, lookupPool: () => Promise<Address>): Promise<Address> {
+    const cached = this.poolCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.pool;
+
+    const pending = this.poolLookups.get(key);
+    if (pending) return pending;
+
+    const lookup = lookupPool().then((pool) => {
+      this.poolCache.set(key, {
+        pool,
+        expiresAt: pool === zeroAddress ? Date.now() + MISSING_POOL_CACHE_MS : Number.POSITIVE_INFINITY,
+      });
+      return pool;
+    }).finally(() => this.poolLookups.delete(key));
+    this.poolLookups.set(key, lookup);
+    return lookup;
+  }
+
+  private scanChain(position: PositionRecord): ChainClient {
+    const chain = this.chains.getById(position.chainId);
+    const clients = this.chains as unknown as { getForScan?: (name: typeof chain.registry.name) => ChainClient };
+    return typeof clients.getForScan === "function" ? clients.getForScan(chain.registry.name) : chain;
+  }
+
   private async quoteV4(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address): Promise<SwapRoute | null> {
     if (position.protocol !== "v4") return null;
     const meta = position.metadata as Record<string, unknown>;
@@ -170,7 +215,7 @@ export class RoutePlanner {
     const zeroForOne = tokenInL === currency0.toLowerCase() && tokenOutL === currency1.toLowerCase();
     if (!zeroForOne && (tokenInL !== currency1.toLowerCase() || tokenOutL !== currency0.toLowerCase())) return null;
 
-    const { client, registry } = this.chains.getById(position.chainId);
+    const { client, registry } = this.scanChain(position);
     const poolKey: V4PoolKey = { currency0, currency1, fee, tickSpacing, hooks };
     for (let attempt = 1; attempt <= V4_QUOTE_ATTEMPTS; attempt += 1) {
       try {

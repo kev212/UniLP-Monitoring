@@ -112,6 +112,37 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[0]![1]).toEqual(["position"]);
   });
 
+  it("persists a durable token rescue job with bigint NFT IDs", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({
+      rowCount: 1,
+      rows: [{
+        id: "blink-rescue",
+        chain_id: 4663,
+        token_address: "0x0000000000000000000000000000000000000001",
+        quote_token: "0x0000000000000000000000000000000000000002",
+        position_manager: "0x0000000000000000000000000000000000000003",
+        token_ids: ["1", "2"],
+        status: "polling",
+        pending_raw_transaction: null,
+        metadata: {},
+        last_error: null,
+      }],
+    });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.getOrCreateTokenRescueJob({
+      id: "blink-rescue",
+      chainId: 4663,
+      tokenAddress: "0x0000000000000000000000000000000000000001",
+      quoteToken: "0x0000000000000000000000000000000000000002",
+      positionManager: "0x0000000000000000000000000000000000000003",
+      tokenIds: [1n, 2n],
+    })).resolves.toMatchObject({ tokenIds: [1n, 2n], status: "polling" });
+    expect(query.mock.calls[0]![0]).toContain("INSERT INTO token_rescue_jobs");
+    expect(query.mock.calls[0]![1]![5]).toBe('["1","2"]');
+  });
+
   it("merges group status metadata and clears a pending signed transaction when requested", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [] });

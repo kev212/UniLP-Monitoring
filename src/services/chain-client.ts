@@ -33,6 +33,7 @@ export class ChainClients {
   private readonly clients = new Map<ChainName, ChainClient>();
   private readonly scanClients = new Map<ChainName, ChainClient>();
   private readonly logClients = new Map<ChainName, ChainClient>();
+  private readonly executionClients = new Map<ChainName, ChainClient>();
   private readonly enabledChains: Set<ChainName>;
   private readonly tokenMetadata = new Map<string, { decimals: number; symbol: string }>();
 
@@ -40,24 +41,28 @@ export class ChainClients {
     this.enabledChains = new Set(config.chains);
     for (const name of ["base", "robinhood", "bsc"] as const) {
       const registry = chainRegistry[name];
-      const endpoints = uniqueUrls([
-        config.alchemyHttp[name],
+      const publicEndpoints = uniqueUrls([
         config.rpcHttp[name],
         config.rpcHttpFallback[name],
       ]);
-      // Critical reads and writes must share HTTP failover. A configured WSS
-      // endpoint cannot be allowed to bypass the public Robinhood fallback.
-      const transport = createRpcTransport(endpoints);
+      const normalTransport = createRpcTransport([
+        ...publicEndpoints,
+        ...(config.alchemyHttp[name] ? [config.alchemyHttp[name]] : []),
+      ]);
       this.clients.set(name, {
         registry,
-        transport,
+        transport: normalTransport,
         client: createPublicClient({
           chain: registry.chain,
-          transport,
+          transport: normalTransport,
           pollingInterval: 4_000,
         }),
       });
-      const scanTransport = createRpcTransport(endpoints);
+      const scanTransport = createRpcTransport(uniqueUrls([
+        config.rpcHttp[name],
+        config.rpcHttpScanFallback?.[name],
+        config.rpcHttpFallback[name],
+      ]));
       this.scanClients.set(name, {
         registry,
         transport: scanTransport,
@@ -69,6 +74,7 @@ export class ChainClients {
       });
       const logTransport = createRpcTransport(uniqueUrls([
         config.rpcHttp[name],
+        config.rpcHttpScanFallback?.[name],
         config.rpcHttpFallback[name],
       ]));
       this.logClients.set(name, {
@@ -77,6 +83,19 @@ export class ChainClients {
         client: createPublicClient({
           chain: registry.chain,
           transport: logTransport,
+          pollingInterval: 4_000,
+        }),
+      });
+      const executionTransport = createRpcTransport(uniqueUrls([
+        config.alchemyHttp[name],
+        ...publicEndpoints,
+      ]));
+      this.executionClients.set(name, {
+        registry,
+        transport: executionTransport,
+        client: createPublicClient({
+          chain: registry.chain,
+          transport: executionTransport,
           pollingInterval: 4_000,
         }),
       });
@@ -98,6 +117,12 @@ export class ChainClients {
   getForLogs(name: ChainName): ChainClient {
     const item = this.logClients.get(name);
     if (!item) throw new Error(`Chain ${name} is not configured for log queries`);
+    return item;
+  }
+
+  getForExecution(name: ChainName): ChainClient {
+    const item = this.executionClients.get(name);
+    if (!item) throw new Error(`Chain ${name} is not configured for execution`);
     return item;
   }
 

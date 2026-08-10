@@ -120,12 +120,65 @@ describe("RPC failover transport", () => {
         robinhood: "https://fallback.example/rpc",
         bsc: "https://bsc-fallback.example/rpc",
       },
+      rpcHttpScanFallback: {
+        robinhood: "https://rpc.arrowrpc.com",
+      },
     } as RuntimeConfig);
 
     await expect(clients.getForLogs("robinhood").client.getChainId()).resolves.toBe(4663);
     expect(urls).toEqual([
       "https://public.example/rpc",
-      "https://fallback.example/rpc",
+      "https://rpc.arrowrpc.com/",
     ]);
+  });
+
+  it("keeps heavy scans on public and Arrow RPCs", async () => {
+    const urls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x1237" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const clients = new ChainClients({
+      chains: ["robinhood"],
+      alchemyHttp: { base: undefined, robinhood: "https://alchemy.example/rpc", bsc: undefined },
+      rpcHttp: { base: "https://base.example/rpc", robinhood: "https://public.example/rpc", bsc: "https://bsc.example/rpc" },
+      rpcHttpFallback: { robinhood: "https://public-fallback.example/rpc" },
+      rpcHttpScanFallback: { robinhood: "https://rpc.arrowrpc.com" },
+    } as RuntimeConfig);
+
+    await clients.getForScan("robinhood").client.getChainId();
+
+    expect(urls).toEqual(["https://public.example/rpc"]);
+    expect(urls.some((url) => url.includes("alchemy.example"))).toBe(false);
+  });
+
+  it("uses Alchemy first for execution and never uses Arrow", async () => {
+    const urls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x1237" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const clients = new ChainClients({
+      chains: ["robinhood"],
+      alchemyHttp: { base: undefined, robinhood: "https://alchemy.example/rpc", bsc: undefined },
+      rpcHttp: { base: "https://base.example/rpc", robinhood: "https://public.example/rpc", bsc: "https://bsc.example/rpc" },
+      rpcHttpFallback: { robinhood: "https://public-fallback.example/rpc" },
+      rpcHttpScanFallback: { robinhood: "https://rpc.arrowrpc.com" },
+    } as RuntimeConfig);
+
+    await clients.getForExecution("robinhood").client.getChainId();
+
+    expect(urls).toEqual(["https://alchemy.example/rpc"]);
+    expect(urls.some((url) => url.includes("arrowrpc.com"))).toBe(false);
   });
 });

@@ -37,6 +37,7 @@ const config: RuntimeConfig = {
   maxLogBlockRange: 2_000n,
   rpcRequestDelayMs: 0,
   rpcBootstrapLookbackBlocks: 50_000n,
+  blinkRescuePollIntervalMs: 15_000,
   startBlocks: { base: 0n, robinhood: 0n },
 };
 

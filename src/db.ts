@@ -18,10 +18,14 @@ import type {
   PositionGroupPnlSnapshotRecord,
   PositionGroupRecord,
   PositionGroupStatus,
+  PositionGroupShapeVersion,
   PositionRecord,
   PositionStatus,
   Protocol,
   RiskSettings,
+  TokenRescueJob,
+  TokenRescuePendingTransaction,
+  TokenRescueStatus,
   TrailingStopState,
 } from "./types.js";
 
@@ -43,6 +47,19 @@ interface PositionRow {
   metadata: Record<string, unknown>;
 }
 
+interface TokenRescueJobRow {
+  id: string;
+  chain_id: number;
+  token_address: string;
+  quote_token: string;
+  position_manager: string;
+  token_ids: string[];
+  status: TokenRescueStatus;
+  pending_raw_transaction: TokenRescuePendingTransaction | null;
+  metadata: Record<string, unknown>;
+  last_error: string | null;
+}
+
 interface PositionGroupRow {
   id: string;
   chain_id: number;
@@ -54,7 +71,7 @@ interface PositionGroupRow {
   token1: string;
   quote_token: string;
   shape: "bid_ask";
-  shape_version: "delta-amount-linear-v1";
+  shape_version: PositionGroupShapeVersion;
   requested_bin_count: number;
   generated_bin_count: number;
   mintable_bin_count: number;
@@ -241,7 +258,7 @@ export class Database {
         token1 TEXT NOT NULL,
         quote_token TEXT NOT NULL,
         shape TEXT NOT NULL CHECK (shape = 'bid_ask'),
-        shape_version TEXT NOT NULL CHECK (shape_version = 'delta-amount-linear-v1'),
+         shape_version TEXT NOT NULL CHECK (shape_version IN ('delta-amount-linear-v1', 'delta-amount-linear-v2')),
         requested_bin_count INTEGER NOT NULL,
         generated_bin_count INTEGER NOT NULL,
         mintable_bin_count INTEGER NOT NULL,
@@ -271,8 +288,18 @@ export class Database {
         metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS position_groups_chain_status_updated_idx ON position_groups(chain_id, status, updated_at ASC);
+       );
+       ALTER TABLE position_groups DROP CONSTRAINT IF EXISTS position_groups_shape_version_check;
+       DO $$
+       BEGIN
+         IF NOT EXISTS (
+           SELECT 1 FROM pg_constraint WHERE conname = 'position_groups_shape_version_check'
+         ) THEN
+           ALTER TABLE position_groups ADD CONSTRAINT position_groups_shape_version_check
+             CHECK (shape_version IN ('delta-amount-linear-v1', 'delta-amount-linear-v2'));
+         END IF;
+       END $$;
+       CREATE INDEX IF NOT EXISTS position_groups_chain_status_updated_idx ON position_groups(chain_id, status, updated_at ASC);
       CREATE INDEX IF NOT EXISTS position_groups_status_updated_idx ON position_groups(status, updated_at ASC);
       CREATE TABLE IF NOT EXISTS position_group_bins (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -329,6 +356,21 @@ export class Database {
         ON position_group_execution_attempts(group_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS position_group_execution_attempts_group_stage_status_idx
         ON position_group_execution_attempts(group_id, stage, status, created_at DESC);
+      CREATE TABLE IF NOT EXISTS token_rescue_jobs (
+        id TEXT PRIMARY KEY,
+        chain_id INTEGER NOT NULL,
+        token_address TEXT NOT NULL,
+        quote_token TEXT NOT NULL,
+        position_manager TEXT NOT NULL,
+        token_ids JSONB NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('polling', 'collected', 'swapped', 'completed', 'needs_review')),
+        pending_raw_transaction JSONB,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        last_error TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS token_rescue_jobs_chain_status_idx ON token_rescue_jobs(chain_id, status, updated_at ASC);
       CREATE TABLE IF NOT EXISTS position_group_cashflows (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         group_id UUID NOT NULL REFERENCES position_groups(id) ON DELETE CASCADE,
@@ -1759,6 +1801,111 @@ export class Database {
     );
   }
 
+  async getOrCreateTokenRescueJob(input: {
+    id: string;
+    chainId: number;
+    tokenAddress: Address;
+    quoteToken: Address;
+    positionManager: Address;
+    tokenIds: bigint[];
+  }): Promise<TokenRescueJob> {
+    const result = await this.pool.query<TokenRescueJobRow>(
+      `INSERT INTO token_rescue_jobs (id, chain_id, token_address, quote_token, position_manager, token_ids, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'polling')
+       ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id
+       RETURNING *`,
+      [
+        input.id,
+        input.chainId,
+        input.tokenAddress.toLowerCase(),
+        input.quoteToken.toLowerCase(),
+        input.positionManager.toLowerCase(),
+        JSON.stringify(input.tokenIds.map(String)),
+      ],
+    );
+    return mapTokenRescueJob(result.rows[0]!);
+  }
+
+  async getTokenRescueJob(id: string): Promise<TokenRescueJob | null> {
+    const result = await this.pool.query<TokenRescueJobRow>("SELECT * FROM token_rescue_jobs WHERE id = $1", [id]);
+    return result.rowCount ? mapTokenRescueJob(result.rows[0]!) : null;
+  }
+
+  async setTokenRescueJobState(
+    id: string,
+    status: TokenRescueStatus,
+    metadata: Record<string, unknown> = {},
+    lastError: string | null = null,
+    expectedStatus: TokenRescueStatus | null = null,
+  ): Promise<TokenRescueJob> {
+    const result = await this.pool.query<TokenRescueJobRow>(
+      `UPDATE token_rescue_jobs
+       SET status = $2,
+           metadata = metadata || $3::jsonb,
+           last_error = $4,
+           updated_at = NOW()
+       WHERE id = $1
+         AND status <> 'completed'
+         AND ($5::text IS NULL OR status = $5)
+       RETURNING *`,
+      [id, status, JSON.stringify(metadata), lastError, expectedStatus],
+    );
+    if (!result.rowCount) throw new Error(`Token rescue job ${id} was not found`);
+    return mapTokenRescueJob(result.rows[0]!);
+  }
+
+  async setTokenRescuePendingTransaction(
+    id: string,
+    expectedStatus: TokenRescueStatus,
+    pending: TokenRescuePendingTransaction,
+    metadata: Record<string, unknown> = {},
+  ): Promise<TokenRescueJob> {
+    const result = await this.pool.query<TokenRescueJobRow>(
+      `UPDATE token_rescue_jobs
+       SET pending_raw_transaction = $3::jsonb,
+           metadata = metadata || $4::jsonb,
+           last_error = NULL,
+           updated_at = NOW()
+       WHERE id = $1
+         AND status = $2
+         AND pending_raw_transaction IS NULL
+       RETURNING *`,
+      [id, expectedStatus, JSON.stringify(pending), JSON.stringify(metadata)],
+    );
+    if (!result.rowCount) throw new Error(`Token rescue job ${id} cannot accept a signed transaction`);
+    return mapTokenRescueJob(result.rows[0]!);
+  }
+
+  async clearTokenRescuePendingTransaction(
+    id: string,
+    expectedHash: string,
+    status: TokenRescueStatus,
+    metadata: Record<string, unknown> = {},
+    lastError: string | null = null,
+  ): Promise<TokenRescueJob> {
+    const result = await this.pool.query<TokenRescueJobRow>(
+      `UPDATE token_rescue_jobs
+       SET status = $3,
+           pending_raw_transaction = NULL,
+           metadata = metadata || $4::jsonb,
+           last_error = $5,
+           updated_at = NOW()
+       WHERE id = $1
+         AND pending_raw_transaction->>'hash' = $2
+       RETURNING *`,
+      [id, expectedHash, status, JSON.stringify(metadata), lastError],
+    );
+    if (!result.rowCount) throw new Error(`Token rescue job ${id} was not found`);
+    return mapTokenRescueJob(result.rows[0]!);
+  }
+
+  async setTokenRescueJobError(id: string, lastError: string): Promise<void> {
+    await this.pool.query(
+      "UPDATE token_rescue_jobs SET last_error = $2, updated_at = NOW() WHERE id = $1",
+      [id, lastError],
+    );
+  }
+
   async hasPendingRawTransaction(chainId: number): Promise<boolean> {
     const result = await this.pool.query(
       `SELECT 1
@@ -1782,14 +1929,20 @@ export class Database {
          AND group_record.status NOT IN ('settled', 'cancelled')
          AND attempt.status IN ('planned', 'submitted')
          AND attempt.signed_raw_transaction IS NOT NULL
-         AND NOT EXISTS (
+          AND NOT EXISTS (
            SELECT 1
            FROM position_group_execution_attempts terminal
            WHERE terminal.group_id = attempt.group_id
              AND terminal.stage = attempt.stage
              AND terminal.transaction_hash IS NOT DISTINCT FROM attempt.transaction_hash
-             AND terminal.status IN ('failed', 'confirmed')
-         )
+              AND terminal.status IN ('failed', 'confirmed')
+          )
+       UNION ALL
+       SELECT 1
+       FROM token_rescue_jobs
+       WHERE chain_id = $1
+         AND status NOT IN ('completed', 'needs_review')
+         AND pending_raw_transaction IS NOT NULL
        LIMIT 1`,
       [chainId],
     );
@@ -2421,6 +2574,21 @@ function mapPositionGroupPnlSnapshot(row: PositionGroupPnlSnapshotRow): Position
     rangeCurrentTick: row.range_current_tick === null ? null : Number(row.range_current_tick),
     rangeCurrentSqrtPrice: row.range_current_sqrt_price === null ? null : BigInt(row.range_current_sqrt_price),
     createdAt: new Date(row.created_at),
+  };
+}
+
+function mapTokenRescueJob(row: TokenRescueJobRow): TokenRescueJob {
+  return {
+    id: row.id,
+    chainId: row.chain_id,
+    tokenAddress: row.token_address as Address,
+    quoteToken: row.quote_token as Address,
+    positionManager: row.position_manager as Address,
+    tokenIds: row.token_ids.map(BigInt),
+    status: row.status,
+    pendingRawTransaction: row.pending_raw_transaction,
+    metadata: row.metadata,
+    lastError: row.last_error,
   };
 }
 

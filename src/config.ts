@@ -7,6 +7,7 @@ import { z } from "zod";
 import type { ChainName, PoolScanSettings, QuoteToken } from "./types.js";
 
 export const PUBLIC_ROBINHOOD_RPC_HTTP = "https://rpc.mainnet.chain.robinhood.com";
+export const PUBLIC_ROBINHOOD_SCAN_RPC_HTTP = "https://rpc.arrowrpc.com";
 
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
@@ -20,6 +21,7 @@ const envSchema = z.object({
   ROBINHOOD_RPC_HTTP: z.string().url(),
   ROBINHOOD_RPC_WSS: z.string().url().optional().or(z.literal("")),
   ROBINHOOD_RPC_HTTP_FALLBACK: z.string().url().optional().or(z.literal("")),
+  ROBINHOOD_SCAN_RPC_HTTP: z.string().url().default(PUBLIC_ROBINHOOD_SCAN_RPC_HTTP),
   BSC_RPC_HTTP: z.string().url().default("https://bsc-dataseed.bnbchain.org"),
   BSC_RPC_WSS: z.string().url().optional().or(z.literal("")),
   BSC_RPC_HTTP_FALLBACK: z.string().url().optional().or(z.literal("")),
@@ -85,6 +87,7 @@ const envSchema = z.object({
   MAX_LOG_BLOCK_RANGE: z.coerce.number().int().min(1).max(100_000).optional(),
   RPC_REQUEST_DELAY_MS: z.coerce.number().int().min(0).max(5_000).optional(),
   RPC_BOOTSTRAP_LOOKBACK_BLOCKS: z.coerce.number().int().min(1_000).max(1_000_000).default(50_000),
+  BLINK_RESCUE_POLL_INTERVAL_MS: z.coerce.number().int().min(5_000).max(300_000).default(15_000),
   START_BLOCK_BASE: z.coerce.bigint().min(0n).default(0n),
   START_BLOCK_ROBINHOOD: z.coerce.bigint().min(0n).default(0n),
   START_BLOCK_BSC: z.coerce.bigint().min(0n).default(0n),
@@ -101,6 +104,7 @@ export interface RuntimeConfig {
   rpcHttp: Record<ChainName, string>;
   rpcWss: Partial<Record<ChainName, string>>;
   rpcHttpFallback: Partial<Record<ChainName, string>>;
+  rpcHttpScanFallback: Partial<Record<ChainName, string>>;
   alchemyHttp: Partial<Record<ChainName, string>>;
   quoteTokens: Record<ChainName, QuoteToken[]>;
   stopLossPercent: number;
@@ -150,6 +154,7 @@ export interface RuntimeConfig {
   maxLogBlockRange: bigint;
   rpcRequestDelayMs: number;
   rpcBootstrapLookbackBlocks: bigint;
+  blinkRescuePollIntervalMs: number;
   startBlocks: Record<ChainName, bigint>;
   telegram?: { token: string; chatId: string; userId: string };
 }
@@ -273,7 +278,12 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     },
     rpcHttpFallback: {
       ...(env.BASE_RPC_HTTP_FALLBACK ? { base: env.BASE_RPC_HTTP_FALLBACK } : {}),
-    robinhood: env.ROBINHOOD_RPC_HTTP_FALLBACK || PUBLIC_ROBINHOOD_RPC_HTTP,
+      robinhood: env.ROBINHOOD_RPC_HTTP_FALLBACK || PUBLIC_ROBINHOOD_RPC_HTTP,
+      ...(env.BSC_RPC_HTTP_FALLBACK ? { bsc: env.BSC_RPC_HTTP_FALLBACK } : {}),
+    },
+    rpcHttpScanFallback: {
+      ...(env.BASE_RPC_HTTP_FALLBACK ? { base: env.BASE_RPC_HTTP_FALLBACK } : {}),
+      robinhood: env.ROBINHOOD_SCAN_RPC_HTTP,
       ...(env.BSC_RPC_HTTP_FALLBACK ? { bsc: env.BSC_RPC_HTTP_FALLBACK } : {}),
     },
     alchemyHttp: {
@@ -349,6 +359,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
       ? env.RPC_REQUEST_DELAY_MS
       : 0,
     rpcBootstrapLookbackBlocks: BigInt(env.RPC_BOOTSTRAP_LOOKBACK_BLOCKS),
+    blinkRescuePollIntervalMs: env.BLINK_RESCUE_POLL_INTERVAL_MS,
     startBlocks: { base: env.START_BLOCK_BASE, robinhood: env.START_BLOCK_ROBINHOOD, bsc: env.START_BLOCK_BSC },
     telegram,
   };

@@ -145,6 +145,7 @@ type BidAskDatabase = Pick<
   | "setPositionGroupOpenTransaction"
   | "recordPositionGroupExecution"
   | "withExecutionLock"
+  | "hasPendingRawTransaction"
 >;
 
 export type BidAskOpenReconciler = (
@@ -202,9 +203,13 @@ export class PositionOpener {
     return this.chains.getForScan(chain).client;
   }
 
+  private executionClient(chain: ChainName): PublicClient {
+    return this.chains.getForExecution(chain).client;
+  }
+
   private walletClient(chain: ChainName) {
     if (!this.account) throw new Error("Executor private key is not configured");
-    const { registry, transport } = this.chains.getForScan(chain);
+    const { registry, transport } = this.chains.getForExecution(chain);
     return createWalletClient({ chain: registry.chain, transport, account: this.account });
   }
 
@@ -480,7 +485,7 @@ export class PositionOpener {
     if (!this.isStillStraddling(preview, refreshed.currentTick)) throw new Error("Pool price moved outside the dual-side range; review and confirm again");
 
     if (preview.protocol === "v4") {
-      await this.ensureWrappedNativeFunding(this.client(preview.chain), preview.chain, preview.quoteToken, preview.depositAmount, this.config.executorAddress);
+      await this.ensureWrappedNativeFunding(this.executionClient(preview.chain), preview.chain, preview.quoteToken, preview.depositAmount, this.config.executorAddress);
     }
     const swapResult = await this.swapQuoteForBase(merged);
     const baseAmount = swapResult.actualBaseOut;
@@ -497,7 +502,7 @@ export class PositionOpener {
     if (!this.database || !this.reconcileBidAskOpen) {
       throw new Error("Bid-Ask open requires durable group persistence and receipt reconciliation");
     }
-    const client = this.client(preview.chain);
+    const client = this.executionClient(preview.chain);
     const firstState = await this.readBidAskPool(preview.poolAddress, preview.chain);
     this.assertBidAskPoolSupported(firstState);
     this.assertBidAskStateMatches(preview, firstState);
@@ -955,7 +960,7 @@ export class PositionOpener {
   }
 
   private async simulateAndEstimateBidAsk(chain: ChainName, plan: TransactionPlan, binCount: number): Promise<BidAskGasResult> {
-    const client = this.client(chain);
+    const client = this.executionClient(chain);
     try {
       await client.call({ account: this.config.executorAddress, to: plan.to, data: plan.data, value: plan.value ?? 0n });
       const estimatedGas = BigInt(await client.estimateGas({ account: this.config.executorAddress, to: plan.to, data: plan.data, value: plan.value ?? 0n }));
@@ -1100,7 +1105,8 @@ export class PositionOpener {
     if (!this.database) throw new Error("Bid-Ask group database is not configured");
     const chainId = this.chains.get(chain).registry.chain.id;
     const run = async (): Promise<{ hash: Hex | null; receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>> }> => {
-      const client = this.client(chain);
+      if (await this.database!.hasPendingRawTransaction(chainId)) throw new Error(`Chain ${chainId} has an unresolved signed transaction`);
+      const client = this.executionClient(chain);
       const executor = this.config.executorAddress;
       await client.call({ account: executor, to, data, value });
       await this.database!.recordPositionGroupExecution(groupId, "open_batch", "planned", undefined, undefined, undefined, undefined, {
@@ -1160,7 +1166,7 @@ export class PositionOpener {
   }
 
   private async executeV3(preview: OpenPositionPreview, deadline: bigint): Promise<{ hash: Hex | null }> {
-    const client = this.client(preview.chain);
+    const client = this.executionClient(preview.chain);
     const { registry } = this.chains.get(preview.chain);
     const positionManager = registry.contracts.v3.positionManager;
     const executor = this.config.executorAddress;
@@ -1180,7 +1186,7 @@ export class PositionOpener {
   }
 
   private async executeV4(preview: OpenPositionPreview, deadline: bigint): Promise<{ hash: Hex | null }> {
-    const client = this.client(preview.chain);
+    const client = this.executionClient(preview.chain);
     const { registry } = this.chains.get(preview.chain);
     const positionManager = registry.contracts.v4.positionManager;
     const executor = this.config.executorAddress;
@@ -1201,7 +1207,7 @@ export class PositionOpener {
   }
 
   private async executeV3Dual(preview: OpenPositionPreview, deadline: bigint, quoteAmount: bigint, baseAmount: bigint): Promise<{ hash: Hex | null }> {
-    const client = this.client(preview.chain);
+    const client = this.executionClient(preview.chain);
     const { registry } = this.chains.get(preview.chain);
     const positionManager = registry.contracts.v3.positionManager;
     const executor = this.config.executorAddress;
@@ -1240,7 +1246,7 @@ export class PositionOpener {
   }
 
   private async executeV4Dual(preview: OpenPositionPreview, deadline: bigint, quoteAmount: bigint, baseAmount: bigint): Promise<{ hash: Hex | null }> {
-    const client = this.client(preview.chain);
+    const client = this.executionClient(preview.chain);
     const { registry } = this.chains.get(preview.chain);
     const positionManager = registry.contracts.v4.positionManager;
     const executor = this.config.executorAddress;
@@ -1442,7 +1448,7 @@ export class PositionOpener {
     if (swapAmount === 0n || !preview.baseToken) return { hash: null, actualBaseOut: 0n };
 
     const executor = this.config.executorAddress;
-    const client = this.client(preview.chain);
+    const client = this.executionClient(preview.chain);
     const { registry } = this.chains.get(preview.chain);
 
     if (this.tradingApi) {
@@ -1531,7 +1537,7 @@ export class PositionOpener {
   }
 
   private async broadcast(chain: ChainName, to: Address, data: Hex, value = 0n): Promise<{ hash: Hex | null }> {
-    const client = this.client(chain);
+    const client = this.executionClient(chain);
     const executor = this.config.executorAddress;
 
     await client.call({ account: executor, to, data, value });

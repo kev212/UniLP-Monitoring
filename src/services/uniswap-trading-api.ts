@@ -6,6 +6,7 @@ const API_URL = "https://trade-api.gateway.uniswap.org/v1";
 const UNIVERSAL_ROUTER_VERSION = "2.1.1";
 export const UNISWAP_API_ROUTER = "0x02E5be68D46DAc0B524905bfF209cf47EE6dB2a9" as Address;
 const QUOTE_VALIDITY_MS = 10_000;
+const QUOTE_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const TRADING_API_UNIVERSAL_ROUTERS: Readonly<Record<number, Address>> = {
   4663: "0x8876789976decbfcbbbe364623c63652db8c0904",
   8453: "0xFdf682F51FE81Aa4898F0AE2163d8A55c127fbC7",
@@ -37,6 +38,8 @@ interface TradingApiTransaction {
 }
 
 export class UniswapTradingApi {
+  private quoteRateLimitedUntil = 0;
+
   constructor(
     private readonly apiKey: string,
     private readonly slippageBps: number,
@@ -46,18 +49,27 @@ export class UniswapTradingApi {
 
   async quote(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address, slippageBps = this.slippageBps): Promise<TradingApiQuote | null> {
     if (!Number.isSafeInteger(slippageBps) || slippageBps < 1 || slippageBps > 2_000) throw new Error("Trading API slippage must be between 1 and 2000 bps");
-    const response = await this.post("/quote", {
-      swapper: position.owner,
-      recipient: position.owner,
-      tokenIn,
-      tokenOut,
-      tokenInChainId: position.chainId,
-      tokenOutChainId: position.chainId,
-      amount: amountIn.toString(),
-      type: "EXACT_INPUT",
-      slippageTolerance: slippageBps / 100,
-      routingPreference: "BEST_PRICE",
-    }, true);
+    if (Date.now() < this.quoteRateLimitedUntil) return null;
+    let response: Json | null;
+    try {
+      response = await this.post("/quote", {
+        swapper: position.owner,
+        recipient: position.owner,
+        tokenIn,
+        tokenOut,
+        tokenInChainId: position.chainId,
+        tokenOutChainId: position.chainId,
+        amount: amountIn.toString(),
+        type: "EXACT_INPUT",
+        slippageTolerance: slippageBps / 100,
+        routingPreference: "BEST_PRICE",
+      }, true);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("failed (429)")) {
+        this.quoteRateLimitedUntil = Date.now() + QUOTE_RATE_LIMIT_COOLDOWN_MS;
+      }
+      throw error;
+    }
     if (!response) return null;
 
     if (response.routing !== "CLASSIC") {

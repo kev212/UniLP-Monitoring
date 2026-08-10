@@ -26,7 +26,7 @@ export type PositionGroupStatus =
 export type PositionGroupBinStatus = "planned" | "minted" | "closed" | "skipped" | "needs_review";
 export type PositionGroupBinSide = "token0" | "token1";
 export type PositionGroupShape = "bid_ask";
-export type PositionGroupShapeVersion = "delta-amount-linear-v1";
+export type PositionGroupShapeVersion = "delta-amount-linear-v1" | "delta-amount-linear-v2";
 
 export type PositionGroupExecutionStage =
   | "approve_quote"
@@ -41,6 +41,28 @@ export type PositionGroupExecutionStage =
 export type PositionGroupExecutionStatus = "planned" | "submitted" | "confirmed" | "failed";
 
 export type PositionGroupCashflowType = "open_debit" | "close_receipt" | "settlement_swap" | "unwrap_quote";
+
+export type TokenRescueStatus = "polling" | "collected" | "swapped" | "completed" | "needs_review";
+
+export interface TokenRescuePendingTransaction {
+  stage: "collect" | "approve_reset" | "approve" | "swap" | "unwrap";
+  hash: Hex;
+  serializedTransaction: Hex;
+  submittedAt: string;
+}
+
+export interface TokenRescueJob {
+  id: string;
+  chainId: number;
+  tokenAddress: Address;
+  quoteToken: Address;
+  positionManager: Address;
+  tokenIds: bigint[];
+  status: TokenRescueStatus;
+  pendingRawTransaction: TokenRescuePendingTransaction | null;
+  metadata: Record<string, unknown>;
+  lastError: string | null;
+}
 
 export type ExitTrigger = "stop_loss" | "take_profit" | "trailing_take_profit" | "profit_oor_above" | "out_of_range_above" | "manual";
 

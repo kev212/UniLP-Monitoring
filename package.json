@@ -14,7 +14,8 @@
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "backfill:ba-history": "node dist/commands/backfill-ba-history.js"
+    "backfill:ba-history": "node dist/commands/backfill-ba-history.js",
+    "rescue:blink": "node dist/commands/blink-rescue.js"
   },
   "dependencies": {
     "@uniswap/sdk-core": "7.18.0",

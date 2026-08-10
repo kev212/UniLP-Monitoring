@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { encodeFunctionData, parseAbi } from "viem";
 
 import type { PositionRecord } from "../src/types.js";
@@ -73,6 +73,16 @@ describe("UniswapTradingApi", () => {
     const api = new UniswapTradingApi("test-key", 100, async () => json({ detail: "No quotes available" }, 404));
 
     await expect(api.quote(position, tokenIn, 1_000n, tokenOut)).resolves.toBeNull();
+  });
+
+  it("pauses quote requests after a rate limit response", async () => {
+    const request = vi.fn(async () => json({ detail: "Rate limit exceeded" }, 429));
+    const api = new UniswapTradingApi("test-key", 100, request);
+
+    await expect(api.quote(position, tokenIn, 1_000n, tokenOut)).rejects.toThrow("failed (429)");
+    await expect(api.quote(position, tokenIn, 1_000n, tokenOut)).resolves.toBeNull();
+
+    expect(request).toHaveBeenCalledTimes(1);
   });
 
   it("strips permit fields and validates API swap calldata", async () => {

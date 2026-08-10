@@ -37,6 +37,7 @@ import {
   v4StateViewAbi,
   v4UniversalRouterAbi,
 } from "../abi.js";
+import { chainRegistry } from "../chains.js";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
@@ -49,7 +50,7 @@ import type {
   PositionRecord,
   TransactionPlan,
 } from "../types.js";
-import type { ChainClients } from "./chain-client.js";
+import type { ChainClient, ChainClients } from "./chain-client.js";
 import type { Notifier } from "./notifier.js";
 import type { PositionReader, PositionValue } from "./position-reader.js";
 import type { RoutePlanner, SwapRoute } from "./route-planner.js";
@@ -788,7 +789,7 @@ export class Executor {
     if (group.protocol !== "v3" && group.protocol !== "v4") {
       throw new GroupIntegrityError(`Unsupported group protocol ${group.protocol}`);
     }
-    if (group.shape !== "bid_ask" || group.shapeVersion !== "delta-amount-linear-v1") {
+    if (group.shape !== "bid_ask" || (group.shapeVersion !== "delta-amount-linear-v1" && group.shapeVersion !== "delta-amount-linear-v2")) {
       throw new GroupIntegrityError(`Position group ${group.id} is not a supported Bid-Ask group`);
     }
     if (group.owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) {
@@ -818,7 +819,8 @@ export class Executor {
     const missingPositionId = positionIds.find((positionId) => !byId.has(positionId));
     if (missingPositionId) throw new GroupIntegrityError(`Active child position ${missingPositionId} is unavailable`);
 
-    const { client } = this.chains.getById(group.chainId);
+    const { registry } = this.chains.getById(group.chainId);
+    const { client } = this.scanChain(registry.name);
     const blockNumber = await client.getBlockNumber();
     const removeSlippageBps = effectiveRemoveSlippageBps(
       this.config.removeLiquiditySlippageBps,
@@ -1661,7 +1663,7 @@ export class Executor {
     if (!leaseToken) throw new Error("Position group lease is required before broadcast");
     const renew = this.groupDatabase().renewPositionGroupLease;
     if (renew && !(await renew.call(this.database, group.id, leaseToken))) throw new Error("Position group lease ownership was lost before broadcast");
-    const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport: this.chains.getForScan(registry.name).transport });
+      const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport: this.executionChain(registry.name).transport });
     const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account, to: plan.to, data: plan.data, value: plan.value ?? 0n });
     const serializedTransaction = await wallet.signTransaction(preparedRequest);
     const hash = keccak256(serializedTransaction);
@@ -1726,7 +1728,7 @@ export class Executor {
         const wallet = createWalletClient({
           account: this.account!,
           chain: registry.chain,
-          transport: this.chains.getForScan(registry.name).transport,
+          transport: this.executionChain(registry.name).transport,
         });
         try {
           const hash = await wallet.sendRawTransaction({ serializedTransaction: pending.serializedTransaction });
@@ -2525,11 +2527,26 @@ export class Executor {
     const name = registry.name;
     const existing = this.executorClientCache.get(name);
     if (existing) return existing;
-    const executionClient = typeof this.chains.getForScan === "function"
-      ? this.chains.getForScan(name).client
-      : client;
+    const executionClient = this.executionChain(name).client ?? client;
     this.executorClientCache.set(name, executionClient);
     return executionClient;
+  }
+
+  private executionChain(name: Parameters<ChainClients["getForExecution"]>[0]): ChainClient {
+    const clients = this.chains as unknown as {
+      getForExecution?: (chain: Parameters<ChainClients["getForExecution"]>[0]) => ChainClient;
+      getForScan?: (chain: Parameters<ChainClients["getForExecution"]>[0]) => ChainClient;
+    };
+    if (typeof clients.getForExecution === "function") return clients.getForExecution(name);
+    if (typeof clients.getForScan === "function") return clients.getForScan(name);
+    return this.chains.getById(chainRegistry[name].chain.id);
+  }
+
+  private scanChain(name: Parameters<ChainClients["getForExecution"]>[0]): ChainClient {
+    const clients = this.chains as unknown as { getForScan?: (chain: Parameters<ChainClients["getForExecution"]>[0]) => ChainClient };
+    return typeof clients.getForScan === "function"
+      ? clients.getForScan(name)
+      : this.chains.getById(chainRegistry[name].chain.id);
   }
 
   private send(position: PositionRecord, stage: string, plan: TransactionPlan): Promise<Hex | null> {
@@ -2562,7 +2579,7 @@ export class Executor {
     if (!(await this.database.renewSettlementLease(position.id, leaseToken))) {
       throw new Error("Settlement lease ownership was lost before broadcast");
     }
-    const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport: this.chains.getForScan(registry.name).transport });
+    const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport: this.executionChain(registry.name).transport });
     const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account, to: plan.to, data: plan.data, value: plan.value ?? 0n });
     const request = stage === "swap_to_quote"
       ? { ...preparedRequest, gas: bufferedGasLimit(preparedRequest.gas, this.config.swapGasLimitMultiplierPercent) }
@@ -2692,7 +2709,7 @@ export class Executor {
     const wallet = createWalletClient({
       account: this.account,
       chain: registry.chain,
-      transport: this.chains.getForScan(registry.name).transport,
+      transport: this.executionChain(registry.name).transport,
     });
     try {
       const hash = await wallet.sendRawTransaction({ serializedTransaction: pending.serializedTransaction });
@@ -2906,7 +2923,7 @@ export class Executor {
 
   private async findV4WithdrawalEvent(position: PositionRecord, salt: Hex) {
     const { registry } = this.chains.getById(position.chainId);
-    const { client } = this.chains.getForScan(registry.name);
+    const { client } = this.scanChain(registry.name);
     const { client: logClient } = this.chains.getForLogs(registry.name);
     const fromBlock = position.openedAtBlock ?? 0n;
     let toBlock = await client.getBlockNumber();

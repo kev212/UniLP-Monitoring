@@ -9,11 +9,15 @@ import {
   tickToFloorSpacing,
 } from "./uniswap-math.js";
 
-export type BidAskShapeVersion = "delta-amount-linear-v1";
+export type BidAskShapeVersion = "delta-amount-linear-v1" | "delta-amount-linear-v2";
 export type BidAskBinSide = "token0" | "token1";
 export type BidAskRangeOrientation = "below" | "above";
 
-export const BID_ASK_SHAPE_VERSION: BidAskShapeVersion = "delta-amount-linear-v1";
+export const BID_ASK_SHAPE_VERSION: BidAskShapeVersion = "delta-amount-linear-v2";
+
+const BID_ASK_TOTAL_WEIGHT_MICROS = 1_000_000;
+const BID_ASK_ANCHOR_WEIGHT_MICROS = 100_000;
+const BID_ASK_NON_ANCHOR_WEIGHT_MICROS = BID_ASK_TOTAL_WEIGHT_MICROS - BID_ASK_ANCHOR_WEIGHT_MICROS;
 
 export interface BidAskRangeInput {
   currentTick: number;
@@ -147,20 +151,44 @@ export function validateBidAskRange(input: BidAskRangeInput): BidAskValidatedRan
 }
 
 /** Calculate Delta weights for indexes ordered from the lower to the upper edge. */
-export function calculateBidAskWeights(binCount: number, anchorIndex: number): BidAskWeight[] {
+export function calculateBidAskWeights(
+  binCount: number,
+  anchorIndex: number,
+  shapeVersion: BidAskShapeVersion = BID_ASK_SHAPE_VERSION,
+): BidAskWeight[] {
   assertPositiveInteger("binCount", binCount);
   assertInteger("anchorIndex", anchorIndex);
   if (anchorIndex < 0 || anchorIndex >= binCount) throw new Error("Bid-Ask anchor index is outside the generated bins");
 
   const lastIndex = binCount - 1;
-  const balance = Math.max(anchorIndex, lastIndex - anchorIndex, 1);
+  if (shapeVersion === "delta-amount-linear-v1") {
+    const balance = Math.max(anchorIndex, lastIndex - anchorIndex, 1);
+    return Array.from({ length: binCount }, (_, index) => {
+      const distance = Math.abs(index - anchorIndex);
+      const floatingWeight = Math.max(0.02, distance / balance);
+      return {
+        distance,
+        weightMicros: Math.max(1, Math.round(floatingWeight * 1_000_000)),
+      };
+    });
+  }
+
+  if (binCount === 1) return [{ distance: 0, weightMicros: BID_ASK_TOTAL_WEIGHT_MICROS }];
+  const distanceSum = Array.from({ length: binCount }, (_, index) => Math.abs(index - anchorIndex))
+    .reduce((sum, distance) => sum + distance, 0);
+  if (distanceSum <= 0) throw new Error("Bid-Ask non-anchor distance sum must be positive");
+
+  let allocatedNonAnchor = 0;
+  const nonAnchorIndexes = Array.from({ length: binCount }, (_, index) => index).filter((index) => index !== anchorIndex);
+  const lastNonAnchorIndex = nonAnchorIndexes.at(-1)!;
   return Array.from({ length: binCount }, (_, index) => {
     const distance = Math.abs(index - anchorIndex);
-    const floatingWeight = Math.max(0.02, distance / balance);
-    return {
-      distance,
-      weightMicros: Math.max(1, Math.round(floatingWeight * 1_000_000)),
-    };
+    if (index === anchorIndex) return { distance, weightMicros: BID_ASK_ANCHOR_WEIGHT_MICROS };
+    const weightMicros = index === lastNonAnchorIndex
+      ? BID_ASK_TOTAL_WEIGHT_MICROS - BID_ASK_ANCHOR_WEIGHT_MICROS - allocatedNonAnchor
+      : Math.floor((BID_ASK_NON_ANCHOR_WEIGHT_MICROS * distance) / distanceSum);
+    allocatedNonAnchor += weightMicros;
+    return { distance, weightMicros };
   });
 }
 

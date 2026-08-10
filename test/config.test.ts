@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { loadConfig, PUBLIC_ROBINHOOD_RPC_HTTP } from "../src/config.js";
+import { loadConfig, PUBLIC_ROBINHOOD_RPC_HTTP, PUBLIC_ROBINHOOD_SCAN_RPC_HTTP } from "../src/config.js";
 
 function environment(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
@@ -60,6 +60,7 @@ describe("loadConfig", () => {
     expect(config.discoveryIntervalMs).toBe(30_000);
     expect(config.maxLogBlockRange).toBe(2_000n);
     expect(config.rpcRequestDelayMs).toBe(0);
+    expect(config.blinkRescuePollIntervalMs).toBe(15_000);
     expect(config.oorAboveMinDistancePercent).toBe(10);
     expect(config.oorAboveMinDurationMs).toBe(3_600_000);
     expect(config.oorAboveProfitDurationMs).toBe(300_000);
@@ -186,6 +187,7 @@ describe("loadConfig", () => {
     expect(config.rpcHttp.base).toBe("https://mainnet.base.org");
     expect(config.rpcHttp.robinhood).toBe("https://rpc.mainnet.chain.robinhood.com");
     expect(config.rpcHttpFallback.robinhood).toBe(PUBLIC_ROBINHOOD_RPC_HTTP);
+    expect(config.rpcHttpScanFallback.robinhood).toBe(PUBLIC_ROBINHOOD_SCAN_RPC_HTTP);
     expect(config.alchemyHttp.base).toContain("alchemy.com");
     expect(config.alchemyHttp.robinhood).toContain("alchemy.com");
   });
@@ -194,6 +196,13 @@ describe("loadConfig", () => {
     const config = loadConfig(environment({ ROBINHOOD_RPC_HTTP_FALLBACK: "https://public-fallback.example/rpc" }));
 
     expect(config.rpcHttpFallback.robinhood).toBe("https://public-fallback.example/rpc");
+  });
+
+  it("allows an explicit heavy-scan fallback without changing transaction fallback", () => {
+    const config = loadConfig(environment({ ROBINHOOD_SCAN_RPC_HTTP: "https://rpc.arrowrpc.com" }));
+
+    expect(config.rpcHttpScanFallback.robinhood).toBe("https://rpc.arrowrpc.com");
+    expect(config.rpcHttpFallback.robinhood).toBe(PUBLIC_ROBINHOOD_RPC_HTTP);
   });
 
   it("rejects remove-liquidity max slippage below base", () => {

@@ -473,17 +473,20 @@ describe("Executor pending settlement recovery", () => {
 
   it("uses the chain client's failover client for executor calls", () => {
     const primaryClient = {};
-    const failoverClient = {};
+    const scanClient = {};
+    const executionClient = {};
     const chains = {
       getById: vi.fn(() => ({ client: primaryClient, registry: { name: "robinhood" } })),
-      getForScan: vi.fn(() => ({ client: failoverClient })),
+      getForScan: vi.fn(() => ({ client: scanClient })),
+      getForExecution: vi.fn(() => ({ client: executionClient })),
     };
     const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
 
     const selected = (executor as any).executorClient(4663);
 
-    expect(selected).toBe(failoverClient);
-    expect(chains.getForScan).toHaveBeenCalledWith("robinhood");
+    expect(selected).toBe(executionClient);
+    expect(chains.getForExecution).toHaveBeenCalledWith("robinhood");
+    expect(chains.getForScan).not.toHaveBeenCalled();
   });
 
   it("classifies provider rate limits and timeouts as transient RPC errors", () => {
@@ -491,6 +494,7 @@ describe("Executor pending settlement recovery", () => {
     expect(isTransientRpcError(new Error("The operation was aborted due to timeout"))).toBe(true);
     expect(isTransientRpcError({ status: 429, message: "rate limited" })).toBe(true);
     expect(isTransientRpcError({ cause: { code: -32005, message: "resource unavailable" } })).toBe(true);
+    expect(isTransientRpcError(new Error("unsupported block number 32436872"))).toBe(true);
     expect(isTransientRpcError(new Error("Execution reverted for an unknown reason"))).toBe(false);
   });
 
