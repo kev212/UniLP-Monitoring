@@ -91,6 +91,7 @@ export interface BidAskOpenPreview {
   quoteToken: Address;
   quoteTokenSymbol: string;
   quoteIsToken0: boolean;
+  direction: BidAskDirection;
   token0: Address;
   token1: Address;
   token0Symbol: string;
@@ -255,7 +256,8 @@ export class PositionOpener {
     if (!quoteIsToken0 && quoteAddress !== state.token1.toLowerCase()) {
       throw new Error("Quote token is neither token0 nor token1 of this pool");
     }
-    assertBidAskDirection(direction, quoteIsToken0);
+    void direction;
+    const resolvedDirection = bidAskDirectionForQuote(quoteIsToken0);
 
     const outer = bidAskOuterTicks(state.currentTick, state.tickSpacing, quoteIsToken0, rangePercent);
     const [token0Decimals, token1Decimals] = await Promise.all([
@@ -286,6 +288,7 @@ export class PositionOpener {
       quoteToken: quoteToken.address,
       quoteTokenSymbol: quoteToken.symbol,
       quoteIsToken0,
+      direction: resolvedDirection,
       token0: state.token0,
       token1: state.token1,
       token0Symbol,
@@ -1771,14 +1774,6 @@ export function selectOpenQuoteToken(allowed: readonly QuoteToken[], token0: Add
 
 export function bidAskDirectionForQuote(quoteIsToken0: boolean): BidAskDirection {
   return quoteIsToken0 ? "above" : "below";
-}
-
-export function assertBidAskDirection(direction: BidAskDirection | undefined, quoteIsToken0: boolean): void {
-  if (direction === undefined) return;
-  const expected = bidAskDirectionForQuote(quoteIsToken0);
-  if (direction !== expected) {
-    throw new Error(`Bid-Ask direction must be ${expected} for the selected quote side`);
-  }
 }
 
 export function openPoolQuoteAddress(protocol: "v3" | "v4", chainId: number, quoteToken: QuoteToken): Address {

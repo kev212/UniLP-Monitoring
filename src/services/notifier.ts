@@ -2259,7 +2259,7 @@ export function formatBidAskLadderReview(preview: unknown, request: BidAskLadder
     `${protocol} | ${request.chain} | ${pair}`,
     `Pool: ${pool}${fee ? ` | fee ${fee}` : ""}`,
     ...(poolKey ? [`V4 pool key: ${poolKey}`] : []),
-    `One-sided range: ${request.direction} ${request.rangePercent}% | quote-oriented | no opening swap`,
+    `One-sided range: ${stringValue(firstValue(details.direction, plan.direction)) ?? request.direction} ${request.rangePercent}% | quote-oriented | no opening swap`,
     ...(currentPrice ? [`Current price: ${currentPrice}`] : []),
     ...(lowerPrice && upperPrice
       ? [`Outer range: ${lowerPrice} → ${upperPrice}`]

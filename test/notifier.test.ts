@@ -106,6 +106,39 @@ describe("Telegram dashboard callbacks", () => {
     expect(text).toContain("0.00002 USDG");
   });
 
+  it("prefers the preview-derived direction when the request direction is stale", () => {
+    const text = formatBidAskLadderReview({
+      protocol: "v4",
+      pair: "PACK/ETH",
+      poolAddress: "0x0000000000000000000000000000000000000001",
+      direction: "above",
+      token0Symbol: "ETH",
+      token0Decimals: 18,
+      plan: {
+        requestedBinCount: 1,
+        generatedBinCount: 1,
+        mintableBinCount: 1,
+        bins: [{ index: 0, tickLower: 100, tickUpper: 200, side: "token0", allocatedAmount0: 10n, allocatedAmount1: 0n }],
+      },
+    }, {
+      poolAddress: "0x0000000000000000000000000000000000000001",
+      chain: "robinhood",
+      direction: "below",
+      rangePercent: 60,
+      binCount: 1,
+      depositAmount: 1_000n,
+      quoteToken: { symbol: "ETH", address: "0x0000000000000000000000000000000000000000" },
+      protocols: ["v3", "v4"],
+      maxBins: 16,
+      maxPriceDeviationBps: 100,
+      atomicMaxBlockGasBps: 8_000,
+      transactionDeadlineSeconds: 300,
+      maxRetries: 3,
+    });
+
+    expect(text).toContain("One-sided range: above 60%");
+  });
+
   it("parses a position selection callback", () => {
     expect(parseDashboardAction("lp:confirm:1:4663:v4:49339")).toEqual({
       type: "confirm",

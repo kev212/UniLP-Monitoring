@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { encodeAbiParameters, keccak256, zeroAddress, type Address, type Hex } from "viem";
 
 import { chainRegistry } from "../src/chains.js";
-import { assertBidAskDirection, bidAskDirectionForQuote, openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken, wrappedNativeShortfall } from "../src/services/position-opener.js";
+import { bidAskDirectionForQuote, openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken, wrappedNativeShortfall } from "../src/services/position-opener.js";
 import { ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
 
 const chainId = 4663;
@@ -187,6 +187,7 @@ describe("Bid-Ask NVDA opening", () => {
     expect(preview.protocol).toBe(protocol);
     expect(preview.quoteToken).toBe(nvdaAddress);
     expect(preview.quoteTokenDecimals).toBe(18);
+    expect(preview.direction).toBe(quoteIsToken0 ? "above" : "below");
     expect(quoteIsToken0 ? preview.token0Symbol : preview.token1Symbol).toBe("NVDA");
     expect(quoteIsToken0 ? preview.totalAmount0 : preview.totalAmount1).toBe(3n * 10n ** 18n);
     expect(quoteIsToken0 ? preview.totalAmount1 : preview.totalAmount0).toBe(0n);
@@ -195,17 +196,15 @@ describe("Bid-Ask NVDA opening", () => {
       : bin.allocatedAmount0 === 0n && bin.allocatedAmount1 > 0n)).toBe(true);
   });
 
-  it("validates the requested direction against the selected quote side", () => {
+  it("maps the quote side to its only feasible ladder direction", () => {
     expect(bidAskDirectionForQuote(true)).toBe("above");
     expect(bidAskDirectionForQuote(false)).toBe("below");
-    expect(() => assertBidAskDirection("above", false)).toThrow("must be below");
-    expect(() => assertBidAskDirection("below", false)).not.toThrow();
   });
 
-  it("rejects a mismatched direction before building the ladder", async () => {
+  it("normalizes a mismatched direction instead of failing", async () => {
     const { opener, pool } = poolOpener("v4");
 
-    await expect(opener.prepareBidAskOpen(
+    const preview = await opener.prepareBidAskOpen(
       pool,
       "robinhood",
       30,
@@ -213,7 +212,28 @@ describe("Bid-Ask NVDA opening", () => {
       { symbol: "NVDA", address: nvdaAddress },
       3,
       "above",
-    )).rejects.toThrow("must be below");
+    );
+
+    expect(preview.direction).toBe("below");
+    expect(preview.bins.every((bin) => bin.allocatedAmount0 === 0n && bin.allocatedAmount1 > 0n)).toBe(true);
+  });
+
+  it("normalizes the default below request to above for an ETH-as-token0 pool", async () => {
+    const { opener, pool } = poolOpener("v4", zeroAddress, packAddress);
+
+    const preview = await opener.prepareBidAskOpen(
+      pool,
+      "robinhood",
+      30,
+      3n * 10n ** 18n,
+      { symbol: "ETH", address: zeroAddress },
+      3,
+      "below",
+    );
+
+    expect(preview.direction).toBe("above");
+    expect(preview.quoteIsToken0).toBe(true);
+    expect(preview.bins.every((bin) => bin.allocatedAmount0 > 0n && bin.allocatedAmount1 === 0n)).toBe(true);
   });
 });
 
