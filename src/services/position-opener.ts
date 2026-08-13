@@ -33,9 +33,11 @@ const { Pool: V4SdkPool, Position: V4SdkPosition, V4PositionManager } = require(
 type V3Position = import("@uniswap/v3-sdk").Position;
 type V4Position = import("@uniswap/v4-sdk").Position;
 type V3FeeAmount = import("@uniswap/v3-sdk").FeeAmount;
-const OPEN_QUOTE_PRIORITY = ["USDG", "USDC", "WETH", "ETH"];
+const OPEN_QUOTE_PRIORITY = ["USDG", "USDC", "WETH", "ETH", "NVDA"];
+const NVDA_SYMBOL = "NVDA";
 
 export type OpenMode = "single" | "dual";
+export type BidAskDirection = "above" | "below";
 
 export interface OpenPositionPreview {
   protocol: "v3" | "v4";
@@ -49,8 +51,11 @@ export interface OpenPositionPreview {
   quoteIsToken0: boolean;
   token0: Address;
   token1: Address;
+  token0Symbol: string;
+  token1Symbol: string;
   token0Decimals: number;
   token1Decimals: number;
+  quoteTokenDecimals: number;
   currentTick: number;
   tickSpacing: number;
   tickLower: number;
@@ -88,8 +93,11 @@ export interface BidAskOpenPreview {
   quoteIsToken0: boolean;
   token0: Address;
   token1: Address;
+  token0Symbol: string;
+  token1Symbol: string;
   token0Decimals: number;
   token1Decimals: number;
+  quoteTokenDecimals: number;
   currentTick: number;
   tickSpacing: number;
   sqrtPriceX96: bigint;
@@ -218,6 +226,10 @@ export class PositionOpener {
     const isV4 = normalized.length === 66 && normalized.startsWith("0x");
     const protocol = isV4 ? "v4" : "v3";
 
+    if (mode === "dual" && quoteToken.symbol === NVDA_SYMBOL) {
+      throw new Error("NVDA quote supports single-side normal opens only");
+    }
+
     if (protocol === "v3") return this.prepareV3(normalized, chain, rangePercent, depositAmount, quoteToken, mode);
     return this.prepareV4(normalized, chain, rangePercent, depositAmount, quoteToken, mode);
   }
@@ -229,6 +241,7 @@ export class PositionOpener {
     depositAmount: bigint,
     quoteToken: QuoteToken,
     requestedBinCount: number,
+    direction?: BidAskDirection,
   ): Promise<BidAskOpenPreview> {
     if (chain !== "base" && chain !== "robinhood") throw new Error("Bid-Ask ladders are supported on Base and Robinhood only");
     const normalized = poolAddress.toLowerCase() as Hex;
@@ -242,14 +255,18 @@ export class PositionOpener {
     if (!quoteIsToken0 && quoteAddress !== state.token1.toLowerCase()) {
       throw new Error("Quote token is neither token0 nor token1 of this pool");
     }
+    assertBidAskDirection(direction, quoteIsToken0);
 
     const outer = bidAskOuterTicks(state.currentTick, state.tickSpacing, quoteIsToken0, rangePercent);
     const [token0Decimals, token1Decimals] = await Promise.all([
       this.tokenDecimals(this.client(chain), state.token0),
       this.tokenDecimals(this.client(chain), state.token1),
     ]);
-    const baseToken = quoteIsToken0 ? state.token1 : state.token0;
-    const baseSymbol = await this.tokenSymbol(this.client(chain), baseToken);
+    const [token0Symbol, token1Symbol] = await Promise.all([
+      this.tokenSymbol(this.client(chain), state.token0),
+      this.tokenSymbol(this.client(chain), state.token1),
+    ]);
+    const baseSymbol = quoteIsToken0 ? token1Symbol : token0Symbol;
     const plan = this.makeBidAskPlan(state, chain, quoteIsToken0, token0Decimals, token1Decimals, outer, depositAmount, requestedBinCount);
     const deadline = this.bidAskDeadline();
     const batchPlan = this.buildBidAskBatch(state, chain, plan, quoteIsToken0, quoteToken, deadline);
@@ -271,8 +288,11 @@ export class PositionOpener {
       quoteIsToken0,
       token0: state.token0,
       token1: state.token1,
+      token0Symbol,
+      token1Symbol,
       token0Decimals,
       token1Decimals,
+      quoteTokenDecimals: quoteIsToken0 ? token0Decimals : token1Decimals,
       currentTick: state.currentTick,
       tickSpacing: state.tickSpacing,
       sqrtPriceX96: state.sqrtPriceX96,
@@ -308,8 +328,9 @@ export class PositionOpener {
     depositAmount: bigint,
     quoteToken: QuoteToken,
     requestedBinCount: number,
+    direction?: BidAskDirection,
   ): Promise<BidAskOpenPreview> {
-    return this.prepareBidAskOpen(poolAddress, chain, rangePercent, depositAmount, quoteToken, requestedBinCount);
+    return this.prepareBidAskOpen(poolAddress, chain, rangePercent, depositAmount, quoteToken, requestedBinCount, direction);
   }
 
   async prepareBidAskLadder(
@@ -319,8 +340,9 @@ export class PositionOpener {
     depositAmount: bigint,
     quoteToken: QuoteToken,
     requestedBinCount: number,
+    direction?: BidAskDirection,
   ): Promise<BidAskOpenPreview> {
-    return this.prepareBidAskOpen(poolAddress, chain, rangePercent, depositAmount, quoteToken, requestedBinCount);
+    return this.prepareBidAskOpen(poolAddress, chain, rangePercent, depositAmount, quoteToken, requestedBinCount, direction);
   }
 
   async detectQuoteToken(poolAddress: string, chain: ChainName): Promise<QuoteToken> {
@@ -369,6 +391,16 @@ export class PositionOpener {
     ]);
 
     if (!V3_SUPPORTED_FEES.has(Number(fee))) throw new Error(`V3 fee tier ${fee} is unsupported by the official SDK`);
+    const { registry } = this.chains.get(chain);
+    const factoryPool = await client.readContract({
+      address: registry.contracts.v3.factory,
+      abi: v3FactoryAbi,
+      functionName: "getPool",
+      args: [token0, token1, Number(fee)],
+    }) as Address;
+    if (factoryPool.toLowerCase() !== pool.toLowerCase()) {
+      throw new Error("V3 pool does not match the configured factory");
+    }
     return this.buildPreview("v3", chain, pool, token0, token1, Number(fee), Number(tickSpacing), slot0[1], slot0[0], liquidity, zeroAddress, rangePercent, depositAmount, quoteToken, mode);
   }
 
@@ -384,6 +416,12 @@ export class PositionOpener {
     ]);
 
     const poolKey = poolKeyResult as unknown as V4PoolKey;
+    if (bidAskPoolId(poolKey).toLowerCase() !== poolId.toLowerCase()) {
+      throw new Error("V4 pool key does not match the pool id");
+    }
+    if (poolKey.hooks.toLowerCase() !== zeroAddress.toLowerCase()) {
+      throw new Error("Normal opening supports plain/no-hook V4 pools only");
+    }
 
     return this.buildPreview("v4", chain, poolId, poolKey.currency0, poolKey.currency1, Number(poolKey.fee), poolKey.tickSpacing, slot0[1], slot0[0], liquidity, poolKey.hooks, rangePercent, depositAmount, quoteToken, mode);
   }
@@ -455,11 +493,14 @@ export class PositionOpener {
       this.formatPrice(sqrtUpper, quoteIsToken0, baseDecimals, quoteDecimals),
     );
 
+    const token0Symbol = quoteIsToken0 ? quoteToken.symbol : baseSymbol;
+    const token1Symbol = quoteIsToken0 ? baseSymbol : quoteToken.symbol;
     const basePreview: OpenPositionPreview = {
       protocol, chain, poolAddress: pool, pair, feeTier: fee,
       feeLabel: hooks !== zeroAddress ? `${(fee / 10_000).toFixed(2)}% dynamic` : `${(fee / 10_000).toFixed(2)}%`,
       quoteToken: quoteToken.address, quoteTokenSymbol: quoteToken.symbol,
-      quoteIsToken0, token0, token1, token0Decimals, token1Decimals, currentTick, tickSpacing, tickLower, tickUpper, sqrtPriceX96, poolLiquidity, hooks, liquidity, depositAmount,
+      quoteIsToken0, token0, token1, token0Symbol, token1Symbol, token0Decimals, token1Decimals,
+      quoteTokenDecimals: quoteDecimals, currentTick, tickSpacing, tickLower, tickUpper, sqrtPriceX96, poolLiquidity, hooks, liquidity, depositAmount,
       lowerPrice, upperPrice, currentPrice, dropPercent: rangePercent, mode,
     };
 
@@ -1644,9 +1685,12 @@ export class PositionOpener {
   }
 
   private async tokenDecimals(client: PublicClient, token: Address): Promise<number> {
-    if (token === zeroAddress) return 18;
-    try { return Number(await client.readContract({ address: token, abi: erc20Abi, functionName: "decimals" })); }
-    catch { return 18; }
+    if (token.toLowerCase() === zeroAddress.toLowerCase()) return 18;
+    const decimals = Number(await client.readContract({ address: token, abi: erc20Abi, functionName: "decimals" }));
+    if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) {
+      throw new Error(`Invalid token decimals for ${token}`);
+    }
+    return decimals;
   }
 
   private async tokenSymbol(client: PublicClient, token: Address): Promise<string> {
@@ -1723,6 +1767,18 @@ export function selectOpenQuoteToken(allowed: readonly QuoteToken[], token0: Add
     OPEN_QUOTE_PRIORITY.includes(symbol) && (address.toLowerCase() === token0.toLowerCase() || address.toLowerCase() === token1.toLowerCase()),
   );
   return matches.sort((a, b) => OPEN_QUOTE_PRIORITY.indexOf(a.symbol) - OPEN_QUOTE_PRIORITY.indexOf(b.symbol))[0] ?? null;
+}
+
+export function bidAskDirectionForQuote(quoteIsToken0: boolean): BidAskDirection {
+  return quoteIsToken0 ? "above" : "below";
+}
+
+export function assertBidAskDirection(direction: BidAskDirection | undefined, quoteIsToken0: boolean): void {
+  if (direction === undefined) return;
+  const expected = bidAskDirectionForQuote(quoteIsToken0);
+  if (direction !== expected) {
+    throw new Error(`Bid-Ask direction must be ${expected} for the selected quote side`);
+  }
 }
 
 export function openPoolQuoteAddress(protocol: "v3" | "v4", chainId: number, quoteToken: QuoteToken): Address {

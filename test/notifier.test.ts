@@ -99,6 +99,7 @@ describe("Telegram dashboard callbacks", () => {
       maxRetries: 3,
     });
 
+    expect(text).toContain("One-sided range: below 60%");
     expect(text).toContain("Atomic open: 123000");
     expect(text).toContain("one failed batch reverts every NFT");
     expect(text).toContain("bin 0: ticks 100 → 200");

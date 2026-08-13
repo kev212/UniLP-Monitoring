@@ -13,7 +13,7 @@ function environment(overrides: Record<string, string> = {}): NodeJS.ProcessEnv 
     ROBINHOOD_RPC_WSS: "",
     BSC_RPC_HTTP: "https://bsc-dataseed.bnbchain.org",
     QUOTE_TOKEN_ALLOWLIST_BASE: "USDC:0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913,WETH:0x4200000000000000000000000000000000000006",
-    QUOTE_TOKEN_ALLOWLIST_ROBINHOOD: "USDG:0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168,WETH:0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    QUOTE_TOKEN_ALLOWLIST_ROBINHOOD: "USDG:0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168,WETH:0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73,NVDA:0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
     QUOTE_TOKEN_ALLOWLIST_BSC: "USDT:0x55d398326f99059fF775485246999027B3197955,WBNB:0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
     STOP_LOSS_PERCENT: "-10",
     TAKE_PROFIT_PERCENT: "20",
@@ -47,7 +47,7 @@ describe("loadConfig", () => {
 
     expect(config.chains).toEqual(["base", "robinhood"]);
     expect(config.quoteTokens.base.map((token) => token.symbol)).toEqual(["USDC", "WETH"]);
-    expect(config.quoteTokens.robinhood.map((token) => token.symbol)).toEqual(["USDG", "WETH"]);
+    expect(config.quoteTokens.robinhood.map((token) => token.symbol)).toEqual(["USDG", "WETH", "NVDA"]);
     expect(config.dryRun).toBe(true);
     expect(config.pnlIncludeGas).toBe(false);
     expect(config.trailingStopActivationPercent).toBe(5);

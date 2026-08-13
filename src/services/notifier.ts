@@ -1621,7 +1621,7 @@ export class Notifier {
         maxRetries: this.config.bidAskLadderMaxRetries,
       };
       const result = await Promise.resolve(prepare.name === "prepareBidAskOpen" || prepare.call.length > 1
-        ? invokeBidAskOpenerMethod(this.positionOpener, prepare.call, [request.poolAddress, request.chain, request.rangePercent, request.depositAmount, request.quoteToken, request.binCount])
+        ? invokeBidAskOpenerMethod(this.positionOpener, prepare.call, [request.poolAddress, request.chain, request.rangePercent, request.depositAmount, request.quoteToken, request.binCount, request.direction])
         : invokeBidAskOpenerMethod(this.positionOpener, prepare.call, [request]));
       if (!isRecord(result)) throw new Error("Bid-Ask ladder preview is invalid");
       preview = result;
@@ -2259,7 +2259,7 @@ export function formatBidAskLadderReview(preview: unknown, request: BidAskLadder
     `${protocol} | ${request.chain} | ${pair}`,
     `Pool: ${pool}${fee ? ` | fee ${fee}` : ""}`,
     ...(poolKey ? [`V4 pool key: ${poolKey}`] : []),
-    `One-sided range: ${request.rangePercent}% | quote-oriented | no opening swap`,
+    `One-sided range: ${request.direction} ${request.rangePercent}% | quote-oriented | no opening swap`,
     ...(currentPrice ? [`Current price: ${currentPrice}`] : []),
     ...(lowerPrice && upperPrice
       ? [`Outer range: ${lowerPrice} → ${upperPrice}`]

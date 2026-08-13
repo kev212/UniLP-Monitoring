@@ -1,16 +1,59 @@
 import { Ether, Token } from "@uniswap/sdk-core";
 import { FeeAmount, Pool as V3Pool, Position as V3Position } from "@uniswap/v3-sdk";
 import { Pool as V4Pool, Position as V4Position } from "@uniswap/v4-sdk";
-import { describe, expect, it } from "vitest";
-import { zeroAddress } from "viem";
+import { describe, expect, it, vi } from "vitest";
+import { encodeAbiParameters, keccak256, zeroAddress, type Address, type Hex } from "viem";
 
-import { openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken, wrappedNativeShortfall } from "../src/services/position-opener.js";
+import { chainRegistry } from "../src/chains.js";
+import { assertBidAskDirection, bidAskDirectionForQuote, openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken, wrappedNativeShortfall } from "../src/services/position-opener.js";
 import { ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
 
 const chainId = 4663;
 const token0 = new Token(chainId, "0x0000000000000000000000000000000000000001", 6, "USDG");
 const token1 = new Token(chainId, "0x0000000000000000000000000000000000000002", 18, "VLAD");
 const sqrtPriceX96 = (1n << 96n).toString();
+const nvdaAddress = "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC" as Address;
+const packAddress = "0x0145AcbcceFbEd6F303C420bEeaaAc72E905430b" as Address;
+const v3PoolAddress = "0x0000000000000000000000000000000000000044" as Address;
+
+function poolOpener(protocol: "v3" | "v4", tokenA = packAddress, tokenB = nvdaAddress, hooks = zeroAddress) {
+  const poolKey = { currency0: tokenA, currency1: tokenB, fee: 10_000, tickSpacing: 200, hooks };
+  const poolId = keccak256(encodeAbiParameters(
+    [{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }],
+    [poolKey.currency0, poolKey.currency1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks],
+  ));
+  const client = {
+    readContract: vi.fn(async ({ functionName, address }: { functionName: string; address: Address }) => {
+      if (functionName === "token0") return tokenA;
+      if (functionName === "token1") return tokenB;
+      if (functionName === "fee") return 10_000;
+      if (functionName === "tickSpacing") return 200;
+      if (functionName === "liquidity" || functionName === "getLiquidity") return 10n ** 30n;
+      if (functionName === "slot0" || functionName === "getSlot0") return [1n << 96n, 0, 0, 0, 0, 0, true];
+      if (functionName === "getPool") return v3PoolAddress;
+      if (functionName === "poolKeys") return poolKey;
+      if (functionName === "decimals") return 18;
+      if (functionName === "symbol") return address.toLowerCase() === nvdaAddress.toLowerCase() ? "NVDA" : "PACK";
+      throw new Error(`unexpected ${functionName}`);
+    }),
+  };
+  const chains = {
+    get: vi.fn(() => ({ registry: chainRegistry.robinhood, client })),
+    getForScan: vi.fn(() => ({ registry: chainRegistry.robinhood, client })),
+  };
+  const config = {
+    quoteTokens: { robinhood: [{ symbol: "NVDA", address: nvdaAddress }] },
+    executorAddress: "0x0000000000000000000000000000000000000011",
+    bidAskLadderEnabled: true,
+    bidAskLadderProtocols: ["v3", "v4"],
+    bidAskLadderMaxBins: 10,
+  };
+  return {
+    opener: new PositionOpener(config as never, chains as never),
+    pool: protocol === "v3" ? v3PoolAddress as Hex : poolId,
+    client,
+  };
+}
 
 describe("SDK single-side liquidity", () => {
   it("selects only the actual supported quote currency from a pool", () => {
@@ -27,6 +70,58 @@ describe("SDK single-side liquidity", () => {
     expect(selectOpenQuoteToken(allowed, nvda, weth)).toEqual({ symbol: "WETH", address: weth });
     expect(selectOpenQuoteToken(allowed, nvda, zeroAddress)).toEqual({ symbol: "ETH", address: zeroAddress });
     expect(selectOpenQuoteToken(allowed, nvda, usdg)).toEqual({ symbol: "USDG", address: usdg });
+    expect(selectOpenQuoteToken(allowed, nvda, token1.address as Address)).toEqual({ symbol: "NVDA", address: nvda });
+  });
+
+  it.each([
+    ["v3", false],
+    ["v3", true],
+    ["v4", false],
+    ["v4", true],
+  ] as const)("prepares a normal single-side %s position funded by NVDA with quoteIsToken0=%s", async (protocol, quoteIsToken0) => {
+    const { opener, pool } = poolOpener(protocol, quoteIsToken0 ? nvdaAddress : packAddress, quoteIsToken0 ? packAddress : nvdaAddress);
+
+    const preview = await opener.prepareOpen(pool, "robinhood", 30, 3n * 10n ** 18n, { symbol: "NVDA", address: nvdaAddress });
+
+    expect(preview.protocol).toBe(protocol);
+    expect(preview.quoteToken).toBe(nvdaAddress);
+    expect(preview.quoteTokenDecimals).toBe(18);
+    expect(preview.quoteIsToken0).toBe(quoteIsToken0);
+    if (quoteIsToken0) expect(preview.tickLower).toBeGreaterThan(preview.currentTick);
+    else expect(preview.tickUpper).toBeLessThanOrEqual(preview.currentTick);
+    expect(preview.pair).toBe(quoteIsToken0 ? "PACK/NVDA" : "NVDA/PACK");
+  });
+
+  it("rejects dual-side opening when NVDA is the quote", async () => {
+    const { opener, pool } = poolOpener("v3");
+
+    await expect(opener.prepareOpen(pool, "robinhood", 30, 3n * 10n ** 18n, { symbol: "NVDA", address: nvdaAddress }, "dual"))
+      .rejects.toThrow("single-side normal opens only");
+  });
+
+  it("rejects hooked V4 pools before preparing a normal open", async () => {
+    const { opener, pool } = poolOpener("v4", packAddress, nvdaAddress, "0x0000000000000000000000000000000000000001");
+
+    await expect(opener.prepareOpen(pool, "robinhood", 30, 3n * 10n ** 18n, { symbol: "NVDA", address: nvdaAddress }))
+      .rejects.toThrow("plain/no-hook V4 pools only");
+  });
+
+  it("fails closed when ERC-20 decimals cannot be read", async () => {
+    const { opener, pool, client } = poolOpener("v3");
+    client.readContract.mockImplementation(async ({ functionName }: { functionName: string }) => {
+      if (functionName === "token0") return packAddress;
+      if (functionName === "token1") return nvdaAddress;
+      if (functionName === "fee") return 10_000;
+      if (functionName === "tickSpacing") return 200;
+      if (functionName === "liquidity") return 10n ** 30n;
+      if (functionName === "slot0") return [1n << 96n, 0, 0, 0, 0, 0, true];
+      if (functionName === "getPool") return v3PoolAddress;
+      if (functionName === "decimals") throw new Error("RPC unavailable");
+      throw new Error(`unexpected ${functionName}`);
+    });
+
+    await expect(opener.prepareOpen(pool, "robinhood", 30, 3n * 10n ** 18n, { symbol: "NVDA", address: nvdaAddress }))
+      .rejects.toThrow("RPC unavailable");
   });
 
   it("uses wrapped ETH for V3 and native ETH for V4 quote matching", async () => {
@@ -67,6 +162,58 @@ describe("SDK single-side liquidity", () => {
     expect(v3.mintAmounts.amount1.toString()).toBe("20000000000000000000");
     expect(v4.mintAmounts.amount0.toString()).toBe("0");
     expect(v4.mintAmounts.amount1.toString()).toBe("20000000000000000000");
+  });
+});
+
+describe("Bid-Ask NVDA opening", () => {
+  it.each([
+    ["v3", false],
+    ["v3", true],
+    ["v4", false],
+    ["v4", true],
+  ] as const)("prepares an atomic %s ladder allocated only in NVDA with quoteIsToken0=%s", async (protocol, quoteIsToken0) => {
+    const { opener, pool } = poolOpener(protocol, quoteIsToken0 ? nvdaAddress : packAddress, quoteIsToken0 ? packAddress : nvdaAddress);
+
+    const preview = await opener.prepareBidAskOpen(
+      pool,
+      "robinhood",
+      30,
+      3n * 10n ** 18n,
+      { symbol: "NVDA", address: nvdaAddress },
+      3,
+      quoteIsToken0 ? "above" : "below",
+    );
+
+    expect(preview.protocol).toBe(protocol);
+    expect(preview.quoteToken).toBe(nvdaAddress);
+    expect(preview.quoteTokenDecimals).toBe(18);
+    expect(quoteIsToken0 ? preview.token0Symbol : preview.token1Symbol).toBe("NVDA");
+    expect(quoteIsToken0 ? preview.totalAmount0 : preview.totalAmount1).toBe(3n * 10n ** 18n);
+    expect(quoteIsToken0 ? preview.totalAmount1 : preview.totalAmount0).toBe(0n);
+    expect(preview.bins.every((bin) => quoteIsToken0
+      ? bin.allocatedAmount0 > 0n && bin.allocatedAmount1 === 0n
+      : bin.allocatedAmount0 === 0n && bin.allocatedAmount1 > 0n)).toBe(true);
+  });
+
+  it("validates the requested direction against the selected quote side", () => {
+    expect(bidAskDirectionForQuote(true)).toBe("above");
+    expect(bidAskDirectionForQuote(false)).toBe("below");
+    expect(() => assertBidAskDirection("above", false)).toThrow("must be below");
+    expect(() => assertBidAskDirection("below", false)).not.toThrow();
+  });
+
+  it("rejects a mismatched direction before building the ladder", async () => {
+    const { opener, pool } = poolOpener("v4");
+
+    await expect(opener.prepareBidAskOpen(
+      pool,
+      "robinhood",
+      30,
+      3n * 10n ** 18n,
+      { symbol: "NVDA", address: nvdaAddress },
+      3,
+      "above",
+    )).rejects.toThrow("must be below");
   });
 });
 

@@ -10,6 +10,7 @@ const token0 = "0x0000000000000000000000000000000000000022" as Address;
 const token1 = "0x0000000000000000000000000000000000000033" as Address;
 const v3Pool = "0x0000000000000000000000000000000000000044" as Address;
 const openHash = `0x${"a".repeat(64)}` as Hex;
+const nvda = "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC" as Address;
 
 function group(protocol: "v3" | "v4", poolKey: string, positionManager: Address, planJson: Record<string, unknown> = {}): PositionGroupRecord {
   return {
@@ -173,6 +174,28 @@ describe("historical discovery reads", () => {
     expect(value).toBe(30n);
     expect(archiveClient.readContract).toHaveBeenCalledWith(expect.objectContaining({ blockNumber: 123n }));
     expect(regularClient.readContract).not.toHaveBeenCalled();
+  });
+});
+
+describe("quote token assignment", () => {
+  it("recognizes NVDA as the quote side of a Robinhood position", () => {
+    const discovery = new DiscoveryService(
+      {} as never,
+      {} as never,
+      {
+        quoteTokens: {
+          base: [],
+          robinhood: [{ symbol: "NVDA", address: nvda }],
+          bsc: [],
+        },
+      } as never,
+    );
+
+    const quoteToken = (discovery as unknown as {
+      findQuoteToken(name: "robinhood", token0: Address, token1: Address): Address | null;
+    }).findQuoteToken("robinhood", token0, nvda);
+
+    expect(quoteToken).toBe(nvda);
   });
 });
 
