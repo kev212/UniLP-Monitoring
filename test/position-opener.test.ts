@@ -14,6 +14,7 @@ const token1 = new Token(chainId, "0x0000000000000000000000000000000000000002", 
 const sqrtPriceX96 = (1n << 96n).toString();
 const nvdaAddress = "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC" as Address;
 const packAddress = "0x0145AcbcceFbEd6F303C420bEeaaAc72E905430b" as Address;
+const wethAddress = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73" as Address;
 const v3PoolAddress = "0x0000000000000000000000000000000000000044" as Address;
 
 function poolOpener(protocol: "v3" | "v4", tokenA = packAddress, tokenB = nvdaAddress, hooks = zeroAddress) {
@@ -125,13 +126,12 @@ describe("SDK single-side liquidity", () => {
   });
 
   it("uses wrapped ETH for V3 and native ETH for V4 quote matching", async () => {
-    const weth = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73" as const;
-    expect(Ether.onChain(chainId).wrapped.address).toBe(weth);
-    expect(openPoolQuoteAddress("v3", chainId, { symbol: "ETH", address: zeroAddress })).toBe(weth);
+    expect(Ether.onChain(chainId).wrapped.address).toBe(wethAddress);
+    expect(openPoolQuoteAddress("v3", chainId, { symbol: "ETH", address: zeroAddress })).toBe(wethAddress);
     expect(openPoolQuoteAddress("v4", chainId, { symbol: "ETH", address: zeroAddress })).toBe(zeroAddress);
   });
 
-  it("wraps only the WETH shortfall required for a V4 open", () => {
+  it("wraps only the WETH shortfall required for an open", () => {
     expect(wrappedNativeShortfall(10n, 10n)).toBe(0n);
     expect(wrappedNativeShortfall(7n, 10n)).toBe(3n);
   });
@@ -238,6 +238,42 @@ describe("Bid-Ask NVDA opening", () => {
 });
 
 describe("SDK dual-side liquidity", () => {
+  it("wraps V3 WETH funding before swapping the quote side", async () => {
+    const executor = "0x0000000000000000000000000000000000000011" as Address;
+    const client = {};
+    const opener = new PositionOpener({ executorAddress: executor } as never, {} as never);
+    const harness = opener as any;
+    const depositAmount = 100_000_000_000_000_000n;
+    const preview = {
+      protocol: "v3",
+      chain: "robinhood",
+      poolAddress: v3PoolAddress,
+      quoteToken: wethAddress,
+      quoteTokenSymbol: "ETH",
+      dropPercent: 30,
+      depositAmount,
+      mode: "dual",
+      currentTick: 0,
+      tickLower: -200,
+      tickUpper: 200,
+      quoteSideAmount: 60_000_000_000_000_000n,
+    };
+    const wrap = vi.fn().mockResolvedValue(undefined);
+    const swap = vi.fn().mockResolvedValue({ hash: null, actualBaseOut: 1n });
+
+    harness.prepareOpen = vi.fn().mockResolvedValue(preview);
+    harness.isStillStraddling = vi.fn().mockReturnValue(true);
+    harness.executionClient = vi.fn().mockReturnValue(client);
+    harness.ensureWrappedNativeFunding = wrap;
+    harness.swapQuoteForBase = swap;
+    harness.executeV3Dual = vi.fn().mockResolvedValue({ hash: null });
+
+    await opener.executeOpen(preview as never);
+
+    expect(wrap).toHaveBeenCalledWith(client, "robinhood", wethAddress, depositAmount, executor);
+    expect(wrap.mock.invocationCallOrder[0]).toBeLessThan(swap.mock.invocationCallOrder[0]!);
+  });
+
   it("uses true percentage bounds instead of equal logarithmic tick distances", () => {
     const lower = ticksForDropPercent(30);
     const upper = ticksForRisePercent(30);

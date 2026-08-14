@@ -528,9 +528,7 @@ export class PositionOpener {
 
     if (!this.isStillStraddling(preview, refreshed.currentTick)) throw new Error("Pool price moved outside the dual-side range; review and confirm again");
 
-    if (preview.protocol === "v4") {
-      await this.ensureWrappedNativeFunding(this.executionClient(preview.chain), preview.chain, preview.quoteToken, preview.depositAmount, this.config.executorAddress);
-    }
+    await this.ensureWrappedNativeFunding(this.executionClient(preview.chain), preview.chain, preview.quoteToken, preview.depositAmount, this.config.executorAddress);
     const swapResult = await this.swapQuoteForBase(merged);
     const baseAmount = swapResult.actualBaseOut;
     const quoteSideAmount = merged.quoteSideAmount ?? 0n;
@@ -1634,7 +1632,7 @@ export class PositionOpener {
     await this.ensureNativeBalance(client, owner, shortfall);
 
     if (this.config.dryRun) {
-      log.info({ token, shortfall: shortfall.toString() }, "dry-run: native ETH wrap needed for V4 open");
+      log.info({ token, shortfall: shortfall.toString() }, "dry-run: native ETH wrap needed for open position");
       return;
     }
 
@@ -1643,7 +1641,7 @@ export class PositionOpener {
     const hash = await wallet.sendTransaction({ to: token, data, value: shortfall, account: this.account!, chain: this.chains.get(chain).registry.chain });
     const receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
     if (receipt.status !== "success") throw new Error(`Native ETH wrap reverted for ${token}`);
-    log.info({ hash, token, shortfall: shortfall.toString() }, "native ETH wrapped for V4 open");
+    log.info({ hash, token, shortfall: shortfall.toString() }, "native ETH wrapped for open position");
   }
 
   private async tokenBalance(client: PublicClient, token: Address, owner: Address): Promise<bigint> {
