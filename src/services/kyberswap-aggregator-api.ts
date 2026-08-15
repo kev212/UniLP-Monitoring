@@ -5,7 +5,7 @@ import type { PositionRecord, TransactionPlan } from "../types.js";
 const API_URL = "https://aggregator-api.kyberswap.com";
 const KYBER_ROUTER = "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5" as Address;
 const NATIVE_TOKEN = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE" as Address;
-const CHAIN_NAMES: Readonly<Record<number, string>> = { 4663: "robinhood", 8453: "base" };
+const CHAIN_NAMES: Readonly<Record<number, string>> = { 56: "bsc", 4663: "robinhood", 8453: "base" };
 const kyberRouterAbi = parseAbi(["function swap((address callTarget,address approveTarget,bytes targetData,(address srcToken,address dstToken,address[] srcReceivers,uint256[] srcAmounts,address[] feeReceivers,uint256[] feeAmounts,address dstReceiver,uint256 amount,uint256 minReturnAmount,uint256 flags,bytes permit) desc,bytes clientData) execution) payable returns (uint256)"]);
 
 type Json = Record<string, unknown>;

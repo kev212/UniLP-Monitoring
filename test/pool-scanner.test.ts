@@ -155,6 +155,7 @@ describe("scan pool eligibility", () => {
   it("builds pool links for Base and Robinhood", () => {
     expect(uniswapPoolUrl("0xpool", "base")).toBe("https://app.uniswap.org/explore/pools/base/0xpool");
     expect(uniswapPoolUrl("0xpool")).toBe("https://app.uniswap.org/explore/pools/robinhood/0xpool");
+    expect(uniswapPoolUrl("0xpool", "bsc")).toBe("https://app.uniswap.org/explore/pools/bnb/0xpool");
   });
 
   it("builds an Uniswap explorer URL from either a pool address or V4 pool ID", () => {
@@ -223,5 +224,61 @@ describe("Gecko request scheduling", () => {
     await Promise.all([first, second, interactive]);
 
     expect(calls).toEqual(["background-1", "interactive", "background-2"]);
+  });
+});
+
+describe("investigate Gecko fallback", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("fills TVL and pair name from Gecko when DexScreener has no V4 pool", async () => {
+    const poolId = "0x3967c61f2478a77e29a85db6c5ea8a5a599547f564d97a4f871c6673ae5393d6";
+    const usdt = "0x55d398326f99059ff775485246999027b3197955";
+    const token = "0xbeea1d618e533a387d941f58a7d4c9b7bd377777";
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.includes("dexscreener.com")) return new Response(JSON.stringify({ pairs: null }), { status: 200 });
+      if (url.includes("/networks/bsc/pools/")) {
+        return new Response(JSON.stringify({
+          data: {
+            attributes: {
+              address: poolId,
+              name: "牛来 / USDT 4%",
+              pool_name: "牛来 / USDT",
+              reserve_in_usd: "12714.6135",
+              volume_usd: { h1: "3700.87", h6: "12846.93", h24: "12846.93" },
+              base_token_price_usd: "0.0044",
+              fdv_usd: "4428442",
+              pool_created_at: "2026-08-15T06:21:24Z",
+              price_change_percentage: { h1: "-1.178", h6: "0.602", h24: "0.602" },
+              transactions: { h1: { buys: 30, sells: 38 } },
+            },
+            relationships: {
+              base_token: { data: { id: `bsc_${token}` } },
+              quote_token: { data: { id: `bsc_${usdt}` } },
+              dex: { data: { id: "uniswap-v4-bsc" } },
+            },
+          },
+          included: [
+            { id: `bsc_${token}`, type: "token", attributes: { address: token, symbol: "NIULAI" } },
+            { id: `bsc_${usdt}`, type: "token", attributes: { address: usdt, symbol: "USDT" } },
+          ],
+        }), { status: 200 });
+      }
+      return new Response("{}", { status: 404 });
+    }));
+    const scanner = new PoolScanner({ getForScan: () => ({}) } as never, {} as never, 0);
+    vi.spyOn(scanner as never as { readV4PoolOnChain: () => Promise<unknown> }, "readV4PoolOnChain").mockResolvedValue({
+      feeTier: 40_000,
+      currentLpFee: 40_000,
+      activeLiquidity: true,
+      hooks: "0x0000000000000000000000000000000000000000",
+    });
+
+    const result = await scanner.investigatePool(poolId, "bsc");
+    expect(result.marketSource).toBe("geckoterminal");
+    expect(result.pair).toBe("牛来/USDT");
+    expect(result.tvlUsd).toBeCloseTo(12_714.6135);
+    expect(result.volume1hUsd).toBeCloseTo(3700.87);
+    expect(result.txns1h).toEqual({ buys: 30, sells: 38 });
+    expect(result.dexScreenerFound).toBe(true);
   });
 });

@@ -112,4 +112,12 @@ describe("KyberSwapAggregatorApi", () => {
 
     await expect(api.createSwap(position, quote!)).rejects.toThrow("below the accepted minimum");
   });
+
+  it("quotes BSC routes through the bsc chain slug", async () => {
+    const request = vi.fn<typeof fetch>().mockResolvedValueOnce(json(routeResponse()));
+    const api = new KyberSwapAggregatorApi("UniLP-Monitoring", 200, 2_500, 10_000, request, () => now);
+    const quote = await api.quote({ ...position, chainId: 56 }, tokenIn, 1_000n, tokenOut);
+    expect(quote?.chainId).toBe(56);
+    expect(String(request.mock.calls[0]![0])).toContain("/bsc/api/v1/routes?");
+  });
 });

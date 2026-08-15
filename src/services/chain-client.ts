@@ -62,6 +62,7 @@ export class ChainClients {
         config.rpcHttp[name],
         config.rpcHttpScanFallback?.[name],
         config.rpcHttpFallback[name],
+        ...(name === "bsc" && config.alchemyHttp.bsc ? [config.alchemyHttp.bsc] : []),
       ]));
       this.scanClients.set(name, {
         registry,
@@ -72,20 +73,25 @@ export class ChainClients {
           pollingInterval: 4_000,
         }),
       });
-      const logTransport = createRpcTransport(uniqueUrls([
-        config.rpcHttp[name],
-        config.rpcHttpScanFallback?.[name],
-        config.rpcHttpFallback[name],
-      ]));
-      this.logClients.set(name, {
-        registry,
-        transport: logTransport,
-        client: createPublicClient({
-          chain: registry.chain,
+      const logUrls = name === "bsc"
+        ? uniqueUrls([config.alchemyHttp.bsc])
+        : uniqueUrls([
+          config.rpcHttp[name],
+          config.rpcHttpScanFallback?.[name],
+          config.rpcHttpFallback[name],
+        ]);
+      if (logUrls.length > 0) {
+        const logTransport = createRpcTransport(logUrls);
+        this.logClients.set(name, {
+          registry,
           transport: logTransport,
-          pollingInterval: 4_000,
-        }),
-      });
+          client: createPublicClient({
+            chain: registry.chain,
+            transport: logTransport,
+            pollingInterval: 4_000,
+          }),
+        });
+      }
       const executionTransport = createRpcTransport(uniqueUrls([
         config.alchemyHttp[name],
         ...publicEndpoints,

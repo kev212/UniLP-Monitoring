@@ -1,11 +1,11 @@
 # UniLP Guardian
 
-Monitor dan auto-exit Uniswap LP untuk Base dan Robinhood Chain. UniLP mendeteksi posisi LP dari wallet executor, menghitung PnL dalam quote token, mengirim dashboard Telegram, dan dapat menutup posisi berdasarkan rule risiko.
+Monitor dan auto-exit Uniswap LP untuk Base, Robinhood Chain, dan BNB Smart Chain. UniLP mendeteksi posisi LP dari wallet executor, menghitung PnL dalam quote token, mengirim dashboard Telegram, dan dapat menutup posisi berdasarkan rule risiko.
 
 ## Fitur
 
 - Dukungan Uniswap V2, V3, dan V4.
-- Deteksi-only PancakeSwap V3 BSC untuk NFT yang langsung dimiliki wallet executor.
+- Uniswap V4 di BNB Smart Chain untuk scan, investigasi, monitoring, open/close, dan Bid-Ask Ladder.
 - Stop loss, take profit, trailing stop, dan auto-exit out-of-range.
 - PnL receipt-backed, history close, PnL card, dan kalender realized PnL UTC.
 - Dashboard Telegram untuk status, manual close, scan token, dan pool scan.
@@ -47,13 +47,16 @@ Mulai dengan `DRY_RUN=true`. Ubah ke `false` hanya setelah cashflow, PnL, dan si
 | `BASE_RPC_HTTP`, `ROBINHOOD_RPC_HTTP` | Endpoint RPC public primary untuk monitoring dan transaksi. |
 | `ROBINHOOD_RPC_HTTP_FALLBACK` | Fallback public RPC untuk monitoring dan transaksi saat primary timeout, throttled, atau error transient. |
 | `ROBINHOOD_SCAN_RPC_HTTP` | Fallback RPC khusus discovery, historical reads, logs, dan pekerjaan berat. Tidak pernah digunakan untuk transaksi. |
-| `BSC_RPC_HTTP` | Endpoint BSC untuk discovery PancakeSwap V3. |
+| `BSC_RPC_HTTP` | Endpoint public BSC untuk current-state monitoring. |
+| `ALCHEMY_BSC_HTTP` | Endpoint Alchemy BSC untuk archive/log, bootstrap NFT, dan execution. |
+| `AUTO_EXIT_CHAINS` | Chain yang boleh auto-exit. Default `base,robinhood`. |
+| `BSC_POSITION_MONITOR_INTERVAL_MS` | Interval monitoring BSC. Default `10000`. |
 | `ALCHEMY_BASE_HTTP`, `ALCHEMY_ROBINHOOD_HTTP` | Endpoint RPC execution dan one-time wallet bootstrap. Alchemy bukan primary untuk monitoring atau scan. |
 | `TELEGRAM_CHAT_ID`, `TELEGRAM_USER_ID` | Chat dan user yang diizinkan mengakses bot. |
 
 Lihat `.env.example` untuk seluruh variable dan nilai default.
 
-PancakeSwap V3 BSC harus diaktifkan eksplisit melalui `CHAINS=bsc` atau ditambahkan ke daftar chain. Posisi BSC disimpan sebagai `needs_review` dan tidak dimonitor atau dieksekusi otomatis.
+BSC Uniswap V4 diaktifkan melalui `CHAINS=robinhood,bsc`. Auto-exit BSC tetap dimatikan sampai `AUTO_EXIT_CHAINS` memuat `bsc`.
 
 ## Telegram Commands
 
@@ -61,7 +64,8 @@ PancakeSwap V3 BSC harus diaktifkan eksplisit melalui `CHAINS=bsc` atau ditambah
 | --- | --- |
 | `/status` | Dashboard posisi aktif. |
 | `/close <nomor atau key>` | Menutup posisi secara manual. |
-| `/scan <token-address>` | Mencari pool V3/V4 untuk token. |
+| `/scan [base\|robinhood\|bsc] <token-address>` | Mencari pool Uniswap untuk token. |
+| `/investigate [bsc\|bnb] <pool-id>` | Menganalisis pool V4/V3. |
 | `/scan_pools` | Mencari kandidat pool berdasarkan yield 1 jam. |
 | `/history` | Riwayat close dengan PnL minimal `+/-0.5%`. |
 | `/calendar` | Kalender realized PnL UTC. |

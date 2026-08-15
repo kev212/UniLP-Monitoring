@@ -28,8 +28,13 @@ import type {
   TokenRescueStatus,
   TrailingStopState,
 } from "./types.js";
+import { normalizeToUsd6 } from "./services/token-meta.js";
 
 const HISTORY_MIN_PNL_BPS = 50n;
+const USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
+const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+const USDT = "0x55d398326f99059ff775485246999027b3197955";
+const WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
 
 interface PositionRow {
   id: string;
@@ -1910,10 +1915,14 @@ export class Database {
     const result = await this.pool.query(
       `SELECT 1
        FROM positions
-       WHERE chain_id = $1
-          AND status <> 'settled'
-          AND metadata ? 'pendingRawTransaction'
-          AND metadata->'pendingRawTransaction' <> 'null'::jsonb
+        WHERE chain_id = $1
+           AND status <> 'settled'
+           AND NOT (
+             status = 'needs_review'
+             AND metadata->'settlementRetryDisabled' = 'true'::jsonb
+           )
+           AND metadata ? 'pendingRawTransaction'
+           AND metadata->'pendingRawTransaction' <> 'null'::jsonb
        UNION ALL
        SELECT 1
        FROM position_groups
@@ -2312,15 +2321,17 @@ export class Database {
       return;
     }
     const quoteTokenLower = row.quote_token.toLowerCase();
-    const isUsdStable = quoteTokenLower === "0x5fc5360d0400a0fd4f2af552add042d716f1d168" // USDG Robinhood
-      || quoteTokenLower === "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"; // USDC Base
+    const isSixDecimalStable = quoteTokenLower === USDG || quoteTokenLower === USDC;
+    const isUsdt = quoteTokenLower === USDT;
     const settlementUsdStr = typeof meta.settlementUsd === "string" ? meta.settlementUsd : undefined;
     const settlementUsd = settlementUsdStr ? BigInt(settlementUsdStr) : 0n;
-    const finalPnlUsd = isUsdStable
-      ? finalPnl
-      : totalReceived > 0n && settlementUsd > 0n
-        ? (finalPnl * settlementUsd) / totalReceived
-        : 0n;
+    const finalPnlUsd = totalReceived > 0n && settlementUsd > 0n
+      ? (finalPnl * settlementUsd) / totalReceived
+      : isSixDecimalStable
+        ? finalPnl
+        : isUsdt
+          ? normalizeToUsd6(finalPnl, 18)
+          : 0n;
 
     const updated = await this.pool.query(
       `UPDATE close_history
@@ -2375,11 +2386,12 @@ export class Database {
          LEFT JOIN position_groups g ON g.id = h.position_group_id
          WHERE h.final_pnl_usd = 0
            AND LOWER(h.quote_token) IN (
-             '0x0000000000000000000000000000000000000000',
-             '0x0bd7d308f8e1639fab988df18a8011f41eacad73',
-             '0x4200000000000000000000000000000000000006'
-           )
-         ORDER BY h.settled_at DESC
+              '0x0000000000000000000000000000000000000000',
+              '0x0bd7d308f8e1639fab988df18a8011f41eacad73',
+              '0x4200000000000000000000000000000000000006',
+              '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c'
+            )
+          ORDER BY h.settled_at DESC
         LIMIT 50`,
     );
     return result.rows.map(row => ({
@@ -2418,7 +2430,8 @@ export class Database {
           AND LOWER(g.quote_token) IN (
             '0x0000000000000000000000000000000000000000',
             '0x0bd7d308f8e1639fab988df18a8011f41eacad73',
-            '0x4200000000000000000000000000000000000006'
+            '0x4200000000000000000000000000000000000006',
+            '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c'
           )
         ORDER BY g.settled_at DESC
         LIMIT 100`,

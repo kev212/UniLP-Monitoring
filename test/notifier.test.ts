@@ -1,13 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import type { PositionOpener } from "../src/services/position-opener.js";
-import { canRequestManualClose, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins, positionRangeLine } from "../src/services/notifier.js";
+import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins, positionRangeLine } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
     const token = "0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913";
     expect(parseScanInput(`base ${token}`)).toEqual({ chain: "base", token });
     expect(parseScanInput(token)).toEqual({ chain: "robinhood", token });
+    expect(parseScanInput(`bsc ${token}`)).toEqual({ chain: "bsc", token });
+    expect(parseScanInput(`bnb ${token}`)).toEqual({ chain: "bsc", token });
     expect(parseScanInput("base 0xinvalid")).toBeNull();
   });
 
@@ -24,6 +26,17 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseOpenPoolInput(`https://app.uniswap.org/explore/pools/robinhood/${poolId}?foo=bar#pool`)).toBe(poolId);
     expect(parseOpenPoolInput(`https://app.uniswap.org/explore/pools/base/${poolId}`)).toBeNull();
     expect(parseOpenPoolInput(`https://example.com/explore/pools/robinhood/${poolId}`)).toBeNull();
+    expect(parseOpenPoolInput(`https://app.uniswap.org/explore/pools/bnb/${poolId}`, "bsc")).toBe(poolId);
+    expect(parseOpenPoolInput("0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913", "bsc")).toBeNull();
+  });
+
+  it("parses BSC investigation aliases and Uniswap bnb links", () => {
+    const poolId = "0x6dbc403a0afed02fe5d180476257ed9b88c3a50d0ba48435af9fde2a4bcb018a";
+    expect(parseInvestigateInput(`bsc ${poolId}`)).toEqual({ chain: "bsc", poolIdentifier: poolId });
+    expect(parseInvestigateInput(`bnb ${poolId}`)).toEqual({ chain: "bsc", poolIdentifier: poolId });
+    expect(parseInvestigateInput(poolId)).toEqual({ chain: "robinhood", poolIdentifier: poolId });
+    expect(parseInvestigateInput(`https://app.uniswap.org/explore/pools/bnb/${poolId}`)).toEqual({ chain: "bsc", poolIdentifier: poolId });
+    expect(parseInvestigateInput("bsc 0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913")).toBeNull();
   });
 
   it("parses dashboard navigation callbacks", () => {
@@ -36,12 +49,17 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseDashboardAction("lp:openmode:single")).toEqual({ type: "open_mode", mode: "single", page: 0 });
     expect(parseDashboardAction("lp:openmode:dual:2")).toEqual({ type: "open_mode", mode: "dual", page: 2 });
     expect(parseDashboardAction("lp:openmode:both")).toBeNull();
+    expect(parseDashboardAction("lp:open_chain:bsc:single:0")).toEqual({ type: "open_chain", chain: "bsc", mode: "single", page: 0 });
   });
 
   it("parses the enabled-only Bid-Ask ladder path", () => {
     expect(parseDashboardAction("lp:open_ladder:2")).toEqual({ type: "open_ladder", page: 2 });
     expect(parseDashboardAction("lp:open_ladder_chain:base:1")).toEqual({ type: "open_ladder_chain", chain: "base", page: 1 });
-    expect(parseDashboardAction("lp:open_ladder_chain:bsc:1")).toBeNull();
+    expect(parseDashboardAction("lp:open_ladder_chain:bsc:1")).toEqual({ type: "open_ladder_chain", chain: "bsc", page: 1 });
+    expect(parseDashboardAction("lp:scan_chain:bsc:0")).toEqual({ type: "scan_chain", chain: "bsc", page: 0 });
+    expect(chainButtonLabel("bsc")).toBe("BSC");
+    expect(chainButtonLabel("robinhood")).toBe("Robinhood");
+    expect(["robinhood", "bsc"].includes("base")).toBe(false);
     expect(parseBidAskPoolInput("https://app.uniswap.org/explore/pools/base/0x0000000000000000000000000000000000000000000000000000000000000001", "base")).toBe("0x0000000000000000000000000000000000000000000000000000000000000001");
     expect(parseBidAskRangeInput("below 60")).toEqual({ direction: "below", rangePercent: 60 });
     expect(parseBidAskRangeInput("+30%")).toEqual({ direction: "above", rangePercent: 30 });

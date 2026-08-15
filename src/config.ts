@@ -30,7 +30,8 @@ const envSchema = z.object({
   ALCHEMY_BSC_HTTP: z.string().url().optional().or(z.literal("")),
   QUOTE_TOKEN_ALLOWLIST_BASE: z.string().default(""),
   QUOTE_TOKEN_ALLOWLIST_ROBINHOOD: z.string().default(""),
-  QUOTE_TOKEN_ALLOWLIST_BSC: z.string().default("USDT:0x55d398326f99059fF775485246999027B3197955,WBNB:0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"),
+  QUOTE_TOKEN_ALLOWLIST_BSC: z.string().default("USDT:0x55d398326f99059fF775485246999027B3197955,WBNB:0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c,BNB:0x0000000000000000000000000000000000000000"),
+  AUTO_EXIT_CHAINS: z.string().default("base,robinhood"),
   STOP_LOSS_PERCENT: z.coerce.number().negative(),
   TAKE_PROFIT_PERCENT: z.coerce.number().positive(),
   TRAILING_STOP_ACTIVATION_PERCENT: z.coerce.number().positive().default(5),
@@ -118,6 +119,7 @@ export interface RuntimeConfig {
   positionMonitorIntervalMs: number;
   discoveryIntervalMs: number;
   chainMonitorIntervalMs: Partial<Record<ChainName, number>>;
+  autoExitChains: ChainName[];
   positionMonitorConcurrency: number;
   maxSwapSlippageBps: number;
   settlementSwapSlippageBps: number;
@@ -309,8 +311,9 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     chainMonitorIntervalMs: {
       ...(env.BASE_POSITION_MONITOR_INTERVAL_MS !== undefined ? { base: env.BASE_POSITION_MONITOR_INTERVAL_MS } : {}),
       ...(env.ROBINHOOD_POSITION_MONITOR_INTERVAL_MS !== undefined ? { robinhood: env.ROBINHOOD_POSITION_MONITOR_INTERVAL_MS } : {}),
-      ...(env.BSC_POSITION_MONITOR_INTERVAL_MS !== undefined ? { bsc: env.BSC_POSITION_MONITOR_INTERVAL_MS } : {}),
+      bsc: env.BSC_POSITION_MONITOR_INTERVAL_MS ?? 10_000,
     },
+    autoExitChains: parseChains(env.AUTO_EXIT_CHAINS),
     positionMonitorConcurrency: env.POSITION_MONITOR_CONCURRENCY,
     maxSwapSlippageBps: env.MAX_SWAP_SLIPPAGE_BPS,
     settlementSwapSlippageBps: env.SETTLEMENT_SWAP_SLIPPAGE_BPS,

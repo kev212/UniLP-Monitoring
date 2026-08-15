@@ -150,6 +150,7 @@ describe("historical discovery reads", () => {
       {
         getById: vi.fn(() => ({ registry: chainRegistry.robinhood, client: regularClient })),
         getForScan: vi.fn(() => ({ registry: chainRegistry.robinhood, client: archiveClient })),
+        getForLogs: vi.fn(() => ({ registry: chainRegistry.robinhood, client: archiveClient })),
       } as never,
       {} as never,
     );

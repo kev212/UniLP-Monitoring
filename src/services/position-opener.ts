@@ -3,6 +3,7 @@ import { createWalletClient, encodeAbiParameters, encodeFunctionData, keccak256,
 import { privateKeyToAccount } from "viem/accounts";
 
 import { erc20Abi, permit2Abi, v3FactoryAbi, v3PoolAbi, v4PoolKeysAbi, v4StateViewAbi, wethAbi } from "../abi.js";
+import { chainRegistry } from "../chains.js";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
@@ -33,7 +34,6 @@ const { Pool: V4SdkPool, Position: V4SdkPosition, V4PositionManager } = require(
 type V3Position = import("@uniswap/v3-sdk").Position;
 type V4Position = import("@uniswap/v4-sdk").Position;
 type V3FeeAmount = import("@uniswap/v3-sdk").FeeAmount;
-const OPEN_QUOTE_PRIORITY = ["USDG", "USDC", "WETH", "ETH", "NVDA"];
 const NVDA_SYMBOL = "NVDA";
 
 export type OpenMode = "single" | "dual";
@@ -231,6 +231,7 @@ export class PositionOpener {
       throw new Error("NVDA quote supports single-side normal opens only");
     }
 
+    if (chain === "bsc" && protocol !== "v4") throw new Error("BSC accepts Uniswap V4 pool IDs only");
     if (protocol === "v3") return this.prepareV3(normalized, chain, rangePercent, depositAmount, quoteToken, mode);
     return this.prepareV4(normalized, chain, rangePercent, depositAmount, quoteToken, mode);
   }
@@ -244,14 +245,15 @@ export class PositionOpener {
     requestedBinCount: number,
     direction?: BidAskDirection,
   ): Promise<BidAskOpenPreview> {
-    if (chain !== "base" && chain !== "robinhood") throw new Error("Bid-Ask ladders are supported on Base and Robinhood only");
+    if (chain !== "base" && chain !== "robinhood" && chain !== "bsc") throw new Error("Bid-Ask ladders are supported on Base, Robinhood, and BSC only");
     const normalized = poolAddress.toLowerCase() as Hex;
     const protocol = normalized.length === 66 && normalized.startsWith("0x") ? "v4" : "v3";
+    if (chain === "bsc" && protocol !== "v4") throw new Error("BSC Bid-Ask ladders accept Uniswap V4 pool IDs only");
     this.assertBidAskEnabled(protocol, requestedBinCount);
 
     const state = await this.readBidAskPool(normalized, chain);
     this.assertBidAskPoolSupported(state);
-    const quoteAddress = openPoolQuoteAddress(protocol, this.chains.get(chain).registry.chain.id, quoteToken).toLowerCase();
+    const quoteAddress = openPoolQuoteAddress(protocol, this.chains.getForScan(chain).registry.chain.id, quoteToken).toLowerCase();
     const quoteIsToken0 = quoteAddress === state.token0.toLowerCase();
     if (!quoteIsToken0 && quoteAddress !== state.token1.toLowerCase()) {
       throw new Error("Quote token is neither token0 nor token1 of this pool");
@@ -265,8 +267,8 @@ export class PositionOpener {
       this.tokenDecimals(this.client(chain), state.token1),
     ]);
     const [token0Symbol, token1Symbol] = await Promise.all([
-      this.tokenSymbol(this.client(chain), state.token0),
-      this.tokenSymbol(this.client(chain), state.token1),
+      this.tokenSymbol(this.client(chain), state.token0, chain),
+      this.tokenSymbol(this.client(chain), state.token1, chain),
     ]);
     const baseSymbol = quoteIsToken0 ? token1Symbol : token0Symbol;
     const plan = this.makeBidAskPlan(state, chain, quoteIsToken0, token0Decimals, token1Decimals, outer, depositAmount, requestedBinCount);
@@ -355,7 +357,7 @@ export class PositionOpener {
     let token0: Address;
     let token1: Address;
     if (isV4) {
-      const { registry } = this.chains.get(chain);
+      const { registry } = this.chains.getForScan(chain);
       const bytes25 = normalized.slice(0, 2 + 25 * 2) as Hex;
       const poolKey = await client.readContract({ address: registry.contracts.v4.positionManager, abi: v4PoolKeysAbi, functionName: "poolKeys", args: [bytes25] }) as unknown as V4PoolKey;
       token0 = poolKey.currency0;
@@ -367,13 +369,11 @@ export class PositionOpener {
       ]);
     }
     const allowed = this.config.quoteTokens[chain] ?? [];
-    const quote = selectOpenQuoteToken(allowed, token0, token1);
-    // Uniswap V3 stores native ETH pools as WETH, but its PositionManager can
-    // wrap native ETH in the mint multicall. Keep the pool address as WETH while
-    // exposing ETH as the funding currency to the user.
-    if (quote) return !isV4 && quote.symbol === "WETH" ? { ...quote, symbol: "ETH" } : quote;
-    if ((token0.toLowerCase() === zeroAddress || token1.toLowerCase() === zeroAddress) && allowed.some(({ symbol }) => symbol === "ETH")) {
-      return { symbol: "ETH", address: zeroAddress };
+    const registry = this.chains.getForScan(chain).registry;
+    const quote = selectOpenQuoteToken(allowed, token0, token1, registry.quotePriority);
+    if (quote) return !isV4 && quote.symbol === registry.wrappedSymbol ? { ...quote, symbol: registry.nativeSymbol } : quote;
+    if ((token0.toLowerCase() === zeroAddress || token1.toLowerCase() === zeroAddress) && allowed.some(({ symbol }) => symbol === registry.nativeSymbol)) {
+      return { symbol: registry.nativeSymbol, address: zeroAddress };
     }
     throw new Error("Pool tidak memiliki quote token dari allowlist");
   }
@@ -394,7 +394,7 @@ export class PositionOpener {
     ]);
 
     if (!V3_SUPPORTED_FEES.has(Number(fee))) throw new Error(`V3 fee tier ${fee} is unsupported by the official SDK`);
-    const { registry } = this.chains.get(chain);
+    const { registry } = this.chains.getForScan(chain);
     const factoryPool = await client.readContract({
       address: registry.contracts.v3.factory,
       abi: v3FactoryAbi,
@@ -409,7 +409,7 @@ export class PositionOpener {
 
   private async prepareV4(poolId: Hex, chain: ChainName, rangePercent: number, depositAmount: bigint, quoteToken: QuoteToken, mode: OpenMode): Promise<OpenPositionPreview> {
     const client = this.client(chain);
-    const { registry } = this.chains.get(chain);
+    const { registry } = this.chains.getForScan(chain);
     const bytes25 = poolId.slice(0, 2 + 25 * 2) as Hex;
 
     const [slot0, liquidity, poolKeyResult] = await Promise.all([
@@ -447,7 +447,7 @@ export class PositionOpener {
     mode: OpenMode,
   ): Promise<OpenPositionPreview> {
     const client = this.client(chain);
-    const quoteAddr = openPoolQuoteAddress(protocol, this.chains.get(chain).registry.chain.id, quoteToken).toLowerCase() as Address;
+    const quoteAddr = openPoolQuoteAddress(protocol, this.chains.getForScan(chain).registry.chain.id, quoteToken).toLowerCase() as Address;
     const quoteIsToken0 = quoteAddr === token0.toLowerCase();
     if (!quoteIsToken0 && quoteAddr !== token1.toLowerCase()) {
       throw new Error("Quote token is neither token0 nor token1 of this pool");
@@ -457,7 +457,7 @@ export class PositionOpener {
     const baseToken = quoteIsToken0 ? token1 : token0;
     const baseDecimals = quoteIsToken0 ? token1Decimals : token0Decimals;
     const quoteDecimals = quoteIsToken0 ? token0Decimals : token1Decimals;
-    const baseSymbol = await this.tokenSymbol(client, baseToken);
+    const baseSymbol = await this.tokenSymbol(client, baseToken, chain);
 
     let tickLower: number;
     let tickUpper: number;
@@ -539,7 +539,7 @@ export class PositionOpener {
   }
 
   async executeBidAskOpen(preview: BidAskOpenPreview): Promise<BidAskOpenExecution> {
-    if (preview.chain !== "base" && preview.chain !== "robinhood") throw new Error("Bid-Ask ladders are supported on Base and Robinhood only");
+    if (preview.chain !== "base" && preview.chain !== "robinhood" && preview.chain !== "bsc") throw new Error("Bid-Ask ladders are supported on Base, Robinhood, and BSC only");
     this.assertBidAskEnabled(preview.protocol, preview.requestedBinCount);
     if (!this.database || !this.reconcileBidAskOpen) {
       throw new Error("Bid-Ask open requires durable group persistence and receipt reconciliation");
@@ -559,12 +559,12 @@ export class PositionOpener {
       if (isBidAskNativeFunding(preview.protocol, preview.quoteToken, preview.quoteTokenSymbol)) {
         await this.ensureNativeBalance(client, executor, quoteAmount);
       } else {
-        await this.ensureApproval(client, preview.quoteToken, this.chains.get(preview.chain).registry.contracts.v3.positionManager, quoteAmount, executor, preview.chain);
+        await this.ensureApproval(client, preview.quoteToken, this.chains.getForScan(preview.chain).registry.contracts.v3.positionManager, quoteAmount, executor, preview.chain);
       }
     } else if (preview.quoteToken.toLowerCase() === zeroAddress.toLowerCase()) {
       await this.ensureNativeBalance(client, executor, quoteAmount);
     } else {
-      const { registry } = this.chains.get(preview.chain);
+      const { registry } = this.chains.getForScan(preview.chain);
       await this.ensureWrappedNativeFunding(client, preview.chain, preview.quoteToken, quoteAmount, executor);
       await this.ensureApproval(client, preview.quoteToken, registry.contracts.v4.permit2, quoteAmount, executor, preview.chain);
       await this.ensurePermit2Approval(client, preview.quoteToken, registry.contracts.v4.positionManager, quoteAmount, executor, preview.chain);
@@ -669,7 +669,7 @@ export class PositionOpener {
 
   private async readBidAskPool(poolAddress: Hex, chain: ChainName): Promise<BidAskPoolState> {
     const client = this.client(chain);
-    const { registry } = this.chains.get(chain);
+    const { registry } = this.chains.getForScan(chain);
     const isV4 = poolAddress.length === 66 && poolAddress.startsWith("0x");
 
     if (!isV4) {
@@ -841,7 +841,7 @@ export class PositionOpener {
     amount0: bigint,
     amount1: bigint,
   ): V3Position | V4Position {
-    const chainId = this.chains.get(chain).registry.chain.id;
+    const chainId = this.chains.getForScan(chain).registry.chain.id;
     if (state.protocol === "v3") {
       const pool = new V3SdkPool(
         new Token(chainId, state.token0, token0Decimals),
@@ -902,7 +902,7 @@ export class PositionOpener {
 
     if (state.protocol === "v3") {
       return buildV3BidAskOpenPlan({
-        chainId: this.chains.get(chain).registry.chain.id,
+        chainId: this.chains.getForScan(chain).registry.chain.id,
         positionManager,
         token0: state.token0,
         token1: state.token1,
@@ -948,7 +948,7 @@ export class PositionOpener {
       ? { currency: zeroAddress, recipient }
       : undefined;
     return buildV4BidAskOpenPlan({
-      chainId: this.chains.get(chain).registry.chain.id,
+      chainId: this.chains.getForScan(chain).registry.chain.id,
       positionManager,
       poolKey: state.poolKey as BidAskV4PoolKey,
       recipient,
@@ -980,7 +980,7 @@ export class PositionOpener {
   }
 
   private positionManager(chain: ChainName, protocol: "v3" | "v4"): Address {
-    const { registry } = this.chains.get(chain);
+    const { registry } = this.chains.getForScan(chain);
     return protocol === "v3" ? registry.contracts.v3.positionManager : registry.contracts.v4.positionManager;
   }
 
@@ -1041,7 +1041,7 @@ export class PositionOpener {
 
   private async persistBidAskPlan(preview: BidAskOpenPreview): Promise<string | undefined> {
     if (!this.database) return undefined;
-    const chainId = this.chains.get(preview.chain).registry.chain.id;
+    const chainId = this.chains.getForScan(preview.chain).registry.chain.id;
     const positionManager = preview.positionManager;
     const expectedAmounts = preview.plan.bins.reduce(
       (totals, bin) => ({
@@ -1145,7 +1145,7 @@ export class PositionOpener {
 
   private async broadcastBidAsk(chain: ChainName, groupId: string, to: Address, data: Hex, value = 0n): Promise<{ hash: Hex | null; receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>> }> {
     if (!this.database) throw new Error("Bid-Ask group database is not configured");
-    const chainId = this.chains.get(chain).registry.chain.id;
+    const chainId = this.chains.getForScan(chain).registry.chain.id;
     const run = async (): Promise<{ hash: Hex | null; receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>> }> => {
       if (await this.database!.hasPendingRawTransaction(chainId)) throw new Error(`Chain ${chainId} has an unresolved signed transaction`);
       const client = this.executionClient(chain);
@@ -1209,7 +1209,7 @@ export class PositionOpener {
 
   private async executeV3(preview: OpenPositionPreview, deadline: bigint): Promise<{ hash: Hex | null }> {
     const client = this.executionClient(preview.chain);
-    const { registry } = this.chains.get(preview.chain);
+    const { registry } = this.chains.getForScan(preview.chain);
     const positionManager = registry.contracts.v3.positionManager;
     const executor = this.config.executorAddress;
 
@@ -1222,14 +1222,14 @@ export class PositionOpener {
       recipient: executor,
       deadline: deadline.toString(),
       slippageTolerance: new Percent(0, 10_000),
-      ...(useNative ? { useNative: Ether.onChain(this.chains.get(preview.chain).registry.chain.id) } : {}),
+      ...(useNative ? { useNative: Ether.onChain(this.chains.getForScan(preview.chain).registry.chain.id) } : {}),
     });
     return this.broadcast(preview.chain, positionManager, parameters.calldata as Hex, BigInt(parameters.value));
   }
 
   private async executeV4(preview: OpenPositionPreview, deadline: bigint): Promise<{ hash: Hex | null }> {
     const client = this.executionClient(preview.chain);
-    const { registry } = this.chains.get(preview.chain);
+    const { registry } = this.chains.getForScan(preview.chain);
     const positionManager = registry.contracts.v4.positionManager;
     const executor = this.config.executorAddress;
 
@@ -1243,17 +1243,17 @@ export class PositionOpener {
       deadline: deadline.toString(),
       slippageTolerance: new Percent(0, 10_000),
       hookData: "0x",
-      ...(preview.token0.toLowerCase() === zeroAddress ? { useNative: Ether.onChain(this.chains.get(preview.chain).registry.chain.id) } : {}),
+      ...(preview.token0.toLowerCase() === zeroAddress ? { useNative: Ether.onChain(this.chains.getForScan(preview.chain).registry.chain.id) } : {}),
     });
     return this.broadcast(preview.chain, positionManager, parameters.calldata as Hex, BigInt(parameters.value));
   }
 
   private async executeV3Dual(preview: OpenPositionPreview, deadline: bigint, quoteAmount: bigint, baseAmount: bigint): Promise<{ hash: Hex | null }> {
     const client = this.executionClient(preview.chain);
-    const { registry } = this.chains.get(preview.chain);
+    const { registry } = this.chains.getForScan(preview.chain);
     const positionManager = registry.contracts.v3.positionManager;
     const executor = this.config.executorAddress;
-    const chainId = this.chains.get(preview.chain).registry.chain.id;
+    const chainId = this.chains.getForScan(preview.chain).registry.chain.id;
 
     const useNative = preview.quoteToken === zeroAddress;
     if (quoteAmount > 0n) {
@@ -1289,10 +1289,10 @@ export class PositionOpener {
 
   private async executeV4Dual(preview: OpenPositionPreview, deadline: bigint, quoteAmount: bigint, baseAmount: bigint): Promise<{ hash: Hex | null }> {
     const client = this.executionClient(preview.chain);
-    const { registry } = this.chains.get(preview.chain);
+    const { registry } = this.chains.getForScan(preview.chain);
     const positionManager = registry.contracts.v4.positionManager;
     const executor = this.config.executorAddress;
-    const chainId = this.chains.get(preview.chain).registry.chain.id;
+    const chainId = this.chains.getForScan(preview.chain).registry.chain.id;
 
     const useNative = preview.quoteToken === zeroAddress;
     if (quoteAmount > 0n) {
@@ -1344,7 +1344,7 @@ export class PositionOpener {
     quoteIsToken0: boolean,
     mode: OpenMode,
   ): V3Position {
-    const chainId = this.chains.get(chain).registry.chain.id;
+    const chainId = this.chains.getForScan(chain).registry.chain.id;
     const pool = new V3SdkPool(
       new Token(chainId, token0, token0Decimals),
       new Token(chainId, token1, token1Decimals),
@@ -1394,7 +1394,7 @@ export class PositionOpener {
     quoteIsToken0: boolean,
     mode: OpenMode,
   ): V4Position {
-    const chainId = this.chains.get(chain).registry.chain.id;
+    const chainId = this.chains.getForScan(chain).registry.chain.id;
     const currency0 = token0.toLowerCase() === zeroAddress ? Ether.onChain(chainId) : new Token(chainId, token0, token0Decimals);
     const currency1 = new Token(chainId, token1, token1Decimals);
     const pool = new V4SdkPool(currency0, currency1, fee, tickSpacing, hooks, sqrtPriceX96.toString(), poolLiquidity.toString(), currentTick);
@@ -1491,13 +1491,13 @@ export class PositionOpener {
 
     const executor = this.config.executorAddress;
     const client = this.executionClient(preview.chain);
-    const { registry } = this.chains.get(preview.chain);
+    const { registry } = this.chains.getForScan(preview.chain);
 
     if (this.tradingApi) {
       let apiPlan: { to: Address; data: Hex; value?: bigint } | null = null;
       try {
         let quote = await this.tradingApi.quote(
-          { chainId: this.chains.get(preview.chain).registry.chain.id, owner: executor } as PositionRecord,
+          { chainId: this.chains.getForScan(preview.chain).registry.chain.id, owner: executor } as PositionRecord,
           preview.quoteToken,
           swapAmount,
           preview.baseToken,
@@ -1513,7 +1513,7 @@ export class PositionOpener {
           // Approval can take a block and Trading API quotes expire quickly, so refresh
           // the quote after an approval transaction before building calldata.
           quote = await this.tradingApi.quote(
-            { chainId: this.chains.get(preview.chain).registry.chain.id, owner: executor } as PositionRecord,
+            { chainId: this.chains.getForScan(preview.chain).registry.chain.id, owner: executor } as PositionRecord,
             preview.quoteToken,
             swapAmount,
             preview.baseToken,
@@ -1521,7 +1521,7 @@ export class PositionOpener {
           );
           if (!quote) throw new Error("Trading API route disappeared after approval");
           apiPlan = await this.tradingApi.createSwap(
-            { chainId: this.chains.get(preview.chain).registry.chain.id, owner: executor } as PositionRecord,
+            { chainId: this.chains.getForScan(preview.chain).registry.chain.id, owner: executor } as PositionRecord,
             quote,
           );
         }
@@ -1540,7 +1540,7 @@ export class PositionOpener {
     if (preview.quoteToken === zeroAddress) throw new Error("No Trading API route is available for native-ETH dual-side open");
     if (!this.routes) throw new Error("No swap route available for dual-side open");
     const swapRoute = await this.routes.quoteDirect(
-      { chainId: this.chains.get(preview.chain).registry.chain.id } as PositionRecord,
+      { chainId: this.chains.getForScan(preview.chain).registry.chain.id } as PositionRecord,
       preview.quoteToken,
       swapAmount,
       preview.baseToken,
@@ -1550,7 +1550,7 @@ export class PositionOpener {
     const minOut = applySlippage(swapRoute.expectedOut, this.config.maxSwapSlippageBps);
     const adjustedRoute = { ...swapRoute, minimumOut: minOut };
     const deadline = BigInt(Math.floor(Date.now() / 1_000) + 300);
-    const plan = buildSwapPlan(this.chains.get(preview.chain).registry.chain.id, executor, adjustedRoute, deadline);
+    const plan = buildSwapPlan(this.chains.getForScan(preview.chain).registry.chain.id, executor, adjustedRoute, deadline);
 
     if (this.config.dryRun) {
       log.info({ swapAmount: swapAmount.toString(), expectedBase: swapRoute.expectedOut.toString(), protocol: swapRoute.protocol }, "dry-run: dual-side swap via local route");
@@ -1590,7 +1590,7 @@ export class PositionOpener {
     }
 
     const wallet = this.walletClient(chain);
-    const hash = await wallet.sendTransaction({ to, data, value, account: this.account!, chain: this.chains.get(chain).registry.chain });
+    const hash = await wallet.sendTransaction({ to, data, value, account: this.account!, chain: this.chains.getForScan(chain).registry.chain });
     const receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
     if (receipt.status !== "success") throw new Error(`Open position transaction reverted: ${hash}`);
     log.info({ hash, to }, "open position transaction broadcast");
@@ -1611,7 +1611,7 @@ export class PositionOpener {
 
     const wallet = this.walletClient(chain);
     const approveData = encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [spender, amount] });
-    const hash = await wallet.sendTransaction({ to: token, data: approveData, account: this.account!, chain: this.chains.get(chain).registry.chain });
+    const hash = await wallet.sendTransaction({ to: token, data: approveData, account: this.account!, chain: this.chains.getForScan(chain).registry.chain });
     const receipt = await client.waitForTransactionReceipt({ hash });
     if (receipt.status !== "success") throw new Error(`ERC-20 approval reverted for ${token}`);
     log.info({ hash, token, spender }, "approval submitted");
@@ -1623,7 +1623,7 @@ export class PositionOpener {
   }
 
   private async ensureWrappedNativeFunding(client: PublicClient, chain: ChainName, token: Address, amount: bigint, owner: Address): Promise<void> {
-    const wrappedNative = Ether.onChain(this.chains.get(chain).registry.chain.id).wrapped.address.toLowerCase();
+    const wrappedNative = Ether.onChain(this.chains.getForScan(chain).registry.chain.id).wrapped.address.toLowerCase();
     if (token.toLowerCase() !== wrappedNative) return;
 
     const balance = await client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
@@ -1638,7 +1638,7 @@ export class PositionOpener {
 
     const wallet = this.walletClient(chain);
     const data = encodeFunctionData({ abi: wethAbi, functionName: "deposit" });
-    const hash = await wallet.sendTransaction({ to: token, data, value: shortfall, account: this.account!, chain: this.chains.get(chain).registry.chain });
+    const hash = await wallet.sendTransaction({ to: token, data, value: shortfall, account: this.account!, chain: this.chains.getForScan(chain).registry.chain });
     const receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
     if (receipt.status !== "success") throw new Error(`Native ETH wrap reverted for ${token}`);
     log.info({ hash, token, shortfall: shortfall.toString() }, "native ETH wrapped for open position");
@@ -1657,7 +1657,7 @@ export class PositionOpener {
     }
     if (amount > (1n << 160n) - 1n) throw new Error("Permit2 approval amount overflows uint160");
 
-    const { registry } = this.chains.get(chain);
+    const { registry } = this.chains.getForScan(chain);
     const permit2 = registry.contracts.v4.permit2;
     const allowance = await client.readContract({
       address: permit2,
@@ -1679,7 +1679,7 @@ export class PositionOpener {
       functionName: "approve",
       args: [token, spender, amount, expiration],
     });
-    const hash = await wallet.sendTransaction({ to: permit2, data: approvalData, account: this.account!, chain: this.chains.get(chain).registry.chain });
+    const hash = await wallet.sendTransaction({ to: permit2, data: approvalData, account: this.account!, chain: this.chains.getForScan(chain).registry.chain });
     const receipt = await client.waitForTransactionReceipt({ hash });
     if (receipt.status !== "success") throw new Error(`Permit2 approval reverted for ${token}`);
     log.info({ hash, token, spender }, "Permit2 approval submitted");
@@ -1694,8 +1694,8 @@ export class PositionOpener {
     return decimals;
   }
 
-  private async tokenSymbol(client: PublicClient, token: Address): Promise<string> {
-    if (token === zeroAddress) return "ETH";
+  private async tokenSymbol(client: PublicClient, token: Address, chain: ChainName): Promise<string> {
+    if (token === zeroAddress) return chainRegistry[chain].nativeSymbol;
     try { return await client.readContract({ address: token, abi: erc20Abi, functionName: "symbol" }); }
     catch { return "???"; }
   }
@@ -1724,7 +1724,7 @@ function bidAskOuterTicks(currentTick: number, tickSpacing: number, quoteIsToken
 }
 
 function isBidAskNativeFunding(protocol: "v3" | "v4", token: Address, symbol: string): boolean {
-  return token.toLowerCase() === zeroAddress.toLowerCase() || (protocol === "v3" && symbol === "ETH");
+  return token.toLowerCase() === zeroAddress.toLowerCase() || (protocol === "v3" && (symbol === "ETH" || symbol === "BNB"));
 }
 
 function bidAskPoolId(poolKey: V4PoolKey): Hex {
@@ -1763,11 +1763,16 @@ function jsonSafe(value: unknown): Record<string, unknown> {
   ))) as Record<string, unknown>;
 }
 
-export function selectOpenQuoteToken(allowed: readonly QuoteToken[], token0: Address, token1: Address): QuoteToken | null {
+export function selectOpenQuoteToken(
+  allowed: readonly QuoteToken[],
+  token0: Address,
+  token1: Address,
+  priority: readonly string[] = ["USDG", "USDC", "WETH", "ETH", "NVDA"],
+): QuoteToken | null {
   const matches = allowed.filter(({ symbol, address }) =>
-    OPEN_QUOTE_PRIORITY.includes(symbol) && (address.toLowerCase() === token0.toLowerCase() || address.toLowerCase() === token1.toLowerCase()),
+    priority.includes(symbol) && (address.toLowerCase() === token0.toLowerCase() || address.toLowerCase() === token1.toLowerCase()),
   );
-  return matches.sort((a, b) => OPEN_QUOTE_PRIORITY.indexOf(a.symbol) - OPEN_QUOTE_PRIORITY.indexOf(b.symbol))[0] ?? null;
+  return matches.sort((a, b) => priority.indexOf(a.symbol) - priority.indexOf(b.symbol))[0] ?? null;
 }
 
 export function bidAskDirectionForQuote(quoteIsToken0: boolean): BidAskDirection {

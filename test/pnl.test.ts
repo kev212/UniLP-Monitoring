@@ -579,4 +579,15 @@ describe("position group valuation fees", () => {
 
     expect(valued.snapshot.feeQuoteUsdg).toBe(120n);
   });
+
+  it("normalizes 18-decimal USDT fees to six-decimal USD", async () => {
+    const usdt = "0x0000000000000000000000000000000000000099" as Address;
+    const fee = 120n * 10n ** 12n;
+    const { pnl, group } = setup(usdt, weth, usdt, 500n * 10n ** 12n, 0n, fee, 0n, [{ symbol: "USDT", address: usdt }]);
+
+    const valued = await pnl.valueGroup(group, 10n);
+
+    expect(valued.snapshot.feeQuote).toBe(fee * 2n);
+    expect(valued.snapshot.feeQuoteUsdg).toBe(240n);
+  });
 });

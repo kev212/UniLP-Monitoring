@@ -14,7 +14,7 @@ function environment(overrides: Record<string, string> = {}): NodeJS.ProcessEnv 
     BSC_RPC_HTTP: "https://bsc-dataseed.bnbchain.org",
     QUOTE_TOKEN_ALLOWLIST_BASE: "USDC:0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913,WETH:0x4200000000000000000000000000000000000006",
     QUOTE_TOKEN_ALLOWLIST_ROBINHOOD: "USDG:0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168,WETH:0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73,NVDA:0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
-    QUOTE_TOKEN_ALLOWLIST_BSC: "USDT:0x55d398326f99059fF775485246999027B3197955,WBNB:0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+    QUOTE_TOKEN_ALLOWLIST_BSC: "USDT:0x55d398326f99059fF775485246999027B3197955,WBNB:0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c,BNB:0x0000000000000000000000000000000000000000",
     STOP_LOSS_PERCENT: "-10",
     TAKE_PROFIT_PERCENT: "20",
     TRAILING_STOP_ACTIVATION_PERCENT: "5",
@@ -130,12 +130,14 @@ describe("loadConfig", () => {
     expect(() => loadConfig(environment({ SCANV2_ENABLED: "yes" }))).toThrow("SCANV2_ENABLED");
   });
 
-  it("configures BSC Pancake V3 discovery explicitly", () => {
+  it("configures BSC Uniswap V4 discovery explicitly", () => {
     const config = loadConfig(environment({ CHAINS: "bsc", START_BLOCK_BSC: "26956207" }));
     expect(config.chains).toEqual(["bsc"]);
     expect(config.rpcHttp.bsc).toBe("https://bsc-dataseed.bnbchain.org");
-    expect(config.quoteTokens.bsc.map((token) => token.symbol)).toEqual(["USDT", "WBNB"]);
+    expect(config.quoteTokens.bsc.map((token) => token.symbol)).toEqual(["USDT", "WBNB", "BNB"]);
     expect(config.startBlocks.bsc).toBe(26_956_207n);
+    expect(config.autoExitChains).toEqual(["base", "robinhood"]);
+    expect(config.chainMonitorIntervalMs.bsc).toBe(10_000);
   });
 
   it("loads a local Uniswap Trading API key", () => {

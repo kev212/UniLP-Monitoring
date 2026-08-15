@@ -1,7 +1,9 @@
 import { zeroAddress, type Address } from "viem";
 
 import { erc20Abi } from "../abi.js";
+import { chainRegistry } from "../chains.js";
 import type { RuntimeConfig } from "../config.js";
+import { isUsdStableSymbol } from "./token-meta.js";
 import type { Database } from "../db.js";
 import type { ChainName } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
@@ -46,7 +48,7 @@ export class PortfolioService {
   };
   private refreshRunning = false;
   private refreshTimer?: ReturnType<typeof setInterval>;
-  private lastWethUsd?: number;
+  private lastNativeUsd = new Map<ChainName, number>();
 
   constructor(
     private readonly config: RuntimeConfig,
@@ -73,7 +75,7 @@ export class PortfolioService {
     this.refreshRunning = true;
     try {
       const totals = await Promise.all(this.config.chains
-        .filter((chain): chain is ChainName => chain === "base" || chain === "robinhood")
+        .filter((chain): chain is ChainName => chain === "base" || chain === "robinhood" || chain === "bsc")
         .map((chain) => this.refreshChain(chain)));
       const walletUsd = totals.reduce((total, current) => total + current.walletUsd, 0);
       const activeLpUsd = totals.reduce((total, current) => total + current.activeLpUsd, 0);
@@ -116,8 +118,6 @@ export class PortfolioService {
       ...this.config.quoteTokens[chain].map((token) => token.address),
     ])] as Address[];
     const prices = await this.tokenPrices(chain, addresses);
-    const stable = this.config.quoteTokens[chain].find((token) => token.symbol === "USDG");
-    const stableDecimals = stable ? await this.tokenDecimals(chain, stable.address) : 6;
     let walletUsd = 0;
     for (const balance of balances) {
       const price = this.usdPrice(chain, balance.address, prices);
@@ -136,7 +136,7 @@ export class PortfolioService {
       if (quotePrice === null) continue;
       const decimals = await this.tokenDecimals(chain, position.quoteToken);
       activeLpUsd += Number(snapshot.liquidationQuote) / 10 ** decimals * quotePrice;
-      activeLpUsd += Number(snapshot.feeQuoteUsdg) / 10 ** stableDecimals;
+      activeLpUsd += Number(snapshot.feeQuoteUsdg) / 1_000_000;
     }
     for (const group of activeGroups) {
       const snapshot = await this.database.getLatestPositionGroupPnlSnapshot(group.id);
@@ -145,7 +145,7 @@ export class PortfolioService {
       if (quotePrice === null) continue;
       const decimals = await this.tokenDecimals(chain, group.quoteToken);
       activeLpUsd += Number(snapshot.liquidationQuote) / 10 ** decimals * quotePrice;
-      activeLpUsd += Number(snapshot.feeQuoteUsdg) / 10 ** stableDecimals;
+      activeLpUsd += Number(snapshot.feeQuoteUsdg) / 1_000_000;
     }
     return { walletUsd, activeLpUsd };
   }
@@ -193,26 +193,27 @@ export class PortfolioService {
     const prices = new Map<string, number>();
     const stableAddresses = new Set<string>();
     for (const quote of this.config.quoteTokens[chain]) {
-      if (quote.symbol === "USDG" || quote.symbol === "USDC") {
+      if (isUsdStableSymbol(quote.symbol)) {
         const address = quote.address.toLowerCase();
         stableAddresses.add(address);
         prices.set(address, 1);
       }
     }
-    const wethAddress = this.config.quoteTokens[chain].find((token) => token.symbol === "WETH")?.address.toLowerCase();
-    if (wethAddress) {
-      const wethUsd = await this.canonicalWethPrice(chain, wethAddress, stableAddresses);
-      if (wethUsd !== null) this.lastWethUsd = wethUsd;
-      if (this.lastWethUsd !== undefined) {
-        prices.set(wethAddress, this.lastWethUsd);
-        prices.set(zeroAddress, this.lastWethUsd);
+    const wrappedAddress = this.config.quoteTokens[chain].find((token) => token.symbol === chainRegistry[chain].wrappedSymbol)?.address.toLowerCase();
+    if (wrappedAddress) {
+      const nativeUsd = await this.canonicalWethPrice(chain, wrappedAddress, stableAddresses);
+      if (nativeUsd !== null) this.lastNativeUsd.set(chain, nativeUsd);
+      const cached = this.lastNativeUsd.get(chain);
+      if (cached !== undefined) {
+        prices.set(wrappedAddress, cached);
+        prices.set(zeroAddress, cached);
       }
     }
     const nonStable = addresses.filter((address) => !prices.has(address.toLowerCase()) && address.toLowerCase() !== zeroAddress);
     for (let offset = 0; offset < nonStable.length; offset += 25) {
       const batch = nonStable.slice(offset, offset + 25);
       try {
-        const response = await fetch(`${DEXSCREENER_BASE}/tokens/v1/${chain}/${batch.join(",")}`, { signal: AbortSignal.timeout(15_000) });
+        const response = await fetch(`${DEXSCREENER_BASE}/tokens/v1/${chainRegistry[chain].dexScreenerChain}/${batch.join(",")}`, { signal: AbortSignal.timeout(15_000) });
         if (!response.ok) continue;
         const pairs = await response.json() as DexTokenPair[];
         for (const pair of pairs) {

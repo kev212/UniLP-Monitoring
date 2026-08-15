@@ -2,6 +2,7 @@ import { Bot, Context, InlineKeyboard, InputFile, type CommandContext } from "gr
 import { isAddress, parseUnits, zeroAddress, type Address } from "viem";
 import sharp from "sharp";
 
+import { chainHeading, chainRegistry, parseChainAlias } from "../chains.js";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
@@ -21,7 +22,7 @@ import { sqrtRatioAtTick } from "./uniswap-math.js";
 
 type ChatContext = CommandContext<Context>;
 
-type BidAskLadderChain = "base" | "robinhood";
+type BidAskLadderChain = "base" | "robinhood" | "bsc";
 type BidAskLadderDirection = "above" | "below";
 type BidAskLadderProtocol = "v3" | "v4";
 
@@ -63,6 +64,7 @@ type DashboardAction =
   | { type: "close"; page: number }
   | { type: "status"; page: number }
   | { type: "scan"; page: number }
+  | { type: "scan_chain"; chain: ChainName; page: number }
   | { type: "scan_pools"; page: number }
   | { type: "config"; page: number }
   | { type: "config_reset"; page: number }
@@ -81,6 +83,7 @@ type DashboardAction =
   | { type: "history_page"; page: number }
   | { type: "open"; page: number }
   | { type: "open_mode"; mode: "single" | "dual"; page: number }
+  | { type: "open_chain"; chain: ChainName; mode: "single" | "dual"; page: number }
   | { type: "open_ladder"; page: number }
   | { type: "open_ladder_chain"; chain: BidAskLadderChain; page: number }
   | { type: "open_pool_input"; page: number }
@@ -159,11 +162,11 @@ export class Notifier {
     void this.bot.api.setMyCommands([
       { command: "status", description: "Tampilkan status semua posisi LP aktif" },
       { command: "close", description: "Tutup posisi LP — fallback /close <nomor> atau /close <key>" },
-      { command: "scan", description: "Scan token — /scan [base|robinhood] <contract>" },
+      { command: "scan", description: "Scan token — /scan [base|robinhood|bsc] <contract>" },
       ...(this.config.scanV2Enabled ? [{ command: "scanv2", description: "Scan concentrated yield — /scanv2 [chain] <contract> [range%]" }] : []),
       { command: "scan_pools", description: "Cari pool V3/V4 dengan estimasi yield 1 jam tertinggi" },
       { command: "scan_stocks", description: "Scan pool tokenized stock (NVDA AAPL TSLA dll) by yield" },
-      { command: "investigate", description: "Cek yield/h pool — /investigate <address atau link Uniswap>" },
+      { command: "investigate", description: "Cek yield/h pool — /investigate [bsc|bnb] <pool-id atau link Uniswap>" },
       { command: "gem", description: "💎 Hidden gem radar — yield gacor V3/V4" },
       { command: "history", description: "Tampilkan riwayat posisi close >= ±0.5% PnL" },
       { command: "calendar", description: "Tampilkan kalender realized PnL UTC" },
@@ -283,8 +286,7 @@ export class Notifier {
     const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
     const chainName = this.chains.getById(position.chainId).registry.name;
     const stableToken = this.config.quoteTokens[chainName]?.[0];
-    const stableDec = stableToken ? (stableToken.symbol === "USDC" || stableToken.symbol === "USDG" ? 6 : 18) : 0;
-    const stableSymbol = stableToken?.symbol ?? "??";
+    const stableSymbol = stableToken?.symbol ?? "USD";
     const feeParts: string[] = [formatToken(snapshot.feeQuote, qtDec, 2)];
     if (snapshot.feeNonQuote) {
       const nqSymbol = await this.tokenLabel(snapshot.feeNonQuote.token, position.chainId);
@@ -292,8 +294,8 @@ export class Notifier {
       feeParts.push(`+ ${nqAmount} ${nqSymbol}`);
     }
     const feeDisplay = snapshot.feeNonQuote
-      ? `${feeParts.join(" ")} (≈ ${formatToken(snapshot.feeQuoteUsdg, stableDec, 4)} ${stableSymbol})`
-      : `${formatToken(snapshot.feeQuoteUsdg, stableDec, 4)} ${stableSymbol}`;
+      ? `${feeParts.join(" ")} (≈ ${formatToken(snapshot.feeQuoteUsdg, 6, 4)} ${stableSymbol})`
+      : `${formatToken(snapshot.feeQuoteUsdg, 6, 4)} ${stableSymbol}`;
     log.info({ Pool: `${position.positionKey} ${pair} | CV: ${formatToken(snapshot.liquidationQuote, qtDec, 2)} ${qtSymbol} | Fees: ${feeDisplay} | PnL: ${formatBps(snapshot.pnlBps)}%` });
   }
 
@@ -494,8 +496,20 @@ export class Notifier {
         return;
       }
       if (action.type === "scan") {
-        this.pendingInput.set(chatId, { kind: "scan_token", chain: "robinhood" });
-        await this.replyTemp(ctx, "Kirim address token Robinhood untuk di-scan, atau gunakan /scan base <address>.", { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
+        await this.editDashboardMessage(chatId, message.message_id, "🔍 Scan token\nPilih chain:", this.chainPickerKeyboard(
+          (chain) => `lp:scan_chain:${chain}:${action.page}`,
+          dashboardAction("status", action.page),
+        ));
+        return;
+      }
+      if (action.type === "scan_chain") {
+        if (!this.isEnabledChain(action.chain)) {
+          await this.replyTemp(ctx, "Chain tidak aktif.");
+          return;
+        }
+        this.pendingInput.set(chatId, { kind: "scan_token", chain: action.chain });
+        await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
+        await this.replyTemp(ctx, `Kirim address token ${chainRegistry[action.chain].displayName} untuk di-scan.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
         return;
       }
       if (action.type === "scan_pools") {
@@ -597,12 +611,10 @@ export class Notifier {
           await this.replyTemp(ctx, "Bid-Ask Ladder sedang dimatikan.");
           return;
         }
-        const keyboard = new InlineKeyboard()
-          .text("Base", `lp:open_ladder_chain:base:${action.page}`)
-          .text("Robinhood", `lp:open_ladder_chain:robinhood:${action.page}`)
-          .row()
-          .text("← Back", dashboardAction("open", action.page));
-        await this.editDashboardMessage(chatId, message.message_id, "🟣 Bid-Ask Ladder\nPilih chain:", keyboard);
+        await this.editDashboardMessage(chatId, message.message_id, "🟣 Bid-Ask Ladder\nPilih chain:", this.chainPickerKeyboard(
+          (chain) => `lp:open_ladder_chain:${chain}:${action.page}`,
+          dashboardAction("open", action.page),
+        ));
         return;
       }
       if (action.type === "open_ladder_chain") {
@@ -610,15 +622,30 @@ export class Notifier {
           await this.replyTemp(ctx, "Bid-Ask Ladder sedang dimatikan.");
           return;
         }
+        if (!this.isEnabledChain(action.chain)) {
+          await this.replyTemp(ctx, "Chain tidak aktif.");
+          return;
+        }
         this.pendingInput.set(chatId, { kind: "bid_ask_pool", chain: action.chain, dashboardMessageId: message.message_id });
         await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
-        await this.replyTemp(ctx, `🟣 Bid-Ask Ladder (${action.chain === "base" ? "Base" : "Robinhood"})\nKirim pool address (V3 contract) atau V4 pool ID.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
+        await this.replyTemp(ctx, `🟣 Bid-Ask Ladder (${chainRegistry[action.chain].displayName})\nKirim ${action.chain === "bsc" ? "V4 pool ID" : "pool address (V3 contract) atau V4 pool ID"}.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
         return;
       }
       if (action.type === "open_mode") {
-        this.pendingInput.set(chatId, { kind: "open_pool", chain: "robinhood", mode: action.mode, dashboardMessageId: message.message_id });
+        await this.editDashboardMessage(chatId, message.message_id, `🟢 Open Position (${action.mode === "dual" ? "Dual-side" : "Single-side"})\nPilih chain:`, this.chainPickerKeyboard(
+          (chain) => `lp:open_chain:${chain}:${action.mode}:${action.page}`,
+          dashboardAction("open", action.page),
+        ));
+        return;
+      }
+      if (action.type === "open_chain") {
+        if (!this.isEnabledChain(action.chain)) {
+          await this.replyTemp(ctx, "Chain tidak aktif.");
+          return;
+        }
+        this.pendingInput.set(chatId, { kind: "open_pool", chain: action.chain, mode: action.mode, dashboardMessageId: message.message_id });
         await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
-        await this.replyTemp(ctx, `🟢 Open Position (${action.mode === "dual" ? "Dual-side" : "Single-side"})\nKirim pool address (V3 contract) atau V4 pool ID.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
+        await this.replyTemp(ctx, `🟢 Open Position (${action.mode === "dual" ? "Dual-side" : "Single-side"} · ${chainRegistry[action.chain].displayName})\nKirim ${action.chain === "bsc" ? "V4 pool ID" : "pool address (V3 contract) atau V4 pool ID"}.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
         return;
       }
       if (action.type === "open_confirm") {
@@ -911,6 +938,9 @@ export class Notifier {
     const feeTier = typeof position.metadata.fee === "number" ? position.metadata.fee : undefined;
     const feeLabel = feeTier !== undefined ? ` · ${formatFeeTier(feeTier)}` : "";
 
+    if (position.status === "needs_review") {
+      return `${index}. ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}\n`;
+    }
     if (!snapshot || !position.quoteToken) {
       if (!position.quoteToken) return `${index}. ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}\n`;
       const blockNumber = observation?.blockNumber;
@@ -1013,7 +1043,9 @@ export class Notifier {
     const feeTier = typeof position.metadata.fee === "number" ? position.metadata.fee : undefined;
     const feeLabel = feeTier !== undefined ? ` · ${formatFeeTier(feeTier)}` : "";
 
-    if (!position.quoteToken || !blockNumber) return `${index}. ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}\n`;
+    if (position.status === "needs_review" || !position.quoteToken || !blockNumber) {
+      return `${index}. ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}\n`;
+    }
     try {
       const valued = await pnl.value(position, blockNumber);
       const qtSymbol = this.quoteSymbol(position.quoteToken);
@@ -1072,7 +1104,11 @@ export class Notifier {
 
     const parsed = parseScanInput(ctx.match.trim());
     if (!parsed) {
-      await this.replyTemp(ctx, "Gunakan /scan <token-address> atau /scan base|robinhood <token-address>.");
+      await this.replyTemp(ctx, "Gunakan /scan <token-address> atau /scan base|robinhood|bsc <token-address>.");
+      return;
+    }
+    if (!this.isEnabledChain(parsed.chain)) {
+      await this.replyTemp(ctx, `Chain ${parsed.chain} tidak aktif.`);
       return;
     }
 
@@ -1089,6 +1125,10 @@ export class Notifier {
     const parsed = parseScanV2Input(ctx.match.trim());
     if (!parsed) {
       await this.replyTemp(ctx, "Gunakan /scanv2 <token>, /scanv2 base <token>, atau tambahkan range 5-90%.");
+      return;
+    }
+    if (!this.isEnabledChain(parsed.chain)) {
+      await this.replyTemp(ctx, `Chain ${parsed.chain} tidak aktif.`);
       return;
     }
     if (this.scanV2Running) {
@@ -1139,7 +1179,7 @@ export class Notifier {
     this.tokenScanRunning = true;
 
     try {
-      await this.replyTemp(ctx, `🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(token)} di ${chain}...`, undefined, 120_000);
+      await this.replyTemp(ctx, `🔍 Mencari pool Uniswap ${chain === "bsc" ? "V4" : "V3/V4"} untuk ${shortAddress(token)} di ${chainRegistry[chain].displayName}...`, undefined, 120_000);
     } catch (error) {
       this.tokenScanRunning = false;
       throw error;
@@ -1151,13 +1191,13 @@ export class Notifier {
     try {
       const scan = await scanner.scan(token, chain);
       if (scan.active.length === 0 && scan.watchlist.length === 0) {
-        await this.sendTemp(["Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 6h >= $100 untuk token ini."], chatId, 120_000);
+        await this.sendTemp([`Tidak ditemukan pool Uniswap ${chain === "bsc" ? "V4" : "V3/V4"} dengan TVL > $0 dan Vol 6h >= $100 untuk token ini.`], chatId, 120_000);
         return;
       }
 
       const lines: string[] = [
         `🔍 SCAN: ${shortAddress(token)}`,
-        `Chain: ${chain === "base" ? "Base (8453)" : "Robinhood (4663)"}`,
+        `Chain: ${chainHeading(chainRegistry[chain])}`,
         `Top active: ${scan.active.length} | Watchlist: ${scan.watchlist.length}`,
         "",
       ];
@@ -1341,20 +1381,15 @@ export class Notifier {
     const chatId = ctx.chat.id.toString();
     if (!this.authorized(chatId, ctx.from?.id.toString())) return;
 
-    const raw = ctx.match.trim();
-    if (!raw) {
-      await this.replyTemp(ctx, "Gunakan /investigate <pool address atau link Uniswap>.");
-      return;
-    }
-    const poolAddress = parseOpenPoolInput(raw);
-    if (!poolAddress) {
-      await this.replyTemp(ctx, "Address atau link pool Uniswap Robinhood tidak valid.");
+    const parsed = parseInvestigateInput(ctx.match.trim());
+    if (!parsed) {
+      await this.replyTemp(ctx, "Gunakan /investigate [bsc|bnb] <pool-id atau link Uniswap>.");
       return;
     }
 
-    await this.replyTemp(ctx, `🔍 Investigating ${shortAddress(poolAddress as Address)}...`, undefined, 60_000);
+    await this.replyTemp(ctx, `🔍 Investigating ${shortAddress(parsed.poolIdentifier as Address)}...`, undefined, 60_000);
     try {
-      const result = await scanner.investigatePool(poolAddress, "robinhood");
+      const result = await scanner.investigatePool(parsed.poolIdentifier, parsed.chain);
       await this.replyTemp(ctx, formatInvestigateResult(result), undefined, 180_000);
     } catch (error) {
       await this.replyTemp(ctx, `❌ ${errorMessage(error).slice(0, 200)}`);
@@ -1369,19 +1404,23 @@ export class Notifier {
     if (!pending || !text || text.startsWith("/")) return;
     this.pendingInput.delete(chatId);
     if (pending.kind === "scan_token") {
-      const parsed = parseScanInput(text);
-      if (!parsed) {
-        await this.replyTemp(ctx, "Gunakan address token atau format: base <token-address>.");
+      const token = text.split(/\s+/).filter(Boolean).at(-1);
+      if (!token || !isAddress(token, { strict: false })) {
+        this.pendingInput.set(chatId, pending);
+        await this.replyTemp(ctx, "Kirim address token yang valid.");
         return;
       }
-      await this.runTokenScan(ctx, scanner, parsed.token, parsed.chain);
+      await this.runTokenScan(ctx, scanner, token as Address, pending.chain);
       return;
     }
     try {
       if (pending.kind === "open_pool") {
-        const poolAddress = parseOpenPoolInput(text);
+        const poolAddress = parseOpenPoolInput(text, pending.chain);
         if (!poolAddress) {
-          await this.replyTemp(ctx, "Address atau link pool Uniswap Robinhood tidak valid.");
+          this.pendingInput.set(chatId, pending);
+          await this.replyTemp(ctx, pending.chain === "bsc"
+            ? "Pool tidak valid. Kirim V4 pool ID atau link Uniswap /explore/pools/bnb/..."
+            : "Address atau link pool Uniswap tidak valid.");
           return;
         }
         this.pendingInput.set(chatId, { kind: "open_range", chain: pending.chain, poolAddress, mode: pending.mode, dashboardMessageId: pending.dashboardMessageId });
@@ -1401,8 +1440,10 @@ export class Notifier {
         if (!this.positionOpener) throw new Error("Position opener is not configured");
         const quoteToken = await this.positionOpener.detectQuoteToken(pending.poolAddress, pending.chain);
         this.pendingInput.set(chatId, { kind: "open_amount", chain: pending.chain, poolAddress: pending.poolAddress, rangePercent, mode: pending.mode, quoteToken, dashboardMessageId: pending.dashboardMessageId });
-        const example = quoteToken.symbol === "USDG" || quoteToken.symbol === "USDC" ? "200" : "0.01";
-        const fundingHint = quoteToken.symbol === "WETH" ? " ETH native akan di-wrap otomatis bila saldo WETH kurang." : "";
+        const example = quoteToken.symbol === "USDG" || quoteToken.symbol === "USDC" || quoteToken.symbol === "USDT" ? "200" : "0.01";
+        const fundingHint = quoteToken.symbol === "WETH" || quoteToken.symbol === "WBNB"
+          ? ` ${quoteToken.symbol === "WBNB" ? "BNB" : "ETH"} native akan di-wrap otomatis bila saldo ${quoteToken.symbol} kurang.`
+          : "";
         await this.replyTemp(ctx, `Kirim jumlah deposit dalam ${quoteToken.symbol} (contoh: ${example}).${fundingHint}`, { reply_markup: { force_reply: true } as any });
         return;
       }
@@ -1424,7 +1465,9 @@ export class Notifier {
         const poolAddress = parseBidAskPoolInput(text, pending.chain);
         if (!poolAddress) {
           this.pendingInput.set(chatId, pending);
-          await this.replyTemp(ctx, "Pool tidak valid. Kirim V3 address, V4 pool ID, atau link pool Base/Robinhood.");
+          await this.replyTemp(ctx, pending.chain === "bsc"
+            ? "Pool tidak valid. Kirim V4 pool ID atau link Uniswap /explore/pools/bnb/..."
+            : "Pool tidak valid. Kirim V3 address, V4 pool ID, atau link pool Uniswap.");
           return;
         }
         this.pendingInput.set(chatId, { kind: "bid_ask_range", chain: pending.chain, poolAddress, dashboardMessageId: pending.dashboardMessageId });
@@ -1476,7 +1519,7 @@ export class Notifier {
           quoteToken,
           dashboardMessageId: pending.dashboardMessageId,
         });
-        const example = quoteToken.symbol === "USDG" || quoteToken.symbol === "USDC" ? "200" : "0.01";
+        const example = quoteToken.symbol === "USDG" || quoteToken.symbol === "USDC" || quoteToken.symbol === "USDT" ? "200" : "0.01";
         await this.replyTemp(ctx, `Kirim jumlah deposit dalam ${quoteToken.symbol} (contoh: ${example}). Tidak ada opening swap; hanya ${quoteToken.symbol} yang dialokasikan ke bins.`, { reply_markup: { force_reply: true } as any });
         return;
       }
@@ -1548,15 +1591,15 @@ export class Notifier {
     const lines = [
       "🟢 OPEN POSITION — REVIEW",
       "",
-      `${preview.protocol.toUpperCase()} ${preview.pair} | ${preview.feeLabel}`,
+      `${chainHeading(chainRegistry[preview.chain])} | ${preview.protocol.toUpperCase()} ${preview.pair} | ${preview.feeLabel}`,
       `Current price: ${preview.currentPrice}`,
       `Range: ${preview.lowerPrice} → ${preview.upperPrice}`,
       `Ticks: ${preview.tickLower} → ${preview.tickUpper} | current ${preview.currentTick}`,
     ];
 
     if (mode === "dual" && preview.baseTokenSymbol !== undefined && preview.quoteSideAmount !== undefined && preview.swapAmount !== undefined && preview.baseAmount !== undefined) {
-      const quoteDec = preview.quoteTokenSymbol === "USDG" || preview.quoteTokenSymbol === "USDC" ? 6 : 18;
-      const baseDec = preview.baseTokenSymbol === "USDG" || preview.baseTokenSymbol === "USDC" ? 6 : 18;
+      const quoteDec = preview.quoteTokenDecimals;
+      const baseDec = preview.quoteIsToken0 ? preview.token1Decimals : preview.token0Decimals;
       lines.push(`Range: ±${rangePercent}%`);
       lines.push(`Deposit: ${depositFormatted} ${preview.quoteTokenSymbol}`);
       lines.push("");
@@ -1998,6 +2041,18 @@ export class Notifier {
     }
   }
 
+  private isEnabledChain(chain: ChainName): boolean {
+    return this.config.chains.includes(chain);
+  }
+
+  private chainPickerKeyboard(toCallback: (chain: ChainName) => string, backAction: string): InlineKeyboard {
+    const keyboard = new InlineKeyboard();
+    for (const chain of this.config.chains) {
+      keyboard.text(chainButtonLabel(chain), toCallback(chain));
+    }
+    return keyboard.row().text("← Back", backAction);
+  }
+
   private authorized(chatId: string, userId: string | undefined): boolean {
     return Boolean(this.config.telegram
       && chatId === this.config.telegram.chatId
@@ -2012,8 +2067,10 @@ export class Notifier {
 
   private async tokenLabel(address: Address | null, chainId?: number): Promise<string> {
     if (!address) return "0x0";
-    if (address.toLowerCase() === zeroAddress) return "ETH";
-    const qt = this.config.quoteTokens.robinhood.concat(this.config.quoteTokens.base).find(q => q.address.toLowerCase() === address.toLowerCase());
+    if (address.toLowerCase() === zeroAddress) {
+      return chainId ? (chainRegistry.base.chain.id === chainId ? chainRegistry.base.nativeSymbol : chainId === 56 ? chainRegistry.bsc.nativeSymbol : chainRegistry.robinhood.nativeSymbol) : "ETH";
+    }
+    const qt = this.config.quoteTokens.robinhood.concat(this.config.quoteTokens.base, this.config.quoteTokens.bsc).find(q => q.address.toLowerCase() === address.toLowerCase());
     if (qt) return qt.symbol;
     const cached = this.chains.getCachedToken(address);
     if (cached) return cached.symbol;
@@ -2032,7 +2089,7 @@ export class Notifier {
 
   private quoteSymbol(address: Address | null): string {
     if (!address) return "?";
-    for (const chain of ["robinhood", "base"] as const) {
+    for (const chain of ["robinhood", "base", "bsc"] as const) {
       const qt = this.config.quoteTokens[chain].find(q => q.address.toLowerCase() === address.toLowerCase());
       if (qt) return qt.symbol;
     }
@@ -2139,9 +2196,19 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
     const page = parseDashboardPage(parts[3]);
     return page === null ? null : { type: "open_mode", mode: parts[2], page };
   }
+  if (parts.length === 5 && parts[0] === "lp" && parts[1] === "open_chain" && (parts[3] === "single" || parts[3] === "dual")) {
+    const chain = parseChainAlias(parts[2] ?? "");
+    const page = parseDashboardPage(parts[4]);
+    return !chain || page === null ? null : { type: "open_chain", chain, mode: parts[3], page };
+  }
   if (parts.length === 4 && parts[0] === "lp" && parts[1] === "open_ladder_chain" && isBidAskLadderChain(parts[2])) {
     const page = parseDashboardPage(parts[3]);
     return page === null ? null : { type: "open_ladder_chain", chain: parts[2], page };
+  }
+  if (parts.length === 4 && parts[0] === "lp" && parts[1] === "scan_chain") {
+    const chain = parseChainAlias(parts[2] ?? "");
+    const page = parseDashboardPage(parts[3]);
+    return !chain || page === null ? null : { type: "scan_chain", chain, page };
   }
   if (parts.length === 3 && parts[0] === "lp" && isDashboardAction(parts[1])) {
     const page = parseDashboardPage(parts[2]);
@@ -2218,7 +2285,7 @@ function isRiskSettingKey(value: string | undefined): value is RiskSettingKey {
 }
 
 function isBidAskLadderChain(value: string | undefined): value is BidAskLadderChain {
-  return value === "base" || value === "robinhood";
+  return value === "base" || value === "robinhood" || value === "bsc";
 }
 
 export function isExpiredCallbackError(error: unknown): boolean {
@@ -2511,18 +2578,63 @@ function shortHash(hash: string): string {
   return `${hash.slice(0, 10)}...${hash.slice(-8)}`;
 }
 
+export function chainButtonLabel(chain: ChainName): string {
+  if (chain === "bsc") return "BSC";
+  if (chain === "robinhood") return "Robinhood";
+  return "Base";
+}
+
 export function parseScanInput(raw: string): { chain: ChainName; token: Address } | null {
   const parts = raw.trim().split(/\s+/).filter(Boolean);
-  const chain = parts.length === 2 ? parts[0]?.toLowerCase() : "robinhood";
+  const chain = parts.length === 2 ? parseChainAlias(parts[0] ?? "") : "robinhood";
   const token = parts.length === 2 ? parts[1] : parts[0];
-  if ((chain !== "base" && chain !== "robinhood") || !token || !isAddress(token, { strict: false })) return null;
+  if (!chain || !token || !isAddress(token, { strict: false })) return null;
   return { chain, token: token as Address };
 }
 
-export function parseOpenPoolInput(raw: string): string | null {
+export function parseInvestigateInput(raw: string): { chain: ChainName; poolIdentifier: string } | null {
+  const parts = raw.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return null;
+  const explicitChain = parts.length >= 2 ? parseChainAlias(parts[0] ?? "") : undefined;
+  const identifier = explicitChain ? parts.slice(1).join(" ") : raw.trim();
+  const parsed = parseInvestigateIdentifier(identifier, explicitChain ?? "robinhood");
+  if (!parsed) return null;
+  if (explicitChain && parsed.chain !== explicitChain) return null;
+  return parsed;
+}
+
+function parseInvestigateIdentifier(raw: string, fallbackChain: ChainName): { chain: ChainName; poolIdentifier: string } | null {
   const value = raw.trim();
-  if (isAddress(value, { strict: false })) return value.toLowerCase();
+  if (/^0x[0-9a-fA-F]{64}$/.test(value)) {
+    return { chain: fallbackChain, poolIdentifier: value.toLowerCase() };
+  }
+  if (isAddress(value, { strict: false })) {
+    if (fallbackChain === "bsc") return null;
+    return { chain: fallbackChain, poolIdentifier: value.toLowerCase() };
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" || url.hostname !== "app.uniswap.org") return null;
+  const path = url.pathname.split("/").filter(Boolean);
+  if (path.length !== 4 || path[0] !== "explore" || path[1] !== "pools") return null;
+  const chain = Object.values(chainRegistry).find((registry) => registry.uniswapSlug === path[2])?.name;
+  const identifier = path[3]!;
+  if (!chain) return null;
+  if (chain === "bsc" && !/^0x[0-9a-fA-F]{64}$/.test(identifier)) return null;
+  if (isAddress(identifier, { strict: false }) || /^0x[0-9a-fA-F]{64}$/.test(identifier)) {
+    return { chain, poolIdentifier: identifier.toLowerCase() };
+  }
+  return null;
+}
+
+export function parseOpenPoolInput(raw: string, chain: ChainName = "robinhood"): string | null {
+  const value = raw.trim();
   if (/^0x[0-9a-fA-F]{64}$/.test(value)) return value.toLowerCase();
+  if (isAddress(value, { strict: false })) return chain === "bsc" ? null : value.toLowerCase();
 
   let url: URL;
   try {
@@ -2533,8 +2645,10 @@ export function parseOpenPoolInput(raw: string): string | null {
   if (url.protocol !== "https:" || url.hostname !== "app.uniswap.org") return null;
 
   const parts = url.pathname.split("/").filter(Boolean);
-  if (parts.length !== 4 || parts[0] !== "explore" || parts[1] !== "pools" || parts[2] !== "robinhood") return null;
+  if (parts.length !== 4 || parts[0] !== "explore" || parts[1] !== "pools") return null;
+  if (parts[2] !== chainRegistry[chain].uniswapSlug) return null;
   const identifier = parts[3]!;
+  if (chain === "bsc" && !/^0x[0-9a-fA-F]{64}$/.test(identifier)) return null;
   if (isAddress(identifier, { strict: false }) || /^0x[0-9a-fA-F]{64}$/.test(identifier)) return identifier.toLowerCase();
   return null;
 }
@@ -2551,7 +2665,7 @@ export function parseBidAskPoolInput(raw: string, chain: BidAskLadderChain): str
   }
   if (url.protocol !== "https:" || url.hostname !== "app.uniswap.org") return null;
   const parts = url.pathname.split("/").filter(Boolean);
-  if (parts.length !== 4 || parts[0] !== "explore" || parts[1] !== "pools" || parts[2] !== chain) return null;
+  if (parts.length !== 4 || parts[0] !== "explore" || parts[1] !== "pools" || parts[2] !== chainRegistry[chain].uniswapSlug) return null;
   const identifier = parts[3]!;
   return isAddress(identifier, { strict: false }) || /^0x[0-9a-fA-F]{64}$/.test(identifier)
     ? identifier.toLowerCase()
@@ -2995,17 +3109,21 @@ function formatGemResult(result: GemScanResult): string {
 }
 
 function formatInvestigateResult(r: InvestigateResult): string {
-  const effectiveFee = r.currentLpFee ?? r.feeTier;
-  const feeRate = effectiveFee / 1_000_000;
-  const feePct = (effectiveFee / 10_000).toFixed(2);
+  const registry = chainRegistry[r.chain ?? "robinhood"];
+  const configuredDynamic = r.dynamicFee || r.feeTier === 0x80_0000;
+  const effectiveFee = r.currentLpFee ?? (configuredDynamic ? undefined : r.feeTier);
+  const feeRate = (effectiveFee ?? 0) / 1_000_000;
+  const feeLabel = configuredDynamic ? "dynamic" : `${((effectiveFee ?? r.feeTier) / 10_000).toFixed(2)}%`;
   const lines: string[] = [
     "🔍 INVESTIGATE POOL",
-    `${r.protocol.toUpperCase()} ${r.pair} | Fee: ${feePct}%${r.dynamicFee ? " dynamic" : ""} | Robinhood`,
+    `${chainHeading(registry)} | Uniswap ${r.protocol.toUpperCase()}`,
+    `${r.pair} | Fee: ${feeLabel}${r.currentLpFee !== undefined && configuredDynamic ? ` | current ${((r.currentLpFee) / 10_000).toFixed(2)}%` : ""}`,
     "",
   ];
+  if (r.hooks && r.hooks !== "0x0000000000000000000000000000000000000000") lines.push(`Hook: ${r.hooks}`);
 
   if (!r.dexScreenerFound) {
-    lines.push("⚠️ Pool tidak ditemukan di DexScreener — tidak ada data volume/TVL.");
+    lines.push("⚠️ Volume/TVL tidak tersedia di DexScreener atau GeckoTerminal.");
     lines.push(`Active liquidity: ${r.activeLiquidity ? "YES" : "NO (zero)"}`);
     return lines.join("\n");
   }
@@ -3016,7 +3134,7 @@ function formatInvestigateResult(r: InvestigateResult): string {
     const yield1h = r.tvlUsd > 0 ? (r.volume1hUsd * feeRate / r.tvlUsd) * 100 : 0;
     const yield6h = r.tvlUsd > 0 ? (r.volume6hUsd * feeRate / r.tvlUsd / 6) * 100 : 0;
     lines.push("📊 YIELD/HOUR (gross pool-wide)");
-    lines.push(`   1h spot:  ${yield1h.toFixed(2)}%/h  | Vol: $${fmtUsd(r.volume1hUsd)}  | Est fees: $${fmtUsd(fees1h)}`);
+    lines.push(`   1h spot:  ${yield1h.toFixed(2)}%/h  | Vol: $${fmtUsd(r.volume1hUsd)}  | Est fees (volume × current fee): $${fmtUsd(fees1h)}`);
     lines.push(`   6h avg:   ${yield6h.toFixed(2)}%/h  | Vol: $${fmtUsd(r.volume6hUsd)}  | Est fees: $${fmtUsd(fees6h)}`);
     lines.push("");
   } else {
@@ -3047,6 +3165,7 @@ function formatInvestigateResult(r: InvestigateResult): string {
 
   if (!r.activeLiquidity) lines.push("⚠️ Zero active liquidity on-chain");
 
+  if (r.marketSource === "geckoterminal") lines.push("Sumber: GeckoTerminal");
   lines.push("", "Gross pool yield = volume × fee / TVL. Bukan jaminan return personal LP.");
   return lines.join("\n");
 }

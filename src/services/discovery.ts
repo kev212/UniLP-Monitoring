@@ -23,6 +23,8 @@ import type { Database } from "../db.js";
 import { log } from "../log.js";
 import type { ChainName, PositionGroupBinRecord, PositionGroupRecord, PositionRecord, PositionStatus, Protocol } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
+import { getLogsChunked } from "./log-query.js";
+import { hasV4Hooks } from "./v4-pool.js";
 import { isTransientRpcError } from "../rpc.js";
 import type { Notifier } from "./notifier.js";
 import { amountsForLiquidity } from "./uniswap-math.js";
@@ -520,18 +522,10 @@ export class DiscoveryService {
     params: { fromBlock: bigint; toBlock: bigint; [key: string]: unknown },
   ): Promise<Log[]> {
     const { client } = this.chains.getForLogs(name);
-    const chunk = this.config.maxLogBlockRange;
-    const all: Log[] = [];
-    let start = params.fromBlock;
-    const end = params.toBlock;
-    while (start <= end) {
-      const windowEnd = minBigInt(end, start + chunk - 1n);
-      const page = await throttledGetLogs(client, { ...params, fromBlock: start, toBlock: windowEnd } as Parameters<PublicClient["getLogs"]>[0], this.config.rpcRequestDelayMs);
-      all.push(...(page as Log[]));
-      if (windowEnd >= end) break;
-      start = windowEnd + 1n;
-    }
-    return all;
+    return getLogsChunked(client, params, {
+      maxBlockRange: this.config.maxLogBlockRange,
+      delayMs: this.config.rpcRequestDelayMs,
+    });
   }
 
   private async discoverV2(name: ChainName, transfers: Log[]): Promise<void> {
@@ -868,6 +862,7 @@ export class DiscoveryService {
           address: registry.contracts.v4.positionManager, abi: v4PoolKeysAbi, functionName: "poolKeys", args: [bytes25],
         });
         const quoteToken = this.findQuoteToken(name, poolKey.currency0, poolKey.currency1);
+        const hooked = hasV4Hooks(poolKey.hooks);
         const position = await this.database.upsertPosition({
           chainId: registry.chain.id,
           protocol: "v4",
@@ -877,7 +872,7 @@ export class DiscoveryService {
           token0: poolKey.currency0,
           token1: poolKey.currency1,
           quoteToken,
-          status: quoteToken && candidate.historyTrusted ? "syncing" : "needs_review",
+          status: !hooked && quoteToken && candidate.historyTrusted ? "syncing" : "needs_review",
           liquidity: 0n,
           openedAtBlock: candidate.blockNumber,
           metadata: {
@@ -888,7 +883,8 @@ export class DiscoveryService {
             positionManager: registry.contracts.v4.positionManager,
             source: "pool_manager_event",
             historyTrusted: candidate.historyTrusted,
-            ...(candidate.historyTrusted ? {} : { reason: "v4_position_transferred_or_history_unavailable" }),
+            dex: registry.dex,
+            ...(hooked ? { reason: "unsupported_v4_hooks" } : candidate.historyTrusted ? {} : { reason: "v4_position_transferred_or_history_unavailable" }),
           },
         });
         try {
@@ -982,6 +978,7 @@ export class DiscoveryService {
     });
     const { tickLower, tickUpper } = unpackV4PositionInfo(packedPositionInfo);
     const quoteToken = this.findQuoteToken(name, poolKey.currency0, poolKey.currency1);
+    const hooked = hasV4Hooks(poolKey.hooks);
     const refreshed = await this.database.upsertPosition({
       chainId: registry.chain.id,
       protocol: "v4",
@@ -991,7 +988,7 @@ export class DiscoveryService {
       token0: poolKey.currency0,
       token1: poolKey.currency1,
       quoteToken,
-      status: quoteToken && historyTrusted ? "syncing" : "needs_review",
+      status: !hooked && quoteToken && historyTrusted ? "syncing" : "needs_review",
       liquidity,
       openedAtBlock,
       metadata: {
@@ -1006,6 +1003,8 @@ export class DiscoveryService {
         salt: pad(toHex(tokenId), { size: 32 }),
         positionManager: registry.contracts.v4.positionManager,
         historyTrusted,
+        dex: registry.dex,
+        ...(hooked ? { reason: "unsupported_v4_hooks" } : {}),
       },
     });
     try {
@@ -1069,7 +1068,7 @@ export class DiscoveryService {
     if (!salt || tickLower === undefined || tickUpper === undefined || fee === undefined || tickSpacing === undefined || !hooks || !currency0 || !currency1) return;
 
     const { registry } = this.chains.get(name);
-    const historicalClient = this.chains.getForScan(name).client;
+    const historicalClient = this.chains.getForLogs(name).client;
     const events = await this.getLogsChunked(name, {
       address: registry.contracts.v4.poolManager,
       event: v4PoolManagerModifyLiquidityEvent,
@@ -1275,13 +1274,13 @@ export class DiscoveryService {
     let cursor = oldestBlock;
     while (cursor <= latest) {
       const end = minBigInt(latest, cursor + bulkChunk - 1n);
-      const events = await throttledGetLogs(client, {
+      const events = await getLogsChunked(client, {
         address: registry.contracts.v4.poolManager,
         event: v4PoolManagerModifyLiquidityEvent,
         args: { sender: registry.contracts.v4.positionManager },
         fromBlock: cursor,
         toBlock: end,
-      } as Parameters<PublicClient["getLogs"]>[0], 0);
+      }, { maxBlockRange: this.config.maxLogBlockRange, delayMs: 0 });
       for (const event of events) {
         const args = logArgs<{ salt?: Hex; liquidityDelta?: bigint }>(event);
         if (args.salt && args.liquidityDelta !== undefined) allEvents.push({ salt: args.salt, liquidityDelta: args.liquidityDelta });
@@ -1378,7 +1377,8 @@ export class DiscoveryService {
 
   private async quoteV3AmountsAtBlock(position: PositionRecord, amount0: bigint, amount1: bigint, blockNumber: bigint): Promise<bigint> {
     if (!position.poolAddress || !position.quoteToken) throw new Error("V3 position has no pool or quote token");
-    const { client } = this.chains.getById(position.chainId);
+    const { registry } = this.chains.getById(position.chainId);
+    const client = this.chains.getForLogs(registry.name).client;
     const slot0 = await client.readContract({ address: position.poolAddress, abi: v3PoolAbi, functionName: "slot0", blockNumber });
     const square = slot0[0] * slot0[0];
     const q192 = 1n << 192n;
@@ -1390,7 +1390,7 @@ export class DiscoveryService {
   private async quoteV4AmountsAtBlock(position: PositionRecord, amount0: bigint, amount1: bigint, blockNumber: bigint): Promise<bigint> {
     if (!position.quoteToken) throw new Error("V4 position has no quote token");
     const { registry } = this.chains.getById(position.chainId);
-    const historicalClient = this.chains.getForScan(registry.name).client;
+    const historicalClient = this.chains.getForLogs(registry.name).client;
     const metadata = position.metadata as { currency0?: Address; currency1?: Address; fee?: number; tickSpacing?: number; hooks?: Address };
     if (!metadata.currency0 || !metadata.currency1 || metadata.fee === undefined || metadata.tickSpacing === undefined || !metadata.hooks) {
       throw new Error("V4 position metadata is incomplete");
@@ -1416,7 +1416,7 @@ export class DiscoveryService {
     const m0 = match(token0);
     const m1 = match(token1);
     if (m0 && m1) {
-      const priority = ["USDG", "USDC", "WETH", "ETH"];
+      const priority = this.chains.get(name).registry.quotePriority;
       for (const sym of priority) {
         if (m0.symbol === sym) return m0.address;
         if (m1.symbol === sym) return m1.address;
@@ -1774,48 +1774,10 @@ function v4PoolId(currency0: Address, currency1: Address, fee: number, tickSpaci
   ));
 }
 
-function minBigInt(left: bigint, right: bigint): bigint {
-  return left < right ? left : right;
-}
-
 function logArgs<T extends object>(entry: Log): T {
   return (entry as unknown as { args: T }).args;
 }
 
-// Serializes every getLogs request through a single queue with a minimum spacing so that
-// providers with tight compute-units-per-second limits (e.g. Alchemy Free tier) are not flooded.
-let lastGetLogsAt = 0;
-let getLogsTail: Promise<unknown> = Promise.resolve();
-
-async function throttledGetLogs(
-  client: PublicClient,
-  params: Parameters<PublicClient["getLogs"]>[0],
-  delayMs: number,
-): Promise<Log[]> {
-  const run = getLogsTail.then(async () => {
-    const elapsed = Date.now() - lastGetLogsAt;
-    if (delayMs > 0 && elapsed < delayMs) await sleep(delayMs - elapsed);
-    lastGetLogsAt = Date.now();
-    return getLogsWithRetry(client, params);
-  });
-  getLogsTail = run.then(() => undefined, () => undefined);
-  return run;
-}
-
-async function getLogsWithRetry(client: PublicClient, params: Parameters<PublicClient["getLogs"]>[0]): Promise<Log[]> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      return (await client.getLogs(params)) as Log[];
-    } catch (error) {
-      lastError = error;
-      if (!isTransientRpcError(error)) throw error;
-      await sleep(500 * 2 ** attempt);
-    }
-  }
-  throw lastError;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function minBigInt(left: bigint, right: bigint): bigint {
+  return left < right ? left : right;
 }

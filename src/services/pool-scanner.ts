@@ -1,9 +1,11 @@
 import { isAddress, isHex, zeroAddress, type Address, type Hex } from "viem";
 
+import { chainRegistry, isEligibleScanDex } from "../chains.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
 import type { ChainName, PoolScanSettings } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
+import { isDynamicFee, v4PoolId } from "./v4-pool.js";
 import { estimateConcentratedYield, fetchOhlcv, type ConcentratedEstimate } from "./concentrated-yield.js";
 
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
@@ -89,11 +91,15 @@ export interface VerifiedPool {
   feeTier?: number;
   currentLpFee?: number;
   activeLiquidity: boolean;
+  hooks?: string;
+  tickSpacing?: number;
 }
 
 export interface InvestigateResult {
+  chain: ChainName;
   protocol: "v3" | "v4";
   pairAddress: string;
+  hooks?: string;
   pair: string;
   baseToken: { address: string; symbol: string };
   quoteToken: { address: string; symbol: string };
@@ -114,6 +120,7 @@ export interface InvestigateResult {
   priceChange24h: number;
   priceUsd: string | null;
   dexScreenerFound: boolean;
+  marketSource?: "dexscreener" | "geckoterminal";
 }
 
 interface DexScreenerPairDetail {
@@ -143,14 +150,24 @@ interface GeckoPool {
     pool_name?: string;
     reserve_in_usd: string;
     pool_created_at?: string;
-    volume_usd: { h1: string; h6: string; h24: string };
+    volume_usd: { h1?: string; h6?: string; h24?: string };
     base_token_price_usd?: string;
+    fdv_usd?: string | null;
+    market_cap_usd?: string | null;
+    price_change_percentage?: { h1?: string; h6?: string; h24?: string };
+    transactions?: { h1?: { buys?: number; sells?: number } };
   };
   relationships: {
     base_token: { data: { id: string } };
     quote_token: { data: { id: string } };
     dex: { data: { id: string } };
   };
+}
+
+interface GeckoIncludedToken {
+  id: string;
+  type: string;
+  attributes?: { address?: string; symbol?: string; name?: string };
 }
 
 interface GeckoTokenResponse {
@@ -197,7 +214,7 @@ export class PoolScanner {
       return { active: [], watchlist: [] };
     }
 
-    const dexTvlMap = await this.buildDexScreenerTvlMap(normalized);
+    const dexTvlMap = await this.buildDexScreenerTvlMap(normalized, chain);
     const scored = (await mapWithConcurrency(pools, TOKEN_SCAN_VERIFY_CONCURRENCY, (raw) =>
       this.toScoredPool(raw, normalized, true, chain, dexTvlMap),
     )).filter((pool): pool is ScoredPool => pool !== null);
@@ -209,7 +226,7 @@ export class PoolScanner {
   async scanV2(tokenAddress: Address, chain: ChainName = "robinhood", downsidePercent = 35, onProgress?: (completed: number, total: number) => void): Promise<PoolScan> {
     const normalized = tokenAddress.toLowerCase();
     const rawPools = await this.fetchUniswapPools(normalized, chain, "interactive");
-    const dexTvlMap = await this.buildDexScreenerTvlMap(normalized);
+    const dexTvlMap = await this.buildDexScreenerTvlMap(normalized, chain);
     const verified = (await mapWithConcurrency(rawPools, TOKEN_SCAN_VERIFY_CONCURRENCY, (raw) => this.toScoredPool(raw, normalized, false, chain, dexTvlMap)))
       .filter((pool): pool is ScoredPool => pool !== null && pool.activeLiquidity)
       .sort((a, b) => b.volume6hUsd - a.volume6hUsd)
@@ -325,9 +342,9 @@ export class PoolScanner {
       .map((pool) => ({ ...pool, tokenMarketCapUsd: valuation.value, tokenValuationSource: valuation.source, tokenTotalActiveTvlUsd: totalActiveTvlUsd, tokenOldestPoolAgeSeconds: oldestPoolAgeSeconds }));
   }
 
-  private async fetchDexScreenerPairs(token: string): Promise<DexScreenerPair[]> {
+  private async fetchDexScreenerPairs(token: string, chain: ChainName = "robinhood"): Promise<DexScreenerPair[]> {
     try {
-      const response = await fetch(`${DEXSCREENER_BASE}/token-pairs/v1/robinhood/${token}`, {
+      const response = await fetch(`${DEXSCREENER_BASE}/token-pairs/v1/${chainRegistry[chain].dexScreenerChain}/${token}`, {
         headers: { Accept: "application/json" },
         signal: AbortSignal.timeout(15_000),
       });
@@ -446,16 +463,17 @@ export class PoolScanner {
     const data = Array.isArray(body) ? body : (body as Record<string, unknown>)?.data;
     if (!Array.isArray(data)) return [];
 
-    const pools = (data as GeckoPool[]).filter((p) => {
-      const dexId = p.relationships?.dex?.data?.id ?? "";
-      return dexId.startsWith("uniswap-v3") || dexId.startsWith("uniswap-v4");
-    });
+    const chain = context.startsWith("uniswap") ? "robinhood" : Object.values(chainRegistry).find((registry) => context.includes(registry.geckoNetwork))?.name ?? "robinhood";
+    const registry = /\/networks\/([^/]+)\//.exec(url);
+    const network = registry?.[1];
+    const scanRegistry = Object.values(chainRegistry).find((item) => item.geckoNetwork === network) ?? chainRegistry[chain];
+    const pools = (data as GeckoPool[]).filter((p) => isEligibleScanDex(scanRegistry, p.relationships?.dex?.data?.id ?? ""));
     log.info({ context, priority, pools: pools.length }, "GeckoTerminal pool response parsed");
     return pools;
   }
 
-  private async buildDexScreenerTvlMap(token: string): Promise<Map<string, number>> {
-    const pairs = await this.fetchDexScreenerPairs(token);
+  private async buildDexScreenerTvlMap(token: string, chain: ChainName = "robinhood"): Promise<Map<string, number>> {
+    const pairs = await this.fetchDexScreenerPairs(token, chain);
     const map = new Map<string, number>();
     for (const pair of pairs) {
       const usd = Number(pair.liquidity?.usd ?? 0);
@@ -466,11 +484,11 @@ export class PoolScanner {
     return map;
   }
 
-  async buildGeckoTvlMap(token: string): Promise<Map<string, number>> {
+  async buildGeckoTvlMap(token: string, chain: ChainName = "robinhood"): Promise<Map<string, number>> {
     const map = new Map<string, number>();
     let pools: GeckoPool[];
     try {
-      pools = await this.fetchUniswapPools(token, "robinhood", "background");
+      pools = await this.fetchUniswapPools(token, chain, "background");
     } catch {
       return map;
     }
@@ -746,11 +764,21 @@ export class PoolScanner {
       const c0 = String(poolKey.currency0).toLowerCase();
       const c1 = String(poolKey.currency1).toLowerCase();
       if (c0 !== searchToken && c1 !== searchToken) return null;
+      const computedId = v4PoolId({
+        currency0: poolKey.currency0 as Address,
+        currency1: poolKey.currency1 as Address,
+        fee: Number(poolKey.fee),
+        tickSpacing: Number(poolKey.tickSpacing),
+        hooks: poolKey.hooks as Address,
+      });
+      if (computedId.toLowerCase() !== poolId.toLowerCase() || slot0[0] === 0n) return null;
 
       return {
         feeTier: Number(poolKey.fee),
         currentLpFee: Number(slot0[3]),
         activeLiquidity: liquidity > 0n,
+        hooks: poolKey.hooks,
+        tickSpacing: Number(poolKey.tickSpacing),
       };
     } catch {
       return null;
@@ -801,10 +829,11 @@ export class PoolScanner {
   async investigatePool(poolAddress: string, chain: ChainName = "robinhood"): Promise<InvestigateResult> {
     const normalized = poolAddress.toLowerCase();
     const isV4 = isHex(normalized) && normalized.length === 66;
+    if (chain === "bsc" && !isV4) throw new Error("BSC investigation accepts Uniswap V4 pool IDs only");
     const protocol: "v3" | "v4" = isV4 ? "v4" : "v3";
 
     const [dexData, onChain] = await Promise.all([
-      this.fetchDexScreenerPair(normalized),
+      this.fetchDexScreenerPair(normalized, chain),
       isV4 ? this.readV4PoolOnChain(normalized as Address, chain) : this.readV3PoolOnChain(normalized as Address, chain),
     ]);
 
@@ -812,71 +841,155 @@ export class PoolScanner {
 
     const feeTier = onChain.feeTier ?? 0;
     const currentLpFee = onChain.currentLpFee;
-    const dynamicFee = protocol === "v4" && currentLpFee !== undefined && currentLpFee !== feeTier;
+    const dynamicFee = protocol === "v4" && isDynamicFee(feeTier);
+    const geckoData = dexData ? null : await this.fetchGeckoPool(normalized, chain);
 
-    let resolvedTvlUsd = Number(dexData?.liquidity?.usd ?? 0);
+    let resolvedTvlUsd = Number(dexData?.liquidity?.usd ?? geckoData?.tvlUsd ?? 0);
     if (resolvedTvlUsd <= 0 && dexData) {
-      const geckoTvlMap = await this.buildGeckoTvlMap(dexData.baseToken.address.toLowerCase());
+      const geckoTvlMap = await this.buildGeckoTvlMap(dexData.baseToken.address.toLowerCase(), chain);
       resolvedTvlUsd = geckoTvlMap.get(normalized) ?? 0;
     }
 
-    if (!dexData) {
-      const symbol = protocol === "v3" ? shortAddr(normalized as Address) : "V4";
+    if (dexData) {
       return {
+        chain,
         protocol,
         pairAddress: normalized,
-        pair: symbol,
-        baseToken: { address: "", symbol: "?" },
-        quoteToken: { address: "", symbol: "?" },
+        hooks: onChain.hooks,
+        pair: `${dexData.baseToken.symbol}/${dexData.quoteToken.symbol}`,
+        baseToken: dexData.baseToken,
+        quoteToken: dexData.quoteToken,
         feeTier,
         currentLpFee,
         dynamicFee,
         activeLiquidity: onChain.activeLiquidity,
-        tvlUsd: 0,
-        volume1hUsd: 0,
-        volume6hUsd: 0,
-        volume24hUsd: 0,
-        marketCapUsd: null,
-        fdvUsd: null,
-        pairCreatedAt: null,
-        txns1h: { buys: 0, sells: 0 },
-        priceChange1h: 0,
-        priceChange6h: 0,
-        priceChange24h: 0,
-        priceUsd: null,
-        dexScreenerFound: false,
+        tvlUsd: resolvedTvlUsd,
+        volume1hUsd: Number(dexData.volume?.h1 ?? 0),
+        volume6hUsd: Number(dexData.volume?.h6 ?? 0),
+        volume24hUsd: Number(dexData.volume?.h24 ?? 0),
+        marketCapUsd: dexData.marketCap ?? null,
+        fdvUsd: dexData.fdv ?? null,
+        pairCreatedAt: dexData.pairCreatedAt ?? null,
+        txns1h: { buys: dexData.txns?.h1?.buys ?? 0, sells: dexData.txns?.h1?.sells ?? 0 },
+        priceChange1h: dexData.priceChange?.h1 ?? 0,
+        priceChange6h: dexData.priceChange?.h6 ?? 0,
+        priceChange24h: dexData.priceChange?.h24 ?? 0,
+        priceUsd: dexData.priceUsd ?? null,
+        dexScreenerFound: true,
+        marketSource: "dexscreener",
+      };
+    }
+
+    if (geckoData) {
+      return {
+        chain,
+        protocol,
+        pairAddress: normalized,
+        hooks: onChain.hooks,
+        ...geckoData,
+        feeTier,
+        currentLpFee,
+        dynamicFee,
+        activeLiquidity: onChain.activeLiquidity,
+        dexScreenerFound: true,
+        marketSource: "geckoterminal",
       };
     }
 
     return {
+      chain,
       protocol,
       pairAddress: normalized,
-      pair: `${dexData.baseToken.symbol}/${dexData.quoteToken.symbol}`,
-      baseToken: dexData.baseToken,
-      quoteToken: dexData.quoteToken,
+      hooks: onChain.hooks,
+      pair: protocol === "v3" ? shortAddr(normalized as Address) : "V4",
+      baseToken: { address: "", symbol: "?" },
+      quoteToken: { address: "", symbol: "?" },
       feeTier,
       currentLpFee,
       dynamicFee,
       activeLiquidity: onChain.activeLiquidity,
-      tvlUsd: resolvedTvlUsd,
-      volume1hUsd: Number(dexData.volume?.h1 ?? 0),
-      volume6hUsd: Number(dexData.volume?.h6 ?? 0),
-      volume24hUsd: Number(dexData.volume?.h24 ?? 0),
-      marketCapUsd: dexData.marketCap ?? null,
-      fdvUsd: dexData.fdv ?? null,
-      pairCreatedAt: dexData.pairCreatedAt ?? null,
-      txns1h: { buys: dexData.txns?.h1?.buys ?? 0, sells: dexData.txns?.h1?.sells ?? 0 },
-      priceChange1h: dexData.priceChange?.h1 ?? 0,
-      priceChange6h: dexData.priceChange?.h6 ?? 0,
-      priceChange24h: dexData.priceChange?.h24 ?? 0,
-      priceUsd: dexData.priceUsd ?? null,
-      dexScreenerFound: true,
+      tvlUsd: 0,
+      volume1hUsd: 0,
+      volume6hUsd: 0,
+      volume24hUsd: 0,
+      marketCapUsd: null,
+      fdvUsd: null,
+      pairCreatedAt: null,
+      txns1h: { buys: 0, sells: 0 },
+      priceChange1h: 0,
+      priceChange6h: 0,
+      priceChange24h: 0,
+      priceUsd: null,
+      dexScreenerFound: false,
     };
   }
 
-  private async fetchDexScreenerPair(pairAddress: string): Promise<DexScreenerPairDetail | null> {
+  private async fetchGeckoPool(poolAddress: string, chain: ChainName): Promise<{
+    pair: string;
+    baseToken: { address: string; symbol: string };
+    quoteToken: { address: string; symbol: string };
+    tvlUsd: number;
+    volume1hUsd: number;
+    volume6hUsd: number;
+    volume24hUsd: number;
+    marketCapUsd: number | null;
+    fdvUsd: number | null;
+    pairCreatedAt: number | null;
+    txns1h: { buys: number; sells: number };
+    priceChange1h: number;
+    priceChange6h: number;
+    priceChange24h: number;
+    priceUsd: string | null;
+  } | null> {
+    const network = chainRegistry[chain].geckoNetwork;
     try {
-      const response = await fetch(`${DEXSCREENER_BASE}/latest/dex/pairs/robinhood/${pairAddress}`, {
+      const response = await this.fetchGecko(
+        `${GECKO_BASE}/networks/${network}/pools/${poolAddress}?include=base_token,quote_token`,
+        "interactive",
+      );
+      if (!response.ok) return null;
+      const body = await response.json() as { data?: GeckoPool; included?: GeckoIncludedToken[] };
+      const pool = body.data;
+      if (!pool?.attributes) return null;
+      if (!isEligibleScanDex(chainRegistry[chain], pool.relationships?.dex?.data?.id ?? "")) return null;
+      const tokens = new Map((body.included ?? []).filter((item) => item.type === "token").map((item) => [item.id, item]));
+      const baseRel = pool.relationships.base_token.data.id;
+      const quoteRel = pool.relationships.quote_token.data.id;
+      const base = tokens.get(baseRel);
+      const quote = tokens.get(quoteRel);
+      const baseAddress = (base?.attributes?.address ?? normalizeNetworkToken(baseRel)).toLowerCase();
+      const quoteAddress = (quote?.attributes?.address ?? normalizeNetworkToken(quoteRel)).toLowerCase();
+      const pairName = pool.attributes.pool_name || pool.attributes.name || `${base?.attributes?.symbol ?? "?"} / ${quote?.attributes?.symbol ?? "?"}`;
+      const created = pool.attributes.pool_created_at ? Date.parse(pool.attributes.pool_created_at) : NaN;
+      return {
+        pair: poolPair(pairName, true),
+        baseToken: { address: baseAddress, symbol: base?.attributes?.symbol ?? "?" },
+        quoteToken: { address: quoteAddress, symbol: quote?.attributes?.symbol ?? "?" },
+        tvlUsd: Number(pool.attributes.reserve_in_usd || 0),
+        volume1hUsd: Number(pool.attributes.volume_usd?.h1 || 0),
+        volume6hUsd: Number(pool.attributes.volume_usd?.h6 || 0),
+        volume24hUsd: Number(pool.attributes.volume_usd?.h24 || 0),
+        marketCapUsd: optionalPositiveNumber(pool.attributes.market_cap_usd),
+        fdvUsd: optionalPositiveNumber(pool.attributes.fdv_usd),
+        pairCreatedAt: Number.isFinite(created) ? created : null,
+        txns1h: {
+          buys: pool.attributes.transactions?.h1?.buys ?? 0,
+          sells: pool.attributes.transactions?.h1?.sells ?? 0,
+        },
+        priceChange1h: Number(pool.attributes.price_change_percentage?.h1 || 0),
+        priceChange6h: Number(pool.attributes.price_change_percentage?.h6 || 0),
+        priceChange24h: Number(pool.attributes.price_change_percentage?.h24 || 0),
+        priceUsd: pool.attributes.base_token_price_usd ?? null,
+      };
+    } catch (error) {
+      log.warn({ error: error instanceof Error ? error.message : String(error), poolAddress, chain }, "GeckoTerminal pool lookup failed");
+      return null;
+    }
+  }
+
+  private async fetchDexScreenerPair(pairAddress: string, chain: ChainName = "robinhood"): Promise<DexScreenerPairDetail | null> {
+    try {
+      const response = await fetch(`${DEXSCREENER_BASE}/latest/dex/pairs/${chainRegistry[chain].dexScreenerChain}/${pairAddress}`, {
         headers: { Accept: "application/json" },
         signal: AbortSignal.timeout(15_000),
       });
@@ -966,12 +1079,16 @@ export class PoolScanner {
         functionName: "poolKeys",
         args: [bytes25],
       });
-      const poolKey = poolKeyResult as { fee: number };
+      const poolKey = poolKeyResult as { currency0: Address; currency1: Address; fee: number; tickSpacing: number; hooks: Address };
+      const computedId = v4PoolId(poolKey);
+      if (computedId.toLowerCase() !== poolId.toLowerCase() || slot0[0] === 0n) return null;
 
       return {
         feeTier: Number(poolKey.fee),
         currentLpFee: Number(slot0[3]),
         activeLiquidity: liquidity > 0n,
+        hooks: poolKey.hooks,
+        tickSpacing: Number(poolKey.tickSpacing),
       };
     } catch {
       return null;
@@ -1008,7 +1125,7 @@ function dexValuation(pairs: readonly DexScreenerPair[]): { value: number; sourc
 }
 
 export function uniswapPoolUrl(poolIdentifier: string, chain: ChainName = "robinhood"): string {
-  return `https://app.uniswap.org/explore/pools/${chain}/${poolIdentifier}`;
+  return `https://app.uniswap.org/explore/pools/${chainRegistry[chain].uniswapSlug}/${poolIdentifier}`;
 }
 
 function normalizeNetworkToken(value: string): string {
@@ -1099,6 +1216,11 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function optionalPositiveNumber(value: string | null | undefined): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
 function sleep(ms: number): Promise<void> {

@@ -1,7 +1,7 @@
 import { defineChain, zeroAddress, type Address, type Chain } from "viem";
 import { base, bsc } from "viem/chains";
 
-import type { ChainName } from "./types.js";
+import type { ChainName, Protocol } from "./types.js";
 
 const robinhood = defineChain({
   id: 4663,
@@ -23,20 +23,42 @@ export interface UniswapContracts {
 
 export interface ChainRegistry {
   name: ChainName;
+  aliases: readonly string[];
   chain: Chain;
   contracts: UniswapContracts;
-  discoveryProtocols: readonly ("v2" | "v3" | "v4")[];
+  discoveryProtocols: readonly Protocol[];
   monitoringEnabled: boolean;
-  dex: "uniswap" | "pancakeswap-v3";
+  dex: "uniswap";
+  displayName: string;
+  nativeSymbol: string;
+  wrappedSymbol: string;
+  wrappedNative: Address;
+  geckoNetwork: string;
+  geckoV4DexId: string;
+  dexScreenerChain: string;
+  uniswapSlug: string;
+  explorerUrl: string;
+  quotePriority: readonly string[];
 }
 
 export const chainRegistry: Record<ChainName, ChainRegistry> = {
   base: {
     name: "base",
+    aliases: ["base"],
     chain: base,
     discoveryProtocols: ["v2", "v3", "v4"],
     monitoringEnabled: true,
     dex: "uniswap",
+    displayName: "Base",
+    nativeSymbol: "ETH",
+    wrappedSymbol: "WETH",
+    wrappedNative: "0x4200000000000000000000000000000000000006",
+    geckoNetwork: "base",
+    geckoV4DexId: "uniswap-v4-base",
+    dexScreenerChain: "base",
+    uniswapSlug: "base",
+    explorerUrl: "https://basescan.org",
+    quotePriority: ["USDC", "WETH", "ETH"],
     contracts: {
       v2: {
         factory: "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6",
@@ -60,10 +82,21 @@ export const chainRegistry: Record<ChainName, ChainRegistry> = {
   },
   robinhood: {
     name: "robinhood",
+    aliases: ["robinhood"],
     chain: robinhood,
     discoveryProtocols: ["v2", "v3", "v4"],
     monitoringEnabled: true,
     dex: "uniswap",
+    displayName: "Robinhood Chain",
+    nativeSymbol: "ETH",
+    wrappedSymbol: "WETH",
+    wrappedNative: "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    geckoNetwork: "robinhood",
+    geckoV4DexId: "uniswap-v4-robinhood",
+    dexScreenerChain: "robinhood",
+    uniswapSlug: "robinhood",
+    explorerUrl: "https://robinhoodchain.blockscout.com",
+    quotePriority: ["USDG", "USDC", "WETH", "ETH", "NVDA"],
     contracts: {
       v2: {
         factory: "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
@@ -87,26 +120,75 @@ export const chainRegistry: Record<ChainName, ChainRegistry> = {
   },
   bsc: {
     name: "bsc",
+    aliases: ["bsc", "bnb"],
     chain: bsc,
-    discoveryProtocols: ["v3"],
-    monitoringEnabled: false,
-    dex: "pancakeswap-v3",
+    discoveryProtocols: ["v4"],
+    monitoringEnabled: true,
+    dex: "uniswap",
+    displayName: "BNB Smart Chain",
+    nativeSymbol: "BNB",
+    wrappedSymbol: "WBNB",
+    wrappedNative: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+    geckoNetwork: "bsc",
+    geckoV4DexId: "uniswap-v4-bsc",
+    dexScreenerChain: "bsc",
+    uniswapSlug: "bnb",
+    explorerUrl: "https://bscscan.com",
+    quotePriority: ["USDT", "WBNB", "BNB"],
     contracts: {
       v2: { factory: zeroAddress, router: zeroAddress },
       v3: {
-        factory: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
-        positionManager: "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364",
-        quoter: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
-        swapRouter: "0x1b81D678ffb9C0263b24A97847620C99d213eB14",
-      },
-      v4: {
-        poolManager: zeroAddress,
+        factory: zeroAddress,
         positionManager: zeroAddress,
         quoter: zeroAddress,
-        stateView: zeroAddress,
-        universalRouter: zeroAddress,
-        permit2: zeroAddress,
+        swapRouter: zeroAddress,
+      },
+      v4: {
+        poolManager: "0x28e2ea090877bf75740558f6bfb36a5ffee9e9df",
+        positionManager: "0x7a4a5c919ae2541aed11041a1aeee68f1287f95b",
+        quoter: "0x9f75dd27d6664c475b90e105573e550ff69437b0",
+        stateView: "0xd13dd3d6e93f276fafc9db9e6bb47c1180aee0c4",
+        universalRouter: "0x1906c1d672b88cd1b9ac7593301ca990f94eae07",
+        permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3",
       },
     },
   },
 };
+
+export function parseChainAlias(value: string): ChainName | undefined {
+  const normalized = value.trim().toLowerCase();
+  for (const registry of Object.values(chainRegistry)) {
+    if (registry.aliases.includes(normalized)) return registry.name;
+  }
+  return undefined;
+}
+
+export function registryByChainId(chainId: number): ChainRegistry | undefined {
+  return Object.values(chainRegistry).find((registry) => registry.chain.id === chainId);
+}
+
+export function isProtocolDeployed(registry: ChainRegistry, protocol: Protocol): boolean {
+  if (registry.discoveryProtocols && !registry.discoveryProtocols.includes(protocol)) return false;
+  if (!registry.contracts) return true;
+  if (!registry.discoveryProtocols) {
+    if (protocol === "v2") return Boolean(registry.contracts.v2);
+    if (protocol === "v3") return Boolean(registry.contracts.v3);
+    return Boolean(registry.contracts.v4);
+  }
+  if (protocol === "v2") return registry.contracts.v2?.factory !== zeroAddress && registry.contracts.v2?.router !== zeroAddress;
+  if (protocol === "v3") return registry.contracts.v3?.factory !== zeroAddress && registry.contracts.v3?.positionManager !== zeroAddress;
+  return registry.contracts.v4?.poolManager !== zeroAddress && registry.contracts.v4?.positionManager !== zeroAddress;
+}
+
+export function isEligibleScanDex(registry: ChainRegistry, dexId: string): boolean {
+  if (registry.name === "bsc") return dexId === registry.geckoV4DexId;
+  return dexId.startsWith("uniswap-v3") || dexId.startsWith("uniswap-v4");
+}
+
+export function isWrappedNative(registry: ChainRegistry, address: Address): boolean {
+  return address.toLowerCase() === registry.wrappedNative.toLowerCase();
+}
+
+export function chainHeading(registry: ChainRegistry): string {
+  return `${registry.displayName} (${registry.chain.id})`;
+}

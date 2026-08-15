@@ -337,6 +337,7 @@ describe("Database native USD backfill", () => {
     await expect(database.hasPendingRawTransaction(4663)).resolves.toBe(true);
 
     expect(query.mock.calls[0]![0]).toContain("pendingRawTransaction");
+    expect(query.mock.calls[0]![0]).toContain("settlementRetryDisabled");
     expect(query.mock.calls[0]![1]).toEqual([4663]);
   });
 

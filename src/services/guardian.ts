@@ -108,6 +108,8 @@ export class Guardian {
 
     for (const position of positions) {
       let candidate = position;
+      if (candidate.protocol === "v4" && await this.executor.settleExternallyClosedV4(candidate)) continue;
+      if (isInactiveReviewReason(candidate.metadata.reason)) continue;
       if (candidate.protocol === "v4") {
         try {
           const refreshed = await this.discovery.refreshV4Position(name, candidate);
@@ -116,6 +118,7 @@ export class Guardian {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           if (message.includes("NOT_MINTED")) {
+            if (await this.executor.settleExternallyClosedV4(candidate)) continue;
             const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(candidate.id, { reason: "nft_burned_unverified" });
             log[reviewed ? "warn" : "info"](
               { positionId: candidate.id, positionKey: candidate.positionKey },
@@ -204,6 +207,7 @@ export class Guardian {
         ?? profitOorTrigger
         ?? oorTrigger;
       if (!trigger || !valued.twapGuard.ready) return true;
+      if (!this.canAutoExit(name)) return true;
       if (trigger === "trailing_take_profit" && this.pnl.trailingExitEstimateGateBps(group.metadata) === null) {
         await this.database.setPositionGroupStatus(group.id, "needs_review", { reason: "trailing_exit_state_missing", settlementRetryDisabled: true });
         return true;
@@ -389,6 +393,7 @@ export class Guardian {
         log.info({ positionId: position.id, trigger: effectiveTrigger, nextAttemptAt: new Date(nextAttemptAt!).toISOString() }, "exit retry waiting for backoff");
         return true;
       }
+      if (!this.canAutoExit(name)) return true;
       if (this.queuedExitPositions.has(position.id)) return true;
       if (effectiveTrigger === "trailing_take_profit") {
         if (!(await this.trailingExitEstimateAllowed(position, blockNumber))) return true;
@@ -426,7 +431,7 @@ export class Guardian {
           return true;
         }
         if (await this.executor.autoSettleZeroLiquidityV3(name, position)) return true;
-        if (await this.executor.autoSettleZeroLiquidityV4(name, position)) return true;
+        if (await this.executor.settleExternallyClosedV4(position)) return true;
         const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(position.id, { reason: "on_chain_liquidity_zero_unverified" });
         if (!reviewed) {
           log.info({ positionId: position.id, positionKey: position.positionKey, reason: message }, "V4 liquidity is gone but settlement remains pending");
@@ -565,6 +570,10 @@ export class Guardian {
     } finally {
       this.queuedExitPositions.delete(position.id);
     }
+  }
+
+  private canAutoExit(name: ChainName): boolean {
+    return !this.config.autoExitChains || this.config.autoExitChains.includes(name);
   }
 
   private async trailingExitEstimateAllowed(position: PositionRecord, blockNumber: bigint, valued?: Awaited<ReturnType<PnlService["value"]>>): Promise<PnlSnapshot | null> {
@@ -776,6 +785,15 @@ export function shouldWaitForExitRetry(trigger: ExitTrigger, nextAttemptAt: numb
 
 export function shouldResumeExitRetry(trigger: ExitTrigger): boolean {
   return trigger === "stop_loss" || trigger === "take_profit" || trigger === "manual";
+}
+
+function isInactiveReviewReason(reason: unknown): boolean {
+  return reason === "on_chain_liquidity_zero_unverified"
+    || reason === "nft_burned_unverified"
+    || reason === "liquidity_reconciled_to_zero_unverified"
+    || reason === "externally_closed"
+    || reason === "nft_burned"
+    || reason === "nft_transferred_away";
 }
 
 function parseExitRetry(metadata: Record<string, unknown>): { reason: ExitTrigger; nextAttemptAt: number } | null {

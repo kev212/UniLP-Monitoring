@@ -1,4 +1,4 @@
-import { encodeAbiParameters, encodeFunctionData, type Address, type Hex } from "viem";
+import { encodeAbiParameters, encodeFunctionData, zeroAddress, type Address, type Hex } from "viem";
 
 import { v2RouterAbi, v3SwapRouterAbi, v4UniversalRouterAbi } from "../abi.js";
 import type { TransactionPlan } from "../types.js";
@@ -75,6 +75,7 @@ export function buildSwapPlan(
       chainId,
       to: route.router,
       data: encodeFunctionData({ abi: v4UniversalRouterAbi, functionName: "execute", args: ["0x10" as Hex, [v4Input], deadline] }),
+      value: route.tokenIn.toLowerCase() === zeroAddress ? route.amountIn : 0n,
       description: "swap V4 route",
     };
   }

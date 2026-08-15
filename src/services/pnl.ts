@@ -19,6 +19,7 @@ import type { PositionReader } from "./position-reader.js";
 import type { RoutePlanner } from "./route-planner.js";
 import type { UniswapTradingApi } from "./uniswap-trading-api.js";
 import { quoteRangeState } from "./quote-range.js";
+import { normalizeToUsd6 } from "./token-meta.js";
 import { applySlippage, sqrtRatioAtTick } from "./uniswap-math.js";
 
 const POSITION_READ_TIMEOUT_MS = 15_000;
@@ -68,6 +69,7 @@ export class PnlService {
     localOnly = false,
   ): Promise<ValuedPosition> {
     if (!position.quoteToken) throw new Error("Position has no eligible quote token");
+    const quoteToken = position.quoteToken;
     const value = await withTimeout(
       this.reader.read(position, blockNumber),
       POSITION_READ_TIMEOUT_MS,
@@ -92,14 +94,14 @@ export class PnlService {
         } : undefined,
       );
     }
-    const quoteIsToken0 = value.token0.token.toLowerCase() === position.quoteToken.toLowerCase();
+    const quoteIsToken0 = value.token0.token.toLowerCase() === quoteToken.toLowerCase();
     const quoteAmount = quoteIsToken0 ? value.token0.amount : value.token1.amount;
     const nonQuote = quoteIsToken0 ? value.token1 : value.token0;
     const quoteSideFee = quoteIsToken0 ? value.unclaimedFees0 : value.unclaimedFees1;
     const nonQuoteFee = quoteIsToken0 ? value.unclaimedFees1 : value.unclaimedFees0;
     const [route, feeRoute] = await Promise.all([
-       this.quoteFresh(position, nonQuote.token, nonQuote.amount, position.quoteToken, quoteSlippageBps, localOnly),
-       this.quoteFresh(position, nonQuote.token, nonQuoteFee, position.quoteToken, quoteSlippageBps, localOnly),
+       this.quoteFresh(position, nonQuote.token, nonQuote.amount, quoteToken, quoteSlippageBps, localOnly),
+       this.quoteFresh(position, nonQuote.token, nonQuoteFee, quoteToken, quoteSlippageBps, localOnly),
     ]);
     if (nonQuote.amount > 0n && !route) throw new Error("No safe direct Uniswap route from LP asset to quote token");
 
@@ -113,15 +115,12 @@ export class PnlService {
     const totals = await this.database.getCashflowTotals(position.id);
     if (totals.deposits === 0n) throw new Error("Position cost basis has not been reconstructed");
 
-    let feeQuoteUsdg = feeQuote;
-    const chainName = this.config.chains.find((name) => chainRegistry[name].chain.id === position.chainId);
-    if (chainName) {
-      const stable = this.config.quoteTokens[chainName]?.[0]?.address;
-      if (stable && position.quoteToken.toLowerCase() !== stable.toLowerCase() && feeQuote > 0n) {
-        const stableRoute = await this.quoteFresh(position, position.quoteToken, feeQuote, stable, quoteSlippageBps, localOnly);
-        feeQuoteUsdg = stableRoute?.minimumOut ?? 0n;
-      }
-    }
+    const feeQuoteUsdg = await this.toFeeUsd6(
+      position.chainId,
+      quoteToken,
+      feeQuote,
+      (stable, amount) => this.quoteFresh(position, quoteToken, amount, stable, quoteSlippageBps, localOnly),
+    );
     const pnlQuote = totals.realized + feeQuote + liquidationQuote - totals.deposits;
     const pnlBps = (pnlQuote * 10_000n) / totals.deposits;
     const twapGuard = recordObservations
@@ -207,15 +206,12 @@ export class PnlService {
 
     const liquidationQuote = quoteAmount + (route?.minimumOut ?? 0n);
     const feeQuote = quoteFee + (feeRoute?.minimumOut ?? 0n);
-    let feeQuoteUsdg = feeQuote;
-    const chainName = this.config.chains.find((name) => chainRegistry[name].chain.id === group.chainId);
-    if (chainName) {
-      const stable = this.config.quoteTokens[chainName]?.[0]?.address;
-      if (stable && group.quoteToken.toLowerCase() !== stable.toLowerCase() && feeQuote > 0n) {
-        const stableRoute = await this.quoteFresh(children[0]!, group.quoteToken, feeQuote, stable, quoteSlippageBps, localOnly);
-        feeQuoteUsdg = stableRoute?.minimumOut ?? 0n;
-      }
-    }
+    const feeQuoteUsdg = await this.toFeeUsd6(
+      group.chainId,
+      group.quoteToken,
+      feeQuote,
+      (stable, amount) => this.quoteFresh(children[0]!, group.quoteToken, amount, stable, quoteSlippageBps, localOnly),
+    );
     const totals = await this.database.getPositionGroupCashflowTotals(group.id);
     const deposits = totals.deposits > 0n ? totals.deposits : group.deployedCostQuote;
     if (deposits <= 0n) throw new Error("Position group cost basis has not been reconstructed");
@@ -363,6 +359,25 @@ export class PnlService {
     const difference = marker > previous.priceMarker ? marker - previous.priceMarker : previous.priceMarker - marker;
     const deviationBps = (difference * 10_000n) / previous.priceMarker;
     return { ready: deviationBps <= BigInt(this.config.maxTwapDeviationBps), deviationBps };
+  }
+
+  private async toFeeUsd6(
+    chainId: number,
+    quoteToken: Address,
+    feeQuote: bigint,
+    convert: (stable: Address, amount: bigint) => Promise<{ minimumOut: bigint } | null>,
+  ): Promise<bigint> {
+    const chainName = this.config.chains.find((name) => chainRegistry[name].chain.id === chainId);
+    if (!chainName) return feeQuote;
+    const stable = this.config.quoteTokens[chainName]?.[0];
+    if (!stable) return feeQuote;
+    const decimals = stable.symbol.toUpperCase() === "USDT" ? 18 : 6;
+    if (quoteToken.toLowerCase() === stable.address.toLowerCase()) {
+      return normalizeToUsd6(feeQuote, decimals);
+    }
+    if (feeQuote <= 0n) return 0n;
+    const route = await convert(stable.address, feeQuote);
+    return normalizeToUsd6(route?.minimumOut ?? 0n, decimals);
   }
 }
 

@@ -1,6 +1,7 @@
 import { zeroAddress, type Address, type Hex } from "viem";
 
 import { v2FactoryAbi, v2RouterAbi, v3FactoryAbi, v3QuoterAbi, v4QuoterAbi } from "../abi.js";
+import { isProtocolDeployed } from "../chains.js";
 import { log } from "../log.js";
 import type { ChainName, PositionRecord, QuoteToken } from "../types.js";
 import { applySlippage } from "./uniswap-math.js";
@@ -56,9 +57,9 @@ export class RoutePlanner {
     const { registry } = this.chains.getById(position.chainId);
     const paths = this.candidatePaths(registry.name, tokenIn, tokenOut);
     const [v2Quotes, v3Quotes, v4Quote] = await Promise.all([
-      this.quoteV2(position, paths, amountIn, opts?.excludedPool),
-      this.quoteV3(position, paths, amountIn, opts?.excludedPool),
-      opts?.includeV4 === false
+      isProtocolDeployed(registry, "v2") ? this.quoteV2(position, paths, amountIn, opts?.excludedPool) : Promise.resolve([]),
+      isProtocolDeployed(registry, "v3") ? this.quoteV3(position, paths, amountIn, opts?.excludedPool) : Promise.resolve([]),
+      opts?.includeV4 === false || !isProtocolDeployed(registry, "v4")
         ? Promise.resolve(null)
         : this.quoteV4(position, tokenIn, amountIn, tokenOut),
     ]);

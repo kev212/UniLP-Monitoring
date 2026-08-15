@@ -62,6 +62,7 @@ import { buildSwapPlan } from "./swap-builder.js";
 import { buildV3BidAskClosePlan, buildV4BidAskClosePlan, type V4PoolKey } from "./bid-ask-batch.js";
 import { receiptTokenTransfers } from "./discovery.js";
 import { applySlippage } from "./uniswap-math.js";
+import { isUsdStableSymbol, normalizeToUsd6 } from "./token-meta.js";
 
 export { isTransientRpcError } from "../rpc.js";
 
@@ -275,10 +276,10 @@ export class Executor {
 
   private relatedPairKey(chainId: number, token0: Address, token1: Address): string {
     const { registry } = this.chains.getById(chainId);
-    const weth = this.config.quoteTokens[registry.name]?.find((token) => token.symbol === "WETH")?.address.toLowerCase();
+    const wrapped = (registry.wrappedNative ?? chainRegistry[registry.name]?.wrappedNative ?? zeroAddress).toLowerCase();
     const canonical = (token: Address): string => {
       const normalized = token.toLowerCase();
-      return weth && (normalized === zeroAddress.toLowerCase() || normalized === weth) ? weth : normalized;
+      return normalized === zeroAddress.toLowerCase() || normalized === wrapped ? wrapped : normalized;
     };
     return `${chainId}:${[canonical(token0), canonical(token1)].sort().join(":")}`;
   }
@@ -617,6 +618,7 @@ export class Executor {
         await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
           reason,
           settlementRetryDisabled: true,
+          pendingRawTransaction: null,
         });
         log.warn({ positionId: position.id, positionKey: position.positionKey, reason }, "external settlement requires transaction reconciliation");
         return;
@@ -1260,8 +1262,9 @@ export class Executor {
 
   private async unwrapGroupQuote(group: PositionGroupRecord, amount: bigint, closeHash: string, trigger?: ExitTrigger): Promise<boolean> {
     const { registry } = this.chains.getById(group.chainId);
-    const weth = this.config.quoteTokens[registry.name]?.find((token) => token.symbol === "WETH");
-    if (!weth || group.quoteToken.toLowerCase() !== weth.address.toLowerCase() || amount <= 0n) return true;
+    const meta = chainMeta(registry);
+    const wrapped = this.config.quoteTokens[registry.name]?.find((token) => token.symbol === meta.wrappedSymbol);
+    if (!wrapped || group.quoteToken.toLowerCase() !== wrapped.address.toLowerCase() || amount <= 0n) return true;
     const metadata = group.metadata as Record<string, unknown>;
     const confirmedAmount = metadata.unwrapQuoteConfirmed === true
       && typeof metadata.unwrapQuoteAmount === "string"
@@ -1282,7 +1285,7 @@ export class Executor {
     });
     const plan: TransactionPlan = {
       chainId: group.chainId,
-      to: weth.address as Address,
+      to: wrapped.address as Address,
       data: encodeFunctionData({ abi: wethAbi, functionName: "withdraw", args: [amountToUnwrap] }),
       description: "unwrap_quote",
     };
@@ -1410,9 +1413,15 @@ export class Executor {
       nativeBenchmark = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
       if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark native group settlement swap");
     }
-    const localBenchmark = isNativeSettlement
+    let localBenchmark = isNativeSettlement
       ? nativeBenchmark
       : await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
+    if (!localBenchmark && !isNativeSettlement && position.chainId === chainRegistry.bsc.chain.id) {
+      if (!this.kyberswapApi) throw new Error("KyberSwap is required to benchmark BSC group settlement swap");
+      nativeBenchmark = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+      if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark BSC group settlement swap");
+      localBenchmark = nativeBenchmark;
+    }
     if (!localBenchmark) throw new Error("No safe local route available to benchmark group settlement swap");
     const minimumAcceptableOut = applySlippage(localBenchmark.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
     const quoteJobs: Promise<ApiSwapCandidate | null>[] = [];
@@ -1892,8 +1901,9 @@ export class Executor {
   private wethQuoteToken(position: PositionRecord): Address | null {
     if (!position.quoteToken || position.quoteToken.toLowerCase() === zeroAddress) return null;
     const { registry } = this.chains.getById(position.chainId);
-    const weth = this.config.quoteTokens[registry.name]?.find((token) => token.symbol === "WETH");
-    return weth && weth.address.toLowerCase() === position.quoteToken.toLowerCase() ? weth.address : null;
+    const wrappedSymbol = registry.wrappedSymbol ?? chainRegistry[registry.name]?.wrappedSymbol ?? "WETH";
+    const wrapped = this.config.quoteTokens[registry.name]?.find((token) => token.symbol === wrappedSymbol);
+    return wrapped && wrapped.address.toLowerCase() === position.quoteToken.toLowerCase() ? wrapped.address : null;
   }
 
   private async saveSettlementBalance(position: PositionRecord, swapExpectedOut = 0n, swapTransactionHash?: Hex): Promise<bigint> {
@@ -1925,13 +1935,14 @@ export class Executor {
     const qtLower = position.quoteToken.toLowerCase();
     const { registry } = this.chains.getById(position.chainId);
     const quoteTokens = this.config.quoteTokens[registry.name] ?? [];
-    const stable = quoteTokens.find(q => q.symbol === "USDG" || q.symbol === "USDC");
-    const weth = quoteTokens.find(q => q.symbol === "WETH") ?? quoteTokens.find(q => q.symbol === "ETH");
-    const isEth = qtLower === zeroAddress || (weth ? qtLower === weth.address.toLowerCase() : false);
+    const stable = quoteTokens.find((q) => isUsdStableSymbol(q.symbol));
+    const chain = chainMeta(registry);
+    const wrapped = quoteTokens.find((q) => q.symbol === chain.wrappedSymbol) ?? quoteTokens.find((q) => q.symbol === chain.nativeSymbol);
+    const isNative = qtLower === zeroAddress || (wrapped ? qtLower === wrapped.address.toLowerCase() : false);
     let settlementUsd = 0n;
     if (stable && qtLower === stable.address.toLowerCase()) {
-      settlementUsd = totalReceived;
-    } else if (isEth) {
+      settlementUsd = normalizeToUsd6(totalReceived, stableDecimals(stable.symbol));
+    } else if (isNative) {
       try {
         settlementUsd = await this.computeEthUsd(position.chainId, totalReceived);
       } catch (error) {
@@ -2044,10 +2055,12 @@ export class Executor {
     try {
       const { registry } = this.chains.getById(chainId);
       const quoteTokens = this.config.quoteTokens[registry.name] ?? [];
-      const stable = quoteTokens.find((quote) => quote.symbol === "USDG" || quote.symbol === "USDC") ?? quoteTokens[0];
+      const stable = quoteTokens.find((quote) => isUsdStableSymbol(quote.symbol)) ?? quoteTokens[0];
       if (!stable) return 0n;
-      const weth = quoteTokens.find(q => q.symbol === "WETH") ?? quoteTokens.find(q => q.symbol === "ETH");
-      const tokenIn = weth ? weth.address : zeroAddress;
+    const wrappedSymbol = registry.wrappedSymbol ?? chainRegistry[registry.name]?.wrappedSymbol ?? "WETH";
+    const nativeSymbol = registry.nativeSymbol ?? chainRegistry[registry.name]?.nativeSymbol ?? "ETH";
+    const wrapped = quoteTokens.find((q) => q.symbol === wrappedSymbol) ?? quoteTokens.find((q) => q.symbol === nativeSymbol);
+      const tokenIn = wrapped ? wrapped.address : zeroAddress;
       const route = await this.routes.quoteDirect(
         { chainId } as PositionRecord,
         tokenIn,
@@ -2055,7 +2068,7 @@ export class Executor {
         stable.address,
       );
       if (!route) return 0n;
-      return (ethWei * route.expectedOut) / (10n ** 18n);
+      return normalizeToUsd6((ethWei * route.expectedOut) / (10n ** 18n), stableDecimals(stable.symbol));
     } catch {
       return 0n;
     }
@@ -2072,13 +2085,14 @@ export class Executor {
     try {
       const { registry } = this.chains.getById(group.chainId);
       const quoteTokens = this.config.quoteTokens[registry.name] ?? [];
-      const stable = quoteTokens.find((quote) => quote.symbol === "USDG" || quote.symbol === "USDC");
+      const stable = quoteTokens.find((quote) => isUsdStableSymbol(quote.symbol));
       if (!stable) return null;
       const quoteToken = group.quoteToken.toLowerCase();
-      if (quoteToken === stable.address.toLowerCase()) return finalPnlQuote;
+      if (quoteToken === stable.address.toLowerCase()) return normalizeToUsd6(finalPnlQuote, stableDecimals(stable.symbol));
 
-      const weth = quoteTokens.find((quote) => quote.symbol === "WETH") ?? quoteTokens.find((quote) => quote.symbol === "ETH");
-      const isEthQuote = quoteToken === zeroAddress || (weth && quoteToken === weth.address.toLowerCase());
+      const meta = chainMeta(registry);
+      const wrapped = quoteTokens.find((quote) => quote.symbol === meta.wrappedSymbol) ?? quoteTokens.find((quote) => quote.symbol === meta.nativeSymbol);
+      const isEthQuote = quoteToken === zeroAddress || (wrapped && quoteToken === wrapped.address.toLowerCase());
       const settlementUsd = isEthQuote
         ? await this.computeEthUsd(group.chainId, totalReceivedQuote)
         : (await this.routes.quoteDirect({ chainId: group.chainId } as PositionRecord, group.quoteToken, totalReceivedQuote, stable.address))?.expectedOut ?? 0n;
@@ -2113,6 +2127,7 @@ export class Executor {
         args: [BigInt(position.positionKey)],
       });
       if (liquidity > 0n) return true;
+      if (await this.settleExternallyClosedV4(position)) return false;
       const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(position.id, { reason: "on_chain_liquidity_zero_unverified" });
       if (!reviewed) {
         log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 liquidity is gone but settlement remains pending");
@@ -2123,6 +2138,7 @@ export class Executor {
     } catch (error) {
       const message = errorMessage(error);
       if (!message.includes("NOT_MINTED")) throw error;
+      if (await this.settleExternallyClosedV4(position)) return false;
       const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(position.id, { reason: "nft_burned_unverified" });
       if (!reviewed) {
         log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 NFT is burned but settlement remains pending");
@@ -2131,6 +2147,53 @@ export class Executor {
       log.warn({ positionId: position.id, positionKey: position.positionKey }, "V4 NFT is burned without a verified settlement");
       return false;
     }
+  }
+
+  async settleExternallyClosedV4(position: PositionRecord): Promise<boolean> {
+    if (position.protocol !== "v4") return false;
+    if (hasPendingSettlement(position.status, position.metadata)) return false;
+    if (await this.database.recoverVerifiedSettlement(position.id)) return true;
+    const { client, registry } = this.chains.getById(position.chainId);
+    if (await this.autoSettleZeroLiquidityV4(registry.name, position)) return true;
+
+    let reason: string | null = null;
+    try {
+      const [owner, liquidity] = await Promise.all([
+        client.readContract({
+          address: registry.contracts.v4.positionManager,
+          abi: v4PositionManagerAbi,
+          functionName: "ownerOf",
+          args: [BigInt(position.positionKey)],
+        }),
+        client.readContract({
+          address: registry.contracts.v4.positionManager,
+          abi: v4PositionManagerAbi,
+          functionName: "getPositionLiquidity",
+          args: [BigInt(position.positionKey)],
+        }),
+      ]);
+      if (owner.toLowerCase() !== position.owner.toLowerCase()) reason = "nft_transferred_away";
+      else if (liquidity === 0n) reason = "externally_closed";
+    } catch (error) {
+      if (!errorMessage(error).includes("NOT_MINTED")) return false;
+      reason = "nft_burned";
+    }
+    if (!reason) return false;
+
+    const existingTotal = typeof position.metadata.totalReceived === "string" ? position.metadata.totalReceived : "0";
+    const settled = await this.database.setPositionStatusUnlessSettled(position.id, "settled", {
+      reason,
+      totalReceived: existingTotal,
+      closeReceiptAccounted: false,
+    });
+    if (!settled) return false;
+    this.finalizeCloseHistory({
+      ...position,
+      status: "settled",
+      metadata: { ...position.metadata, totalReceived: existingTotal, reason },
+    });
+    log.info({ positionId: position.id, positionKey: position.positionKey, reason }, "settled inactive V4 position without a reconstructed close receipt");
+    return true;
   }
 
   private async recoverSettlementPosition(position: PositionRecord): Promise<PositionRecord | null> {
@@ -2175,9 +2238,15 @@ export class Executor {
       nativeBenchmark = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
       if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark native settlement swap");
     }
-    const localBenchmark = isNativeSettlement
+    let localBenchmark = isNativeSettlement
       ? nativeBenchmark
       : await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
+    if (!localBenchmark && !isNativeSettlement && position.chainId === chainRegistry.bsc.chain.id) {
+      if (!this.kyberswapApi) throw new Error("KyberSwap is required to benchmark BSC settlement swap");
+      nativeBenchmark = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+      if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark BSC settlement swap");
+      localBenchmark = nativeBenchmark;
+    }
     if (!localBenchmark) throw new Error("No safe local route available to benchmark settlement swap");
     const minimumAcceptableOut = applySlippage(localBenchmark.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
     const quoteJobs: Promise<ApiSwapCandidate | null>[] = [];
@@ -2347,10 +2416,10 @@ export class Executor {
     tokenOut: Address,
     slippageBps: number,
   ): Promise<PreparedSwap | null> {
-    if (tokenIn.toLowerCase() === zeroAddress) throw new Error("Local native-token settlement is unsupported");
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const quoted = await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
       if (!quoted) throw new Error("No safe local route remains for post-close settlement");
+      if (tokenIn.toLowerCase() === zeroAddress && quoted.protocol !== "v4") throw new Error("Local native-token settlement is unsupported");
       const route = { ...quoted, minimumOut: applySlippage(quoted.expectedOut, slippageBps) };
       let approvalChanged = false;
       if (route.protocol === "v4") {
@@ -2807,10 +2876,11 @@ export class Executor {
         const receipt = await client.getTransactionReceipt({ hash: swapHash });
         if (!receipt) continue;
         const blockNum = receipt.blockNumber;
+        const meta = chainMeta(registry);
         const wethAddr = (item.isNativeQuote
-          ? (this.config.quoteTokens[registry.name]?.find(q => q.symbol === "WETH" || q.symbol === "ETH")?.address ?? item.quoteToken)
+          ? (this.config.quoteTokens[registry.name]?.find((q) => q.symbol === meta.wrappedSymbol || q.symbol === meta.nativeSymbol)?.address ?? item.quoteToken)
           : item.quoteToken) as Address;
-        const stableAddr = (this.config.quoteTokens[registry.name]?.find(q => q.symbol === "USDG" || q.symbol === "USDC")?.address
+        const stableAddr = (this.config.quoteTokens[registry.name]?.find((q) => isUsdStableSymbol(q.symbol))?.address
           ?? this.config.quoteTokens[registry.name]?.[0]?.address) as Address;
         if (!stableAddr) continue;
         let usdPerEthMicro = 0n;
@@ -3277,4 +3347,12 @@ export function bufferedGasLimit(estimatedGas: bigint, multiplierPercent: number
 
 function safeAttemptCount(value: unknown): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function stableDecimals(symbol: string): number {
+  return symbol.toUpperCase() === "USDT" ? 18 : 6;
+}
+
+function chainMeta(registry: { name: import("../types.js").ChainName }): typeof chainRegistry.robinhood {
+  return { ...chainRegistry[registry.name], ...registry };
 }

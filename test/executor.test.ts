@@ -258,6 +258,33 @@ describe("Executor pending settlement recovery", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it("settles an inactive V4 NFT as externally closed when liquidity is already zero", async () => {
+    const database = {
+      recoverVerifiedSettlement: vi.fn().mockResolvedValue(false),
+      setPositionStatusUnlessSettled: vi.fn().mockResolvedValue(true),
+      finalizeCloseHistory: vi.fn().mockResolvedValue(undefined),
+    };
+    const readContract = vi.fn()
+      .mockResolvedValueOnce(owner)
+      .mockResolvedValueOnce(0n);
+    const chains = {
+      getById: vi.fn(() => ({
+        client: { readContract },
+        registry: { name: "bsc", contracts: { v4: { positionManager: "0x7a4a5c919ae2541aed11041a1aeee68f1287f95b" } } },
+      })),
+    };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, { settled: vi.fn() } as never, config);
+    vi.spyOn(executor, "autoSettleZeroLiquidityV4").mockResolvedValue(false);
+    const position = {
+      id: "position", chainId: 56, protocol: "v4", positionKey: "99", owner, poolAddress: null,
+      token0: token, token1: usdg, quoteToken: usdg, status: "needs_review", liquidity: 0n, openedAtBlock: 1n,
+      metadata: { reason: "on_chain_liquidity_zero_unverified" },
+    } as PositionRecord;
+
+    await expect(executor.settleExternallyClosedV4(position)).resolves.toBe(true);
+    expect(database.setPositionStatusUnlessSettled).toHaveBeenCalledWith("position", "settled", expect.objectContaining({ reason: "externally_closed", totalReceived: "0" }));
+  });
+
   it("derives net ERC-20 proceeds from confirmed receipt transfers", () => {
     const logs = [
       transferLog(token, sender, owner, 120n),
@@ -564,6 +591,56 @@ describe("Executor pending settlement recovery", () => {
     expect(kyberswapApi.quote).toHaveBeenCalledTimes(1);
     expect(routes.quoteDirect).not.toHaveBeenCalled();
     expect(client.call).toHaveBeenCalledWith(expect.objectContaining({ data: "0x22" }));
+  });
+
+  it("uses KyberSwap as the BSC settlement benchmark when the local V4 quote is gone", async () => {
+    const client = {
+      readContract: vi.fn().mockResolvedValue(5n),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "bsc" } })) };
+    const kyberQuote = { source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: sender };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue(kyberQuote),
+      approvalSpender: vi.fn().mockReturnValue(sender),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 56, to: sender, data: "0x22", description: "kyber" }),
+    };
+    const routes = { quoteDirect: vi.fn().mockResolvedValue(null) };
+    const bscConfig = { ...config, quoteTokens: { ...config.quoteTokens, bsc: [{ symbol: "USDT", address: usdg }] } } as RuntimeConfig;
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, bscConfig, undefined, kyberswapApi as never);
+    const position = {
+      id: "position", chainId: 56, protocol: "v4", positionKey: "1056851", owner, poolAddress: null,
+      token0: token, token1: usdg, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    const prepared = await (executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string; expectedOut: bigint }>;
+    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
+
+    expect(prepared).toMatchObject({ provider: "kyberswap", expectedOut: 110n });
+    expect(routes.quoteDirect).toHaveBeenCalledTimes(1);
+    expect(kyberswapApi.quote).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not use KyberSwap as a non-BSC fallback when the local quote is gone", async () => {
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: sender }),
+      approvalSpender: vi.fn(),
+      createSwap: vi.fn(),
+    };
+    const routes = { quoteDirect: vi.fn().mockResolvedValue(null) };
+    const executor = new Executor({} as never, { getById: vi.fn() } as never, {} as never, routes as never, {} as never, config, undefined, kyberswapApi as never);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    await expect((executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<unknown>;
+    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200)).rejects.toThrow("No safe local route available to benchmark settlement swap");
+    expect(kyberswapApi.quote).not.toHaveBeenCalled();
   });
 
   it("rejects an aggregator route below the local two-percent minimum floor", async () => {
@@ -923,6 +1000,7 @@ describe("Executor pending settlement recovery", () => {
     expect(database.setPositionStatusUnlessSettled).toHaveBeenCalledWith("position", "needs_review", {
       reason: "pending swap token is no longer held — position externally settled",
       settlementRetryDisabled: true,
+      pendingRawTransaction: null,
     });
     expect(routes.quoteDirect).not.toHaveBeenCalled();
   });
