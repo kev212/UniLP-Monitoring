@@ -27,7 +27,7 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseOpenPoolInput(`https://app.uniswap.org/explore/pools/base/${poolId}`)).toBeNull();
     expect(parseOpenPoolInput(`https://example.com/explore/pools/robinhood/${poolId}`)).toBeNull();
     expect(parseOpenPoolInput(`https://app.uniswap.org/explore/pools/bnb/${poolId}`, "bsc")).toBe(poolId);
-    expect(parseOpenPoolInput("0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913", "bsc")).toBeNull();
+    expect(parseOpenPoolInput("0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913", "bsc")).toBe("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913");
   });
 
   it("parses BSC investigation aliases and Uniswap bnb links", () => {
@@ -36,7 +36,10 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseInvestigateInput(`bnb ${poolId}`)).toEqual({ chain: "bsc", poolIdentifier: poolId });
     expect(parseInvestigateInput(poolId)).toEqual({ chain: "robinhood", poolIdentifier: poolId });
     expect(parseInvestigateInput(`https://app.uniswap.org/explore/pools/bnb/${poolId}`)).toEqual({ chain: "bsc", poolIdentifier: poolId });
-    expect(parseInvestigateInput("bsc 0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913")).toBeNull();
+    expect(parseInvestigateInput("bsc 0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913")).toEqual({
+      chain: "bsc",
+      poolIdentifier: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    });
   });
 
   it("parses dashboard navigation callbacks", () => {

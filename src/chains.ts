@@ -122,7 +122,7 @@ export const chainRegistry: Record<ChainName, ChainRegistry> = {
     name: "bsc",
     aliases: ["bsc", "bnb"],
     chain: bsc,
-    discoveryProtocols: ["v4"],
+    discoveryProtocols: ["v3", "v4"],
     monitoringEnabled: true,
     dex: "uniswap",
     displayName: "BNB Smart Chain",
@@ -138,10 +138,10 @@ export const chainRegistry: Record<ChainName, ChainRegistry> = {
     contracts: {
       v2: { factory: zeroAddress, router: zeroAddress },
       v3: {
-        factory: zeroAddress,
-        positionManager: zeroAddress,
-        quoter: zeroAddress,
-        swapRouter: zeroAddress,
+        factory: "0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7",
+        positionManager: "0x7b8A01B39D58278b5DE7e48c8449c9f4F5170613",
+        quoter: "0x78D78E420Da98ad378D7799bE8f4AF69033EB077",
+        swapRouter: "0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2",
       },
       v4: {
         poolManager: "0x28e2ea090877bf75740558f6bfb36a5ffee9e9df",
@@ -181,7 +181,9 @@ export function isProtocolDeployed(registry: ChainRegistry, protocol: Protocol):
 }
 
 export function isEligibleScanDex(registry: ChainRegistry, dexId: string): boolean {
-  if (registry.name === "bsc") return dexId === registry.geckoV4DexId;
+  if (registry.name === "bsc") {
+    return dexId === registry.geckoV4DexId || dexId === "uniswap-v3-bsc" || dexId === "uniswap-bsc";
+  }
   return dexId.startsWith("uniswap-v3") || dexId.startsWith("uniswap-v4");
 }
 

@@ -49,14 +49,14 @@ Mulai dengan `DRY_RUN=true`. Ubah ke `false` hanya setelah cashflow, PnL, dan si
 | `ROBINHOOD_SCAN_RPC_HTTP` | Fallback RPC khusus discovery, historical reads, logs, dan pekerjaan berat. Tidak pernah digunakan untuk transaksi. |
 | `BSC_RPC_HTTP` | Endpoint public BSC untuk current-state monitoring. |
 | `ALCHEMY_BSC_HTTP` | Endpoint Alchemy BSC untuk archive/log, bootstrap NFT, dan execution. |
-| `AUTO_EXIT_CHAINS` | Chain yang boleh auto-exit. Default `base,robinhood`. |
+| `AUTO_EXIT_CHAINS` | Chain yang boleh auto-exit. Default `base,robinhood,bsc`. |
 | `BSC_POSITION_MONITOR_INTERVAL_MS` | Interval monitoring BSC. Default `10000`. |
 | `ALCHEMY_BASE_HTTP`, `ALCHEMY_ROBINHOOD_HTTP` | Endpoint RPC execution dan one-time wallet bootstrap. Alchemy bukan primary untuk monitoring atau scan. |
 | `TELEGRAM_CHAT_ID`, `TELEGRAM_USER_ID` | Chat dan user yang diizinkan mengakses bot. |
 
 Lihat `.env.example` untuk seluruh variable dan nilai default.
 
-BSC Uniswap V4 diaktifkan melalui `CHAINS=robinhood,bsc`. Auto-exit BSC tetap dimatikan sampai `AUTO_EXIT_CHAINS` memuat `bsc`.
+BSC Uniswap V3/V4 diaktifkan melalui `CHAINS=robinhood,bsc`. Auto-exit SL/TP/trailing/OOR aktif jika `AUTO_EXIT_CHAINS` memuat `bsc`.
 
 ## Telegram Commands
 

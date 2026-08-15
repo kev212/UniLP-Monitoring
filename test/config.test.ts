@@ -136,7 +136,7 @@ describe("loadConfig", () => {
     expect(config.rpcHttp.bsc).toBe("https://bsc-dataseed.bnbchain.org");
     expect(config.quoteTokens.bsc.map((token) => token.symbol)).toEqual(["USDT", "WBNB", "BNB"]);
     expect(config.startBlocks.bsc).toBe(26_956_207n);
-    expect(config.autoExitChains).toEqual(["base", "robinhood"]);
+    expect(config.autoExitChains).toEqual(["base", "robinhood", "bsc"]);
     expect(config.chainMonitorIntervalMs.bsc).toBe(10_000);
   });
 

@@ -628,7 +628,7 @@ export class Notifier {
         }
         this.pendingInput.set(chatId, { kind: "bid_ask_pool", chain: action.chain, dashboardMessageId: message.message_id });
         await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
-        await this.replyTemp(ctx, `🟣 Bid-Ask Ladder (${chainRegistry[action.chain].displayName})\nKirim ${action.chain === "bsc" ? "V4 pool ID" : "pool address (V3 contract) atau V4 pool ID"}.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
+        await this.replyTemp(ctx, `🟣 Bid-Ask Ladder (${chainRegistry[action.chain].displayName})\nKirim pool address (V3 contract) atau V4 pool ID.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
         return;
       }
       if (action.type === "open_mode") {
@@ -645,7 +645,7 @@ export class Notifier {
         }
         this.pendingInput.set(chatId, { kind: "open_pool", chain: action.chain, mode: action.mode, dashboardMessageId: message.message_id });
         await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
-        await this.replyTemp(ctx, `🟢 Open Position (${action.mode === "dual" ? "Dual-side" : "Single-side"} · ${chainRegistry[action.chain].displayName})\nKirim ${action.chain === "bsc" ? "V4 pool ID" : "pool address (V3 contract) atau V4 pool ID"}.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
+        await this.replyTemp(ctx, `🟢 Open Position (${action.mode === "dual" ? "Dual-side" : "Single-side"} · ${chainRegistry[action.chain].displayName})\nKirim pool address (V3 contract) atau V4 pool ID.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
         return;
       }
       if (action.type === "open_confirm") {
@@ -1179,7 +1179,7 @@ export class Notifier {
     this.tokenScanRunning = true;
 
     try {
-      await this.replyTemp(ctx, `🔍 Mencari pool Uniswap ${chain === "bsc" ? "V4" : "V3/V4"} untuk ${shortAddress(token)} di ${chainRegistry[chain].displayName}...`, undefined, 120_000);
+      await this.replyTemp(ctx, `🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(token)} di ${chainRegistry[chain].displayName}...`, undefined, 120_000);
     } catch (error) {
       this.tokenScanRunning = false;
       throw error;
@@ -1191,7 +1191,7 @@ export class Notifier {
     try {
       const scan = await scanner.scan(token, chain);
       if (scan.active.length === 0 && scan.watchlist.length === 0) {
-        await this.sendTemp([`Tidak ditemukan pool Uniswap ${chain === "bsc" ? "V4" : "V3/V4"} dengan TVL > $0 dan Vol 6h >= $100 untuk token ini.`], chatId, 120_000);
+        await this.sendTemp([`Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 6h >= $100 untuk token ini.`], chatId, 120_000);
         return;
       }
 
@@ -1418,9 +1418,7 @@ export class Notifier {
         const poolAddress = parseOpenPoolInput(text, pending.chain);
         if (!poolAddress) {
           this.pendingInput.set(chatId, pending);
-          await this.replyTemp(ctx, pending.chain === "bsc"
-            ? "Pool tidak valid. Kirim V4 pool ID atau link Uniswap /explore/pools/bnb/..."
-            : "Address atau link pool Uniswap tidak valid.");
+          await this.replyTemp(ctx, "Address atau link pool Uniswap tidak valid.");
           return;
         }
         this.pendingInput.set(chatId, { kind: "open_range", chain: pending.chain, poolAddress, mode: pending.mode, dashboardMessageId: pending.dashboardMessageId });
@@ -1465,9 +1463,7 @@ export class Notifier {
         const poolAddress = parseBidAskPoolInput(text, pending.chain);
         if (!poolAddress) {
           this.pendingInput.set(chatId, pending);
-          await this.replyTemp(ctx, pending.chain === "bsc"
-            ? "Pool tidak valid. Kirim V4 pool ID atau link Uniswap /explore/pools/bnb/..."
-            : "Pool tidak valid. Kirim V3 address, V4 pool ID, atau link pool Uniswap.");
+          await this.replyTemp(ctx, "Pool tidak valid. Kirim V3 address, V4 pool ID, atau link pool Uniswap.");
           return;
         }
         this.pendingInput.set(chatId, { kind: "bid_ask_range", chain: pending.chain, poolAddress, dashboardMessageId: pending.dashboardMessageId });
@@ -2609,7 +2605,6 @@ function parseInvestigateIdentifier(raw: string, fallbackChain: ChainName): { ch
     return { chain: fallbackChain, poolIdentifier: value.toLowerCase() };
   }
   if (isAddress(value, { strict: false })) {
-    if (fallbackChain === "bsc") return null;
     return { chain: fallbackChain, poolIdentifier: value.toLowerCase() };
   }
   let url: URL;
@@ -2624,7 +2619,6 @@ function parseInvestigateIdentifier(raw: string, fallbackChain: ChainName): { ch
   const chain = Object.values(chainRegistry).find((registry) => registry.uniswapSlug === path[2])?.name;
   const identifier = path[3]!;
   if (!chain) return null;
-  if (chain === "bsc" && !/^0x[0-9a-fA-F]{64}$/.test(identifier)) return null;
   if (isAddress(identifier, { strict: false }) || /^0x[0-9a-fA-F]{64}$/.test(identifier)) {
     return { chain, poolIdentifier: identifier.toLowerCase() };
   }
@@ -2634,7 +2628,7 @@ function parseInvestigateIdentifier(raw: string, fallbackChain: ChainName): { ch
 export function parseOpenPoolInput(raw: string, chain: ChainName = "robinhood"): string | null {
   const value = raw.trim();
   if (/^0x[0-9a-fA-F]{64}$/.test(value)) return value.toLowerCase();
-  if (isAddress(value, { strict: false })) return chain === "bsc" ? null : value.toLowerCase();
+  if (isAddress(value, { strict: false })) return value.toLowerCase();
 
   let url: URL;
   try {
@@ -2648,7 +2642,6 @@ export function parseOpenPoolInput(raw: string, chain: ChainName = "robinhood"):
   if (parts.length !== 4 || parts[0] !== "explore" || parts[1] !== "pools") return null;
   if (parts[2] !== chainRegistry[chain].uniswapSlug) return null;
   const identifier = parts[3]!;
-  if (chain === "bsc" && !/^0x[0-9a-fA-F]{64}$/.test(identifier)) return null;
   if (isAddress(identifier, { strict: false }) || /^0x[0-9a-fA-F]{64}$/.test(identifier)) return identifier.toLowerCase();
   return null;
 }

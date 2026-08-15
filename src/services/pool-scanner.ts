@@ -829,7 +829,6 @@ export class PoolScanner {
   async investigatePool(poolAddress: string, chain: ChainName = "robinhood"): Promise<InvestigateResult> {
     const normalized = poolAddress.toLowerCase();
     const isV4 = isHex(normalized) && normalized.length === 66;
-    if (chain === "bsc" && !isV4) throw new Error("BSC investigation accepts Uniswap V4 pool IDs only");
     const protocol: "v3" | "v4" = isV4 ? "v4" : "v3";
 
     const [dexData, onChain] = await Promise.all([

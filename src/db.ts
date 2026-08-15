@@ -1235,6 +1235,19 @@ export class Database {
     });
   }
 
+  async releaseOrphanedLeases(): Promise<void> {
+    await this.pool.query(
+      `UPDATE positions
+       SET settlement_lease_token = NULL, settlement_lease_until = NULL
+       WHERE settlement_lease_token IS NOT NULL`,
+    );
+    await this.pool.query(
+      `UPDATE position_groups
+       SET execution_lease_token = NULL, execution_lease_until = NULL, updated_at = NOW()
+       WHERE execution_lease_token IS NOT NULL`,
+    );
+  }
+
   async claimPositionGroupLease(groupId: string, token: string, ttlMs = 300_000): Promise<boolean> {
     const result = await this.pool.query(
       `UPDATE position_groups

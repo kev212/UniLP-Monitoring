@@ -59,6 +59,7 @@ async function main(): Promise<void> {
 
   await database.connect();
   await database.migrate();
+  await database.releaseOrphanedLeases();
   portfolio.start();
   const storedRiskSettings = await database.getGlobalRiskSettings();
   if (isRiskSettings(storedRiskSettings)) {

@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { encodeAbiParameters, keccak256, zeroAddress, type Address, type Hex } from "viem";
 
 import { chainRegistry } from "../src/chains.js";
-import { bidAskDirectionForQuote, openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken, wrappedNativeShortfall } from "../src/services/position-opener.js";
+import { assertMintUtilization, assertSafeOpenMarket, bidAskDirectionForQuote, openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken, wrappedNativeShortfall } from "../src/services/position-opener.js";
 import { ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
 
 const chainId = 4663;
@@ -55,6 +55,35 @@ function poolOpener(protocol: "v3" | "v4", tokenA = packAddress, tokenB = nvdaAd
     client,
   };
 }
+
+describe("open safety guards", () => {
+  it("rejects empty pools and extreme ticks", () => {
+    expect(() => assertSafeOpenMarket(0, 0n)).toThrow("no active liquidity");
+    expect(() => assertSafeOpenMarket(-881161, 1n)).toThrow("extreme tick");
+    expect(() => assertSafeOpenMarket(880_000, 1n)).toThrow("extreme tick");
+    expect(() => assertSafeOpenMarket(0, 1n)).not.toThrow();
+  });
+
+  it("rejects mints that lock less than 90% of the deposit", () => {
+    expect(() => assertMintUtilization(6_078_705n, 299_500_717_867_255_336_348n)).toThrow("less than 90%");
+    expect(() => assertMintUtilization(90n, 100n)).not.toThrow();
+    expect(() => assertMintUtilization(89n, 100n)).toThrow("less than 90%");
+  });
+
+  it("rejects a Bid-Ask preview when the pool tick is unusable", async () => {
+    const { opener, pool, client } = poolOpener("v4");
+    client.readContract = vi.fn(async ({ functionName, address }: { functionName: string; address: Address }) => {
+      if (functionName === "getSlot0") return [5830247392n, -881161, 0, 0];
+      if (functionName === "getLiquidity") return 63n;
+      if (functionName === "poolKeys") return { currency0: packAddress, currency1: nvdaAddress, fee: 10_000, tickSpacing: 200, hooks: zeroAddress };
+      if (functionName === "decimals") return 18;
+      if (functionName === "symbol") return address.toLowerCase() === nvdaAddress.toLowerCase() ? "NVDA" : "PACK";
+      throw new Error(`unexpected ${functionName}`);
+    });
+
+    await expect(opener.prepareBidAskOpen(pool, "robinhood", 30, 3n * 10n ** 18n, { symbol: "NVDA", address: nvdaAddress }, 3)).rejects.toThrow("extreme tick");
+  });
+});
 
 describe("SDK single-side liquidity", () => {
   it("selects only the actual supported quote currency from a pool", () => {

@@ -35,6 +35,10 @@ type V3Position = import("@uniswap/v3-sdk").Position;
 type V4Position = import("@uniswap/v4-sdk").Position;
 type V3FeeAmount = import("@uniswap/v3-sdk").FeeAmount;
 const NVDA_SYMBOL = "NVDA";
+const UNISWAP_MAX_TICK = 887_272;
+const EXTREME_TICK_ABS = 400_000;
+const EXTREME_TICK_EDGE = 20_000;
+const MIN_MINT_UTILIZATION_BPS = 9_000n;
 
 export type OpenMode = "single" | "dual";
 export type BidAskDirection = "above" | "below";
@@ -231,7 +235,6 @@ export class PositionOpener {
       throw new Error("NVDA quote supports single-side normal opens only");
     }
 
-    if (chain === "bsc" && protocol !== "v4") throw new Error("BSC accepts Uniswap V4 pool IDs only");
     if (protocol === "v3") return this.prepareV3(normalized, chain, rangePercent, depositAmount, quoteToken, mode);
     return this.prepareV4(normalized, chain, rangePercent, depositAmount, quoteToken, mode);
   }
@@ -248,10 +251,10 @@ export class PositionOpener {
     if (chain !== "base" && chain !== "robinhood" && chain !== "bsc") throw new Error("Bid-Ask ladders are supported on Base, Robinhood, and BSC only");
     const normalized = poolAddress.toLowerCase() as Hex;
     const protocol = normalized.length === 66 && normalized.startsWith("0x") ? "v4" : "v3";
-    if (chain === "bsc" && protocol !== "v4") throw new Error("BSC Bid-Ask ladders accept Uniswap V4 pool IDs only");
     this.assertBidAskEnabled(protocol, requestedBinCount);
 
     const state = await this.readBidAskPool(normalized, chain);
+    assertSafeOpenMarket(state.currentTick, state.poolLiquidity);
     this.assertBidAskPoolSupported(state);
     const quoteAddress = openPoolQuoteAddress(protocol, this.chains.getForScan(chain).registry.chain.id, quoteToken).toLowerCase();
     const quoteIsToken0 = quoteAddress === state.token0.toLowerCase();
@@ -272,6 +275,7 @@ export class PositionOpener {
     ]);
     const baseSymbol = quoteIsToken0 ? token1Symbol : token0Symbol;
     const plan = this.makeBidAskPlan(state, chain, quoteIsToken0, token0Decimals, token1Decimals, outer, depositAmount, requestedBinCount);
+    assertMintUtilization(quoteIsToken0 ? plan.totalAmount0 : plan.totalAmount1, depositAmount);
     const deadline = this.bidAskDeadline();
     const batchPlan = this.buildBidAskBatch(state, chain, plan, quoteIsToken0, quoteToken, deadline);
     const planHash = hashBidAskPlan(plan);
@@ -452,6 +456,7 @@ export class PositionOpener {
     if (!quoteIsToken0 && quoteAddr !== token1.toLowerCase()) {
       throw new Error("Quote token is neither token0 nor token1 of this pool");
     }
+    assertSafeOpenMarket(currentTick, poolLiquidity);
 
     const [token0Decimals, token1Decimals] = await Promise.all([this.tokenDecimals(client, token0), this.tokenDecimals(client, token1)]);
     const baseToken = quoteIsToken0 ? token1 : token0;
@@ -481,6 +486,8 @@ export class PositionOpener {
 
     if (mode === "single") {
       this.assertSingleSideSpend(position, quoteIsToken0, depositAmount);
+      const lockedQuote = BigInt((quoteIsToken0 ? position.mintAmounts.amount0 : position.mintAmounts.amount1).toString());
+      assertMintUtilization(lockedQuote, depositAmount);
     } else {
       this.assertDualSidePosition(position, quoteIsToken0);
     }
@@ -509,6 +516,7 @@ export class PositionOpener {
 
     if (mode === "dual") {
       const split = this.computeDualSplit(position, quoteIsToken0, depositAmount, sqrtPriceX96);
+      assertMintUtilization(split.quoteSideAmount + split.swapAmount, depositAmount);
       return { ...basePreview, baseToken, baseTokenSymbol: baseSymbol, ...split };
     }
 
@@ -517,6 +525,7 @@ export class PositionOpener {
 
   async executeOpen(preview: OpenPositionPreview): Promise<{ hash: Hex | null; swapHash?: Hex | null }> {
     const deadline = BigInt(Math.floor(Date.now() / 1_000) + 600);
+    assertSafeOpenMarket(preview.currentTick, preview.poolLiquidity);
     const refreshed = await this.prepareOpen(preview.poolAddress, preview.chain, preview.dropPercent, preview.depositAmount, { address: preview.quoteToken, symbol: preview.quoteTokenSymbol }, preview.mode);
     const merged = { ...preview, ...refreshed, tickLower: preview.tickLower, tickUpper: preview.tickUpper };
 
@@ -541,11 +550,13 @@ export class PositionOpener {
   async executeBidAskOpen(preview: BidAskOpenPreview): Promise<BidAskOpenExecution> {
     if (preview.chain !== "base" && preview.chain !== "robinhood" && preview.chain !== "bsc") throw new Error("Bid-Ask ladders are supported on Base, Robinhood, and BSC only");
     this.assertBidAskEnabled(preview.protocol, preview.requestedBinCount);
+    assertSafeOpenMarket(preview.currentTick, preview.poolLiquidity);
     if (!this.database || !this.reconcileBidAskOpen) {
       throw new Error("Bid-Ask open requires durable group persistence and receipt reconciliation");
     }
     const client = this.executionClient(preview.chain);
     const firstState = await this.readBidAskPool(preview.poolAddress, preview.chain);
+    assertSafeOpenMarket(firstState.currentTick, firstState.poolLiquidity);
     this.assertBidAskPoolSupported(firstState);
     this.assertBidAskStateMatches(preview, firstState);
     this.assertBidAskOrientation(preview, firstState.currentTick);
@@ -571,6 +582,7 @@ export class PositionOpener {
     }
 
     const state = await this.readBidAskPool(preview.poolAddress, preview.chain);
+    assertSafeOpenMarket(state.currentTick, state.poolLiquidity);
     this.assertBidAskPoolSupported(state);
     this.assertBidAskStateMatches(preview, state);
     this.assertBidAskOrientation(preview, state.currentTick);
@@ -585,6 +597,7 @@ export class PositionOpener {
       preview.depositAmount,
       preview.requestedBinCount,
     );
+    assertMintUtilization(preview.quoteIsToken0 ? plan.totalAmount0 : plan.totalAmount1, preview.depositAmount);
     const deadline = this.bidAskDeadline();
     const batchPlan = this.buildBidAskBatch(
       state,
@@ -947,6 +960,10 @@ export class PositionOpener {
     const nativeSweep = nativeAmount > 0n
       ? { currency: zeroAddress, recipient }
       : undefined;
+    const quoteCurrency = (quoteIsToken0 ? state.token0 : state.token1).toLowerCase() as Address;
+    const tokenSweep = quoteCurrency !== zeroAddress
+      ? { currency: quoteCurrency, recipient }
+      : undefined;
     return buildV4BidAskOpenPlan({
       chainId: this.chains.getForScan(chain).registry.chain.id,
       positionManager,
@@ -955,6 +972,7 @@ export class PositionOpener {
       deadline,
       value: nativeAmount,
       ...(nativeSweep ? { nativeSweep } : {}),
+      ...(tokenSweep ? { tokenSweep } : {}),
       mints,
     });
   }
@@ -1233,11 +1251,13 @@ export class PositionOpener {
     const positionManager = registry.contracts.v4.positionManager;
     const executor = this.config.executorAddress;
 
-    await this.ensureWrappedNativeFunding(client, preview.chain, preview.quoteToken, preview.depositAmount, executor);
-    await this.ensureApproval(client, preview.quoteToken, registry.contracts.v4.permit2, preview.depositAmount, executor, preview.chain);
-    await this.ensurePermit2Approval(client, preview.quoteToken, positionManager, preview.depositAmount, executor, preview.chain);
     const position = this.v4PositionFromPreview(preview);
     this.assertSingleSideSpend(position, preview.quoteIsToken0, preview.depositAmount);
+    const quoteSpend = BigInt((preview.quoteIsToken0 ? position.mintAmounts.amount0 : position.mintAmounts.amount1).toString());
+    assertMintUtilization(quoteSpend, preview.depositAmount);
+    await this.ensureWrappedNativeFunding(client, preview.chain, preview.quoteToken, quoteSpend, executor);
+    await this.ensureApproval(client, preview.quoteToken, registry.contracts.v4.permit2, quoteSpend, executor, preview.chain);
+    await this.ensurePermit2Approval(client, preview.quoteToken, positionManager, quoteSpend, executor, preview.chain);
     const parameters = V4PositionManager.addCallParameters(position, {
       recipient: executor,
       deadline: deadline.toString(),
@@ -1709,6 +1729,23 @@ export class PositionOpener {
     const whole = raw / scale;
     const frac = (raw % scale).toString().padStart(18, "0").slice(0, 4);
     return `${whole}.${frac}`;
+  }
+}
+
+export function assertSafeOpenMarket(currentTick: number, poolLiquidity: bigint): void {
+  if (poolLiquidity <= 0n) throw new Error("Pool has no active liquidity");
+  if (!Number.isInteger(currentTick)) throw new Error("Pool price is unusable (invalid tick)");
+  if (Math.abs(currentTick) > EXTREME_TICK_ABS) throw new Error("Pool price is unusable (extreme tick)");
+  if (currentTick <= -UNISWAP_MAX_TICK + EXTREME_TICK_EDGE || currentTick >= UNISWAP_MAX_TICK - EXTREME_TICK_EDGE) {
+    throw new Error("Pool price is unusable (extreme tick)");
+  }
+}
+
+export function assertMintUtilization(lockedQuote: bigint, depositAmount: bigint): void {
+  if (depositAmount <= 0n) throw new Error("Deposit amount must be positive");
+  if (lockedQuote < 0n) throw new Error("Minted quote amount is invalid");
+  if (lockedQuote * 10_000n < depositAmount * MIN_MINT_UTILIZATION_BPS) {
+    throw new Error("Minted liquidity uses less than 90% of the deposit");
   }
 }
 

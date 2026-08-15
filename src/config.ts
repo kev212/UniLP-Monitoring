@@ -31,7 +31,7 @@ const envSchema = z.object({
   QUOTE_TOKEN_ALLOWLIST_BASE: z.string().default(""),
   QUOTE_TOKEN_ALLOWLIST_ROBINHOOD: z.string().default(""),
   QUOTE_TOKEN_ALLOWLIST_BSC: z.string().default("USDT:0x55d398326f99059fF775485246999027B3197955,WBNB:0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c,BNB:0x0000000000000000000000000000000000000000"),
-  AUTO_EXIT_CHAINS: z.string().default("base,robinhood"),
+  AUTO_EXIT_CHAINS: z.string().default("base,robinhood,bsc"),
   STOP_LOSS_PERCENT: z.coerce.number().negative(),
   TAKE_PROFIT_PERCENT: z.coerce.number().positive(),
   TRAILING_STOP_ACTIVATION_PERCENT: z.coerce.number().positive().default(5),

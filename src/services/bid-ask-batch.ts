@@ -104,6 +104,10 @@ export interface V4MintBatchPlanOptions extends BidAskBatchPlanOptions {
     currency: Address;
     recipient: Address;
   };
+  tokenSweep?: {
+    currency: Address;
+    recipient: Address;
+  };
 }
 
 export interface V4CloseBatchItem {
@@ -208,8 +212,17 @@ export function buildV4BidAskOpenPlan(options: V4MintBatchPlanOptions): Transact
   if (options.nativeSweep) {
     params.push(encodeAbiParameters(v4PairParameters, [options.nativeSweep.currency, options.nativeSweep.recipient]));
   }
+  if (options.tokenSweep) {
+    params.push(encodeAbiParameters(v4PairParameters, [options.tokenSweep.currency, options.tokenSweep.recipient]));
+  }
 
-  const actions = actionBytes(0x02, ...Array(options.mints.length - 1).fill(0x02), 0x0d, ...(options.nativeSweep ? [0x14] : []));
+  const actions = actionBytes(
+    0x02,
+    ...Array(options.mints.length - 1).fill(0x02),
+    0x0d,
+    ...(options.nativeSweep ? [0x14] : []),
+    ...(options.tokenSweep ? [0x14] : []),
+  );
   return makePlan(
     options,
     encodeFunctionData({

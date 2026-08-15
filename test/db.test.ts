@@ -329,6 +329,17 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[1]![0]).toContain("'submitted'");
   });
 
+  it("clears orphaned settlement and group execution leases on startup", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await database.releaseOrphanedLeases();
+
+    expect(query.mock.calls[0]![0]).toContain("settlement_lease_token = NULL");
+    expect(query.mock.calls[1]![0]).toContain("execution_lease_token = NULL");
+  });
+
   it("blocks new account transactions while a signed transaction is unresolved", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ value: 1 }] });
