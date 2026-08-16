@@ -52,7 +52,12 @@ export class AlchemyBootstrapper {
     const activities = await this.listWalletActivities(endpoint, this.config.executorAddress);
     const v2Activities = registry.discoveryProtocols.includes("v2") ? activities.filter((activity) => activity.category === "erc20") : [];
     const v2Positions = registry.discoveryProtocols.includes("v2") ? await this.discovery.discoverV2Activities(name, v2Activities) : [];
-    const v3Candidates = registry.discoveryProtocols.includes("v3") ? this.nftCandidates(activities, registry.contracts.v3.positionManager) : [];
+    const v3Candidates = registry.discoveryProtocols.includes("v3")
+      ? [
+        ...this.nftCandidates(activities, registry.contracts.v3.positionManager),
+        ...(registry.pancakeV3 ? this.nftCandidates(activities, registry.pancakeV3.positionManager) : []),
+      ]
+      : [];
     const v4Candidates = registry.discoveryProtocols.includes("v4") ? this.nftCandidates(activities, registry.contracts.v4.positionManager) : [];
     const v3Positions = registry.discoveryProtocols.includes("v3") ? await this.discovery.discoverV3Candidates(name, v3Candidates) : [];
     if (registry.discoveryProtocols.includes("v4")) {

@@ -5,9 +5,10 @@ import { isProtocolDeployed } from "../chains.js";
 import { log } from "../log.js";
 import type { ChainName, PositionRecord, QuoteToken } from "../types.js";
 import { applySlippage } from "./uniswap-math.js";
+import { dexNameFromMetadata, v3ContractsFor } from "./v3-deployment.js";
 import type { ChainClient, ChainClients } from "./chain-client.js";
 
-const V3_FEES = [100, 500, 3_000, 10_000] as const;
+const V3_FEES = [100, 500, 2_500, 3_000, 10_000] as const;
 const MAX_CONCURRENT_ROUTE_QUOTES = 4;
 const V4_QUOTE_ATTEMPTS = 3;
 const MISSING_POOL_CACHE_MS = 300_000;
@@ -120,8 +121,9 @@ export class RoutePlanner {
           const pools = await Promise.all(fees.map((fee, index) => this.getV3Pool(position, path[index]!, path[index + 1]!, fee)));
           if (pools.some((pool) => pool === zeroAddress || pool.toLowerCase() === excluded)) return null;
           const encodedPath = encodeV3Path(path, fees);
+          const contracts = v3ContractsFor(registry, dexNameFromMetadata(position.metadata));
           const simulation = await client.simulateContract({
-            address: registry.contracts.v3.quoter,
+            address: contracts.quoter,
             abi: v3QuoterAbi,
             functionName: "quoteExactInput",
             args: [encodedPath, amountIn],
@@ -132,7 +134,7 @@ export class RoutePlanner {
             protocol: "v3" as const,
             pool: pools[0]!,
             pools,
-            router: registry.contracts.v3.swapRouter,
+            router: contracts.swapRouter,
             tokenIn: path[0]!,
             tokenOut: path[path.length - 1]!,
             path,
@@ -151,11 +153,12 @@ export class RoutePlanner {
 
   private async getV3Pool(position: PositionRecord, tokenA: Address, tokenB: Address, fee: number): Promise<Address> {
     const tokens = [tokenA.toLowerCase(), tokenB.toLowerCase()].sort();
-    const key = `v3:${position.chainId}:${tokens[0]}:${tokens[1]}:${fee}`;
+    const dex = dexNameFromMetadata(position.metadata);
+    const key = `v3:${dex}:${position.chainId}:${tokens[0]}:${tokens[1]}:${fee}`;
     return this.getCachedPool(key, async () => {
       const { client, registry } = this.scanChain(position);
       return client.readContract({
-        address: registry.contracts.v3.factory,
+        address: v3ContractsFor(registry, dex).factory,
         abi: v3FactoryAbi,
         functionName: "getPool",
         args: [tokenA, tokenB, fee],

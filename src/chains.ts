@@ -39,6 +39,7 @@ export interface ChainRegistry {
   uniswapSlug: string;
   explorerUrl: string;
   quotePriority: readonly string[];
+  pancakeV3?: UniswapContracts["v3"];
 }
 
 export const chainRegistry: Record<ChainName, ChainRegistry> = {
@@ -152,6 +153,12 @@ export const chainRegistry: Record<ChainName, ChainRegistry> = {
         permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3",
       },
     },
+    pancakeV3: {
+      factory: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+      positionManager: "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364",
+      quoter: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
+      swapRouter: "0x1b81D678ffb9C0263b24A97847620C99d213eB14",
+    },
   },
 };
 
@@ -182,7 +189,11 @@ export function isProtocolDeployed(registry: ChainRegistry, protocol: Protocol):
 
 export function isEligibleScanDex(registry: ChainRegistry, dexId: string): boolean {
   if (registry.name === "bsc") {
-    return dexId === registry.geckoV4DexId || dexId === "uniswap-v3-bsc" || dexId === "uniswap-bsc";
+    return dexId === registry.geckoV4DexId
+      || dexId === "uniswap-v3-bsc"
+      || dexId === "uniswap-bsc"
+      || dexId === "pancakeswap-v3-bsc"
+      || dexId === "pancakeswap-v3";
   }
   return dexId.startsWith("uniswap-v3") || dexId.startsWith("uniswap-v4");
 }

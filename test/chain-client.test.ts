@@ -182,7 +182,7 @@ describe("RPC failover transport", () => {
     expect(urls.some((url) => url.includes("arrowrpc.com"))).toBe(false);
   });
 
-  it("keeps BSC logs on Alchemy and never falls through to public BNB RPC", async () => {
+  it("keeps BSC logs on public RPC and never uses Alchemy", async () => {
     const urls: string[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       urls.push(String(input));
@@ -202,8 +202,8 @@ describe("RPC failover transport", () => {
     } as RuntimeConfig);
 
     await expect(clients.getForLogs("bsc").client.getChainId()).resolves.toBe(56);
-    expect(urls).toEqual(["https://bnb-mainnet.g.alchemy.com/v2/test"]);
-    expect(urls.some((url) => url.includes("bsc-dataseed"))).toBe(false);
+    expect(urls[0]).toContain("bsc-dataseed.bnbchain.org");
+    expect(urls.some((url) => url.includes("alchemy"))).toBe(false);
   });
 
   it("uses public BSC RPC first for current-state scans", async () => {

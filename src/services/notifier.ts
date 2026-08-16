@@ -1418,7 +1418,7 @@ export class Notifier {
         const poolAddress = parseOpenPoolInput(text, pending.chain);
         if (!poolAddress) {
           this.pendingInput.set(chatId, pending);
-          await this.replyTemp(ctx, "Address atau link pool Uniswap tidak valid.");
+          await this.replyTemp(ctx, "Address atau link pool Uniswap/PancakeSwap tidak valid.");
           return;
         }
         this.pendingInput.set(chatId, { kind: "open_range", chain: pending.chain, poolAddress, mode: pending.mode, dashboardMessageId: pending.dashboardMessageId });
@@ -1463,7 +1463,7 @@ export class Notifier {
         const poolAddress = parseBidAskPoolInput(text, pending.chain);
         if (!poolAddress) {
           this.pendingInput.set(chatId, pending);
-          await this.replyTemp(ctx, "Pool tidak valid. Kirim V3 address, V4 pool ID, atau link pool Uniswap.");
+          await this.replyTemp(ctx, "Pool tidak valid. Kirim V3 address, V4 pool ID, atau link Uniswap/PancakeSwap.");
           return;
         }
         this.pendingInput.set(chatId, { kind: "bid_ask_range", chain: pending.chain, poolAddress, dashboardMessageId: pending.dashboardMessageId });
@@ -1587,7 +1587,7 @@ export class Notifier {
     const lines = [
       "🟢 OPEN POSITION — REVIEW",
       "",
-      `${chainHeading(chainRegistry[preview.chain])} | ${preview.protocol.toUpperCase()} ${preview.pair} | ${preview.feeLabel}`,
+      `${chainHeading(chainRegistry[preview.chain])} | ${preview.dex === "pancake" ? "PC" : "UNI"} ${preview.protocol.toUpperCase()} ${preview.pair} | ${preview.feeLabel}`,
       `Current price: ${preview.currentPrice}`,
       `Range: ${preview.lowerPrice} → ${preview.upperPrice}`,
       `Ticks: ${preview.tickLower} → ${preview.tickUpper} | current ${preview.currentTick}`,
@@ -2613,6 +2613,8 @@ function parseInvestigateIdentifier(raw: string, fallbackChain: ChainName): { ch
   } catch {
     return null;
   }
+  const pancake = parsePancakePoolUrl(url);
+  if (pancake) return { chain: "bsc", poolIdentifier: pancake };
   if (url.protocol !== "https:" || url.hostname !== "app.uniswap.org") return null;
   const path = url.pathname.split("/").filter(Boolean);
   if (path.length !== 4 || path[0] !== "explore" || path[1] !== "pools") return null;
@@ -2636,6 +2638,8 @@ export function parseOpenPoolInput(raw: string, chain: ChainName = "robinhood"):
   } catch {
     return null;
   }
+  const pancake = parsePancakePoolUrl(url);
+  if (pancake) return chain === "bsc" ? pancake : null;
   if (url.protocol !== "https:" || url.hostname !== "app.uniswap.org") return null;
 
   const parts = url.pathname.split("/").filter(Boolean);
@@ -2656,6 +2660,8 @@ export function parseBidAskPoolInput(raw: string, chain: BidAskLadderChain): str
   } catch {
     return null;
   }
+  const pancake = parsePancakePoolUrl(url);
+  if (pancake) return chain === "bsc" ? pancake : null;
   if (url.protocol !== "https:" || url.hostname !== "app.uniswap.org") return null;
   const parts = url.pathname.split("/").filter(Boolean);
   if (parts.length !== 4 || parts[0] !== "explore" || parts[1] !== "pools" || parts[2] !== chainRegistry[chain].uniswapSlug) return null;
@@ -2663,6 +2669,14 @@ export function parseBidAskPoolInput(raw: string, chain: BidAskLadderChain): str
   return isAddress(identifier, { strict: false }) || /^0x[0-9a-fA-F]{64}$/.test(identifier)
     ? identifier.toLowerCase()
     : null;
+}
+
+function parsePancakePoolUrl(url: URL): string | null {
+  if (url.protocol !== "https:") return null;
+  const host = url.hostname.toLowerCase();
+  if (host !== "pancakeswap.finance" && host !== "www.pancakeswap.finance") return null;
+  const match = url.pathname.match(/\/(0x[0-9a-fA-F]{40})(?:\/|$)/);
+  return match?.[1] ? match[1].toLowerCase() : null;
 }
 
 export function parseBidAskRangeInput(raw: string): { direction: BidAskLadderDirection; rangePercent: number } | null {
@@ -2997,7 +3011,7 @@ function formatScanPool(pool: ScoredPool, label: string): string[] {
   const feePct = (effectiveFee / 10_000).toFixed(2);
   const dynamicLabel = pool.dynamicFee ? " (dynamic)" : "";
   const lines = [
-    `${label} ${scoreStars(pool.score)} ${pool.protocol.toUpperCase()} ${pool.pair} | ${feePct}%${dynamicLabel}`,
+    `${label} ${scoreStars(pool.score)} ${pool.dex === "pancake" ? "PC" : "UNI"} ${pool.protocol.toUpperCase()} ${pool.pair} | ${feePct}%${dynamicLabel}`,
     `   TVL: $${fmtUsd(pool.tvlUsd)} | Vol 1h: $${fmtUsd(pool.volume1hUsd)} | Gross yield/h (1h): ${fmtPercent(pool.estimatedPoolYield1hPercent)}`,
     `   Vol 6h: $${fmtUsd(pool.volume6hUsd)} | Est. gross fees 6h: $${fmtUsd(pool.estimatedPoolFees6hUsd)} | Yield/h 6h avg: ${fmtPercent(pool.estimatedPoolYieldHourlyPercent)}`,
     `   Score: ${pool.score.toFixed(6)} | Uniswap: ${pool.uniswapUrl}`,

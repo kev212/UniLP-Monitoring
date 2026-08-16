@@ -78,6 +78,9 @@ export const v3SwapRouterAbi = parseAbi([
 ]);
 
 export const v4PositionManagerAbi = parseAbi([
+  "function balanceOf(address owner) view returns (uint256)",
+  "function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)",
+  "function nextTokenId() view returns (uint256)",
   "function ownerOf(uint256 tokenId) view returns (address)",
   "function getPositionLiquidity(uint256 tokenId) view returns (uint128 liquidity)",
   "function getPoolAndPositionInfo(uint256 tokenId) view returns ((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, uint256 positionInfo)",

@@ -26,11 +26,14 @@ import type { RoutePlanner } from "./route-planner.js";
 import { buildSwapPlan } from "./swap-builder.js";
 import { UNISWAP_API_ROUTER, type UniswapTradingApi } from "./uniswap-trading-api.js";
 import { applySlippage, sqrtRatioAtTick, tickToCeilSpacing, tickToFloorSpacing, ticksForDropPercent, ticksForRisePercent } from "./uniswap-math.js";
+import { dexNameFromMetadata, v3ContractsFor, v3Deployments, type DexName } from "./v3-deployment.js";
 
 const require = createRequire(import.meta.url);
 const { Ether, Percent, Token } = require("@uniswap/sdk-core") as typeof import("@uniswap/sdk-core");
 const { FeeAmount, NonfungiblePositionManager, Pool: V3SdkPool, Position: V3SdkPosition } = require("@uniswap/v3-sdk") as typeof import("@uniswap/v3-sdk");
 const { Pool: V4SdkPool, Position: V4SdkPosition, V4PositionManager } = require("@uniswap/v4-sdk") as typeof import("@uniswap/v4-sdk");
+const { Pool: PancakeV3Pool, Position: PancakeV3Position, NonfungiblePositionManager: PancakeNpm, FeeAmount: PancakeFeeAmount } = require("@pancakeswap/v3-sdk") as typeof import("@pancakeswap/v3-sdk");
+const { Token: PancakeToken, Percent: PancakePercent } = require("@pancakeswap/swap-sdk-core") as typeof import("@pancakeswap/swap-sdk-core");
 type V3Position = import("@uniswap/v3-sdk").Position;
 type V4Position = import("@uniswap/v4-sdk").Position;
 type V3FeeAmount = import("@uniswap/v3-sdk").FeeAmount;
@@ -45,6 +48,7 @@ export type BidAskDirection = "above" | "below";
 
 export interface OpenPositionPreview {
   protocol: "v3" | "v4";
+  dex?: DexName;
   chain: ChainName;
   poolAddress: Hex;
   pair: string;
@@ -84,6 +88,7 @@ export interface OpenPositionPreview {
 
 export interface BidAskOpenPreview {
   protocol: "v3" | "v4";
+  dex?: DexName;
   chain: ChainName;
   poolAddress: Hex;
   poolKey?: V4PoolKey;
@@ -141,6 +146,7 @@ export interface BidAskOpenExecution {
 
 const Q192 = 1n << 192n;
 const V3_SUPPORTED_FEES = new Set<number>([FeeAmount.LOWEST, FeeAmount.LOW, FeeAmount.MEDIUM, FeeAmount.HIGH]);
+const PANCAKE_V3_FEES = new Set<number>([PancakeFeeAmount.LOWEST, PancakeFeeAmount.LOW, PancakeFeeAmount.MEDIUM, PancakeFeeAmount.HIGH]);
 
 type V4PoolKey = {
   currency0: Address;
@@ -170,6 +176,7 @@ export type BidAskOpenReconciler = (
 
 interface BidAskPoolState {
   protocol: "v3" | "v4";
+  dex?: DexName;
   poolAddress: Hex;
   token0: Address;
   token1: Address;
@@ -208,6 +215,7 @@ export class PositionOpener {
     private readonly tradingApi?: UniswapTradingApi,
     private readonly database?: BidAskDatabase,
     private readonly reconcileBidAskOpen?: BidAskOpenReconciler,
+    private readonly ingestOpenReceipt?: (chain: ChainName, receipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>) => Promise<unknown>,
   ) {
     this.account = config.executorPrivateKey ? privateKeyToAccount(config.executorPrivateKey) : undefined;
   }
@@ -283,11 +291,12 @@ export class PositionOpener {
 
     return {
       protocol,
+      dex: state.dex ?? "uniswap",
       chain,
       poolAddress: normalized,
       ...(state.poolKey ? { poolKey: state.poolKey } : {}),
       ...(state.poolKey ? { v4PoolKey: state.poolKey } : {}),
-      positionManager: this.positionManager(chain, protocol),
+      positionManager: this.positionManager(chain, protocol, state.dex ?? "uniswap"),
       pair,
       feeTier: state.fee,
       feeLabel: `${(state.fee / 10_000).toFixed(2)}%`,
@@ -397,18 +406,11 @@ export class PositionOpener {
       client.readContract({ address: pool, abi: v3PoolAbi, functionName: "liquidity" }) as Promise<bigint>,
     ]);
 
-    if (!V3_SUPPORTED_FEES.has(Number(fee))) throw new Error(`V3 fee tier ${fee} is unsupported by the official SDK`);
-    const { registry } = this.chains.getForScan(chain);
-    const factoryPool = await client.readContract({
-      address: registry.contracts.v3.factory,
-      abi: v3FactoryAbi,
-      functionName: "getPool",
-      args: [token0, token1, Number(fee)],
-    }) as Address;
-    if (factoryPool.toLowerCase() !== pool.toLowerCase()) {
-      throw new Error("V3 pool does not match the configured factory");
-    }
-    return this.buildPreview("v3", chain, pool, token0, token1, Number(fee), Number(tickSpacing), slot0[1], slot0[0], liquidity, zeroAddress, rangePercent, depositAmount, quoteToken, mode);
+    const dex = await this.detectV3Dex(chain, pool, token0, token1, Number(fee));
+    if (!dex) throw new Error("V3 pool does not match a configured factory");
+    const allowedFees = dex === "pancake" ? PANCAKE_V3_FEES : V3_SUPPORTED_FEES;
+    if (!allowedFees.has(Number(fee))) throw new Error(`V3 fee tier ${fee} is unsupported by the official SDK`);
+    return this.buildPreview("v3", chain, pool, token0, token1, Number(fee), Number(tickSpacing), slot0[1], slot0[0], liquidity, zeroAddress, rangePercent, depositAmount, quoteToken, mode, dex);
   }
 
   private async prepareV4(poolId: Hex, chain: ChainName, rangePercent: number, depositAmount: bigint, quoteToken: QuoteToken, mode: OpenMode): Promise<OpenPositionPreview> {
@@ -449,6 +451,7 @@ export class PositionOpener {
     depositAmount: bigint,
     quoteToken: QuoteToken,
     mode: OpenMode,
+    dex: DexName = "uniswap",
   ): Promise<OpenPositionPreview> {
     const client = this.client(chain);
     const quoteAddr = openPoolQuoteAddress(protocol, this.chains.getForScan(chain).registry.chain.id, quoteToken).toLowerCase() as Address;
@@ -479,7 +482,7 @@ export class PositionOpener {
     }
 
     const position = protocol === "v3"
-      ? this.v3Position(chain, token0, token1, token0Decimals, token1Decimals, fee, sqrtPriceX96, poolLiquidity, currentTick, tickLower, tickUpper, depositAmount, quoteIsToken0, mode)
+      ? this.v3Position(chain, token0, token1, token0Decimals, token1Decimals, fee, sqrtPriceX96, poolLiquidity, currentTick, tickLower, tickUpper, depositAmount, quoteIsToken0, mode, dex)
       : this.v4Position(chain, token0, token1, token0Decimals, token1Decimals, fee, tickSpacing, hooks, sqrtPriceX96, poolLiquidity, currentTick, tickLower, tickUpper, depositAmount, quoteIsToken0, mode);
     const liquidity = BigInt(position.liquidity.toString());
     if (liquidity === 0n) throw new Error("Deposit amount is too small for this pool range");
@@ -506,7 +509,7 @@ export class PositionOpener {
     const token0Symbol = quoteIsToken0 ? quoteToken.symbol : baseSymbol;
     const token1Symbol = quoteIsToken0 ? baseSymbol : quoteToken.symbol;
     const basePreview: OpenPositionPreview = {
-      protocol, chain, poolAddress: pool, pair, feeTier: fee,
+      protocol, dex: protocol === "v3" ? dex : "uniswap", chain, poolAddress: pool, pair, feeTier: fee,
       feeLabel: hooks !== zeroAddress ? `${(fee / 10_000).toFixed(2)}% dynamic` : `${(fee / 10_000).toFixed(2)}%`,
       quoteToken: quoteToken.address, quoteTokenSymbol: quoteToken.symbol,
       quoteIsToken0, token0, token1, token0Symbol, token1Symbol, token0Decimals, token1Decimals,
@@ -570,7 +573,7 @@ export class PositionOpener {
       if (isBidAskNativeFunding(preview.protocol, preview.quoteToken, preview.quoteTokenSymbol)) {
         await this.ensureNativeBalance(client, executor, quoteAmount);
       } else {
-        await this.ensureApproval(client, preview.quoteToken, this.chains.getForScan(preview.chain).registry.contracts.v3.positionManager, quoteAmount, executor, preview.chain);
+        await this.ensureApproval(client, preview.quoteToken, preview.positionManager, quoteAmount, executor, preview.chain);
       }
     } else if (preview.quoteToken.toLowerCase() === zeroAddress.toLowerCase()) {
       await this.ensureNativeBalance(client, executor, quoteAmount);
@@ -640,17 +643,30 @@ export class PositionOpener {
       atomicBatch: true,
       noOpeningSwap: true,
     });
-    const result = await this.broadcastBidAsk(preview.chain, groupId, batchPlan.to, batchPlan.data, batchPlan.value ?? 0n);
-    if (result.hash) {
-      await this.reconcileBidAskOpen(preview.chain, groupId, result.hash, result.receipt);
+    try {
+      const result = await this.broadcastBidAsk(preview.chain, groupId, batchPlan.to, batchPlan.data, batchPlan.value ?? 0n);
+      if (result.hash) {
+        await this.reconcileBidAskOpen(preview.chain, groupId, result.hash, result.receipt);
+      } else {
+        await this.database.setPositionGroupStatus(groupId, "cancelled", {
+          reason: "bid_ask_open_no_transaction",
+          lastExecutionError: "Bid-Ask open did not produce a transaction hash",
+        });
+      }
+      return {
+        hash: result.hash,
+        groupId,
+        plan: batchPlan,
+        estimatedGas: gas.estimatedGas,
+        blockGasLimit: gas.blockGasLimit,
+      };
+    } catch (error) {
+      await this.database.setPositionGroupStatus(groupId, "cancelled", {
+        reason: "bid_ask_open_failed",
+        lastExecutionError: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
     }
-    return {
-      hash: result.hash,
-      groupId,
-      plan: batchPlan,
-      estimatedGas: gas.estimatedGas,
-      blockGasLimit: gas.blockGasLimit,
-    };
   }
 
   async executeBidAsk(preview: BidAskOpenPreview): Promise<BidAskOpenExecution> {
@@ -694,18 +710,12 @@ export class PositionOpener {
         client.readContract({ address: poolAddress, abi: v3PoolAbi, functionName: "tickSpacing" }) as Promise<number>,
         client.readContract({ address: poolAddress, abi: v3PoolAbi, functionName: "liquidity" }) as Promise<bigint>,
       ]);
-      const factoryPool = await client.readContract({
-        address: registry.contracts.v3.factory,
-        abi: v3FactoryAbi,
-        functionName: "getPool",
-        args: [token0, token1, Number(fee)],
-      }) as Address;
-      if (factoryPool.toLowerCase() !== poolAddress.toLowerCase()) {
-        throw new Error("Bid-Ask V3 pool does not match the configured factory");
-      }
+      const dex = await this.detectV3Dex(chain, poolAddress, token0, token1, Number(fee));
+      if (!dex) throw new Error("Bid-Ask V3 pool does not match a configured factory");
       const typedSlot0 = slot0 as readonly [bigint, number, ...unknown[]];
       return {
         protocol: "v3",
+        dex,
         poolAddress,
         token0,
         token1,
@@ -747,7 +757,8 @@ export class PositionOpener {
 
   private assertBidAskPoolSupported(state: BidAskPoolState): void {
     if (state.protocol === "v3") {
-      if (!V3_SUPPORTED_FEES.has(state.fee)) throw new Error(`V3 fee tier ${state.fee} is unsupported by the official SDK`);
+      const allowed = state.dex === "pancake" ? PANCAKE_V3_FEES : V3_SUPPORTED_FEES;
+      if (!allowed.has(state.fee)) throw new Error(`V3 fee tier ${state.fee} is unsupported by the official SDK`);
       return;
     }
     if (state.hooks.toLowerCase() !== zeroAddress.toLowerCase()) {
@@ -856,6 +867,24 @@ export class PositionOpener {
   ): V3Position | V4Position {
     const chainId = this.chains.getForScan(chain).registry.chain.id;
     if (state.protocol === "v3") {
+      if (state.dex === "pancake") {
+        const pancakePool = new PancakeV3Pool(
+          new PancakeToken(chainId, state.token0, token0Decimals, "T0"),
+          new PancakeToken(chainId, state.token1, token1Decimals, "T1"),
+          state.fee as typeof PancakeFeeAmount[keyof typeof PancakeFeeAmount],
+          state.sqrtPriceX96,
+          state.poolLiquidity,
+          state.currentTick,
+        );
+        return PancakeV3Position.fromAmounts({
+          pool: pancakePool,
+          tickLower: bin.tickLower,
+          tickUpper: bin.tickUpper,
+          amount0,
+          amount1,
+          useFullPrecision: true,
+        }) as unknown as V3Position;
+      }
       const pool = new V3SdkPool(
         new Token(chainId, state.token0, token0Decimals),
         new Token(chainId, state.token1, token1Decimals),
@@ -908,7 +937,7 @@ export class PositionOpener {
     quoteToken: QuoteToken,
     deadline: bigint,
   ): TransactionPlan {
-    const positionManager = this.positionManager(chain, state.protocol);
+    const positionManager = this.positionManager(chain, state.protocol, state.dex ?? "uniswap");
     const recipient = this.config.executorAddress;
     const slippageBps = this.bidAskOpenSlippage();
     const nativeAmount = this.bidAskNativeAmount(state, plan, quoteToken, quoteIsToken0);
@@ -997,9 +1026,28 @@ export class PositionOpener {
     return 0n;
   }
 
-  private positionManager(chain: ChainName, protocol: "v3" | "v4"): Address {
+  private async detectV3Dex(chain: ChainName, pool: Address, token0: Address, token1: Address, fee: number): Promise<DexName | null> {
+    const client = this.client(chain);
     const { registry } = this.chains.getForScan(chain);
-    return protocol === "v3" ? registry.contracts.v3.positionManager : registry.contracts.v4.positionManager;
+    for (const deployment of v3Deployments(registry)) {
+      try {
+        const factoryPool = await client.readContract({
+          address: deployment.contracts.factory,
+          abi: v3FactoryAbi,
+          functionName: "getPool",
+          args: [token0, token1, fee],
+        }) as Address;
+        if (factoryPool.toLowerCase() === pool.toLowerCase()) return deployment.dex;
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  private positionManager(chain: ChainName, protocol: "v3" | "v4", dex: DexName = "uniswap"): Address {
+    const { registry } = this.chains.getForScan(chain);
+    return protocol === "v3" ? v3ContractsFor(registry, dex).positionManager : registry.contracts.v4.positionManager;
   }
 
   private bidAskDeadline(): bigint {
@@ -1118,6 +1166,7 @@ export class PositionOpener {
       metadata: {
         managedBy: "position_group",
         strategy: "bid_ask",
+        dex: preview.dex ?? "uniswap",
         shapeVersion: preview.plan.shapeVersion,
         atomicBatch: true,
         noOpeningSwap: true,
@@ -1228,19 +1277,28 @@ export class PositionOpener {
   private async executeV3(preview: OpenPositionPreview, deadline: bigint): Promise<{ hash: Hex | null }> {
     const client = this.executionClient(preview.chain);
     const { registry } = this.chains.getForScan(preview.chain);
-    const positionManager = registry.contracts.v3.positionManager;
+    const dex = preview.dex ?? "uniswap";
+    const positionManager = v3ContractsFor(registry, dex).positionManager;
     const executor = this.config.executorAddress;
 
-    const useNative = preview.quoteTokenSymbol === "ETH";
+    const useNative = preview.quoteTokenSymbol === "ETH" || preview.quoteTokenSymbol === "BNB";
     if (useNative) await this.ensureNativeBalance(client, executor, preview.depositAmount);
     else await this.ensureApproval(client, preview.quoteToken, positionManager, preview.depositAmount, executor, preview.chain);
     const position = this.v3PositionFromPreview(preview);
     this.assertSingleSideSpend(position, preview.quoteIsToken0, preview.depositAmount);
+    if (dex === "pancake") {
+      const parameters = PancakeNpm.addCallParameters(position as never, {
+        recipient: executor,
+        deadline: Number(deadline),
+        slippageTolerance: new PancakePercent(0, 10_000),
+      });
+      return this.broadcast(preview.chain, positionManager, parameters.calldata as Hex, BigInt(parameters.value));
+    }
     const parameters = NonfungiblePositionManager.addCallParameters(position, {
       recipient: executor,
       deadline: deadline.toString(),
       slippageTolerance: new Percent(0, 10_000),
-      ...(useNative ? { useNative: Ether.onChain(this.chains.getForScan(preview.chain).registry.chain.id) } : {}),
+      ...(useNative && preview.quoteTokenSymbol === "ETH" ? { useNative: Ether.onChain(this.chains.getForScan(preview.chain).registry.chain.id) } : {}),
     });
     return this.broadcast(preview.chain, positionManager, parameters.calldata as Hex, BigInt(parameters.value));
   }
@@ -1271,7 +1329,8 @@ export class PositionOpener {
   private async executeV3Dual(preview: OpenPositionPreview, deadline: bigint, quoteAmount: bigint, baseAmount: bigint): Promise<{ hash: Hex | null }> {
     const client = this.executionClient(preview.chain);
     const { registry } = this.chains.getForScan(preview.chain);
-    const positionManager = registry.contracts.v3.positionManager;
+    const dex = preview.dex ?? "uniswap";
+    const positionManager = v3ContractsFor(registry, dex).positionManager;
     const executor = this.config.executorAddress;
     const chainId = this.chains.getForScan(preview.chain).registry.chain.id;
 
@@ -1282,6 +1341,30 @@ export class PositionOpener {
     }
     if (baseAmount > 0n && preview.baseToken) await this.ensureApproval(client, preview.baseToken, positionManager, baseAmount, executor, preview.chain);
 
+    if (dex === "pancake") {
+      const pancakePool = new PancakeV3Pool(
+        new PancakeToken(chainId, preview.token0, preview.token0Decimals, preview.token0Symbol),
+        new PancakeToken(chainId, preview.token1, preview.token1Decimals, preview.token1Symbol),
+        preview.feeTier as typeof PancakeFeeAmount[keyof typeof PancakeFeeAmount],
+        preview.sqrtPriceX96,
+        preview.poolLiquidity,
+        preview.currentTick,
+      );
+      const pancakePosition = PancakeV3Position.fromAmounts({
+        pool: pancakePool,
+        tickLower: preview.tickLower,
+        tickUpper: preview.tickUpper,
+        amount0: preview.quoteIsToken0 ? quoteAmount : baseAmount,
+        amount1: preview.quoteIsToken0 ? baseAmount : quoteAmount,
+        useFullPrecision: true,
+      });
+      const pancakeParams = PancakeNpm.addCallParameters(pancakePosition, {
+        recipient: executor,
+        deadline: Number(deadline),
+        slippageTolerance: new PancakePercent(100, 10_000),
+      });
+      return this.broadcast(preview.chain, positionManager, pancakeParams.calldata as Hex, BigInt(pancakeParams.value));
+    }
     const pool = new V3SdkPool(
       new Token(chainId, preview.token0, preview.token0Decimals),
       new Token(chainId, preview.token1, preview.token1Decimals),
@@ -1363,8 +1446,32 @@ export class PositionOpener {
     depositAmount: bigint,
     quoteIsToken0: boolean,
     mode: OpenMode,
+    dex: DexName = "uniswap",
   ): V3Position {
     const chainId = this.chains.getForScan(chain).registry.chain.id;
+    if (dex === "pancake") {
+      const pool = new PancakeV3Pool(
+        new PancakeToken(chainId, token0, token0Decimals, "T0"),
+        new PancakeToken(chainId, token1, token1Decimals, "T1"),
+        fee as typeof PancakeFeeAmount[keyof typeof PancakeFeeAmount],
+        sqrtPriceX96,
+        poolLiquidity,
+        currentTick,
+      );
+      const pancake = mode === "dual"
+        ? (quoteIsToken0
+          ? PancakeV3Position.fromAmount0({ pool, tickLower, tickUpper, amount0: depositAmount, useFullPrecision: true })
+          : PancakeV3Position.fromAmount1({ pool, tickLower, tickUpper, amount1: depositAmount }))
+        : PancakeV3Position.fromAmounts({
+          pool,
+          tickLower,
+          tickUpper,
+          amount0: quoteIsToken0 ? depositAmount : 0n,
+          amount1: quoteIsToken0 ? 0n : depositAmount,
+          useFullPrecision: true,
+        });
+      return pancake as unknown as V3Position;
+    }
     const pool = new V3SdkPool(
       new Token(chainId, token0, token0Decimals),
       new Token(chainId, token1, token1Decimals),
@@ -1392,7 +1499,7 @@ export class PositionOpener {
     return this.v3Position(
       preview.chain, preview.token0, preview.token1, preview.token0Decimals, preview.token1Decimals,
       preview.feeTier, preview.sqrtPriceX96, preview.poolLiquidity, preview.currentTick,
-      preview.tickLower, preview.tickUpper, preview.depositAmount, preview.quoteIsToken0, preview.mode,
+      preview.tickLower, preview.tickUpper, preview.depositAmount, preview.quoteIsToken0, preview.mode, preview.dex ?? "uniswap",
     );
   }
 
@@ -1614,6 +1721,13 @@ export class PositionOpener {
     const receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
     if (receipt.status !== "success") throw new Error(`Open position transaction reverted: ${hash}`);
     log.info({ hash, to }, "open position transaction broadcast");
+    if (this.ingestOpenReceipt) {
+      try {
+        await this.ingestOpenReceipt(chain, receipt);
+      } catch (error) {
+        log.warn({ err: error, hash, chain }, "open receipt ingest failed");
+      }
+    }
     return { hash };
   }
 

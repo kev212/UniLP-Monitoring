@@ -102,7 +102,7 @@ describe("V3 route quotes", () => {
 
     const getPoolCalls = readContract.mock.calls.filter(([request]) => request.functionName === "getPool");
     const getPairCalls = readContract.mock.calls.filter(([request]) => request.functionName === "getPair");
-    expect(getPoolCalls).toHaveLength(4);
+    expect(getPoolCalls).toHaveLength(5);
     expect(getPairCalls).toHaveLength(1);
     expect(simulateContract).toHaveBeenCalledTimes(3);
   });

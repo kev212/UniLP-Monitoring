@@ -57,12 +57,14 @@ import type { RoutePlanner, SwapRoute } from "./route-planner.js";
 import { isTransientRpcError } from "../rpc.js";
 import { UNISWAP_API_ROUTER, type TradingApiQuote, type UniswapTradingApi } from "./uniswap-trading-api.js";
 import type { KyberSwapAggregatorApi, KyberSwapQuote } from "./kyberswap-aggregator-api.js";
+import { PANCAKE_PERMIT2, PANCAKE_UNIVERSAL_ROUTER, type PancakeUniversalRouter, type PancakeUrQuote } from "./pancake-universal-router.js";
 import { hasPendingSettlement } from "./pending-settlement.js";
 import { buildSwapPlan } from "./swap-builder.js";
 import { buildV3BidAskClosePlan, buildV4BidAskClosePlan, type V4PoolKey } from "./bid-ask-batch.js";
 import { receiptTokenTransfers } from "./discovery.js";
 import { applySlippage } from "./uniswap-math.js";
 import { isUsdStableSymbol, normalizeToUsd6 } from "./token-meta.js";
+import { dexNameFromMetadata, v3ContractsFor } from "./v3-deployment.js";
 
 export { isTransientRpcError } from "../rpc.js";
 
@@ -80,10 +82,11 @@ interface PendingRawTransaction {
 
 type ApiSwapCandidate =
   | { provider: "uniswap"; expectedOut: bigint; minimumOut: bigint; quote: TradingApiQuote }
-  | { provider: "kyberswap"; expectedOut: bigint; minimumOut: bigint; quote: KyberSwapQuote };
+  | { provider: "kyberswap"; expectedOut: bigint; minimumOut: bigint; quote: KyberSwapQuote }
+  | { provider: "pancake"; expectedOut: bigint; minimumOut: bigint; quote: PancakeUrQuote };
 
 interface PreparedSwap {
-  provider: "uniswap" | "kyberswap" | "local";
+  provider: "uniswap" | "kyberswap" | "local" | "pancake";
   expectedOut: bigint;
   minimumOut: bigint;
   plan: TransactionPlan;
@@ -178,6 +181,7 @@ export class Executor {
     private readonly config: RuntimeConfig,
     private readonly tradingApi?: UniswapTradingApi,
     private readonly kyberswapApi?: KyberSwapAggregatorApi,
+    private readonly pancakeUr?: PancakeUniversalRouter,
   ) {
     this.account = config.executorPrivateKey ? privateKeyToAccount(config.executorPrivateKey) : undefined;
     if (this.account && this.account.address.toLowerCase() !== config.executorAddress.toLowerCase()) {
@@ -191,6 +195,77 @@ export class Executor {
   async execute(position: PositionRecord, trigger?: ExitTrigger): Promise<void> {
     if (position.metadata.detectionOnly === true) throw new Error("Detection-only positions cannot be executed");
     return this.runSettlementExclusive(position.id, () => this.executeUnlocked(position, trigger));
+  }
+
+  async settleEmptyV3Group(group: PositionGroupRecord): Promise<boolean> {
+    if (group.protocol !== "v3") return false;
+    let settled = false;
+    await this.runGroupExclusive(group.id, async () => {
+      settled = await this.settleEmptyV3GroupUnlocked(group);
+    });
+    return settled;
+  }
+
+  private async settleEmptyV3GroupUnlocked(group: PositionGroupRecord): Promise<boolean> {
+    const bins = (await this.database.listPositionGroupBins(group.id)).filter((bin) => bin.status === "minted" && bin.tokenId !== null);
+    if (bins.length === 0) return false;
+    const { client } = this.chains.getById(group.chainId);
+    const maxUint128 = (1n << 128n) - 1n;
+    const calls: Hex[] = [];
+    for (const bin of bins) {
+      const details = await client.readContract({
+        address: group.positionManager,
+        abi: v3PositionManagerAbi,
+        functionName: "positions",
+        args: [bin.tokenId!],
+      }) as readonly [bigint, Address, Address, Address, number, number, number, bigint, ...bigint[]];
+      if (details[7] !== 0n) return false;
+      const owner = await client.readContract({
+        address: group.positionManager,
+        abi: v3PositionManagerAbi,
+        functionName: "ownerOf",
+        args: [bin.tokenId!],
+      });
+      if (owner.toLowerCase() !== group.owner.toLowerCase()) return false;
+      calls.push(
+        encodeFunctionData({
+          abi: v3PositionManagerAbi,
+          functionName: "collect",
+          args: [{ tokenId: bin.tokenId!, recipient: group.owner, amount0Max: maxUint128, amount1Max: maxUint128 }],
+        }),
+        encodeFunctionData({ abi: v3PositionManagerAbi, functionName: "burn", args: [bin.tokenId!] }),
+      );
+    }
+    const plan: TransactionPlan = {
+      chainId: group.chainId,
+      to: group.positionManager,
+      data: encodeFunctionData({ abi: v3PositionManagerAbi, functionName: "multicall", args: [calls] }),
+      description: "burn empty V3 bid-ask NFTs",
+    };
+    const hash = await this.sendGroup(group, "close_batch", plan);
+    if (!hash) return false;
+    const receipt = await this.getConfirmedReceipt(group.chainId, hash);
+    if (receipt.status !== "success") return false;
+    const quoteReceived = group.quoteToken
+      ? await this.assetReceivedFromReceipt(group.chainId, group.quoteToken, group.owner, hash, receipt)
+      : 0n;
+    for (const bin of bins) {
+      await this.database.updatePositionGroupBin(group.id, bin.binIndex, { status: "closed", closeTransactionHash: hash });
+      if (bin.positionId) {
+        await this.database.setPositionStatus(bin.positionId, "settled", {
+          closeTransactionHash: hash,
+          reason: "empty_v3_group_burned",
+        });
+      }
+    }
+    const deposits = group.deployedCostQuote;
+    const finalPnlQuote = quoteReceived - deposits;
+    const finalPnlBps = deposits > 0n ? (finalPnlQuote * 10_000n) / deposits : 0n;
+    const finalize = this.groupDatabase().finalizePositionGroup;
+    if (typeof finalize !== "function") return false;
+    const settled = await finalize.call(this.database, group.id, hash, quoteReceived, finalPnlQuote, finalPnlBps, "manual", null);
+    log.info({ groupId: group.id, hash, quoteReceived: quoteReceived.toString() }, "settled empty V3 bid-ask group");
+    return settled;
   }
 
   async executeGroup(groupId: string, trigger?: ExitTrigger): Promise<void> {
@@ -627,9 +702,10 @@ export class Executor {
     }
 
     if (retry.nextAttemptAt && Date.parse(retry.nextAttemptAt) > Date.now()) return;
-    const effectiveSlippageBps = Math.min(
+    const effectiveSlippageBps = effectiveSettlementSlippageBps(
+      this.config.settlementSwapSlippageBps,
       this.config.settlementSwapMaxSlippageBps,
-      this.config.settlementSwapSlippageBps + retry.broadcastAttempts * 100,
+      retry,
     );
 
     try {
@@ -1182,9 +1258,10 @@ export class Executor {
     }
     const retry = swapRetryState(group.metadata);
     if (retry.nextAttemptAt && Date.parse(retry.nextAttemptAt) > Date.now()) return;
-    const effectiveSlippageBps = Math.min(
+    const effectiveSlippageBps = effectiveSettlementSlippageBps(
+      this.config.settlementSwapSlippageBps,
       this.config.settlementSwapMaxSlippageBps,
-      this.config.settlementSwapSlippageBps + retry.broadcastAttempts * 100,
+      retry,
     );
     const synthetic = groupSettlementPosition(group);
     let prepared: PreparedSwap | null;
@@ -1404,6 +1481,9 @@ export class Executor {
     slippageBps: number,
     lastFailedProvider?: string,
   ): Promise<PreparedSwap | null> {
+    if (dexNameFromMetadata(position.metadata) === "pancake" || dexNameFromMetadata(group.metadata) === "pancake") {
+      return this.preparePancakeGroupSettlementSwap(group, position, pending, slippageBps, lastFailedProvider);
+    }
     const { token: tokenIn, amount: amountIn } = pending;
     const tokenOut = group.quoteToken;
     const isNativeSettlement = tokenIn.toLowerCase() === zeroAddress || tokenOut.toLowerCase() === zeroAddress;
@@ -1437,11 +1517,14 @@ export class Executor {
     const results = await Promise.allSettled(quoteJobs);
     const errors: string[] = [];
     const candidates: ApiSwapCandidate[] = [];
+    const belowFloor: ApiSwapCandidate[] = [];
+    const allowBelowFloor = position.chainId === chainRegistry.bsc.chain.id;
     for (const result of results) {
       if (result.status === "fulfilled") {
         if (result.value) {
           if (result.value.expectedOut < minimumAcceptableOut) {
             errors.push(`${result.value.provider}: expected output is below local 2% floor`);
+            if (allowBelowFloor) belowFloor.push(result.value);
             continue;
           }
           candidates.push(result.value);
@@ -1488,6 +1571,23 @@ export class Executor {
       if (error instanceof PendingExecutionError) throw error;
       errors.push(`local: ${errorMessage(error)}`);
     }
+    if (allowBelowFloor) {
+      const fallback = [...belowFloor, ...candidates].sort((left, right) => left.expectedOut === right.expectedOut ? 0 : left.expectedOut > right.expectedOut ? -1 : 1);
+      for (const candidate of fallback) {
+        const floor = applySlippage(candidate.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
+        try {
+          const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, floor);
+          if (!constrained) continue;
+          const prepared = await this.prepareGroupApiSwap(group, position, tokenIn, amountIn, tokenOut, slippageBps, constrained, floor);
+          await this.simulateGroupPlan(group, prepared.plan);
+          log.info({ groupId: group.id, provider: prepared.provider, expectedOut: prepared.expectedOut.toString(), minimumOut: prepared.minimumOut.toString(), slippageBps }, "group settlement swap candidate selected after local route failed");
+          return prepared;
+        } catch (error) {
+          if (error instanceof PendingExecutionError) throw error;
+          errors.push(`${candidate.provider}: ${errorMessage(error)}`);
+        }
+      }
+    }
     const details = errors.filter(Boolean).slice(0, 4).join(" | ");
     throw new Error(`No executable group settlement route${details ? `: ${details}` : ""}`);
   }
@@ -1514,6 +1614,7 @@ export class Executor {
       const plan = await this.tradingApi!.createSwap(position, quote);
       return { provider: "uniswap", expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, plan, approvalChanged };
     }
+    if (candidate.provider !== "kyberswap") throw new Error(`unsupported group settlement provider ${candidate.provider}`);
 
     let quote = candidate.quote;
     const approvalChanged = await this.ensureGroupSettlementApproval(group, position, "v3", this.kyberswapApi!.approvalSpender(quote), tokenIn, amountIn);
@@ -1562,12 +1663,15 @@ export class Executor {
       functionName: "allowance",
       args: [group.owner, token, router],
     });
-    const expiration = Math.floor(Date.now() / 1_000) + 300;
-    if (permitAllowance[0] >= amount && Number(permitAllowance[1]) >= expiration) return changed;
+    if (permit2AllowanceReady(permitAllowance, amount)) return changed;
+    const now = Math.floor(Date.now() / 1_000);
+    const protectedToken = this.isProtectedToken(group.chainId, token);
+    const permitAmount = protectedToken ? amount : MAX_UINT160;
+    const expiration = now + (protectedToken ? 300 : PERMIT2_MAX_EXPIRATION_SECONDS);
     const permitHash = await this.sendGroup(group, "permit2_approve", {
       chainId: group.chainId,
       to: registry.contracts.v4.permit2,
-      data: encodeFunctionData({ abi: permit2Abi, functionName: "approve", args: [token, router, amount, expiration] }),
+      data: encodeFunctionData({ abi: permit2Abi, functionName: "approve", args: [token, router, permitAmount, expiration] }),
       description: "approve aggregate settlement input through Permit2",
     });
     if (!permitHash && !this.config.dryRun) throw new Error("Aggregate Permit2 approval was not confirmed");
@@ -2231,6 +2335,9 @@ export class Executor {
     lastFailedProvider?: string,
     approvalRefreshes = 0,
   ): Promise<PreparedSwap | null> {
+    if (dexNameFromMetadata(position.metadata) === "pancake") {
+      return this.preparePancakeSettlementSwap(position, tokenIn, amountIn, tokenOut, slippageBps, lastFailedProvider, approvalRefreshes);
+    }
     const isNativeSettlement = tokenIn.toLowerCase() === zeroAddress || tokenOut.toLowerCase() === zeroAddress;
     let nativeBenchmark: KyberSwapQuote | null = null;
     if (isNativeSettlement) {
@@ -2262,6 +2369,8 @@ export class Executor {
     const results = await Promise.allSettled(quoteJobs);
     const errors: string[] = [];
     const candidates: ApiSwapCandidate[] = [];
+    const belowFloor: ApiSwapCandidate[] = [];
+    const allowBelowFloor = position.chainId === chainRegistry.bsc.chain.id;
     for (const result of results) {
       if (result.status === "fulfilled") {
         if (result.value) {
@@ -2269,6 +2378,7 @@ export class Executor {
             const reason = `expected output ${result.value.expectedOut} is below local 2% floor ${minimumAcceptableOut}`;
             errors.push(`${result.value.provider}: ${reason}`);
             log.warn({ positionKey: position.positionKey, provider: result.value.provider, expectedOut: result.value.expectedOut.toString(), minimumOut: result.value.minimumOut.toString(), localExpectedOut: localBenchmark.expectedOut.toString(), minimumAcceptableOut: minimumAcceptableOut.toString() }, "settlement swap candidate rejected below local minimum floor");
+            if (allowBelowFloor) belowFloor.push(result.value);
             continue;
           }
           candidates.push(result.value);
@@ -2325,8 +2435,231 @@ export class Executor {
       if (error instanceof PendingExecutionError) throw error;
       errors.push(`local: ${errorMessage(error)}`);
     }
+    if (allowBelowFloor) {
+      const fallback = [...belowFloor, ...candidates].sort((left, right) => left.expectedOut === right.expectedOut ? 0 : left.expectedOut > right.expectedOut ? -1 : 1);
+      for (const candidate of fallback) {
+        const floor = applySlippage(candidate.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
+        try {
+          const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, floor);
+          if (!constrained) continue;
+          const prepared = await this.prepareApiSwap(position, tokenIn, amountIn, tokenOut, slippageBps, constrained, false, floor);
+          if (!prepared || prepared === "approval_changed") continue;
+          await this.simulatePlan(position, prepared.plan);
+          log.info({
+            positionKey: position.positionKey,
+            provider: prepared.provider,
+            expectedOut: prepared.expectedOut.toString(),
+            minimumOut: prepared.minimumOut.toString(),
+            slippageBps,
+            to: prepared.plan.to,
+          }, "settlement swap candidate selected after local route failed");
+          return prepared;
+        } catch (error) {
+          if (error instanceof PendingExecutionError) throw error;
+          errors.push(`${candidate.provider}: ${errorMessage(error)}`);
+        }
+      }
+    }
     const details = errors.filter(Boolean).slice(0, 4).join(" | ");
     throw new Error(`No executable settlement route${details ? `: ${details}` : ""}`);
+  }
+
+  private async preparePancakeSettlementSwap(
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    slippageBps: number,
+    lastFailedProvider?: string,
+    approvalRefreshes = 0,
+  ): Promise<PreparedSwap | null> {
+    const candidates = await this.pancakeSettlementCandidates(position, tokenIn, amountIn, tokenOut, slippageBps);
+    const errors: string[] = [];
+    for (const [index, candidate] of candidates.aboveFloor.entries()) {
+      try {
+        const prepared = await this.preparePancakeCandidate(position, tokenIn, amountIn, tokenOut, slippageBps, candidate, index === 0 && approvalRefreshes < 1, candidates.floor);
+        if (!prepared) return null;
+        if (prepared === "approval_changed") {
+          return this.preparePancakeSettlementSwap(position, tokenIn, amountIn, tokenOut, slippageBps, lastFailedProvider, approvalRefreshes + 1);
+        }
+        await this.simulatePlan(position, prepared.plan);
+        log.info({ positionKey: position.positionKey, provider: prepared.provider, expectedOut: prepared.expectedOut.toString(), minimumOut: prepared.minimumOut.toString() }, "pancake settlement swap candidate selected");
+        return prepared;
+      } catch (error) {
+        if (error instanceof PendingExecutionError) throw error;
+        errors.push(`${candidate.provider}: ${errorMessage(error)}`);
+      }
+    }
+    for (const candidate of candidates.belowFloor) {
+      try {
+        const floor = applySlippage(candidate.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
+        const prepared = await this.preparePancakeCandidate(position, tokenIn, amountIn, tokenOut, slippageBps, candidate, false, floor);
+        if (!prepared || prepared === "approval_changed") continue;
+        await this.simulatePlan(position, prepared.plan);
+        log.info({ positionKey: position.positionKey, provider: prepared.provider, expectedOut: prepared.expectedOut.toString() }, "pancake settlement swap selected after better routes failed");
+        return prepared;
+      } catch (error) {
+        if (error instanceof PendingExecutionError) throw error;
+        errors.push(`${candidate.provider}: ${errorMessage(error)}`);
+      }
+    }
+    const details = errors.filter(Boolean).slice(0, 4).join(" | ");
+    throw new Error(`No executable pancake settlement route${details ? `: ${details}` : ""}`);
+  }
+
+  private async preparePancakeGroupSettlementSwap(
+    group: PositionGroupRecord,
+    position: PositionRecord,
+    pending: { token: Address; amount: bigint },
+    slippageBps: number,
+    lastFailedProvider?: string,
+  ): Promise<PreparedSwap | null> {
+    const candidates = await this.pancakeSettlementCandidates(position, pending.token, pending.amount, group.quoteToken, slippageBps);
+    const errors: string[] = [];
+    for (const candidate of candidates.aboveFloor) {
+      try {
+        const prepared = await this.preparePancakeGroupCandidate(group, position, pending.token, pending.amount, group.quoteToken, slippageBps, candidate, candidates.floor);
+        await this.simulateGroupPlan(group, prepared.plan);
+        log.info({ groupId: group.id, provider: prepared.provider, expectedOut: prepared.expectedOut.toString() }, "pancake group settlement swap candidate selected");
+        return prepared;
+      } catch (error) {
+        if (error instanceof PendingExecutionError) throw error;
+        errors.push(`${candidate.provider}: ${errorMessage(error)}`);
+      }
+    }
+    for (const candidate of candidates.belowFloor) {
+      try {
+        const floor = applySlippage(candidate.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
+        const prepared = await this.preparePancakeGroupCandidate(group, position, pending.token, pending.amount, group.quoteToken, slippageBps, candidate, floor);
+        await this.simulateGroupPlan(group, prepared.plan);
+        return prepared;
+      } catch (error) {
+        if (error instanceof PendingExecutionError) throw error;
+        errors.push(`${candidate.provider}: ${errorMessage(error)}`);
+      }
+    }
+    const details = errors.filter(Boolean).slice(0, 4).join(" | ");
+    throw new Error(`No executable pancake group settlement route${details ? `: ${details}` : ""}`);
+  }
+
+  private async pancakeSettlementCandidates(
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    slippageBps: number,
+  ): Promise<{ aboveFloor: ApiSwapCandidate[]; belowFloor: ApiSwapCandidate[]; floor: bigint }> {
+    const jobs: Promise<ApiSwapCandidate | null>[] = [];
+    if (this.pancakeUr) {
+      jobs.push(this.pancakeUr.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
+        .then((quote) => quote ? { provider: "pancake" as const, expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote } : null));
+    }
+    if (this.kyberswapApi) {
+      jobs.push(this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
+        .then((quote) => quote ? { provider: "kyberswap" as const, expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote } : null));
+    }
+    const results = await Promise.allSettled(jobs);
+    const quoted: ApiSwapCandidate[] = [];
+    for (const result of results) {
+      if (result.status === "fulfilled" && result.value) quoted.push(result.value);
+    }
+    if (quoted.length === 0) throw new Error("No pancake Universal Router or KyberSwap route available");
+    const benchmark = quoted.find((item) => item.provider === "pancake") ?? quoted[0]!;
+    const floor = applySlippage(benchmark.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
+    const aboveFloor = quoted.filter((item) => item.expectedOut >= floor).sort((left, right) => right.expectedOut === left.expectedOut ? 0 : right.expectedOut > left.expectedOut ? -1 : 1);
+    const belowFloor = quoted.filter((item) => item.expectedOut < floor).sort((left, right) => right.expectedOut === left.expectedOut ? 0 : right.expectedOut > left.expectedOut ? -1 : 1);
+    return { aboveFloor, belowFloor, floor };
+  }
+
+  private async preparePancakeCandidate(
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    slippageBps: number,
+    candidate: ApiSwapCandidate,
+    refreshAfterApproval: boolean,
+    minimumAcceptableOut: bigint,
+  ): Promise<PreparedSwap | "approval_changed" | null> {
+    if (candidate.provider === "pancake") {
+      if (!this.pancakeUr) throw new Error("Pancake Universal Router is unavailable");
+      let quote = candidate.quote;
+      const approvalChanged = await this.ensurePancakeUrApprovals(position, tokenIn, amountIn);
+      if (this.config.dryRun && approvalChanged) {
+        await this.database.setPositionStatus(position.id, "paused", { dryRunPlan: "approve pancake permit2 then swap_to_quote" });
+        return null;
+      }
+      if (approvalChanged && refreshAfterApproval) return "approval_changed";
+      if (approvalChanged) {
+        const refreshed = await this.pancakeUr.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+        if (!refreshed) throw new Error("Pancake UR route disappeared after approval");
+        if (refreshed.minimumOut < minimumAcceptableOut) throw new Error("Pancake UR route fell below local minimum floor after approval");
+        quote = refreshed;
+      }
+      const plan = this.pancakeUr.createSwap(position, quote);
+      return { provider: "pancake", expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, plan, approvalChanged };
+    }
+    return this.prepareApiSwap(position, tokenIn, amountIn, tokenOut, slippageBps, candidate, false, minimumAcceptableOut);
+  }
+
+  private async preparePancakeGroupCandidate(
+    group: PositionGroupRecord,
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    slippageBps: number,
+    candidate: ApiSwapCandidate,
+    minimumAcceptableOut: bigint,
+  ): Promise<PreparedSwap> {
+    if (candidate.provider === "pancake") {
+      if (!this.pancakeUr) throw new Error("Pancake Universal Router is unavailable");
+      let quote = candidate.quote;
+      const approvalChanged = await this.ensureGroupPancakeUrApprovals(group, position, tokenIn, amountIn);
+      if (approvalChanged) {
+        const refreshed = await this.pancakeUr.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
+        if (!refreshed) throw new Error("Pancake UR route disappeared after approval");
+        if (refreshed.minimumOut < minimumAcceptableOut) throw new Error("Pancake UR route fell below local minimum floor after approval");
+        quote = refreshed;
+      }
+      return { provider: "pancake", expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, plan: this.pancakeUr.createSwap(position, quote), approvalChanged };
+    }
+    return this.prepareGroupApiSwap(group, position, tokenIn, amountIn, tokenOut, slippageBps, candidate, minimumAcceptableOut);
+  }
+
+  private async ensurePancakeUrApprovals(position: PositionRecord, token: Address, amount: bigint): Promise<boolean> {
+    const permitChanged = await this.ensureApproval(position, token, PANCAKE_PERMIT2, amount, "approve_permit2");
+    const routerChanged = await this.ensurePermit2Approval(position, token, PANCAKE_UNIVERSAL_ROUTER, amount, PANCAKE_PERMIT2);
+    return permitChanged || routerChanged;
+  }
+
+  private async ensureGroupPancakeUrApprovals(
+    group: PositionGroupRecord,
+    position: PositionRecord,
+    token: Address,
+    amount: bigint,
+  ): Promise<boolean> {
+    const erc20Changed = await this.ensureGroupSettlementApproval(group, position, "v3", PANCAKE_PERMIT2, token, amount);
+    const { client } = this.chains.getById(group.chainId);
+    if (amount > MAX_UINT160) throw new Error("Pancake UR settlement amount overflows Permit2 uint160");
+    const permitAllowance = await client.readContract({
+      address: PANCAKE_PERMIT2,
+      abi: permit2Abi,
+      functionName: "allowance",
+      args: [group.owner, token, PANCAKE_UNIVERSAL_ROUTER],
+    });
+    if (permit2AllowanceReady(permitAllowance, amount)) return erc20Changed;
+    const now = Math.floor(Date.now() / 1_000);
+    const protectedToken = this.isProtectedToken(group.chainId, token);
+    const permitAmount = protectedToken ? amount : MAX_UINT160;
+    const expiration = now + (protectedToken ? 300 : PERMIT2_MAX_EXPIRATION_SECONDS);
+    await this.sendGroup(group, "permit2_approve", {
+      chainId: group.chainId,
+      to: PANCAKE_PERMIT2,
+      data: encodeFunctionData({ abi: permit2Abi, functionName: "approve", args: [token, PANCAKE_UNIVERSAL_ROUTER, permitAmount, expiration] }),
+      description: "approve pancake Universal Router through Permit2",
+    });
+    return true;
   }
 
   private async constrainApiCandidate(
@@ -2388,6 +2721,7 @@ export class Executor {
       return { provider: "uniswap", expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, plan, approvalChanged };
     }
 
+    if (candidate.provider !== "kyberswap") throw new Error(`unsupported settlement provider ${candidate.provider}`);
     if (!this.kyberswapApi) throw new Error("KyberSwap API is unavailable");
     let quote = candidate.quote;
     let approvalChanged = false;
@@ -2484,7 +2818,7 @@ export class Executor {
       const burn = encodeFunctionData({ abi: v3PositionManagerAbi, functionName: "burn", args: [tokenId] });
       return {
         chainId: position.chainId,
-        to: registry.contracts.v3.positionManager,
+        to: v3ContractsFor(registry, dexNameFromMetadata(position.metadata)).positionManager,
         data: encodeFunctionData({ abi: v3PositionManagerAbi, functionName: "multicall", args: [[decrease, collect, burn]] }),
         description: "remove V3 liquidity and collect fees",
       };
@@ -2542,23 +2876,24 @@ export class Executor {
     return true;
   }
 
-  private async ensurePermit2Approval(position: PositionRecord, token: Address, spender: Address, amount: bigint): Promise<boolean> {
+  private async ensurePermit2Approval(position: PositionRecord, token: Address, spender: Address, amount: bigint, permit2?: Address): Promise<boolean> {
     if (token.toLowerCase() === zeroAddress) throw new Error("Native ETH does not require Permit2 approval");
     if (amount > MAX_UINT160) throw new Error("Permit2 approval amount overflows uint160");
     const { client, registry } = this.chains.getById(position.chainId);
+    const permit2Address = permit2 ?? registry.contracts.v4.permit2;
     const allowance = await client.readContract({
-      address: registry.contracts.v4.permit2,
+      address: permit2Address,
       abi: permit2Abi,
       functionName: "allowance",
       args: [position.owner, token, spender],
     });
 
     if (this.isProtectedToken(position.chainId, token)) {
+      if (permit2AllowanceReady(allowance, amount) && allowance[0] === amount) return false;
       const expiration = Math.floor(Date.now() / 1_000) + 300;
-      if (allowance[0] === amount && Number(allowance[1]) >= expiration) return false;
       await this.send(position, "permit2_approve", {
         chainId: position.chainId,
-        to: registry.contracts.v4.permit2,
+        to: permit2Address,
         data: encodeFunctionData({
           abi: permit2Abi,
           functionName: "approve",
@@ -2569,12 +2904,12 @@ export class Executor {
       return true;
     }
 
+    if (permit2AllowanceReady(allowance, amount)) return false;
     const now = Math.floor(Date.now() / 1_000);
-    if (allowance[0] >= amount && Number(allowance[1]) > now) return false;
     const expiration = now + PERMIT2_MAX_EXPIRATION_SECONDS;
     await this.send(position, "permit2_approve", {
       chainId: position.chainId,
-      to: registry.contracts.v4.permit2,
+      to: permit2Address,
       data: encodeFunctionData({
         abi: permit2Abi,
         functionName: "approve",
@@ -3027,9 +3362,10 @@ export class Executor {
     const tokenId = BigInt(position.positionKey);
     const { client, registry } = this.chains.getById(position.chainId);
     const { client: logClient } = this.chains.getForLogs(registry.name);
+    const manager = v3ContractsFor(registry, dexNameFromMetadata(position.metadata)).positionManager;
     try {
       const state = await client.readContract({
-        address: registry.contracts.v3.positionManager,
+        address: manager,
         abi: v3PositionManagerAbi,
         functionName: "positions",
         args: [tokenId],
@@ -3038,14 +3374,14 @@ export class Executor {
 
       const [decreases, collects] = await Promise.all([
         logClient.getLogs({
-          address: registry.contracts.v3.positionManager,
+          address: manager,
           event: v3DecreaseLiquidityEvent,
           args: { tokenId },
           fromBlock: position.openedAtBlock ?? 0n,
           toBlock: "latest" as never,
         }),
         logClient.getLogs({
-          address: registry.contracts.v3.positionManager,
+          address: manager,
           event: v3CollectEvent,
           args: { tokenId },
           fromBlock: position.openedAtBlock ?? 0n,
@@ -3142,13 +3478,23 @@ function parsePendingGroupSwap(value: unknown): { token: Address; amount: bigint
   return parsePendingSwap(value);
 }
 
-function groupSettlementPosition(group: PositionGroupRecord): PositionRecord {
+export function permit2AllowanceReady(
+  allowance: readonly [bigint, number | bigint, ...unknown[]],
+  amount: bigint,
+  now = Math.floor(Date.now() / 1_000),
+  minRemainingSeconds = 60,
+): boolean {
+  return allowance[0] >= amount && Number(allowance[1]) > now + minRemainingSeconds;
+}
+
+export function groupSettlementPosition(group: PositionGroupRecord): PositionRecord {
   const plan = group.planJson as Record<string, unknown>;
   const nestedPlan = isRecord(plan.plan) ? plan.plan : plan;
   const poolKey = firstRecord(nestedPlan.poolKey, nestedPlan.v4PoolKey, plan.poolKey, plan.v4PoolKey);
   const metadata: Record<string, unknown> = {
     managedBy: "position_group",
     positionGroupId: group.id,
+    ...(typeof group.metadata.dex === "string" ? { dex: group.metadata.dex } : {}),
   };
   if (poolKey) {
     Object.assign(metadata, {
@@ -3317,6 +3663,14 @@ function swapRetryState(metadata: Record<string, unknown>): SwapRetryState {
     ...(typeof retry.lastProvider === "string" ? { lastProvider: retry.lastProvider } : {}),
     ...(typeof retry.nextAttemptAt === "string" ? { nextAttemptAt: retry.nextAttemptAt } : {}),
   };
+}
+
+export function effectiveSettlementSlippageBps(
+  base: number,
+  max: number,
+  retry: Pick<SwapRetryState, "broadcastAttempts" | "planningFailures">,
+): number {
+  return Math.min(max, base + Math.max(retry.broadcastAttempts, retry.planningFailures) * 100);
 }
 
 export function nextSwapRetry(

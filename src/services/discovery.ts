@@ -25,6 +25,7 @@ import type { ChainName, PositionGroupBinRecord, PositionGroupRecord, PositionRe
 import type { ChainClients } from "./chain-client.js";
 import { getLogsChunked } from "./log-query.js";
 import { hasV4Hooks } from "./v4-pool.js";
+import { dexNameFromMetadata, isKnownV3PositionManager, resolveV3Dex, v3ContractsFor, v3Deployments, type DexName } from "./v3-deployment.js";
 import { isTransientRpcError } from "../rpc.js";
 import type { Notifier } from "./notifier.js";
 import { amountsForLiquidity } from "./uniswap-math.js";
@@ -70,7 +71,7 @@ export class DiscoveryService {
     try {
       if (group.chainId !== registry.chain.id) throw new Error("position group chain does not match the discovery chain");
       if (group.protocol !== "v3" && group.protocol !== "v4") throw new Error(`unsupported position group protocol ${group.protocol}`);
-      if (group.positionManager.toLowerCase() !== expectedPositionManager(registry, group.protocol).toLowerCase()) {
+      if (group.positionManager.toLowerCase() !== expectedPositionManager(registry, group.protocol, group.positionManager).toLowerCase()) {
         throw new Error("position group manager does not match the configured manager");
       }
       if (group.shape !== "bid_ask" || !["delta-amount-linear-v1", "delta-amount-linear-v2", "delta-amount-linear-v3"].includes(group.shapeVersion)) {
@@ -150,6 +151,8 @@ export class DiscoveryService {
       throw new Error("V3 open receipt does not contain exactly one IncreaseLiquidity event per minted token");
     }
     const plannedFee = plannedV3Fee(group);
+    const dex = resolveV3Dex(registry, group.positionManager) ?? dexNameFromMetadata(group.metadata);
+    const contracts = v3ContractsFor(registry, dex);
     const reconciled: V3ReconciledChild[] = [];
     const usedBins = new Set<number>();
     for (const tokenId of expectedTokenIds) {
@@ -176,7 +179,7 @@ export class DiscoveryService {
         throw new Error(`V3 token ${tokenId} does not match the authoritative group position`);
       }
       const pool = await client.readContract({
-        address: registry.contracts.v3.factory,
+        address: contracts.factory,
         abi: v3FactoryAbi,
         functionName: "getPool",
         args: [token0, token1, fee],
@@ -213,13 +216,13 @@ export class DiscoveryService {
         fee: child.fee,
         tickLower: child.tickLower,
         tickUpper: child.tickUpper,
-         positionManager: registry.contracts.v3.positionManager,
+         positionManager: contracts.positionManager,
          positionGroupId: group.id,
          managedBy: "position_group",
          autoExitDisabled: true,
          source: "position_group_open_receipt",
         historyTrusted: true,
-        dex: registry.dex,
+        dex,
       },
     })));
   }
@@ -466,6 +469,35 @@ export class DiscoveryService {
     return typeof this.chains.getForScan === "function" ? this.chains.getForScan(name).client : regular;
   }
 
+  async ingestOpenReceipt(name: ChainName, receipt: TransactionReceipt): Promise<PositionRecord[]> {
+    const { registry } = this.chains.get(name);
+    const hash = receipt.transactionHash;
+    const blockNumber = receipt.blockNumber ?? 0n;
+    const v3: NftActivity[] = [];
+    const v4: NftActivity[] = [];
+    for (const entry of receipt.logs) {
+      const transfer = decodeErc721Transfer(entry);
+      if (!transfer || transfer.from.toLowerCase() !== zeroAddress.toLowerCase()) continue;
+      if (transfer.to.toLowerCase() !== this.config.executorAddress.toLowerCase()) continue;
+      const activity: NftActivity = {
+        asset: entry.address,
+        transactionHash: hash,
+        blockNumber,
+        from: transfer.from,
+        to: transfer.to,
+        tokenId: transfer.tokenId,
+        historyTrusted: true,
+      };
+      if (isKnownV3PositionManager(registry, entry.address)) v3.push(activity);
+      else if (entry.address.toLowerCase() === registry.contracts.v4.positionManager.toLowerCase()) v4.push(activity);
+    }
+    const found: PositionRecord[] = [];
+    if (v3.length > 0) found.push(...await this.discoverV3Candidates(name, v3));
+    if (v4.length > 0) found.push(...await this.discoverV4Candidates(name, v4));
+    log.info({ chain: name, hash, count: found.length }, "ingested positions from open receipt");
+    return found;
+  }
+
   async syncChain(name: ChainName): Promise<void> {
     const { client, registry } = this.chains.get(name);
     await this.reconcilePendingPositionGroupOpens(name);
@@ -492,15 +524,30 @@ export class DiscoveryService {
     if (useLimitedRpcFallback) {
       log.warn({ chain: name, fromBlock, toBlock }, "Alchemy bootstrap is unavailable; using limited RPC lookback instead of genesis scan");
     }
-    log.info({ chain: name, fromBlock, toBlock }, "syncing discovery range");
-    if (registry.discoveryProtocols.includes("v2")) {
-      const v2Transfers = await this.getWalletTransferLogs(name, fromBlock, toBlock);
-      await this.discoverV2(name, v2Transfers);
+    if (registry.discoveryProtocols.includes("v4")) {
+      try {
+        await this.discoverOwnedV4Positions(name, latest);
+      } catch (error) {
+        log.warn({ err: error, chain: name }, "owned V4 enumeration failed");
+      }
     }
-    if (registry.discoveryProtocols.includes("v3")) await this.discoverV3(name, fromBlock, toBlock);
-    if (registry.discoveryProtocols.includes("v4")) await this.discoverV4(name, fromBlock, toBlock);
-    if (registry.monitoringEnabled && registry.discoveryProtocols.includes("v3")) await this.syncV3Cashflows(name, fromBlock, toBlock);
-    if (registry.monitoringEnabled && registry.discoveryProtocols.includes("v4")) await this.syncV4Cashflows(name, fromBlock, toBlock);
+    log.info({ chain: name, fromBlock, toBlock }, "syncing discovery range");
+    try {
+      if (registry.discoveryProtocols.includes("v2")) {
+        const v2Transfers = await this.getWalletTransferLogs(name, fromBlock, toBlock);
+        await this.discoverV2(name, v2Transfers);
+      }
+      if (registry.discoveryProtocols.includes("v3")) {
+        for (const deployment of v3Deployments(registry)) {
+          await this.discoverV3(name, fromBlock, toBlock, deployment.dex);
+        }
+      }
+      if (registry.discoveryProtocols.includes("v4")) await this.discoverV4(name, fromBlock, toBlock);
+      if (registry.monitoringEnabled && registry.discoveryProtocols.includes("v3")) await this.syncV3Cashflows(name, fromBlock, toBlock);
+      if (registry.monitoringEnabled && registry.discoveryProtocols.includes("v4")) await this.syncV4Cashflows(name, fromBlock, toBlock);
+    } catch (error) {
+      log.warn({ err: error, chain: name, fromBlock, toBlock }, "discovery log scan failed; advancing cursor");
+    }
     await this.database.saveCursor(registry.chain.id, toBlock);
   }
 
@@ -620,18 +667,19 @@ export class DiscoveryService {
     }
   }
 
-  private async discoverV3(name: ChainName, fromBlock: bigint, toBlock: bigint): Promise<void> {
+  private async discoverV3(name: ChainName, fromBlock: bigint, toBlock: bigint, dex: DexName = "uniswap"): Promise<void> {
     const { registry } = this.chains.get(name);
+    const contracts = v3ContractsFor(registry, dex);
     const [incoming, outgoing] = await Promise.all([
       this.getLogsChunked(name, {
-        address: registry.contracts.v3.positionManager,
+        address: contracts.positionManager,
         event: erc721TransferEvent,
         args: { to: this.config.executorAddress },
         fromBlock,
         toBlock,
       }),
       this.getLogsChunked(name, {
-        address: registry.contracts.v3.positionManager,
+        address: contracts.positionManager,
         event: erc721TransferEvent,
         args: { from: this.config.executorAddress },
         fromBlock,
@@ -644,7 +692,7 @@ export class DiscoveryService {
       if (args.tokenId === undefined || !item.transactionHash || item.blockNumber == null) continue;
       const existing = candidates.get(args.tokenId);
       candidates.set(args.tokenId, {
-        asset: registry.contracts.v3.positionManager,
+        asset: contracts.positionManager,
         transactionHash: item.transactionHash,
         blockNumber: existing ? minBigInt(existing.blockNumber, item.blockNumber) : item.blockNumber,
         from: args.from,
@@ -653,24 +701,26 @@ export class DiscoveryService {
         historyTrusted: Boolean(existing?.historyTrusted || (args.from?.toLowerCase() === zeroAddress && args.to?.toLowerCase() === this.config.executorAddress.toLowerCase())),
       });
     }
-    await this.discoverV3Candidates(name, [...candidates.values()]);
+    await this.discoverV3Candidates(name, [...candidates.values()], dex);
   }
 
-  async discoverV3Candidates(name: ChainName, candidates: NftActivity[]): Promise<PositionRecord[]> {
+  async discoverV3Candidates(name: ChainName, candidates: NftActivity[], dex: DexName = "uniswap"): Promise<PositionRecord[]> {
     const { client, registry } = this.chains.get(name);
     const positions: PositionRecord[] = [];
     for (const candidate of candidates) {
       const tokenId = candidate.tokenId;
+      const resolvedDex = resolveV3Dex(registry, candidate.asset) ?? dex;
+      const contracts = v3ContractsFor(registry, resolvedDex);
       try {
         const owner = await client.readContract({
-          address: registry.contracts.v3.positionManager,
+          address: contracts.positionManager,
           abi: v3PositionManagerAbi,
           functionName: "ownerOf",
           args: [tokenId],
         });
         if (owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) continue;
         const details = (await client.readContract({
-          address: registry.contracts.v3.positionManager,
+          address: contracts.positionManager,
           abi: v3PositionManagerAbi,
           functionName: "positions",
           args: [tokenId],
@@ -678,7 +728,7 @@ export class DiscoveryService {
         const [, , token0, token1, fee, , , liquidity] = details;
         if (liquidity === 0n) continue;
         const pool = await client.readContract({
-          address: registry.contracts.v3.factory,
+          address: contracts.factory,
           abi: v3FactoryAbi,
           functionName: "getPool",
           args: [token0, token1, fee],
@@ -700,10 +750,10 @@ export class DiscoveryService {
           openedAtBlock: candidate.blockNumber,
           metadata: {
             fee,
-            positionManager: registry.contracts.v3.positionManager,
+            positionManager: contracts.positionManager,
             source: detectionOnly ? "owner_enumeration" : "nft_transfer",
             historyTrusted: candidate.historyTrusted,
-            dex: registry.dex,
+            dex: resolvedDex,
             ...(detectionOnly ? { detectionOnly: true, reason: "detection_only_chain" } : candidate.historyTrusted ? {} : { reason: "v3_position_transferred_or_history_unavailable" }),
           },
         });
@@ -719,30 +769,98 @@ export class DiscoveryService {
 
   async discoverOwnedV3Positions(name: ChainName, blockNumber: bigint): Promise<PositionRecord[]> {
     const { client, registry } = this.chains.get(name);
-    const balance = await client.readContract({
-      address: registry.contracts.v3.positionManager,
-      abi: v3PositionManagerAbi,
-      functionName: "balanceOf",
-      args: [this.config.executorAddress],
-    });
-    const candidates: NftActivity[] = [];
-    for (let index = 0n; index < balance; index += 1n) {
-      const tokenId = await client.readContract({
-        address: registry.contracts.v3.positionManager,
+    const found: PositionRecord[] = [];
+    for (const deployment of v3Deployments(registry)) {
+      const balance = await client.readContract({
+        address: deployment.contracts.positionManager,
         abi: v3PositionManagerAbi,
-        functionName: "tokenOfOwnerByIndex",
-        args: [this.config.executorAddress, index],
+        functionName: "balanceOf",
+        args: [this.config.executorAddress],
       });
-      candidates.push({
-        asset: registry.contracts.v3.positionManager,
-        transactionHash: zeroHash,
-        blockNumber,
-        to: this.config.executorAddress,
-        tokenId,
-        historyTrusted: false,
-      });
+      const candidates: NftActivity[] = [];
+      for (let index = 0n; index < balance; index += 1n) {
+        const tokenId = await client.readContract({
+          address: deployment.contracts.positionManager,
+          abi: v3PositionManagerAbi,
+          functionName: "tokenOfOwnerByIndex",
+          args: [this.config.executorAddress, index],
+        });
+        candidates.push({
+          asset: deployment.contracts.positionManager,
+          transactionHash: zeroHash,
+          blockNumber,
+          to: this.config.executorAddress,
+          tokenId,
+          historyTrusted: false,
+        });
+      }
+      found.push(...await this.discoverV3Candidates(name, candidates, deployment.dex));
     }
-    return this.discoverV3Candidates(name, candidates);
+    return found;
+  }
+
+  async discoverOwnedV4Positions(name: ChainName, blockNumber: bigint): Promise<PositionRecord[]> {
+    const tokenIds = await this.ownedV4TokenIds(name);
+    const found: PositionRecord[] = [];
+    const { registry } = this.chains.get(name);
+    for (const tokenId of tokenIds) {
+      const existing = await this.database.findPositionByKey(registry.chain.id, "v4", tokenId.toString());
+      if (existing) continue;
+      try {
+        const position = await this.upsertV4FromPositionManager(name, tokenId, blockNumber, true, {
+          source: "owner_enumeration",
+        });
+        if (!position) continue;
+        found.push(position);
+        await this.notifier?.positionDiscovered(position);
+        log.info({ chain: name, positionKey: position.positionKey }, "discovered owned V4 position by enumeration");
+      } catch (error) {
+        if (isTransientRpcError(error)) throw error;
+        log.warn({ err: error, chain: name, tokenId: tokenId.toString() }, "owned V4 enumeration candidate failed");
+      }
+    }
+    return found;
+  }
+
+  private async ownedV4TokenIds(name: ChainName): Promise<bigint[]> {
+    const { client, registry } = this.chains.getForScan(name);
+    const manager = registry.contracts.v4.positionManager;
+    try {
+      const nextTokenId = await client.readContract({
+        address: manager,
+        abi: v4PositionManagerAbi,
+        functionName: "nextTokenId",
+      });
+      const lookback = 800n;
+      const start = nextTokenId > lookback ? nextTokenId - lookback : 1n;
+      const ids: bigint[] = [];
+      const batchSize = 15n;
+      for (let tokenId = start; tokenId < nextTokenId; ) {
+        const batch: bigint[] = [];
+        for (let i = 0n; i < batchSize && tokenId < nextTokenId; i += 1n, tokenId += 1n) batch.push(tokenId);
+        const owners = await Promise.all(batch.map(async (id) => {
+          try {
+            const owner = await client.readContract({
+              address: manager,
+              abi: v4PositionManagerAbi,
+              functionName: "ownerOf",
+              args: [id],
+            });
+            return { id, owner };
+          } catch {
+            return null;
+          }
+        }));
+        for (const item of owners) {
+          if (item && item.owner.toLowerCase() === this.config.executorAddress.toLowerCase()) ids.push(item.id);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 80));
+      }
+      return ids;
+    } catch (error) {
+      log.warn({ err: error, chain: name }, "could not enumerate owned V4 positions");
+      return [];
+    }
   }
 
   private async discoverV4(name: ChainName, fromBlock: bigint, toBlock: bigint): Promise<void> {
@@ -1145,9 +1263,10 @@ export class DiscoveryService {
     for (const position of positions) {
       const tokenId = BigInt(position.positionKey);
       try {
+        const manager = v3ContractsFor(registry, dexNameFromMetadata(position.metadata)).positionManager;
         const [increases, collects] = await Promise.all([
-          this.getLogsChunked(name, { address: registry.contracts.v3.positionManager, event: v3IncreaseLiquidityEvent, args: { tokenId }, fromBlock, toBlock }),
-          this.getLogsChunked(name, { address: registry.contracts.v3.positionManager, event: v3CollectEvent, args: { tokenId }, fromBlock, toBlock }),
+          this.getLogsChunked(name, { address: manager, event: v3IncreaseLiquidityEvent, args: { tokenId }, fromBlock, toBlock }),
+          this.getLogsChunked(name, { address: manager, event: v3CollectEvent, args: { tokenId }, fromBlock, toBlock }),
         ]);
         for (const event of increases) {
           if (!event.transactionHash || !event.blockNumber) continue;
@@ -1517,10 +1636,13 @@ type V4PoolKey = {
 };
 
 function expectedPositionManager(
-  registry: { contracts: { v3: { positionManager: Address }; v4: { positionManager: Address } } },
+  registry: { contracts: { v3: { positionManager: Address }; v4: { positionManager: Address } }; pancakeV3?: { positionManager: Address } },
   protocol: "v3" | "v4",
+  stored?: Address,
 ): Address {
-  return protocol === "v3" ? registry.contracts.v3.positionManager : registry.contracts.v4.positionManager;
+  if (protocol === "v4") return registry.contracts.v4.positionManager;
+  if (stored && stored.toLowerCase() === registry.pancakeV3?.positionManager.toLowerCase()) return stored;
+  return registry.contracts.v3.positionManager;
 }
 
 function plannedGroupBins(group: PositionGroupRecord, bins: readonly PositionGroupBinRecord[]): PositionGroupBinRecord[] {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { chainRegistry, isEligibleScanDex, isProtocolDeployed } from "../src/chains.js";
+import { resolveV3Dex, v3ContractsFor } from "../src/services/v3-deployment.js";
 
 describe("BSC Uniswap V4 registry", () => {
   it("replaces PancakeSwap with official Uniswap V4 deployments", () => {
@@ -26,6 +27,10 @@ describe("BSC Uniswap V4 registry", () => {
     expect(isEligibleScanDex(registry, "uniswap-v3-bsc")).toBe(true);
     expect(isEligibleScanDex(registry, "uniswap-bsc")).toBe(true);
     expect(isEligibleScanDex(registry, "uniswap-v2-bsc")).toBe(false);
-    expect(isEligibleScanDex(registry, "pancakeswap-v3-bsc")).toBe(false);
+    expect(isEligibleScanDex(registry, "pancakeswap-v3-bsc")).toBe(true);
+    expect(registry.pancakeV3?.positionManager).toBe("0x46A15B0b27311cedF172AB29E4f4766fbE7F4364");
+    expect(resolveV3Dex(registry, registry.pancakeV3!.positionManager)).toBe("pancake");
+    expect(v3ContractsFor(registry, "pancake").factory).toBe("0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865");
+    expect(v3ContractsFor(registry, "pancake").factory).not.toBe(registry.contracts.v3.factory);
   });
 });

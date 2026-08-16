@@ -65,10 +65,11 @@ async function getLogsWithRetry(client: PublicClient, params: Parameters<PublicC
   let lastError: unknown;
   for (let attempt = 0; attempt < MAX_GET_LOGS_ATTEMPTS; attempt += 1) {
     try {
-      return (await client.getLogs(params)) as Log[];
+      return await withGetLogsTimeout(client.getLogs(params) as Promise<Log[]>, 8_000);
     } catch (error) {
       lastError = error;
-      if (isLogRangeError(error) || !isTransientRpcError(error)) throw error;
+      const text = collectErrorText(error);
+      if (isLogRangeError(error) || text.includes("eth_getLogs timed out") || !isTransientRpcError(error)) throw error;
       await sleep(500 * 2 ** attempt);
     }
   }
@@ -96,4 +97,18 @@ function minBigInt(left: bigint, right: bigint): bigint {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withGetLogsTimeout(promise: Promise<Log[]>, timeoutMs: number): Promise<Log[]> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<Log[]>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`eth_getLogs timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }

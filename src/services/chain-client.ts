@@ -73,13 +73,11 @@ export class ChainClients {
           pollingInterval: 4_000,
         }),
       });
-      const logUrls = name === "bsc"
-        ? uniqueUrls([config.alchemyHttp.bsc])
-        : uniqueUrls([
-          config.rpcHttp[name],
-          config.rpcHttpScanFallback?.[name],
-          config.rpcHttpFallback[name],
-        ]);
+      const logUrls = uniqueUrls([
+        config.rpcHttp[name],
+        config.rpcHttpScanFallback?.[name],
+        config.rpcHttpFallback[name],
+      ]);
       if (logUrls.length > 0) {
         const logTransport = createRpcTransport(logUrls);
         this.logClients.set(name, {

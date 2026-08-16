@@ -67,8 +67,12 @@ export class Guardian {
     try {
       await Promise.all(this.config.chains.map(async (name) => {
         try {
+          if (name === "bsc") {
+            await this.retryNeedsReview(name);
+            return;
+          }
           if (this.alchemyBootstrapper.isEnabled(name)) await this.alchemyBootstrapper.bootstrap(name);
-          await this.discovery.syncChain(name);
+          await withTimeout(this.discovery.syncChain(name), 45_000);
           await this.retryNeedsReview(name);
         } catch (error) {
           log.error({ err: error, chain: name }, "discovery cycle failed");
@@ -221,6 +225,7 @@ export class Guardian {
         return false;
       }
       const reason = error instanceof Error ? error.message : String(error);
+      if (/zero liquidity/i.test(reason) && await this.executor.settleEmptyV3Group(group)) return true;
       if (/Position group child|zero liquidity|NOT_MINTED|different pool|different token pair|ticks differ/i.test(reason)) {
         await this.database.setPositionGroupStatus(group.id, "needs_review", {
           reason: "position_group_child_integrity_changed",
@@ -287,9 +292,6 @@ export class Guardian {
       log.debug({ positionId: position.id, positionKey: position.positionKey, valuationMs: Date.now() - startedAt }, "position valued");
       await this.database.addPnlSnapshot(valued.snapshot);
       await this.notifier.logPnL(position, valued.snapshot);
-      if (position.metadata.autoExitDisabled === true) {
-        return true;
-      }
       const trailing = this.pnl.evaluateTrailingStop(position.metadata, valued.snapshot);
       const oorTrigger = await this.updateOorAboveTimer(position, valued.range);
       const profitOorTrigger = await this.updateProfitOorAboveTimer(position, valued.range, valued.snapshot.pnlBps);
@@ -311,6 +313,8 @@ export class Guardian {
         await this.notifier.armed(position, valued.snapshot);
         return true;
       }
+
+      if (position.metadata.autoExitDisabled === true) return true;
 
       if (trailing.action === "reset") {
         await this.database.clearTrailingStopState(position.id);

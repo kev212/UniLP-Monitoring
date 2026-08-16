@@ -3,7 +3,8 @@ import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, keccak256
 
 import { v3PositionManagerAbi, v4PositionManagerAbi } from "../src/abi.js";
 import type { RuntimeConfig } from "../src/config.js";
-import { bufferedGasLimit, Executor, effectiveRemoveSlippageBps, isTransientRpcError, nextExitRetry, nextSwapRetry, receiptErc20NetReceived } from "../src/services/executor.js";
+import { PANCAKE_PERMIT2 } from "../src/services/pancake-universal-router.js";
+import { bufferedGasLimit, Executor, effectiveRemoveSlippageBps, effectiveSettlementSlippageBps, groupSettlementPosition, isTransientRpcError, nextExitRetry, nextSwapRetry, permit2AllowanceReady, receiptErc20NetReceived } from "../src/services/executor.js";
 import type { PositionGroupBinRecord, PositionGroupRecord, PositionRecord } from "../src/types.js";
 
 const usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as const;
@@ -392,6 +393,8 @@ describe("Executor pending settlement recovery", () => {
     const planning = nextSwapRetry({}, "uniswap", false, 2, now);
     const reverted = nextSwapRetry({}, "uniswap", true, 2, now);
 
+    expect(effectiveSettlementSlippageBps(200, 500, { broadcastAttempts: 0, planningFailures: 3 })).toBe(500);
+    expect(effectiveSettlementSlippageBps(200, 500, { broadcastAttempts: 1, planningFailures: 0 })).toBe(300);
     expect(planning).toMatchObject({ broadcastAttempts: 0, planningFailures: 1, cycleBroadcastAttempts: 0, lastProvider: "uniswap" });
     expect(reverted).toMatchObject({ broadcastAttempts: 1, planningFailures: 0, cycleBroadcastAttempts: 1, lastProvider: "uniswap" });
     expect(Date.parse(planning.nextAttemptAt!)).toBe(now + 3_000);
@@ -623,6 +626,111 @@ describe("Executor pending settlement recovery", () => {
     expect(kyberswapApi.quote).toHaveBeenCalledTimes(1);
   });
 
+  it("uses KyberSwap on BSC when the local V4 quote is optimistic but not executable", async () => {
+    const ur = "0x1906c1d672b88cd1b9ac7593301ca990f94eae07" as Address;
+    const client = {
+      readContract: vi.fn(async ({ functionName, args }: { functionName: string; args?: unknown[] }) => {
+        if (functionName === "allowance") return (args?.length ?? 0) === 3 ? [10n ** 30n, 4_000_000_000] : 10n ** 30n;
+        return 10n ** 30n;
+      }),
+      call: vi.fn(async ({ data }: { data: string }) => {
+        if (data === "0x22") return { data: "0x" };
+        throw new Error("execution reverted");
+      }),
+    };
+    const chains = {
+      getById: vi.fn(() => ({
+        client,
+        registry: { name: "bsc", contracts: { v4: { permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3" } } },
+      })),
+    };
+    const kyberQuote = { source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: sender };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue(kyberQuote),
+      approvalSpender: vi.fn().mockReturnValue(sender),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 56, to: sender, data: "0x22", description: "kyber" }),
+    };
+    const routes = {
+      quoteDirect: vi.fn().mockResolvedValue({
+        protocol: "v4",
+        expectedOut: 200n,
+        minimumOut: 196n,
+        router: ur,
+        tokenIn: token,
+        tokenOut: usdg,
+        path: [token, usdg],
+        amountIn: 5n,
+        pool: zeroAddress,
+        pools: [],
+      }),
+    };
+    const bscConfig = { ...config, quoteTokens: { ...config.quoteTokens, bsc: [{ symbol: "USDT", address: usdg }] } } as RuntimeConfig;
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, bscConfig, undefined, kyberswapApi as never);
+    const position = {
+      id: "position", chainId: 56, protocol: "v4", positionKey: "1059271", owner, poolAddress: null,
+      token0: token, token1: usdg, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    const prepared = await (executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string; expectedOut: bigint }>;
+    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
+
+    expect(prepared).toMatchObject({ provider: "kyberswap", expectedOut: 110n });
+  });
+
+  it("retries Kyber without the local V4 floor after an insufficient-return revert", async () => {
+    const kyberTarget = "0x0000000000000000000000000000000000000005" as Address;
+    const client = {
+      readContract: vi.fn(async ({ functionName, args }: { functionName: string; args?: unknown[] }) => {
+        if (functionName === "allowance") return (args?.length ?? 0) === 3 ? [10n ** 30n, 4_000_000_000] : 10n ** 30n;
+        return 10n ** 30n;
+      }),
+      call: vi.fn()
+        .mockRejectedValueOnce(new Error("Return amount is not enough"))
+        .mockResolvedValue({ data: "0x" }),
+    };
+    const chains = {
+      getById: vi.fn(() => ({
+        client,
+        registry: { name: "bsc", contracts: { v4: { permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3" } } },
+      })),
+    };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: kyberTarget, slippageBps: 200 }),
+      approvalSpender: vi.fn().mockReturnValue(kyberTarget),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 56, to: kyberTarget, data: "0x22", description: "kyber" }),
+    };
+    const routes = {
+      quoteDirect: vi.fn().mockResolvedValue({
+        protocol: "v4",
+        expectedOut: 100n,
+        minimumOut: 98n,
+        router: "0x1906c1d672b88cd1b9ac7593301ca990f94eae07",
+        tokenIn: token,
+        tokenOut: usdg,
+        path: [token, usdg],
+        amountIn: 5n,
+        pool: zeroAddress,
+        pools: [],
+      }),
+    };
+    const bscConfig = { ...config, quoteTokens: { ...config.quoteTokens, bsc: [{ symbol: "USDT", address: usdg }] } } as RuntimeConfig;
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, bscConfig, undefined, kyberswapApi as never);
+    const position = {
+      id: "position", chainId: 56, protocol: "v4", positionKey: "1061958", owner, poolAddress: null,
+      token0: token, token1: usdg, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    const prepared = await (executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string }>;
+    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
+
+    expect(prepared.provider).toBe("kyberswap");
+    expect(kyberswapApi.createSwap).toHaveBeenCalledTimes(2);
+  });
+
   it("does not use KyberSwap as a non-BSC fallback when the local quote is gone", async () => {
     const kyberswapApi = {
       quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: sender }),
@@ -740,6 +848,97 @@ describe("Executor pending settlement recovery", () => {
     expect(prepared.provider).toBe("kyberswap");
     expect(client.call).toHaveBeenNthCalledWith(1, expect.objectContaining({ to: uniswapTarget }));
     expect(client.call).toHaveBeenNthCalledWith(2, expect.objectContaining({ to: kyberTarget }));
+  });
+
+  it("reuses a live Permit2 allowance instead of re-approving every cycle", () => {
+    const now = 1_700_000_000;
+    expect(permit2AllowanceReady([5n, now + 200], 5n, now)).toBe(true);
+    expect(permit2AllowanceReady([5n, now + 30], 5n, now)).toBe(false);
+    expect(permit2AllowanceReady([4n, now + 200], 5n, now)).toBe(false);
+  });
+
+  it("copies pancake dex onto Bid-Ask settlement positions", () => {
+    const group = { ...groupRecord("v3"), chainId: 56, metadata: { dex: "pancake" } } as PositionGroupRecord;
+    expect(groupSettlementPosition(group).metadata.dex).toBe("pancake");
+  });
+
+  it("settles pancake leftovers through Pancake UR or Kyber only", async () => {
+    const pancakeTarget = "0x00000000000000000000000000000000000000aa" as Address;
+    const kyberTarget = "0x00000000000000000000000000000000000000bb" as Address;
+    const client = {
+      readContract: vi.fn(async ({ functionName, args }: { functionName: string; args?: unknown[] }) => {
+        if (functionName === "allowance") return (args?.length ?? 0) === 3 ? [10n ** 30n, 4_000_000_000] : 10n ** 30n;
+        return 10n ** 30n;
+      }),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "bsc", contracts: { v4: { permit2: PANCAKE_PERMIT2 } } } })) };
+    const tradingApi = { quote: vi.fn(), createSwap: vi.fn() };
+    const pancakeQuote = { source: "pancake-ur", expectedOut: 120n, minimumOut: 117n, router: pancakeTarget };
+    const pancakeUr = {
+      quote: vi.fn().mockResolvedValue(pancakeQuote),
+      createSwap: vi.fn().mockReturnValue({ chainId: 56, to: pancakeTarget, data: "0x33", description: "pancake" }),
+    };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: kyberTarget }),
+      approvalSpender: vi.fn().mockReturnValue(kyberTarget),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 56, to: kyberTarget, data: "0x22", description: "kyber" }),
+    };
+    const routes = { quoteDirect: vi.fn() };
+    const bscConfig = { ...config, quoteTokens: { ...config.quoteTokens, bsc: [{ symbol: "USDT", address: usdg }] } } as RuntimeConfig;
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, bscConfig, tradingApi as never, kyberswapApi as never, pancakeUr as never);
+    const position = {
+      id: "position", chainId: 56, protocol: "v3", positionKey: "7142438", owner, poolAddress: null,
+      token0: token, token1: usdg, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: { dex: "pancake" },
+    } as PositionRecord;
+
+    const prepared = await (executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string; expectedOut: bigint }>;
+    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
+
+    expect(prepared).toMatchObject({ provider: "pancake", expectedOut: 120n });
+    expect(tradingApi.quote).not.toHaveBeenCalled();
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
+    expect(pancakeUr.createSwap).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to Kyber when pancake UR simulation fails", async () => {
+    const pancakeTarget = "0x00000000000000000000000000000000000000aa" as Address;
+    const kyberTarget = "0x00000000000000000000000000000000000000bb" as Address;
+    const client = {
+      readContract: vi.fn(async ({ functionName, args }: { functionName: string; args?: unknown[] }) => {
+        if (functionName === "allowance") return (args?.length ?? 0) === 3 ? [10n ** 30n, 4_000_000_000] : 10n ** 30n;
+        return 10n ** 30n;
+      }),
+      call: vi.fn().mockImplementation(({ to }: { to: Address }) => to === pancakeTarget
+        ? Promise.reject(new Error("simulation reverted"))
+        : Promise.resolve({ data: "0x" })),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "bsc", contracts: { v4: { permit2: PANCAKE_PERMIT2 } } } })) };
+    const pancakeUr = {
+      quote: vi.fn().mockResolvedValue({ source: "pancake-ur", expectedOut: 120n, minimumOut: 117n, router: pancakeTarget }),
+      createSwap: vi.fn().mockReturnValue({ chainId: 56, to: pancakeTarget, data: "0x33", description: "pancake" }),
+    };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: kyberTarget }),
+      approvalSpender: vi.fn().mockReturnValue(kyberTarget),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 56, to: kyberTarget, data: "0x22", description: "kyber" }),
+    };
+    const bscConfig = { ...config, quoteTokens: { ...config.quoteTokens, bsc: [{ symbol: "USDT", address: usdg }] } } as RuntimeConfig;
+    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, bscConfig, undefined, kyberswapApi as never, pancakeUr as never);
+    const position = {
+      id: "position", chainId: 56, protocol: "v3", positionKey: "7142438", owner, poolAddress: null,
+      token0: token, token1: usdg, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: { dex: "pancake" },
+    } as PositionRecord;
+
+    const prepared = await (executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string }>;
+    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
+
+    expect(prepared.provider).toBe("kyberswap");
+    expect(kyberswapApi.createSwap).toHaveBeenCalledTimes(1);
   });
 
   it("restores a V4 quote token and pair from burned-position metadata", async () => {

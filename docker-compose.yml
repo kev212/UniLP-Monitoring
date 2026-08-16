@@ -2,9 +2,12 @@ services:
   guardian:
     build: .
     restart: unless-stopped
+    mem_limit: 1536m
+    memswap_limit: 1536m
     env_file: .env
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:?set POSTGRES_USER}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB}
+      NODE_OPTIONS: --max-old-space-size=1400
     depends_on:
       postgres:
         condition: service_healthy

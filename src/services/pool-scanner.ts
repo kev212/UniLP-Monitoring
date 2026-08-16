@@ -6,6 +6,7 @@ import { log } from "../log.js";
 import type { ChainName, PoolScanSettings } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import { isDynamicFee, v4PoolId } from "./v4-pool.js";
+import { v3Deployments, type DexName } from "./v3-deployment.js";
 import { estimateConcentratedYield, fetchOhlcv, type ConcentratedEstimate } from "./concentrated-yield.js";
 
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
@@ -43,6 +44,7 @@ export const ROBINHOOD_STOCK_TOKENS: readonly { address: Address; symbol: string
 
 export interface ScoredPool {
   protocol: "v3" | "v4";
+  dex?: "uniswap" | "pancake";
   pair: string;
   quoteToken: Address;
   uniswapUrl: string;
@@ -93,6 +95,7 @@ export interface VerifiedPool {
   activeLiquidity: boolean;
   hooks?: string;
   tickSpacing?: number;
+  dex?: DexName;
 }
 
 export interface InvestigateResult {
@@ -557,9 +560,12 @@ export class PoolScanner {
 
     return {
       protocol,
+      dex: verified.dex,
       pair,
       quoteToken,
-      uniswapUrl: uniswapPoolUrl(poolAddress, chain),
+      uniswapUrl: verified.dex === "pancake"
+        ? `https://pancakeswap.finance/liquidity/pool/bsc/${poolAddress}`
+        : uniswapPoolUrl(poolAddress, chain),
       activeLiquidity: verified.activeLiquidity,
       feeTier: verified.feeTier ?? 0,
       feeRate,
@@ -669,8 +675,28 @@ export class PoolScanner {
     return this.verifyV4Pool(poolAddress, searchToken, chain);
   }
 
-  async verifyV3Pool(pool: Address, searchToken: string, chain: ChainName): Promise<VerifiedPool | null> {
+  private async matchV3Factory(chain: ChainName, pool: Address, token0: Address, token1: Address, fee: number): Promise<DexName | null> {
     const { client, registry } = this.chains.getForScan(chain);
+    for (const deployment of v3Deployments(registry)) {
+      try {
+        const factoryPool = await client.readContract({
+          address: deployment.contracts.factory,
+          abi: [{ name: "getPool", type: "function", stateMutability: "view", inputs: [
+            { name: "tokenA", type: "address" }, { name: "tokenB", type: "address" }, { name: "fee", type: "uint24" },
+          ], outputs: [{ type: "address" }] }],
+          functionName: "getPool",
+          args: [token0, token1, fee],
+        });
+        if ((factoryPool as string).toLowerCase() === pool.toLowerCase()) return deployment.dex;
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  async verifyV3Pool(pool: Address, searchToken: string, chain: ChainName): Promise<VerifiedPool | null> {
+    const { client } = this.chains.getForScan(chain);
     try {
       const [token0, token1, fee, liquidity] = await Promise.all([
         client.readContract({
@@ -695,18 +721,10 @@ export class PoolScanner {
       const t1 = (token1 as string).toLowerCase();
       if (t0 !== searchToken && t1 !== searchToken) return null;
 
-      const factoryPool = await client.readContract({
-        address: registry.contracts.v3.factory,
-        abi: [{ name: "getPool", type: "function", stateMutability: "view", inputs: [
-          { name: "tokenA", type: "address" }, { name: "tokenB", type: "address" }, { name: "fee", type: "uint24" },
-        ], outputs: [{ type: "address" }] }],
-        functionName: "getPool",
-        args: [token0, token1, fee],
-      });
+      const matched = await this.matchV3Factory(chain, pool, token0 as Address, token1 as Address, Number(fee));
+      if (!matched) return null;
 
-      if ((factoryPool as string).toLowerCase() !== pool.toLowerCase()) return null;
-
-      return { feeTier: Number(fee), activeLiquidity: liquidity > 0n };
+      return { feeTier: Number(fee), activeLiquidity: liquidity > 0n, dex: matched };
     } catch {
       return null;
     }
@@ -1003,7 +1021,7 @@ export class PoolScanner {
   }
 
   private async readV3PoolOnChain(pool: Address, chain: ChainName): Promise<VerifiedPool | null> {
-    const { client, registry } = this.chains.getForScan(chain);
+    const { client } = this.chains.getForScan(chain);
     try {
       const [token0, token1, fee, liquidity] = await Promise.all([
         client.readContract({
@@ -1024,18 +1042,10 @@ export class PoolScanner {
         }),
       ]);
 
-      const factoryPool = await client.readContract({
-        address: registry.contracts.v3.factory,
-        abi: [{ name: "getPool", type: "function", stateMutability: "view", inputs: [
-          { name: "tokenA", type: "address" }, { name: "tokenB", type: "address" }, { name: "fee", type: "uint24" },
-        ], outputs: [{ type: "address" }] }],
-        functionName: "getPool",
-        args: [token0 as Address, token1 as Address, fee as number],
-      });
+      const matched = await this.matchV3Factory(chain, pool, token0 as Address, token1 as Address, Number(fee));
+      if (!matched) return null;
 
-      if ((factoryPool as string).toLowerCase() !== pool.toLowerCase()) return null;
-
-      return { feeTier: Number(fee), activeLiquidity: liquidity > 0n };
+      return { feeTier: Number(fee), activeLiquidity: liquidity > 0n, dex: matched };
     } catch {
       return null;
     }

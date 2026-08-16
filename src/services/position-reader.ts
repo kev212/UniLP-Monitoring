@@ -20,6 +20,7 @@ import {
 import type { PositionRangeInfo, PositionRecord, Protocol, TokenAmount } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import { amountsForLiquidity, applySlippage, sqrtRatioAtTick } from "./uniswap-math.js";
+import { dexNameFromMetadata, v3ContractsFor } from "./v3-deployment.js";
 
 export interface PositionValue {
   protocol: Protocol;
@@ -84,8 +85,9 @@ export class PositionReader {
   private async readV3(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number): Promise<PositionValue> {
     const registry = this.chains.getById(position.chainId).registry;
     const client = this.scanClient(position.chainId);
+    const contracts = v3ContractsFor(registry, dexNameFromMetadata(position.metadata));
     const details = (await client.readContract({
-      address: registry.contracts.v3.positionManager,
+      address: contracts.positionManager,
       abi: v3PositionManagerAbi,
       functionName: "positions",
       args: [BigInt(position.positionKey)],
@@ -95,7 +97,7 @@ export class PositionReader {
     if (liquidity === 0n) throw new Error("V3 position has zero liquidity");
 
     const poolAddress = await client.readContract({
-      address: registry.contracts.v3.factory,
+      address: contracts.factory,
       abi: v3FactoryAbi,
       functionName: "getPool",
       args: [token0, token1, fee],

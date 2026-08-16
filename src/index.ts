@@ -17,6 +17,7 @@ import { PositionOpener } from "./services/position-opener.js";
 import { GemScanner } from "./services/gem-scanner.js";
 import { PortfolioService } from "./services/portfolio.js";
 import { KyberSwapAggregatorApi } from "./services/kyberswap-aggregator-api.js";
+import { PancakeUniversalRouter } from "./services/pancake-universal-router.js";
 import { isRiskSettings, type RiskSettings } from "./types.js";
 
 async function main(): Promise<void> {
@@ -38,7 +39,8 @@ async function main(): Promise<void> {
   const discovery = new DiscoveryService(database, chains, config, notifier);
   const alchemyBootstrapper = new AlchemyBootstrapper(database, chains, discovery, config);
   const pnl = new PnlService(database, reader, routes, config, tradingApi, kyberswapApi);
-  const executor = new Executor(database, chains, reader, routes, notifier, config, tradingApi, kyberswapApi);
+  const pancakeUr = new PancakeUniversalRouter(chains, routes, config.settlementSwapSlippageBps);
+  const executor = new Executor(database, chains, reader, routes, notifier, config, tradingApi, kyberswapApi, pancakeUr);
   const guardian = new Guardian(config, database, chains, alchemyBootstrapper, discovery, pnl, executor, notifier);
   const scanner = new PoolScanner(chains, database);
   const positionOpener = new PositionOpener(
@@ -48,6 +50,7 @@ async function main(): Promise<void> {
     tradingApi,
     database,
     (chain, groupId, transactionHash, receipt) => discovery.reconcileKnownGroupOpen(chain, groupId, transactionHash, receipt),
+    (chain, receipt) => discovery.ingestOpenReceipt(chain, receipt),
   );
   const gemScanner = new GemScanner(chains, database, scanner, config.quoteTokens.robinhood);
   const portfolio = new PortfolioService(config, chains, database);
