@@ -100,4 +100,31 @@ describe("PositionReader block consistency", () => {
     expect(value.observedBlock).toBe(888n);
     expect(value.liquidity).toBe(10n);
   });
+
+  it("includes V3 tokens already owed by the position manager in fees", async () => {
+    const pool = "0x0000000000000000000000000000000000000005" as const;
+    const sqrtPriceX96 = 1n << 96n;
+    const client = {
+      readContract: async (request: { functionName: string }) => {
+        if (request.functionName === "positions") return [0n, owner, token0, token1, 3000, -60, 60, 100n, 0n, 0n, 7n, 9n] as const;
+        if (request.functionName === "getPool") return pool;
+        if (request.functionName === "slot0") return [sqrtPriceX96, 0] as const;
+        if (request.functionName === "feeGrowthGlobal0X128" || request.functionName === "feeGrowthGlobal1X128") return 0n;
+        if (request.functionName === "ticks") return [0n, 0n, 0n, 0n] as const;
+        throw new Error(`Unexpected function ${request.functionName}`);
+      },
+    };
+    const chains = { getById: () => ({ registry: { name: "base", contracts: { v3: { positionManager: pair, factory: pair } } }, client }), getForScan: () => ({ client }) } as never;
+    const reader = new PositionReader(chains, 100);
+    const position: PositionRecord = {
+      id: "position", chainId: 8453, protocol: "v3", positionKey: "1", owner,
+      poolAddress: null, token0, token1, quoteToken: token0, status: "armed",
+      liquidity: 100n, openedAtBlock: 1n, metadata: {},
+    };
+
+    const value = await reader.read(position, 777n);
+
+    expect(value.unclaimedFees0).toBe(7n);
+    expect(value.unclaimedFees1).toBe(9n);
+  });
 });

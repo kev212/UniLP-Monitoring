@@ -94,7 +94,7 @@ export class PositionReader {
       args: [BigInt(position.positionKey)],
       blockNumber,
     })) as readonly [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint];
-    const [, , token0, token1, fee, tickLower, tickUpper, liquidity, feeGrowthInside0Last, feeGrowthInside1Last] = details;
+    const [, , token0, token1, fee, tickLower, tickUpper, liquidity, feeGrowthInside0Last, feeGrowthInside1Last, tokensOwed0, tokensOwed1] = details;
     if (liquidity === 0n) throw new Error("V3 position has zero liquidity");
 
     const poolAddress = await client.readContract({
@@ -117,8 +117,8 @@ export class PositionReader {
     const currentTick = slot0[1];
     const feeGrowthInside0 = v3FeeGrowthInside(feeGrowthGlobal0, currentTick, tickLower, tickUpper, tickLowerData[2], tickUpperData[2]);
     const feeGrowthInside1 = v3FeeGrowthInside(feeGrowthGlobal1, currentTick, tickLower, tickUpper, tickLowerData[3], tickUpperData[3]);
-    const fee0 = feeOwed(liquidity, feeGrowthInside0, feeGrowthInside0Last);
-    const fee1 = feeOwed(liquidity, feeGrowthInside1, feeGrowthInside1Last);
+    const fee0 = tokensOwed0 + feeOwed(liquidity, feeGrowthInside0, feeGrowthInside0Last);
+    const fee1 = tokensOwed1 + feeOwed(liquidity, feeGrowthInside1, feeGrowthInside1Last);
     const principal = amountsForLiquidity(slot0[0], tickLower, tickUpper, liquidity);
 
     return {
