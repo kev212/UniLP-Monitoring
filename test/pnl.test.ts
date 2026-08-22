@@ -225,7 +225,7 @@ describe("fresh valuation quotes", () => {
 
     expect(tradingApi.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg);
     expect(routes.quoteDirect).not.toHaveBeenCalled();
-    expect(valued.snapshot.liquidationQuote).toBe(1_099_000n);
+    expect(valued.snapshot.liquidationQuote).toBe(1_100_000n);
   });
 
   it("uses only the local route for SL revalidation", async () => {
@@ -277,7 +277,7 @@ describe("fresh valuation quotes", () => {
 
     expect(tradingApi.quote).not.toHaveBeenCalled();
     expect(routes.quoteDirect).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg);
-    expect(valued.snapshot.liquidationQuote).toBe(1_099_000n);
+    expect(valued.snapshot.liquidationQuote).toBe(1_100_000n);
   });
 
   it("does not use an unrelated local route when native quote validation has no Kyber quote", async () => {
@@ -374,7 +374,7 @@ describe("fresh valuation quotes", () => {
 
     expect(kyberswap.quote).toHaveBeenCalledWith(position, froge, 10n ** 18n, native, 100);
     expect(routes.quoteDirect).not.toHaveBeenCalled();
-    expect(valued.snapshot.liquidationQuote).toBe(891_100n);
+    expect(valued.snapshot.liquidationQuote).toBe(900_100n);
   });
 
   it("uses native ETH as a quote token without an ERC-20 route", async () => {
@@ -556,10 +556,10 @@ describe("position group valuation fees", () => {
     const valued = await pnl.valueGroup(group, 10n);
 
     expect(valued.snapshot.feeQuote).toBe(120n);
-    expect(valued.snapshot.feeQuoteUsdg).toBe(118n);
+    expect(valued.snapshot.feeQuoteUsdg).toBe(120n);
     expect(database.addPositionGroupPnlSnapshot).toHaveBeenCalledWith(expect.objectContaining({
       feeQuote: 120n,
-      feeQuoteUsdg: 118n,
+      feeQuoteUsdg: 120n,
       quoteToken: weth,
     }));
   });

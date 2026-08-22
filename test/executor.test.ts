@@ -4,7 +4,7 @@ import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, keccak256
 import { v3PositionManagerAbi, v4PositionManagerAbi } from "../src/abi.js";
 import type { RuntimeConfig } from "../src/config.js";
 import { PANCAKE_PERMIT2 } from "../src/services/pancake-universal-router.js";
-import { bufferedGasLimit, Executor, effectiveRemoveSlippageBps, effectiveSettlementSlippageBps, groupSettlementPosition, isTransientRpcError, nextExitRetry, nextSwapRetry, permit2AllowanceReady, receiptErc20NetReceived } from "../src/services/executor.js";
+import { bufferedGasLimit, Executor, TransientCloseError, effectiveRemoveSlippageBps, effectiveSettlementSlippageBps, groupSettlementPosition, isTransientRpcError, nextExitRetry, nextSwapRetry, permit2AllowanceReady, receiptErc20NetReceived } from "../src/services/executor.js";
 import type { PositionGroupBinRecord, PositionGroupRecord, PositionRecord } from "../src/types.js";
 
 const usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as const;
@@ -262,8 +262,7 @@ describe("Executor pending settlement recovery", () => {
   it("settles an inactive V4 NFT as externally closed when liquidity is already zero", async () => {
     const database = {
       recoverVerifiedSettlement: vi.fn().mockResolvedValue(false),
-      setPositionStatusUnlessSettled: vi.fn().mockResolvedValue(true),
-      finalizeCloseHistory: vi.fn().mockResolvedValue(undefined),
+      settleUnverifiedZeroLiquidity: vi.fn().mockResolvedValue(true),
     };
     const readContract = vi.fn()
       .mockResolvedValueOnce(owner)
@@ -283,7 +282,7 @@ describe("Executor pending settlement recovery", () => {
     } as PositionRecord;
 
     await expect(executor.settleExternallyClosedV4(position)).resolves.toBe(true);
-    expect(database.setPositionStatusUnlessSettled).toHaveBeenCalledWith("position", "settled", expect.objectContaining({ reason: "externally_closed", totalReceived: "0" }));
+    expect(database.settleUnverifiedZeroLiquidity).toHaveBeenCalledWith("position", "externally_closed");
   });
 
   it("derives net ERC-20 proceeds from confirmed receipt transfers", () => {
@@ -374,6 +373,76 @@ describe("Executor pending settlement recovery", () => {
     }).assetReceivedFromReceipt(4663, zeroAddress, owner, hash, receipt)).resolves.toBe(100n);
     expect(client.getBalance).toHaveBeenNthCalledWith(1, { address: owner, blockNumber: 99n });
     expect(client.getBalance).toHaveBeenNthCalledWith(2, { address: owner, blockNumber: 100n });
+  });
+
+  it("counts native ETH outflows when auto-settling a V4 burn", async () => {
+    const database = {
+      addCashflow: vi.fn(),
+      recordExecution: vi.fn(),
+      setPositionStatus: vi.fn(),
+      finalizeCloseHistory: vi.fn().mockResolvedValue(undefined),
+    };
+    const notifier = { settled: vi.fn() };
+    const receipt = { status: "success", blockNumber: 100n, gasUsed: 5n, effectiveGasPrice: 3n, logs: [] };
+    const client = {
+      getTransactionReceipt: vi.fn().mockResolvedValue(receipt),
+      getBalance: vi.fn().mockResolvedValueOnce(1_000n).mockResolvedValueOnce(1_085n),
+      getTransaction: vi.fn().mockResolvedValue({ value: 0n }),
+      readContract: vi.fn().mockResolvedValue([1n << 96n, 0]),
+    };
+    const poolManager = "0x8366a39CC670B4001A1121B8F6A443A643e40951" as Address;
+    const chains = {
+      getById: vi.fn(() => ({
+        client,
+        registry: {
+          name: "robinhood",
+          nativeSymbol: "ETH",
+          wrappedSymbol: "WETH",
+          contracts: { v4: { poolManager, positionManager: "0x58daec3116aae6D93017bAAea7749052E8a04fA7", stateView: "0x00000000000000000000000000000000000000aa" } },
+        },
+      })),
+    };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, notifier as never, config);
+    vi.spyOn(executor as any, "findV4WithdrawalEvent").mockResolvedValue({ transactionHash: hash, blockNumber: 100n });
+    vi.spyOn(executor as any, "wethQuoteToken").mockReturnValue(null);
+    vi.spyOn(executor as any, "computeEthUsd").mockResolvedValue(2_030_000_000n);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "770179", owner, poolAddress: null,
+      token0: zeroAddress, token1: token, quoteToken: zeroAddress, status: "needs_review", liquidity: 0n,
+      openedAtBlock: 1n,
+      metadata: { salt: hash, currency0: zeroAddress, currency1: token, fee: 49900, tickSpacing: 200, hooks: zeroAddress },
+    } as PositionRecord;
+
+    await expect(executor.autoSettleZeroLiquidityV4("robinhood", position)).resolves.toBe(true);
+    expect(database.addCashflow).toHaveBeenCalledWith("position", 100n, hash, "withdrawal", 100n, expect.objectContaining({ token0Amount: "100", token1Amount: "0" }));
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "settled", expect.objectContaining({
+      totalReceived: "100",
+      settlementUsd: "2030000000",
+    }));
+    expect(notifier.settled).toHaveBeenCalled();
+  });
+
+  it("does not auto-settle a V4 burn when no token outflows can be reconstructed", async () => {
+    const database = { addCashflow: vi.fn(), setPositionStatus: vi.fn() };
+    const receipt = { status: "success", blockNumber: 100n, logs: [] };
+    const client = { getTransactionReceipt: vi.fn().mockResolvedValue(receipt) };
+    const chains = {
+      getById: vi.fn(() => ({
+        client,
+        registry: { name: "robinhood", contracts: { v4: { poolManager: "0x8366a39CC670B4001A1121B8F6A443A643e40951" } } },
+      })),
+    };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, { settled: vi.fn() } as never, config);
+    vi.spyOn(executor as any, "findV4WithdrawalEvent").mockResolvedValue({ transactionHash: hash, blockNumber: 100n });
+    vi.spyOn(executor as any, "assetReceivedFromReceipt").mockResolvedValue(0n);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
+      token0: zeroAddress, token1: token, quoteToken: zeroAddress, status: "needs_review", liquidity: 0n,
+      openedAtBlock: 1n, metadata: { salt: hash },
+    } as PositionRecord;
+
+    await expect(executor.autoSettleZeroLiquidityV4("robinhood", position)).resolves.toBe(false);
+    expect(database.setPositionStatus).not.toHaveBeenCalled();
   });
 
   it("increments retry attempts after a failed exit", () => {
@@ -519,12 +588,32 @@ describe("Executor pending settlement recovery", () => {
     expect(chains.getForScan).not.toHaveBeenCalled();
   });
 
+  it("uses the public-first scan client for Base execution preflight reads", () => {
+    const primaryClient = {};
+    const scanClient = {};
+    const executionClient = {};
+    const chains = {
+      getById: vi.fn(() => ({ client: primaryClient, registry: { name: "base" } })),
+      getForScan: vi.fn(() => ({ client: scanClient })),
+      getForExecution: vi.fn(() => ({ client: executionClient })),
+    };
+    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
+
+    const selected = (executor as any).executionReadClient(8453);
+
+    expect(selected).toBe(scanClient);
+    expect(chains.getForScan).toHaveBeenCalledWith("base");
+    expect(chains.getForExecution).not.toHaveBeenCalled();
+  });
+
   it("classifies provider rate limits and timeouts as transient RPC errors", () => {
     expect(isTransientRpcError(new Error("HTTP request failed: Status: 429 Too Many Requests"))).toBe(true);
     expect(isTransientRpcError(new Error("The operation was aborted due to timeout"))).toBe(true);
     expect(isTransientRpcError({ status: 429, message: "rate limited" })).toBe(true);
     expect(isTransientRpcError({ cause: { code: -32005, message: "resource unavailable" } })).toBe(true);
     expect(isTransientRpcError(new Error("unsupported block number 32436872"))).toBe(true);
+    expect(isTransientRpcError(new Error("HTTP request failed.\nStatus: 530"))).toBe(true);
+    expect(isTransientRpcError({ status: 530, message: "origin is unreachable" })).toBe(true);
     expect(isTransientRpcError(new Error("Execution reverted for an unknown reason"))).toBe(false);
   });
 
@@ -1204,6 +1293,87 @@ describe("Executor pending settlement recovery", () => {
     expect(routes.quoteDirect).not.toHaveBeenCalled();
   });
 
+  it("settles from the close receipt when a submitted swap is dropped and leftover is gone", async () => {
+    const serialized = stringToHex("pending-swap-tx");
+    const swapHash = keccak256(serialized);
+    const metadata = {
+      pendingSwap: { token, amount: "5" },
+      closeReceiptAccounted: true,
+      settlementQuoteFromClose: "1982164029",
+      settlementPhase: "pending_swap",
+      pendingRawTransaction: { stage: "swap_to_quote", hash: swapHash, serializedTransaction: serialized },
+    };
+    const database = {
+      claimSettlementLease: vi.fn().mockResolvedValue(true),
+      releaseSettlementLease: vi.fn(),
+      getPositionMetadata: vi.fn().mockResolvedValue(metadata),
+      getSubmittedSwapAttempt: vi.fn().mockResolvedValue(swapHash),
+      getConfirmedSwapAttempt: vi.fn().mockResolvedValue(null),
+      recordExecution: vi.fn(),
+      setPositionStatusUnlessSettled: vi.fn(),
+      setPositionStatus: vi.fn(),
+      finalizeCloseHistory: vi.fn().mockResolvedValue(true),
+    };
+    const client = { readContract: vi.fn().mockResolvedValue(0n) };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const notifier = { settled: vi.fn() };
+    const executor = new Executor(database as never, chains as never, {} as never, { quoteDirect: vi.fn() } as never, notifier as never, config);
+    vi.spyOn(executor as any, "getConfirmedReceipt").mockRejectedValue(new Error("not found"));
+    vi.spyOn(executor as any, "pendingRawIsStale").mockResolvedValue(true);
+    const rebroadcast = vi.spyOn(executor as any, "rebroadcastPendingTransaction").mockResolvedValue(undefined);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v3", positionKey: "729224", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata,
+    } as PositionRecord;
+
+    await executor.resume(position);
+
+    expect(rebroadcast).not.toHaveBeenCalled();
+    expect(database.recordExecution).toHaveBeenCalledWith("position", "swap_to_quote", "failed", swapHash, "signed swap was dropped before confirmation");
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "settled", expect.objectContaining({
+      pendingSwap: null,
+      settlementPhase: "settled",
+      pendingRawTransaction: null,
+    }));
+    expect(notifier.settled).toHaveBeenCalled();
+  });
+
+  it("rebroadcasts a submitted swap while its nonce is still pending", async () => {
+    const serialized = stringToHex("pending-swap-tx");
+    const swapHash = keccak256(serialized);
+    const metadata = {
+      pendingSwap: { token, amount: "5" },
+      closeReceiptAccounted: true,
+      settlementPhase: "pending_swap",
+      pendingRawTransaction: { stage: "swap_to_quote", hash: swapHash, serializedTransaction: serialized },
+    };
+    const database = {
+      claimSettlementLease: vi.fn().mockResolvedValue(true),
+      releaseSettlementLease: vi.fn(),
+      getPositionMetadata: vi.fn().mockResolvedValue(metadata),
+      getSubmittedSwapAttempt: vi.fn().mockResolvedValue(swapHash),
+      getConfirmedSwapAttempt: vi.fn().mockResolvedValue(null),
+      recordExecution: vi.fn(),
+      setPositionStatusUnlessSettled: vi.fn(),
+    };
+    const chains = { getById: vi.fn(() => ({ client: {}, registry: { name: "robinhood" } })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
+    vi.spyOn(executor as any, "getConfirmedReceipt").mockRejectedValue(new Error("not found"));
+    vi.spyOn(executor as any, "pendingRawIsStale").mockResolvedValue(false);
+    const rebroadcast = vi.spyOn(executor as any, "rebroadcastPendingTransaction").mockResolvedValue(undefined);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v3", positionKey: "1", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata,
+    } as PositionRecord;
+
+    await executor.resume(position);
+
+    expect(rebroadcast).toHaveBeenCalledWith(position, swapHash);
+    expect(database.recordExecution).not.toHaveBeenCalled();
+  });
+
   it("runs only one settlement worker per position", async () => {
     let releaseWork!: () => void;
     const gate = new Promise<void>((resolve) => { releaseWork = resolve; });
@@ -1348,8 +1518,8 @@ describe("Executor pending settlement recovery", () => {
 
     await executor.executeGroup(groupId, "manual");
 
-    expect(reader.read).toHaveBeenNthCalledWith(1, children[0], 100n, 200);
-    expect(reader.read).toHaveBeenNthCalledWith(2, children[1], 100n, 200);
+    expect(reader.read).toHaveBeenNthCalledWith(1, children[0], 100n, 200, "execution");
+    expect(reader.read).toHaveBeenNthCalledWith(2, children[1], 100n, 200, "execution");
     expect(sendGroup).toHaveBeenCalledTimes(1);
     const plan = sendGroup.mock.calls[0]![2] as { data: Hex };
     const outer = decodeFunctionData({ abi: v3PositionManagerAbi, data: plan.data });
@@ -2158,5 +2328,18 @@ describe("Executor pending settlement recovery", () => {
     expect(executePosition).toHaveBeenCalledTimes(2);
     expect(database.listActivePositions).toHaveBeenCalledTimes(1);
     expect(database.listPositionGroups).toHaveBeenCalledTimes(1);
+  });
+
+  it("queues a related-pair close when every target hits a transient RPC error", async () => {
+    const source = relatedPosition("727323", token, usdg, usdg);
+    const database = {
+      listActivePositions: vi.fn().mockResolvedValue([source]),
+      listPositionGroups: vi.fn().mockResolvedValue([]),
+    };
+    const chains = { getById: vi.fn(() => ({ registry: { name: "robinhood" } })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
+    vi.spyOn(executor, "execute").mockRejectedValue(new TransientCloseError("727323"));
+
+    await expect(executor.executeRelatedPosition(source, "manual")).rejects.toBeInstanceOf(TransientCloseError);
   });
 });

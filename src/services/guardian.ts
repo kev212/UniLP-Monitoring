@@ -13,6 +13,7 @@ import { quoteRangeState } from "./quote-range.js";
 
 const POSITION_EVALUATION_TIMEOUT_MS = 60_000;
 const TRAILING_HARD_FLOOR_DROP_BPS = 200n;
+const NEEDS_REVIEW_RETRY_BACKOFF_MS = 5 * 60_000;
 
 export class Guardian {
   private readonly lastEvaluatedBlock = new Map<number, bigint>();
@@ -108,12 +109,19 @@ export class Guardian {
     const positions = (await this.database.listOpenPositions(registry.chain.id))
       .filter((position) => position.status === "needs_review"
         && !isManagedGroupChild(position)
-        && !hasPendingSettlement(position.status, position.metadata));
+        && !hasPendingSettlement(position.status, position.metadata)
+        && needsReviewRetryReady(position.metadata));
 
     for (const position of positions) {
       let candidate = position;
       if (candidate.protocol === "v4" && await this.executor.settleExternallyClosedV4(candidate)) continue;
-      if (isInactiveReviewReason(candidate.metadata.reason)) continue;
+      if (isInactiveReviewReason(candidate.metadata.reason)) {
+        const settled = await this.database.settleUnverifiedZeroLiquidity(candidate.id, "externally_closed");
+        if (settled) {
+          log.info({ positionId: candidate.id, positionKey: candidate.positionKey }, "settled inactive needs_review position with zero on-chain liquidity");
+        }
+        continue;
+      }
       if (candidate.protocol === "v4") {
         try {
           const refreshed = await this.discovery.refreshV4Position(name, candidate);
@@ -123,10 +131,10 @@ export class Guardian {
           const message = error instanceof Error ? error.message : String(error);
           if (message.includes("NOT_MINTED")) {
             if (await this.executor.settleExternallyClosedV4(candidate)) continue;
-            const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(candidate.id, { reason: "nft_burned_unverified" });
-            log[reviewed ? "warn" : "info"](
+            const settled = await this.database.settleUnverifiedZeroLiquidity(candidate.id, "nft_burned");
+            log.info(
               { positionId: candidate.id, positionKey: candidate.positionKey },
-              reviewed ? "V4 NFT is burned without a verified settlement" : "V4 NFT is burned but settlement remains pending",
+              settled ? "settled burned V4 NFT without a reconstructed receipt" : "V4 NFT is burned but settlement remains pending",
             );
           }
           continue;
@@ -306,11 +314,12 @@ export class Guardian {
             action: trailing.action,
           }, "trailing stop updated");
         }
+        const firstArming = position.metadata.armedAtBlock === undefined || position.metadata.armedAtBlock === null;
         await this.database.setPositionStatus(position.id, "armed", {
           armedAtBlock: blockNumber.toString(),
           twapReady: valued.twapGuard.ready,
         });
-        await this.notifier.armed(position, valued.snapshot);
+        if (firstArming) await this.notifier.armed(position, valued.snapshot);
         return true;
       }
 
@@ -436,15 +445,24 @@ export class Guardian {
         }
         if (await this.executor.autoSettleZeroLiquidityV3(name, position)) return true;
         if (await this.executor.settleExternallyClosedV4(position)) return true;
-        const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(position.id, { reason: "on_chain_liquidity_zero_unverified" });
-        if (!reviewed) {
-          log.info({ positionId: position.id, positionKey: position.positionKey, reason: message }, "V4 liquidity is gone but settlement remains pending");
+        const settled = await this.database.settleUnverifiedZeroLiquidity(position.id, "externally_closed");
+        if (!settled) {
+          log.info({ positionId: position.id, positionKey: position.positionKey, reason: message }, "on-chain liquidity is gone but settlement remains pending");
           return true;
         }
-        log.warn({ positionId: position.id, reason: message }, "zero on-chain liquidity requires settlement review");
+        log.info({ positionId: position.id, positionKey: position.positionKey, reason: message }, "settled position with zero on-chain liquidity and no reconstructed receipt");
         return true;
       }
       if (message.includes("No safe direct Uniswap route") || message.includes("Native-currency")) {
+        const wasPreviouslyArmed = position.status === "armed"
+          || (position.metadata.armedAtBlock !== undefined && position.metadata.armedAtBlock !== null);
+        if (wasPreviouslyArmed) {
+          if (position.status !== "armed") {
+            await this.database.setPositionStatus(position.id, "armed", { reason: null });
+          }
+          log.warn({ positionId: position.id, reason: message }, "valuation route unavailable; retaining armed position");
+          return false;
+        }
         await this.database.setPositionStatus(position.id, "needs_review", { reason: message });
         log.warn({ positionId: position.id, reason: message }, "position requires review before arming");
         return true;
@@ -739,6 +757,13 @@ export class Guardian {
 function isManagedGroupChild(position: PositionRecord): boolean {
   return position.metadata.managedBy === "position_group"
     && typeof position.metadata.positionGroupId === "string";
+}
+
+function needsReviewRetryReady(metadata: Record<string, unknown>, now = Date.now()): boolean {
+  const retriedAt = typeof metadata.needsReviewRetriedAt === "string"
+    ? Date.parse(metadata.needsReviewRetriedAt)
+    : Number.NaN;
+  return !Number.isFinite(retriedAt) || now - retriedAt >= NEEDS_REVIEW_RETRY_BACKOFF_MS;
 }
 
 function sleep(ms: number): Promise<void> {

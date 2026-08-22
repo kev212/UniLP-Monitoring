@@ -65,6 +65,7 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseDashboardAction("lp:scan_chain:bsc:0")).toEqual({ type: "scan_chain", chain: "bsc", page: 0 });
     expect(chainButtonLabel("bsc")).toBe("BSC");
     expect(chainButtonLabel("robinhood")).toBe("Robinhood");
+    expect(chainButtonLabel("base")).toBe("Base");
     expect(["robinhood", "bsc"].includes("base")).toBe(false);
     expect(parseBidAskPoolInput("https://app.uniswap.org/explore/pools/base/0x0000000000000000000000000000000000000000000000000000000000000001", "base")).toBe("0x0000000000000000000000000000000000000000000000000000000000000001");
     expect(parseBidAskRangeInput("below 60")).toEqual({ direction: "below", rangePercent: 60 });
@@ -259,16 +260,16 @@ describe("Telegram dashboard callbacks", () => {
   });
 
   it("uses the normal price progress bar marker", () => {
-    expect(positionRangeLine(0n, 100n, 50n)).toEqual({ bar: "━━━━━│━━━━", percent: 50 });
+    expect(positionRangeLine(0n, 100n, 50n)).toEqual({ bar: "━━━━━━━│━━━━━━", percent: 50 });
   });
 
   it("keeps a 90% marker visibly distinct from the upper endpoint", () => {
-    expect(positionRangeLine(0n, 100n, 90n)).toEqual({ bar: "━━━━━━━━│━", percent: 90 });
-    expect(positionRangeLine(0n, 100n, 100n)).toEqual({ bar: "━━━━━━━━━│", percent: 100 });
+    expect(positionRangeLine(0n, 100n, 90n)).toEqual({ bar: "━━━━━━━━━━━━│━", percent: 90 });
+    expect(positionRangeLine(0n, 100n, 100n)).toEqual({ bar: "━━━━━━━━━━━━━│", percent: 100 });
   });
 
   it("rounds fractional progress instead of truncating bigint division", () => {
-    expect(positionRangeLine(0n, 1_000n, 907n)).toEqual({ bar: "━━━━━━━━│━", percent: 91 });
+    expect(positionRangeLine(0n, 1_000n, 907n)).toEqual({ bar: "━━━━━━━━━━━━│━", percent: 91 });
   });
 
   it("shows textual range status only outside the range", () => {

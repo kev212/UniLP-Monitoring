@@ -280,6 +280,97 @@ describe("pending settlement status recovery", () => {
   });
 });
 
+describe("valuation retry status handling", () => {
+  const position = {
+    id: "route-position",
+    chainId: 4663,
+    protocol: "v4" as const,
+    positionKey: "812384",
+    owner: "0x0000000000000000000000000000000000000001",
+    poolAddress: null,
+    token0: "0x0000000000000000000000000000000000000002",
+    token1: "0x0000000000000000000000000000000000000003",
+    quoteToken: "0x0000000000000000000000000000000000000002",
+    status: "syncing" as const,
+    liquidity: null,
+    openedAtBlock: null,
+    metadata: { armedAtBlock: "100" },
+  } satisfies PositionRecord;
+
+  const snapshot: PnlSnapshot = {
+    positionId: position.id,
+    quoteToken: position.quoteToken,
+    depositsQuote: 1_000n,
+    realizedQuote: 0n,
+    liquidationQuote: 1_000n,
+    pnlQuote: 0n,
+    pnlBps: 0n,
+    blockNumber: 10n,
+    liquidity: 1n,
+    feeQuote: 0n,
+    feeNonQuote: null,
+    feeQuoteUsdg: 0n,
+  };
+
+  it("keeps a previously armed position armed when a route quote is temporarily unavailable", async () => {
+    const database = { setPositionStatus: vi.fn().mockResolvedValue(undefined) };
+    const pnl = { value: vi.fn().mockRejectedValue(new Error("No safe direct Uniswap route from LP asset to quote token")) };
+    const guardian = new Guardian({} as RuntimeConfig, database as never, {} as never, {} as never, {} as never, pnl as never, {} as never, {} as never);
+
+    const result = await (guardian as unknown as {
+      evaluatePosition(name: "robinhood", position: PositionRecord, blockNumber: bigint): Promise<boolean>;
+    }).evaluatePosition("robinhood", position, 10n);
+
+    expect(result).toBe(false);
+    expect(database.setPositionStatus).toHaveBeenCalledWith("route-position", "armed", { reason: null });
+    expect(database.setPositionStatus).not.toHaveBeenCalledWith("route-position", "needs_review", expect.anything());
+  });
+
+  it("does not resend ARMED for a position that already has an armed block", async () => {
+    const database = {
+      addPnlSnapshot: vi.fn().mockResolvedValue(undefined),
+      setPositionStatus: vi.fn().mockResolvedValue(undefined),
+    };
+    const notifier = { logPnL: vi.fn().mockResolvedValue(undefined), armed: vi.fn().mockResolvedValue(undefined) };
+    const pnl = {
+      value: vi.fn().mockResolvedValue({ snapshot, range: undefined, twapGuard: { ready: true } }),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+    };
+    const guardian = new Guardian({} as RuntimeConfig, database as never, {} as never, {} as never, {} as never, pnl as never, {} as never, notifier as never);
+    vi.spyOn(guardian as any, "updateOorAboveTimer").mockResolvedValue(null);
+    vi.spyOn(guardian as any, "updateProfitOorAboveTimer").mockResolvedValue(null);
+
+    await (guardian as unknown as {
+      evaluatePosition(name: "robinhood", position: PositionRecord, blockNumber: bigint): Promise<boolean>;
+    }).evaluatePosition("robinhood", position, 10n);
+
+    expect(database.setPositionStatus).toHaveBeenCalledWith("route-position", "armed", expect.objectContaining({ armedAtBlock: "10" }));
+    expect(notifier.armed).not.toHaveBeenCalled();
+  });
+
+  it("backs off retrying a recently retried needs_review position", async () => {
+    const database = {
+      listOpenPositions: vi.fn().mockResolvedValue([{
+        ...position,
+        status: "needs_review",
+        metadata: { needsReviewRetriedAt: new Date().toISOString() },
+      }]),
+      setPositionStatus: vi.fn().mockResolvedValue(undefined),
+    };
+    const chains = {
+      get: vi.fn(() => ({
+        client: { getBlockNumber: vi.fn().mockResolvedValue(10n) },
+        registry: { chain: { id: 4663 }, monitoringEnabled: true },
+      })),
+    };
+    const guardian = new Guardian({} as RuntimeConfig, database as never, chains as never, {} as never, {} as never, {} as never, {} as never, {} as never);
+
+    await (guardian as unknown as { retryNeedsReview(name: "robinhood"): Promise<void> }).retryNeedsReview("robinhood");
+
+    expect(database.setPositionStatus).not.toHaveBeenCalled();
+  });
+});
+
 describe("stop-loss local quote validation", () => {
   const position = {
     id: "position",

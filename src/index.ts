@@ -57,6 +57,7 @@ async function main(): Promise<void> {
   notifier.setPositionOpener(positionOpener);
   notifier.setGemScanner(gemScanner);
   notifier.setPortfolioService(portfolio);
+  notifier.setDiscovery(discovery);
 
   notifier.registerCommands(database, pnl, executor, scanner);
 
@@ -72,7 +73,16 @@ async function main(): Promise<void> {
   }
   await guardian.validateNetworks();
   scanner.startCandidateRefresh([...config.quoteTokens.robinhood.map(({ address }) => address), zeroAddress], config.poolScanCandidatePages);
-  void executor.backfillStaleCloseHistoryUsd().catch(() => {});
+  void (async () => {
+    try {
+      await executor.backfillStaleCloseHistoryUsd();
+      await database.backfillPositionGroupHistory();
+      const written = await database.backfillSettledPositionHistory();
+      log.info({ written }, "settled-position history backfill complete");
+    } catch (error) {
+      log.warn({ err: error }, "settled-position history backfill failed");
+    }
+  })();
   log.info({ chains: config.chains, dryRun: config.dryRun }, "UniLP Guardian started");
 
   let botRunning = false;

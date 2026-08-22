@@ -47,7 +47,7 @@ export class ChainClients {
       ]);
       const normalTransport = createRpcTransport([
         ...publicEndpoints,
-        ...(config.alchemyHttp[name] ? [config.alchemyHttp[name]] : []),
+        ...(name !== "base" && config.alchemyHttp[name] ? [config.alchemyHttp[name]] : []),
       ]);
       this.clients.set(name, {
         registry,
@@ -62,7 +62,7 @@ export class ChainClients {
         config.rpcHttp[name],
         config.rpcHttpScanFallback?.[name],
         config.rpcHttpFallback[name],
-        ...(name === "bsc" && config.alchemyHttp.bsc ? [config.alchemyHttp.bsc] : []),
+        ...(name === "bsc" && config.alchemyHttp[name] ? [config.alchemyHttp[name]] : []),
       ]));
       this.scanClients.set(name, {
         registry,

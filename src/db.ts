@@ -1,6 +1,7 @@
 import { Pool, type PoolClient } from "pg";
 import type { Address } from "viem";
 
+import { log } from "./log.js";
 import type {
   CloseHistoryRecord,
   PnlCalendarMonth,
@@ -31,6 +32,7 @@ import type {
 import { normalizeToUsd6 } from "./services/token-meta.js";
 
 const HISTORY_MIN_PNL_BPS = 50n;
+const HISTORY_MIN_PNL_USD = 500_000n;
 const USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
 const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const USDT = "0x55d398326f99059ff775485246999027b3197955";
@@ -196,6 +198,9 @@ export class Database {
 
   constructor(connectionString: string) {
     this.pool = new Pool({ connectionString });
+    this.pool.on("error", (error) => {
+      log.warn({ err: error }, "idle postgres client error");
+    });
   }
 
   async connect(): Promise<void> {
@@ -918,12 +923,13 @@ export class Database {
     groupId?: string,
     limit = 1_000,
   ): Promise<PositionGroupHistoryBackfillCandidate[]> {
-    const values: unknown[] = [HISTORY_MIN_PNL_BPS.toString()];
+    const groupUsdExpr = `COALESCE(g.final_pnl_usd, CASE WHEN LOWER(g.quote_token) IN ('${USDG}', '${USDC}') THEN g.final_pnl_quote ELSE 0 END)`;
+    const values: unknown[] = [HISTORY_MIN_PNL_USD.toString(), HISTORY_MIN_PNL_BPS.toString()];
     const conditions = [
        "g.shape = 'bid_ask'",
        "g.status = 'settled'",
        "g.final_pnl_bps IS NOT NULL",
-       "ABS(g.final_pnl_bps) >= $1",
+       `(ABS(${groupUsdExpr}) >= $1 OR (${groupUsdExpr} = 0 AND ABS(g.final_pnl_bps) >= $2))`,
        "g.final_pnl_quote IS NOT NULL",
        "g.close_transaction_hash IS NOT NULL",
        "g.settled_at IS NOT NULL",
@@ -960,16 +966,17 @@ export class Database {
      }));
    }
 
-   async backfillPositionGroupHistory(groupIds?: string[]): Promise<number> {
-     if (groupIds && groupIds.length === 0) return 0;
-     return this.transaction(async (client) => {
-       const values: unknown[] = [HISTORY_MIN_PNL_BPS.toString()];
-       const conditions = [
-         "g.shape = 'bid_ask'",
-         "g.status = 'settled'",
-         "g.final_pnl_bps IS NOT NULL",
-         "ABS(g.final_pnl_bps) >= $1",
-         "g.final_pnl_quote IS NOT NULL",
+async backfillPositionGroupHistory(groupIds?: string[]): Promise<number> {
+    if (groupIds && groupIds.length === 0) return 0;
+    return this.transaction(async (client) => {
+      const groupUsdExpr = `COALESCE(g.final_pnl_usd, CASE WHEN LOWER(g.quote_token) IN ('${USDG}', '${USDC}') THEN g.final_pnl_quote ELSE 0 END)`;
+      const values: unknown[] = [HISTORY_MIN_PNL_USD.toString(), HISTORY_MIN_PNL_BPS.toString()];
+      const conditions = [
+        "g.shape = 'bid_ask'",
+        "g.status = 'settled'",
+        "g.final_pnl_bps IS NOT NULL",
+        `(ABS(${groupUsdExpr}) >= $1 OR (${groupUsdExpr} = 0 AND ABS(g.final_pnl_bps) >= $2))`,
+        "g.final_pnl_quote IS NOT NULL",
          "g.close_transaction_hash IS NOT NULL",
          "g.settled_at IS NOT NULL",
          "EXISTS (SELECT 1 FROM position_group_bins b WHERE b.group_id = g.id AND b.position_id IS NOT NULL)",
@@ -1037,13 +1044,14 @@ export class Database {
                    JOIN positions p ON p.id = b.position_id
                   WHERE b.group_id = g.id AND b.position_id IS NOT NULL
                )
-          FROM position_groups g
-         WHERE g.id = $1
-           AND g.shape = 'bid_ask'
-           AND g.status = 'settled'
-           AND g.final_pnl_bps IS NOT NULL
-           AND ABS(g.final_pnl_bps) >= $2
-           AND g.final_pnl_quote IS NOT NULL
+FROM position_groups g
+          WHERE g.id = $1
+            AND g.shape = 'bid_ask'
+            AND g.status = 'settled'
+            AND g.final_pnl_bps IS NOT NULL
+            AND (ABS(COALESCE(g.final_pnl_usd, CASE WHEN LOWER(g.quote_token) IN ('${USDG}', '${USDC}') THEN g.final_pnl_quote ELSE 0 END)) >= $2
+                 OR (COALESCE(g.final_pnl_usd, CASE WHEN LOWER(g.quote_token) IN ('${USDG}', '${USDC}') THEN g.final_pnl_quote ELSE 0 END) = 0 AND ABS(g.final_pnl_bps) >= 50))
+            AND g.final_pnl_quote IS NOT NULL
            AND g.close_transaction_hash IS NOT NULL
            AND g.settled_at IS NOT NULL
            AND EXISTS (
@@ -1075,7 +1083,7 @@ export class Database {
           settled_at = EXCLUDED.settled_at,
           opened_at_block = EXCLUDED.opened_at_block
         RETURNING id`,
-       [groupId, HISTORY_MIN_PNL_BPS.toString()],
+       [groupId, HISTORY_MIN_PNL_USD.toString()],
      );
      return result.rowCount === 1;
    }
@@ -1567,6 +1575,35 @@ export class Database {
     return result.rowCount === 1;
   }
 
+  async settleUnverifiedZeroLiquidity(positionId: string, reason: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE positions
+       SET status = 'settled',
+           metadata = (metadata - 'pendingSwap' - 'pendingRawTransaction' - 'settlementRetryDisabled')
+             || jsonb_build_object(
+               'reason', $2::text,
+               'settlementPhase', 'settled',
+               'closeReceiptAccounted', false,
+               'externallyClosedAt', NOW()::text
+             ),
+           updated_at = NOW()
+       WHERE id = $1
+         AND status NOT IN ('closing', 'settled')
+         AND (NOT (metadata ? 'pendingSwap') OR metadata->'pendingSwap' = 'null'::jsonb)
+         AND NOT EXISTS (
+           SELECT 1 FROM execution_attempts
+            WHERE execution_attempts.position_id = positions.id
+              AND execution_attempts.stage = 'remove_liquidity'
+              AND execution_attempts.status = 'confirmed'
+         )
+       RETURNING id`,
+      [positionId, reason],
+    );
+    if (!result.rowCount) return false;
+    await this.pool.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);
+    return true;
+  }
+
   async markNeedsReviewIfNoPendingSettlement(positionId: string, metadata: Record<string, unknown>): Promise<boolean> {
     const result = await this.pool.query(
       `UPDATE positions
@@ -1642,7 +1679,9 @@ export class Database {
     await this.pool.query(
       `INSERT INTO cashflows (position_id, block_number, transaction_hash, flow_type, quote_value, details)
        VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (position_id, transaction_hash, flow_type) DO NOTHING`,
+       ON CONFLICT (position_id, transaction_hash, flow_type) DO UPDATE
+         SET quote_value = EXCLUDED.quote_value, details = EXCLUDED.details
+       WHERE cashflows.quote_value < EXCLUDED.quote_value`,
       [positionId, blockNumber.toString(), transactionHash, flowType, quoteValue.toString(), JSON.stringify(details)],
     );
   }
@@ -2136,13 +2175,18 @@ export class Database {
   }
 
   async countCloseHistory(): Promise<number> {
-    const result = await this.pool.query<{ count: string }>("SELECT COUNT(*) AS count FROM close_history WHERE ABS(final_pnl_bps) >= 50");
+    const result = await this.pool.query<{ count: string }>(
+      `SELECT COUNT(*) AS count FROM close_history
+        WHERE ABS(final_pnl_usd) >= ${HISTORY_MIN_PNL_USD.toString()} OR (final_pnl_usd = 0 AND ABS(final_pnl_bps) >= ${HISTORY_MIN_PNL_BPS.toString()})`,
+    );
     return Number(result.rows[0]!.count);
   }
 
   async listCloseHistoryPage(limit: number, offset: number): Promise<CloseHistoryRecord[]> {
     const result = await this.pool.query<CloseHistoryRow>(
-      "SELECT * FROM close_history WHERE ABS(final_pnl_bps) >= 50 ORDER BY settled_at DESC LIMIT $1 OFFSET $2",
+      `SELECT * FROM close_history
+        WHERE ABS(final_pnl_usd) >= ${HISTORY_MIN_PNL_USD.toString()} OR (final_pnl_usd = 0 AND ABS(final_pnl_bps) >= ${HISTORY_MIN_PNL_BPS.toString()})
+        ORDER BY settled_at DESC LIMIT $1 OFFSET $2`,
       [limit, offset],
     );
     return result.rows.map(mapCloseHistory);
@@ -2266,7 +2310,7 @@ export class Database {
          FROM close_history
          WHERE settled_at >= $1
            AND settled_at < $2
-           AND ABS(final_pnl_bps) >= 50
+           AND (ABS(final_pnl_usd) >= ${HISTORY_MIN_PNL_USD.toString()} OR (final_pnl_usd = 0 AND ABS(final_pnl_bps) >= ${HISTORY_MIN_PNL_BPS.toString()}))
            AND final_pnl_usd <> 0
         GROUP BY 1
         ORDER BY 1`,
@@ -2289,22 +2333,27 @@ export class Database {
     };
   }
 
-  async finalizeCloseHistory(positionId: string, trigger: string): Promise<void> {
+  async finalizeCloseHistory(positionId: string, trigger: string): Promise<boolean> {
     const pos = await this.pool.query<{
       chain_id: number; protocol: Protocol; position_key: string; status: PositionStatus;
       token0: string; token1: string; quote_token: string;
       metadata: Record<string, unknown>;
       opened_at_block: string | null;
+      updated_at: Date | string;
     }>(
-      "SELECT chain_id, protocol, position_key, status, token0, token1, quote_token, metadata, opened_at_block FROM positions WHERE id = $1",
+      "SELECT chain_id, protocol, position_key, status, token0, token1, quote_token, metadata, opened_at_block, updated_at FROM positions WHERE id = $1",
       [positionId],
     );
-    if (!pos.rowCount) return;
+    if (!pos.rowCount) return false;
     const row = pos.rows[0]!;
-    if (row.status !== "settled") return;
+    if (row.status !== "settled") return false;
 
     const meta = row.metadata;
-    if (typeof meta.totalReceived !== "string") return;
+    if (meta.historyExcluded === true) {
+      await this.pool.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);
+      return false;
+    }
+    if (typeof meta.totalReceived !== "string") return false;
     const totalReceived = BigInt(meta.totalReceived);
 
     const attempts = await this.pool.query<{ stage: string; transaction_hash: string }>(
@@ -2315,24 +2364,21 @@ export class Database {
        ORDER BY stage, updated_at DESC`,
       [positionId],
     );
-    const closeTx = attempts.rows.find((attempt) => attempt.stage === "remove_liquidity")?.transaction_hash ?? null;
-    if (!closeTx) return;
+    const closeTx = attempts.rows.find((attempt) => attempt.stage === "remove_liquidity")?.transaction_hash
+      ?? (typeof meta.closeTransactionHash === "string" ? meta.closeTransactionHash : null);
+    if (!closeTx) return false;
     const metadataCloseTx = typeof meta.closeTransactionHash === "string" ? meta.closeTransactionHash : null;
-    if (metadataCloseTx && metadataCloseTx.toLowerCase() !== closeTx.toLowerCase()) return;
+    if (metadataCloseTx && metadataCloseTx.toLowerCase() !== closeTx.toLowerCase()) return false;
     const swapTx = attempts.rows.find((attempt) => attempt.stage === "swap_to_quote")?.transaction_hash ?? null;
     const closeSettlement = typeof meta.settlementQuoteFromClose === "string" ? BigInt(meta.settlementQuoteFromClose) : null;
     if (swapTx && closeSettlement !== null && totalReceived <= closeSettlement) {
       await this.pool.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);
-      return;
+      return false;
     }
     const totals = await this.getCashflowTotals(positionId, [closeTx, swapTx].filter((hash): hash is string => hash !== null));
-    if (totals.deposits === 0n) return;
+    if (totals.deposits === 0n) return false;
     const finalPnl = totals.realized + totalReceived - totals.deposits;
     const finalPnlBps = (finalPnl * 10000n) / totals.deposits;
-    if (finalPnlBps > -HISTORY_MIN_PNL_BPS && finalPnlBps < HISTORY_MIN_PNL_BPS) {
-      await this.pool.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);
-      return;
-    }
     const quoteTokenLower = row.quote_token.toLowerCase();
     const isSixDecimalStable = quoteTokenLower === USDG || quoteTokenLower === USDC;
     const isUsdt = quoteTokenLower === USDT;
@@ -2345,29 +2391,70 @@ export class Database {
         : isUsdt
           ? normalizeToUsd6(finalPnl, 18)
           : 0n;
+    const usdKnown = isSixDecimalStable || isUsdt || settlementUsd > 0n;
+    const belowHistoryThreshold = usdKnown
+      ? finalPnlUsd > -HISTORY_MIN_PNL_USD && finalPnlUsd < HISTORY_MIN_PNL_USD
+      : finalPnlBps > -HISTORY_MIN_PNL_BPS && finalPnlBps < HISTORY_MIN_PNL_BPS;
+    if (belowHistoryThreshold) {
+      await this.pool.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);
+      return false;
+    }
 
     const updated = await this.pool.query(
       `UPDATE close_history
-       SET final_pnl_bps = $2, final_pnl_quote = $3, final_pnl_usd = $4,
-            close_transaction_hash = COALESCE($5, close_transaction_hash),
-            swap_transaction_hash = COALESCE($6, swap_transaction_hash), opened_at_block = $7
+       SET final_pnl_bps = $2, final_pnl_quote = $3,
+             final_pnl_usd = CASE
+               WHEN $4::numeric = 0 AND close_history.final_pnl_usd <> 0 THEN close_history.final_pnl_usd
+               ELSE $4::numeric
+             END,
+             close_transaction_hash = COALESCE($5, close_transaction_hash),
+             swap_transaction_hash = COALESCE($6, swap_transaction_hash), opened_at_block = $7,
+             settled_at = COALESCE(settled_at, $8)
         WHERE position_id = $1`,
-      [positionId, finalPnlBps.toString(), finalPnl.toString(), finalPnlUsd.toString(), closeTx, swapTx, row.opened_at_block],
+      [positionId, finalPnlBps.toString(), finalPnl.toString(), finalPnlUsd.toString(), closeTx, swapTx, row.opened_at_block, row.updated_at],
     );
-    if (updated.rowCount) return;
+    if (updated.rowCount) return true;
 
     await this.pool.query(
       `INSERT INTO close_history (position_id, chain_id, protocol, position_key, token0, token1, quote_token,
          final_pnl_bps, final_pnl_quote, final_pnl_usd, trigger, close_transaction_hash, swap_transaction_hash, settled_at, opened_at_block)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), $14)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, COALESCE($14, NOW()), $15)`,
       [
         positionId, row.chain_id, row.protocol, row.position_key,
         row.token0, row.token1, row.quote_token,
         finalPnlBps.toString(), finalPnl.toString(), finalPnlUsd.toString(), trigger,
         closeTx, swapTx,
+        row.updated_at,
         row.opened_at_block,
       ],
     );
+    return true;
+  }
+
+  async backfillSettledPositionHistory(limit = 5_000): Promise<number> {
+    const result = await this.pool.query<{ id: string; trigger: string }>(
+      `SELECT p.id, COALESCE(NULLIF(p.metadata->>'exitTrigger', ''), 'settled') AS trigger
+         FROM positions p
+        WHERE p.status = 'settled'
+        ORDER BY p.updated_at DESC
+        LIMIT $1`,
+      [limit],
+    );
+    let kept = 0;
+    for (const row of result.rows) {
+      try {
+        if (await this.finalizeCloseHistory(row.id, row.trigger)) kept++;
+      } catch (error) {
+        log.warn({ err: error, positionId: row.id }, "settled-position history backfill failed");
+      }
+    }
+    const pruned = await this.pool.query(
+      `DELETE FROM close_history
+        WHERE final_pnl_usd <> 0
+          AND ABS(final_pnl_usd) < ${HISTORY_MIN_PNL_USD.toString()}`,
+    );
+    if (pruned.rowCount) log.info({ pruned: pruned.rowCount }, "pruned close history below ±$0.50");
+    return kept;
   }
 
   async listStaleCloseHistoryUsd(): Promise<{ id: string; positionGroupId: string | null; chainId: number; positionKey: string; finalPnlQuote: string; quoteToken: string; isNativeQuote: boolean; closeTransactionHash: string | null; swapTransactionHash: string | null }[]> {

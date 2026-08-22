@@ -6,6 +6,7 @@ import {
   toHex,
   zeroAddress,
   type Address,
+  type PublicClient,
 } from "viem";
 
 import {
@@ -43,17 +44,17 @@ export interface PositionValue {
 export class PositionReader {
   constructor(private readonly chains: ChainClients, private readonly slippageBps: number) {}
 
-  async read(position: PositionRecord, blockNumber?: bigint, removeSlippageBps?: number): Promise<PositionValue> {
-    const observedBlock = blockNumber ?? await this.scanClient(position.chainId).getBlockNumber();
+  async read(position: PositionRecord, blockNumber?: bigint, removeSlippageBps?: number, rpc: "scan" | "execution" = "scan"): Promise<PositionValue> {
+    const observedBlock = blockNumber ?? await this.rpcClient(position.chainId, rpc).getBlockNumber();
     const effective = removeSlippageBps ?? this.slippageBps;
-    if (position.protocol === "v2") return this.readV2(position, observedBlock, effective);
-    if (position.protocol === "v3") return this.readV3(position, observedBlock, effective);
-    return this.readV4(position, observedBlock, effective);
+    if (position.protocol === "v2") return this.readV2(position, observedBlock, effective, rpc);
+    if (position.protocol === "v3") return this.readV3(position, observedBlock, effective, rpc);
+    return this.readV4(position, observedBlock, effective, rpc);
   }
 
-  private async readV2(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number): Promise<PositionValue> {
+  private async readV2(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: "scan" | "execution" = "scan"): Promise<PositionValue> {
     if (!position.poolAddress) throw new Error("V2 position has no pair address");
-    const client = this.scanClient(position.chainId);
+    const client = this.rpcClient(position.chainId, rpc);
     const [balance, totalSupply, reserves] = await Promise.all([
       client.readContract({ address: position.poolAddress, abi: erc20Abi, functionName: "balanceOf", args: [position.owner], blockNumber }),
       client.readContract({ address: position.poolAddress, abi: v2PairAbi, functionName: "totalSupply", blockNumber }),
@@ -82,9 +83,9 @@ export class PositionReader {
     };
   }
 
-  private async readV3(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number): Promise<PositionValue> {
+  private async readV3(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: "scan" | "execution" = "scan"): Promise<PositionValue> {
     const registry = this.chains.getById(position.chainId).registry;
-    const client = this.scanClient(position.chainId);
+    const client = this.rpcClient(position.chainId, rpc);
     const contracts = v3ContractsFor(registry, dexNameFromMetadata(position.metadata));
     const details = (await client.readContract({
       address: contracts.positionManager,
@@ -138,9 +139,9 @@ export class PositionReader {
     };
   }
 
-  private async readV4(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number): Promise<PositionValue> {
+  private async readV4(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: "scan" | "execution" = "scan"): Promise<PositionValue> {
     const registry = this.chains.getById(position.chainId).registry;
-    const client = this.scanClient(position.chainId);
+    const client = this.rpcClient(position.chainId, rpc);
     const tokenId = BigInt(position.positionKey);
     const metadata = position.metadata as Record<string, unknown>;
     const poolKey = { currency0: metadata.currency0 as Address, currency1: metadata.currency1 as Address, fee: metadata.fee as number, tickSpacing: metadata.tickSpacing as number, hooks: metadata.hooks as Address };
@@ -194,8 +195,12 @@ export class PositionReader {
     };
   }
 
-  private scanClient(chainId: number) {
+  private rpcClient(chainId: number, source: "scan" | "execution" = "scan") {
     const { registry } = this.chains.getById(chainId);
+    if (source === "execution") {
+      const clients = this.chains as unknown as { getForExecution?: (name: typeof registry.name) => { client: PublicClient } };
+      if (typeof clients.getForExecution === "function") return clients.getForExecution(registry.name).client;
+    }
     return this.chains.getForScan(registry.name).client;
   }
 

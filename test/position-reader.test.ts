@@ -70,4 +70,34 @@ describe("PositionReader block consistency", () => {
     expect(value.minAmount0).toBe(95n);
     expect(value.minAmount1).toBe(190n);
   });
+
+  it("reads close valuations from the execution RPC", async () => {
+    const scanClient = { getBlockNumber: async () => 1n, readContract: async () => { throw new Error("scan"); } };
+    const executionClient = {
+      getBlockNumber: async () => 888n,
+      readContract: async (request: { functionName: string }) => {
+        if (request.functionName === "balanceOf") return 10n;
+        if (request.functionName === "totalSupply") return 100n;
+        if (request.functionName === "getReserves") return [1_000n, 2_000n, 123n] as const;
+        throw new Error();
+      },
+    };
+    const getForExecution = () => ({ client: executionClient });
+    const chains = {
+      getById: () => ({ registry: { name: "base" }, client: scanClient }),
+      getForScan: () => ({ client: scanClient }),
+      getForExecution,
+    } as never;
+    const reader = new PositionReader(chains, 100);
+    const position: PositionRecord = {
+      id: "position", chainId: 8453, protocol: "v2", positionKey: pair, owner,
+      poolAddress: pair, token0, token1, quoteToken: token0, status: "armed",
+      liquidity: 10n, openedAtBlock: 1n, metadata: {},
+    };
+
+    const value = await reader.read(position, undefined, undefined, "execution");
+
+    expect(value.observedBlock).toBe(888n);
+    expect(value.liquidity).toBe(10n);
+  });
 });

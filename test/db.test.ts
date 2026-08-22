@@ -367,7 +367,7 @@ describe("Database native USD backfill", () => {
       days: [{ date: "2026-07-01", pnlUsd: 1250000n, closeCount: 2, winCount: 1 }],
     });
     expect(query.mock.calls[0]![0]).toContain("settled_at AT TIME ZONE 'UTC'");
-    expect(query.mock.calls[0]![0]).toContain("ABS(final_pnl_bps) >= 50");
+    expect(query.mock.calls[0]![0]).toContain("ABS(final_pnl_usd) >= 500000");
     expect(query.mock.calls[0]![0]).not.toContain("LIMIT");
   });
 
@@ -379,7 +379,7 @@ describe("Database native USD backfill", () => {
     await database.listCloseHistoryPage(6, 12);
 
     expect(query.mock.calls[0]![0]).toContain("LIMIT $1 OFFSET $2");
-    expect(query.mock.calls[0]![0]).toContain("ABS(final_pnl_bps) >= 50");
+    expect(query.mock.calls[0]![0]).toContain("ABS(final_pnl_usd) >= 500000");
     expect(query.mock.calls[0]![1]).toEqual([6, 12]);
   });
 
@@ -430,9 +430,9 @@ describe("Database native USD backfill", () => {
       finalPnlBps: 50n,
       settledAt: new Date("2026-08-08T00:00:00Z"),
     }]);
-    expect(query.mock.calls[0]![0]).toContain("ABS(g.final_pnl_bps) >= $1");
+    expect(query.mock.calls[0]![0]).toContain("COALESCE(g.final_pnl_usd, CASE WHEN LOWER(g.quote_token) IN");
     expect(query.mock.calls[0]![0]).toContain("h.position_group_id = g.id");
-    expect(query.mock.calls[0]![1]).toEqual(["50", "group", 1_000]);
+    expect(query.mock.calls[0]![1]).toEqual(["500000", "50", "group", 1_000]);
   });
 
   it("backfills group history atomically and idempotently by group ID", async () => {
@@ -447,7 +447,7 @@ describe("Database native USD backfill", () => {
 
     await expect(database.backfillPositionGroupHistory(["group"])).resolves.toBe(1);
     expect(clientQuery.mock.calls[2]![0]).toContain("ON CONFLICT (position_group_id)");
-    expect(clientQuery.mock.calls[2]![1]).toEqual(["group", "50"]);
+    expect(clientQuery.mock.calls[2]![1]).toEqual(["group", "500000"]);
   });
 
   it("includes accrued snapshot fees in PnL card details", async () => {
@@ -549,6 +549,23 @@ describe("Database native USD backfill", () => {
     expect(query).toHaveBeenCalledTimes(1);
   });
 
+  it("removes manually excluded settlement history instead of recreating it", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{
+        chain_id: 4663, protocol: "v4", position_key: "position", status: "settled",
+        token0: "0xtoken0", token1: "0xtoken1", quote_token: "0xquote",
+        metadata: { historyExcluded: true }, opened_at_block: null, updated_at: "2026-08-12T00:00:00Z",
+      }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.finalizeCloseHistory("position", "manual")).resolves.toBe(false);
+
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls[1]).toEqual(["DELETE FROM close_history WHERE position_id = $1", ["position"]]);
+  });
+
   it("excludes close-transaction cashflows from final settlement PnL", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn()
@@ -556,10 +573,11 @@ describe("Database native USD backfill", () => {
         chain_id: 4663, protocol: "v4", position_key: "position", status: "settled",
         token0: "0x5fc5360d0400a0fd4f2af552add042d716f1d168", token1: "0xtoken",
         quote_token: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
-        metadata: { totalReceived: "10000", closeTransactionHash: "0xclose" }, opened_at_block: null,
+        metadata: { totalReceived: "1600000", closeTransactionHash: "0xclose" }, opened_at_block: null,
+        updated_at: "2026-08-12T06:27:42Z",
       }] })
       .mockResolvedValueOnce({ rows: [{ stage: "remove_liquidity", transaction_hash: "0xclose" }] })
-      .mockResolvedValueOnce({ rows: [{ deposits: "10000", realized: "50" }] })
+      .mockResolvedValueOnce({ rows: [{ deposits: "1000000", realized: "50000" }] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [] });
     Object.defineProperty(database, "pool", { value: { query } });
 
@@ -567,10 +585,13 @@ describe("Database native USD backfill", () => {
 
     expect(query.mock.calls[2]![0]).toContain("transaction_hash <> ALL");
     expect(query.mock.calls[2]![1]).toEqual(["position", ["0xclose"]]);
-    expect(query.mock.calls[3]![1].slice(0, 5)).toEqual(["position", "50", "50", "50", "0xclose"]);
+    expect(query.mock.calls[3]![0]).toContain("$4::numeric = 0 AND close_history.final_pnl_usd <> 0");
+    expect(query.mock.calls[3]![0]).toContain("settled_at = COALESCE(settled_at, $8)");
+    expect(query.mock.calls[3]![1].slice(0, 5)).toEqual(["position", "6500", "650000", "650000", "0xclose"]);
+    expect(query.mock.calls[3]![1][7]).toEqual("2026-08-12T06:27:42Z");
   });
 
-  it("removes stale history for a manual close below the ±0.5% threshold", async () => {
+  it("removes stale history for a manual close below the ±$0.50 threshold", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn()
       .mockResolvedValueOnce({ rowCount: 1, rows: [{
@@ -590,21 +611,29 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[3]![0]).toContain("DELETE FROM close_history");
   });
 
-  it("does not finalize history before the close receipt is confirmed", async () => {
+  it("finalizes history from the metadata close hash when execution attempts are missing", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn()
       .mockResolvedValueOnce({ rowCount: 1, rows: [{
         chain_id: 4663, protocol: "v4", position_key: "position", status: "settled",
         token0: "0x5fc5360d0400a0fd4f2af552add042d716f1d168", token1: "0xtoken",
         quote_token: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
-        metadata: { totalReceived: "10000", closeTransactionHash: "0xclose" }, opened_at_block: null,
+        metadata: { totalReceived: "1600000", closeTransactionHash: "0xclose" }, opened_at_block: null,
+        updated_at: "2026-08-12T06:27:42Z",
       }] })
-      .mockResolvedValueOnce({ rows: [] });
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ deposits: "1000000", realized: "50000" }] })
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] });
     Object.defineProperty(database, "pool", { value: { query } });
 
     await database.finalizeCloseHistory("position", "manual");
 
-    expect(query).toHaveBeenCalledTimes(2);
+    expect(query).toHaveBeenCalledTimes(5);
+    expect(query.mock.calls[3]![1].slice(0, 5)).toEqual(["position", "6500", "650000", "650000", "0xclose"]);
+    expect(query.mock.calls[4]![0]).toContain("INSERT INTO close_history");
+    expect(query.mock.calls[4]![1].slice(11, 15)).toEqual([
+      "0xclose", null, "2026-08-12T06:27:42Z", null,
+    ]);
   });
 
   it("removes history when a confirmed swap is missing from the settlement total", async () => {
@@ -627,6 +656,19 @@ describe("Database native USD backfill", () => {
 
     expect(query).toHaveBeenCalledTimes(3);
     expect(query.mock.calls[2]![0]).toContain("DELETE FROM close_history");
+  });
+
+  it("settles unverified zero-liquidity without writing close history", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "position" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.settleUnverifiedZeroLiquidity("position", "externally_closed")).resolves.toBe(true);
+    expect(query.mock.calls[0]![0]).toContain("status = 'settled'");
+    expect(query.mock.calls[0]![0]).toContain("status NOT IN ('closing', 'settled')");
+    expect(query.mock.calls[1]![0]).toContain("DELETE FROM close_history");
   });
 
   it("does not send a closing position to review from stale burn detection", async () => {

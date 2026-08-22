@@ -1,7 +1,7 @@
 import "dotenv/config";
 
 import { readFileSync } from "node:fs";
-import { isAddress, type Address, type Hex } from "viem";
+import { getAddress, isAddress, type Address, type Hex } from "viem";
 import { z } from "zod";
 
 import type { ChainName, PoolScanSettings, QuoteToken } from "./types.js";
@@ -212,7 +212,7 @@ function parseQuoteTokens(value: string, field: string): QuoteToken[] {
     const normalized = address.toLowerCase();
     if (seen.has(normalized)) throw new Error(`${field} has a duplicate token address`);
     seen.add(normalized);
-    return { symbol: symbol.toUpperCase(), address: address as Address };
+    return { symbol: symbol.toUpperCase(), address: getAddress(normalized) };
   });
 }
 

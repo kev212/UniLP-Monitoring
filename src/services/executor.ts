@@ -62,7 +62,7 @@ import { hasPendingSettlement } from "./pending-settlement.js";
 import { buildSwapPlan } from "./swap-builder.js";
 import { buildV3BidAskClosePlan, buildV4BidAskClosePlan, type V4PoolKey } from "./bid-ask-batch.js";
 import { receiptTokenTransfers } from "./discovery.js";
-import { applySlippage } from "./uniswap-math.js";
+import { applySlippage, isUsableSqrtPrice, quoteValueAtSqrtPrice, sqrtRatioAtTick } from "./uniswap-math.js";
 import { isUsdStableSymbol, normalizeToUsd6 } from "./token-meta.js";
 import { dexNameFromMetadata, v3ContractsFor } from "./v3-deployment.js";
 
@@ -126,6 +126,14 @@ class GroupIntegrityError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "GroupIntegrityError";
+  }
+}
+
+export class TransientCloseError extends Error {
+  constructor(readonly positionKey: string, cause?: unknown) {
+    super(`RPC down, close #${positionKey} queued`);
+    this.name = "TransientCloseError";
+    if (cause !== undefined) this.cause = cause;
   }
 }
 
@@ -334,18 +342,28 @@ export class Executor {
     }
 
     const failures: string[] = [];
+    const transients: string[] = [];
     for (const target of targets) {
       try {
         if (target.kind === "group") await this.executeGroup(target.value.id, trigger);
         else await this.execute(target.value, trigger);
       } catch (error) {
         const id = target.kind === "group" ? target.value.id : target.value.positionKey;
-        failures.push(`${target.kind}:${id}`);
-        log.warn({ err: error, pairKey, trigger, target: id, targetKind: target.kind }, "related pair close target failed");
+        if (error instanceof TransientCloseError || isTransientRpcError(error)) {
+          transients.push(`${target.kind}:${id}`);
+          log.warn({ err: error, pairKey, trigger, target: id, targetKind: target.kind }, "related pair close target deferred after transient RPC error");
+        } else {
+          failures.push(`${target.kind}:${id}`);
+          log.warn({ err: error, pairKey, trigger, target: id, targetKind: target.kind }, "related pair close target failed");
+        }
       }
     }
     if (failures.length > 0) {
       throw new Error(`related pair close had ${failures.length} failed target(s): ${failures.join(", ")}`);
+    }
+    if (transients.length > 0) {
+      const key = origin.kind === "position" ? origin.value.positionKey : origin.value.id;
+      throw new TransientCloseError(key);
     }
   }
 
@@ -373,13 +391,24 @@ export class Executor {
       exitAttempts,
     );
 
-    const value = await this.reader.read(position, undefined, removeSlippageBps);
+    let value: PositionValue;
+    let preCloseBalance: bigint;
+    try {
+      const source = this.chains.getById(position.chainId).registry.name === "base" ? "scan" : "execution";
+      value = await this.reader.read(position, undefined, removeSlippageBps, source);
+      preCloseBalance = await this.assetBalance(position.chainId, this.config.executorAddress, position.quoteToken);
+    } catch (error) {
+      if (isTransientRpcError(error)) {
+        await this.queueTransientClose(position, trigger, retryMetadata, error);
+        throw new TransientCloseError(position.positionKey, error);
+      }
+      throw error;
+    }
     log.info({ positionKey: position.positionKey, exitAttempts, removeSlippageBps }, "close attempt with adaptive slippage");
     const quoteIsToken0 = value.token0.token.toLowerCase() === position.quoteToken.toLowerCase();
     const quotePrincipal = quoteIsToken0 ? value.token0.amount : value.token1.amount;
     const quoteFee = quoteIsToken0 ? value.unclaimedFees0 : value.unclaimedFees1;
     const settlementQuoteFromClose = quotePrincipal + quoteFee;
-    const preCloseBalance = await this.assetBalance(position.chainId, this.config.executorAddress, position.quoteToken);
     const closingMetadata = {
       ...position.metadata,
       exitStartedAt: new Date().toISOString(),
@@ -459,6 +488,10 @@ export class Executor {
             lastExecutionError: error.message,
           });
           return;
+        }
+        if (isTransientRpcError(error)) {
+          await this.queueTransientClose(position, trigger, retryMetadata, error);
+          throw new TransientCloseError(position.positionKey, error);
         }
         const message = errorMessage(error);
         await this.database.recordExecution(position.id, "remove_liquidity", "failed", undefined, message);
@@ -631,16 +664,30 @@ export class Executor {
     if (!quoteToken) return;
 
     let retry = swapRetryState(position.metadata);
+    let droppedStaleSwap = false;
     const submittedSwap = await this.database.getSubmittedSwapAttempt(position.id);
     if (submittedSwap) {
-      let receipt: TransactionReceipt;
+      let receipt: TransactionReceipt | undefined;
       try {
         receipt = await this.getConfirmedReceipt(position.chainId, submittedSwap as Hex);
       } catch {
-        await this.rebroadcastPendingTransaction(position, submittedSwap as Hex);
-        log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "swap was broadcast but receipt is not yet available");
-        return;
+        const pendingRaw = parsePendingRawTransaction(position.metadata.pendingRawTransaction);
+        const pendingMatches = pendingRaw !== null && pendingRaw.hash.toLowerCase() === submittedSwap.toLowerCase();
+        if (pendingMatches && await this.pendingRawIsStale(position, pendingRaw)) {
+          await this.database.recordExecution(position.id, "swap_to_quote", "failed", submittedSwap, "signed swap was dropped before confirmation");
+          await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+            pendingRawTransaction: null,
+            lastExecutionError: `swap_to_quote dropped before confirmation: ${submittedSwap}`,
+          });
+          position = { ...position, metadata: { ...position.metadata, pendingRawTransaction: null } };
+          droppedStaleSwap = true;
+        } else {
+          await this.rebroadcastPendingTransaction(position, submittedSwap as Hex);
+          log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "swap was broadcast but receipt is not yet available");
+          return;
+        }
       }
+      if (!droppedStaleSwap && receipt) {
       if (receipt.status === "success") {
         await this.database.recordExecution(position.id, "swap_to_quote", "confirmed", submittedSwap);
         await this.completeSettlement(position, 0n, submittedSwap as Hex, submittedSwap);
@@ -666,6 +713,7 @@ export class Executor {
         this.scheduleSettlementRetry(position, retry);
         return;
       }
+      }
     }
 
     const confirmedSwap = await this.database.getConfirmedSwapAttempt(position.id);
@@ -682,6 +730,11 @@ export class Executor {
 
     const actualBalance = await this.tokenBalance(position.chainId, pending.token);
     if (actualBalance < pending.amount) {
+      if (droppedStaleSwap && position.metadata.closeReceiptAccounted === true) {
+        log.info({ positionId: position.id, positionKey: position.positionKey, pendingAmount: pending.amount.toString(), actualBalance: actualBalance.toString() }, "leftover swap token missing after dropped swap; settling from close receipt");
+        await this.completeSettlement(position);
+        return;
+      }
       const closeReceiptTrusted = position.metadata.closeReceiptAccounted === true
         && retry.broadcastAttempts === 0
         && retry.planningFailures === 0
@@ -898,7 +951,7 @@ export class Executor {
     if (missingPositionId) throw new GroupIntegrityError(`Active child position ${missingPositionId} is unavailable`);
 
     const { registry } = this.chains.getById(group.chainId);
-    const { client } = this.scanChain(registry.name);
+    const { client } = registry.name === "base" ? this.scanChain(registry.name) : this.executionChain(registry.name);
     const blockNumber = await client.getBlockNumber();
     const removeSlippageBps = effectiveRemoveSlippageBps(
       this.config.removeLiquiditySlippageBps,
@@ -907,9 +960,10 @@ export class Executor {
     );
     let values: PositionValue[];
     try {
-      values = await Promise.all(activeBins.map((bin) => this.reader.read(byId.get(bin.positionId!)!, blockNumber, removeSlippageBps)));
+      const source = registry.name === "base" ? "scan" : "execution";
+      values = await Promise.all(activeBins.map((bin) => this.reader.read(byId.get(bin.positionId!)!, blockNumber, removeSlippageBps, source)));
     } catch (error) {
-      if (isTransientRpcError(error)) throw error;
+      if (isTransientRpcError(error)) throw new TransientCloseError(group.id, error);
       throw new GroupIntegrityError(`Could not validate active child state at block ${blockNumber}: ${errorMessage(error)}`);
     }
 
@@ -1629,7 +1683,7 @@ export class Executor {
   }
 
   private simulateGroupPlan(group: PositionGroupRecord, plan: TransactionPlan): Promise<unknown> {
-    return this.executorClient(plan.chainId).call({ account: group.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n });
+    return this.executionReadClient(plan.chainId).call({ account: group.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n });
   }
 
   private async ensureGroupSettlementApproval(
@@ -1765,7 +1819,7 @@ export class Executor {
   private async sendGroupUnlocked(group: PositionGroupRecord, stage: "approve_quote" | "permit2_approve" | "close_batch" | "settlement_swap" | "unwrap_quote", plan: TransactionPlan): Promise<Hex | null> {
     const { registry } = this.chains.getById(plan.chainId);
     const client = this.executorClient(plan.chainId);
-    await client.call({ account: group.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n });
+    await this.executionReadClient(plan.chainId).call({ account: group.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n });
     await this.database.recordPositionGroupExecution(group.id, stage, "planned");
     if (this.config.dryRun) {
       log.info({ groupId: group.id, stage, to: plan.to, description: plan.description }, "dry-run group transaction simulated");
@@ -2232,23 +2286,23 @@ export class Executor {
       });
       if (liquidity > 0n) return true;
       if (await this.settleExternallyClosedV4(position)) return false;
-      const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(position.id, { reason: "on_chain_liquidity_zero_unverified" });
-      if (!reviewed) {
+      const settled = await this.database.settleUnverifiedZeroLiquidity(position.id, "externally_closed");
+      if (!settled) {
         log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 liquidity is gone but settlement remains pending");
         return false;
       }
-      log.warn({ positionId: position.id, positionKey: position.positionKey }, "V4 position has zero liquidity without a verified settlement");
+      log.info({ positionId: position.id, positionKey: position.positionKey }, "settled V4 position with zero on-chain liquidity and no reconstructed receipt");
       return false;
     } catch (error) {
       const message = errorMessage(error);
       if (!message.includes("NOT_MINTED")) throw error;
       if (await this.settleExternallyClosedV4(position)) return false;
-      const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(position.id, { reason: "nft_burned_unverified" });
-      if (!reviewed) {
+      const settled = await this.database.settleUnverifiedZeroLiquidity(position.id, "nft_burned");
+      if (!settled) {
         log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 NFT is burned but settlement remains pending");
         return false;
       }
-      log.warn({ positionId: position.id, positionKey: position.positionKey }, "V4 NFT is burned without a verified settlement");
+      log.info({ positionId: position.id, positionKey: position.positionKey }, "settled burned V4 NFT without a reconstructed receipt");
       return false;
     }
   }
@@ -2284,18 +2338,8 @@ export class Executor {
     }
     if (!reason) return false;
 
-    const existingTotal = typeof position.metadata.totalReceived === "string" ? position.metadata.totalReceived : "0";
-    const settled = await this.database.setPositionStatusUnlessSettled(position.id, "settled", {
-      reason,
-      totalReceived: existingTotal,
-      closeReceiptAccounted: false,
-    });
+    const settled = await this.database.settleUnverifiedZeroLiquidity(position.id, reason);
     if (!settled) return false;
-    this.finalizeCloseHistory({
-      ...position,
-      status: "settled",
-      metadata: { ...position.metadata, totalReceived: existingTotal, reason },
-    });
     log.info({ positionId: position.id, positionKey: position.positionKey, reason }, "settled inactive V4 position without a reconstructed close receipt");
     return true;
   }
@@ -2785,7 +2829,7 @@ export class Executor {
   }
 
   private simulatePlan(position: PositionRecord, plan: TransactionPlan): Promise<unknown> {
-    return this.executorClient(plan.chainId).call({ account: position.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n });
+    return this.executionReadClient(plan.chainId).call({ account: position.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n });
   }
 
   private closePlan(position: PositionRecord, value: Awaited<ReturnType<PositionReader["read"]>>): TransactionPlan {
@@ -2936,6 +2980,13 @@ export class Executor {
     return executionClient;
   }
 
+  private executionReadClient(chainId: number): PublicClient {
+    const { registry } = this.chains.getById(chainId);
+    // Keep Base broadcasts on Alchemy, but route read-only execution preflight
+    // through dRPC/public RPC with Alchemy only as a transport fallback.
+    return registry.name === "base" ? this.scanChain("base").client : this.executorClient(chainId);
+  }
+
   private executionChain(name: Parameters<ChainClients["getForExecution"]>[0]): ChainClient {
     const clients = this.chains as unknown as {
       getForExecution?: (chain: Parameters<ChainClients["getForExecution"]>[0]) => ChainClient;
@@ -2971,7 +3022,7 @@ export class Executor {
   private async sendUnlocked(position: PositionRecord, stage: string, plan: TransactionPlan): Promise<Hex | null> {
     const { registry } = this.chains.getById(plan.chainId);
     const client = this.executorClient(plan.chainId);
-    await client.call({ account: position.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n });
+    await this.executionReadClient(plan.chainId).call({ account: position.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n });
     await this.database.recordExecution(position.id, stage, "planned");
     if (this.config.dryRun) {
       log.info({ positionId: position.id, stage, to: plan.to, description: plan.description }, "dry-run transaction simulated");
@@ -2989,7 +3040,7 @@ export class Executor {
       ? { ...preparedRequest, gas: bufferedGasLimit(preparedRequest.gas, this.config.swapGasLimitMultiplierPercent) }
       : preparedRequest;
     if (stage === "swap_to_quote") {
-      await client.call({ account: position.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n, gas: request.gas });
+      await this.executionReadClient(plan.chainId).call({ account: position.owner, to: plan.to, data: plan.data, value: plan.value ?? 0n, gas: request.gas });
       log.info({ positionId: position.id, positionKey: position.positionKey, estimatedGas: preparedRequest.gas, gasLimit: request.gas }, "swap gas limit buffered");
     }
     const serializedTransaction = await wallet.signTransaction(request);
@@ -3046,7 +3097,7 @@ export class Executor {
       return false;
     } catch (error) {
       if (errorMessage(error).includes("transaction reverted")) throw error;
-      if (await this.pendingApprovalIsStale(position, pending)) {
+      if (await this.pendingRawIsStale(position, pending)) {
         await this.database.recordExecution(position.id, pending.stage, "failed", pending.hash, "signed approval was dropped before confirmation");
         await this.database.setPositionStatusUnlessSettled(position.id, "closing", { pendingRawTransaction: null });
         log.warn({ positionId: position.id, positionKey: position.positionKey, stage: pending.stage, hash: pending.hash }, "cleared stale pending approval for a fresh settlement attempt");
@@ -3057,7 +3108,7 @@ export class Executor {
     }
   }
 
-  private async pendingApprovalIsStale(position: PositionRecord, pending: PendingRawTransaction): Promise<boolean> {
+  private async pendingRawIsStale(position: PositionRecord, pending: PendingRawTransaction): Promise<boolean> {
     let nonce: bigint;
     try {
       const transaction = parseTransaction(pending.serializedTransaction);
@@ -3141,7 +3192,7 @@ export class Executor {
 
   private async assetBalance(chainId: number, owner: Address, token: Address): Promise<bigint> {
     const nativeClient = this.chains.getById(chainId).client;
-    const executorClient = this.executorClient(chainId);
+    const executorClient = this.executionReadClient(chainId);
     const read = (client: PublicClient) => token.toLowerCase() === zeroAddress
       ? client.getBalance({ address: owner })
       : client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
@@ -3155,7 +3206,7 @@ export class Executor {
 
   private async assetBalanceAt(chainId: number, owner: Address, token: Address, blockNumber: bigint): Promise<bigint> {
     const nativeClient = this.chains.getById(chainId).client;
-    const executorClient = this.executorClient(chainId);
+    const executorClient = this.executionReadClient(chainId);
     const read = (client: PublicClient) => token.toLowerCase() === zeroAddress
       ? client.getBalance({ address: owner, blockNumber })
       : client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner], blockNumber });
@@ -3287,7 +3338,11 @@ export class Executor {
       if (!withdrawalEvent || !withdrawalEvent.transactionHash || !withdrawalEvent.blockNumber) return false;
       const receipt = await client.getTransactionReceipt({ hash: withdrawalEvent.transactionHash });
       if (!receipt) return false;
-      const amounts = receiptTokenTransfers(receipt.logs, position.token0, position.token1, position.owner, registry.contracts.v4.poolManager);
+      const amounts = await this.v4ReceiptOutflows(position, receipt, withdrawalEvent.transactionHash);
+      if (amounts.outOfPool0 === 0n && amounts.outOfPool1 === 0n) {
+        log.warn({ positionId: position.id, positionKey: position.positionKey, transactionHash: withdrawalEvent.transactionHash }, "V4 auto-settle found a burn without token outflows");
+        return false;
+      }
       const quoteValue = await this.quoteV4AmountsAtBlock(position, amounts.outOfPool0, amounts.outOfPool1, withdrawalEvent.blockNumber);
       if (quoteValue > 0n) {
         await this.database.addCashflow(position.id, withdrawalEvent.blockNumber, withdrawalEvent.transactionHash, "withdrawal", quoteValue, {
@@ -3311,12 +3366,24 @@ export class Executor {
         log.info({ positionId: position.id, positionKey: position.positionKey, quoteValue: quoteValue.toString() }, "deferred WETH auto-settle to normal flow for unwrap");
         return false;
       }
+      const settlementUsd = position.quoteToken.toLowerCase() === zeroAddress
+        ? await this.computeEthUsd(position.chainId, quoteValue)
+        : 0n;
       await this.database.setPositionStatus(position.id, "settled", {
         totalReceived: quoteValue.toString(),
+        ...(settlementUsd > 0n ? { settlementUsd: settlementUsd.toString() } : {}),
         closeTransactionHash: withdrawalEvent.transactionHash,
         reason: "auto_settle_zero_liquidity",
       });
-      this.finalizeCloseHistory({ ...position, status: "settled", metadata: { ...position.metadata, totalReceived: quoteValue.toString() } });
+      this.finalizeCloseHistory({
+        ...position,
+        status: "settled",
+        metadata: {
+          ...position.metadata,
+          totalReceived: quoteValue.toString(),
+          ...(settlementUsd > 0n ? { settlementUsd: settlementUsd.toString() } : {}),
+        },
+      });
       log.info({ positionId: position.id, positionKey: position.positionKey, quoteValue: quoteValue.toString() }, "auto-settled zero-liquidity V4 position");
       await this.notifier.settled(position);
       return true;
@@ -3436,6 +3503,22 @@ export class Executor {
     }
   }
 
+  private async v4ReceiptOutflows(
+    position: PositionRecord,
+    receipt: TransactionReceipt,
+    transactionHash: Hex,
+  ): Promise<{ outOfPool0: bigint; outOfPool1: bigint }> {
+    const { registry } = this.chains.getById(position.chainId);
+    const amounts = receiptTokenTransfers(receipt.logs, position.token0, position.token1, position.owner, registry.contracts.v4.poolManager);
+    if (position.token0.toLowerCase() === zeroAddress) {
+      amounts.outOfPool0 = await this.assetReceivedFromReceipt(position.chainId, zeroAddress, position.owner, transactionHash, receipt);
+    }
+    if (position.token1.toLowerCase() === zeroAddress) {
+      amounts.outOfPool1 = await this.assetReceivedFromReceipt(position.chainId, zeroAddress, position.owner, transactionHash, receipt);
+    }
+    return amounts;
+  }
+
   private async quoteV4AmountsAtBlock(position: PositionRecord, amount0: bigint, amount1: bigint, blockNumber: bigint): Promise<bigint> {
     if (!position.quoteToken) return 0n;
     const { client, registry } = this.chains.getById(position.chainId);
@@ -3457,11 +3540,30 @@ export class Executor {
       args: [poolId],
       blockNumber,
     });
-    const square = slot0[0] * slot0[0];
-    const q192 = 1n << 192n;
-    return position.quoteToken.toLowerCase() === position.token0.toLowerCase()
-      ? amount0 + ((amount1 * q192) / square)
-      : amount1 + ((amount0 * square) / q192);
+    const quoteIsToken0 = position.quoteToken.toLowerCase() === position.token0.toLowerCase();
+    const tickLower = metadata.tickLower as number | undefined;
+    const tickUpper = metadata.tickUpper as number | undefined;
+    const sqrtPriceX96 = isUsableSqrtPrice(slot0[0], slot0[1])
+      ? slot0[0]
+      : (tickLower !== undefined && tickUpper !== undefined && tickLower < tickUpper
+        ? sqrtRatioAtTick(Math.floor((tickLower + tickUpper) / 2))
+        : 1n);
+    return quoteValueAtSqrtPrice(amount0, amount1, quoteIsToken0, sqrtPriceX96);
+  }
+
+  private async queueTransientClose(
+    position: PositionRecord,
+    trigger: ExitTrigger | undefined,
+    retryMetadata: Record<string, unknown>,
+    error: unknown,
+  ): Promise<void> {
+    const message = errorMessage(error);
+    await this.database.setPositionStatusUnlessSettled(position.id, "armed", {
+      lastExecutionError: message,
+      exitRetry: nextExitRetry(retryMetadata, trigger ?? "manual"),
+      settlementPhase: null,
+    });
+    log.warn({ error: message, positionId: position.id, positionKey: position.positionKey }, "close deferred after transient RPC error");
   }
 }
 

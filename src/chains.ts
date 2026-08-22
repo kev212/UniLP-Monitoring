@@ -27,6 +27,7 @@ export interface ChainRegistry {
   chain: Chain;
   contracts: UniswapContracts;
   discoveryProtocols: readonly Protocol[];
+  autoDiscoverExternalPositions: boolean;
   monitoringEnabled: boolean;
   dex: "uniswap";
   displayName: string;
@@ -48,6 +49,7 @@ export const chainRegistry: Record<ChainName, ChainRegistry> = {
     aliases: ["base"],
     chain: base,
     discoveryProtocols: ["v2", "v3", "v4"],
+    autoDiscoverExternalPositions: false,
     monitoringEnabled: true,
     dex: "uniswap",
     displayName: "Base",
@@ -86,6 +88,7 @@ export const chainRegistry: Record<ChainName, ChainRegistry> = {
     aliases: ["robinhood"],
     chain: robinhood,
     discoveryProtocols: ["v2", "v3", "v4"],
+    autoDiscoverExternalPositions: true,
     monitoringEnabled: true,
     dex: "uniswap",
     displayName: "Robinhood Chain",
@@ -97,7 +100,7 @@ export const chainRegistry: Record<ChainName, ChainRegistry> = {
     dexScreenerChain: "robinhood",
     uniswapSlug: "robinhood",
     explorerUrl: "https://robinhoodchain.blockscout.com",
-    quotePriority: ["USDG", "USDC", "WETH", "ETH", "NVDA"],
+    quotePriority: ["USDG", "USDC", "WETH", "ETH", "NVDA", "SPY"],
     contracts: {
       v2: {
         factory: "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
@@ -124,6 +127,7 @@ export const chainRegistry: Record<ChainName, ChainRegistry> = {
     aliases: ["bsc", "bnb"],
     chain: bsc,
     discoveryProtocols: ["v3", "v4"],
+    autoDiscoverExternalPositions: true,
     monitoringEnabled: true,
     dex: "uniswap",
     displayName: "BNB Smart Chain",

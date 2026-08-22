@@ -28,10 +28,12 @@ import { hasV4Hooks } from "./v4-pool.js";
 import { dexNameFromMetadata, isKnownV3PositionManager, resolveV3Dex, v3ContractsFor, v3Deployments, type DexName } from "./v3-deployment.js";
 import { isTransientRpcError } from "../rpc.js";
 import type { Notifier } from "./notifier.js";
-import { amountsForLiquidity } from "./uniswap-math.js";
+import { amountsForLiquidity, isUsableSqrtPrice, quoteValueAtSqrtPrice, sqrtRatioAtTick } from "./uniswap-math.js";
 
 const OPEN_RECEIPT_RETRY_BACKOFF_MS = 60_000;
 const OPEN_RECEIPT_CORRELATION_FAILED = "group_open_receipt_correlation_failed";
+const OWNER_OF_RETRY_ATTEMPTS = 4;
+const OWNER_OF_RETRY_DELAY_MS = 500;
 
 type TransactionReceipt = Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>;
 
@@ -105,14 +107,7 @@ export class DiscoveryService {
     const client = this.reconciliationClient(name);
     const groups = await this.database.listPositionGroups(registry.chain.id);
     for (const group of groups) {
-      if (group.status !== "opening") {
-        if (group.status !== "needs_review" || group.metadata.reason !== OPEN_RECEIPT_CORRELATION_FAILED) continue;
-        const retriedAt = typeof group.metadata.openReceiptRetriedAt === "string"
-          ? Date.parse(group.metadata.openReceiptRetriedAt)
-          : Number.NaN;
-        if (Number.isFinite(retriedAt) && Date.now() - retriedAt < OPEN_RECEIPT_RETRY_BACKOFF_MS) continue;
-      }
-      if (!group.openTransactionHash || !isHex(group.openTransactionHash) || group.openTransactionHash.length !== 66) continue;
+      if (!shouldRetryPendingGroupOpen(group)) continue;
       let receipt: TransactionReceipt;
       try {
         receipt = await client.getTransactionReceipt({ hash: group.openTransactionHash as Hex });
@@ -158,12 +153,7 @@ export class DiscoveryService {
     for (const tokenId of expectedTokenIds) {
       const increase = increases.find((entry) => entry.tokenId === tokenId);
       if (!increase || increase.liquidity <= 0n) throw new Error(`V3 token ${tokenId} has no positive IncreaseLiquidity event`);
-      const owner = await client.readContract({
-        address: group.positionManager,
-        abi: v3PositionManagerAbi,
-        functionName: "ownerOf",
-        args: [tokenId],
-      });
+      const owner = await this.readMintedNftOwner(name, group.positionManager, "v3", tokenId);
       if (owner.toLowerCase() !== group.owner.toLowerCase()) throw new Error(`V3 token ${tokenId} is not owned by the group owner`);
       const details = (await client.readContract({
         address: group.positionManager,
@@ -269,12 +259,7 @@ export class DiscoveryService {
     for (const tokenId of expectedTokenIds) {
       const modification = byTokenId.get(tokenId);
       if (!modification) throw new Error(`V4 token ${tokenId} has no matching ModifyLiquidity event`);
-      const owner = await client.readContract({
-        address: group.positionManager,
-        abi: v4PositionManagerAbi,
-        functionName: "ownerOf",
-        args: [tokenId],
-      });
+      const owner = await this.readMintedNftOwner(name, group.positionManager, "v4", tokenId);
       if (owner.toLowerCase() !== group.owner.toLowerCase()) throw new Error(`V4 token ${tokenId} is not owned by the group owner`);
       const poolAndPositionInfo = await client.readContract({
         address: group.positionManager,
@@ -412,10 +397,11 @@ export class DiscoveryService {
       );
     }
 
-    const reviewCleanup = group.metadata.reason === OPEN_RECEIPT_CORRELATION_FAILED
+    const reviewCleanup = group.metadata.reason === OPEN_RECEIPT_CORRELATION_FAILED || group.metadata.reason === "bid_ask_open_failed"
       ? {
           reason: null,
           correlationError: null,
+          lastExecutionError: null,
           openReceiptRetriedAt: null,
           pendingRawTransaction: null,
         }
@@ -469,6 +455,47 @@ export class DiscoveryService {
     return typeof this.chains.getForScan === "function" ? this.chains.getForScan(name).client : regular;
   }
 
+  private ownerLookupClients(name: ChainName): PublicClient[] {
+    const scan = this.reconciliationClient(name);
+    try {
+      if (typeof this.chains.getForExecution === "function") {
+        const execution = this.chains.getForExecution(name).client;
+        if (execution !== scan) return name === "base" ? [scan, execution] : [execution, scan];
+      }
+    } catch {
+      // Tests and scan-only chains have no execution client.
+    }
+    return [scan];
+  }
+
+  private async readMintedNftOwner(
+    name: ChainName,
+    positionManager: Address,
+    protocol: "v3" | "v4",
+    tokenId: bigint,
+  ): Promise<Address> {
+    const abi = protocol === "v3" ? v3PositionManagerAbi : v4PositionManagerAbi;
+    const clients = this.ownerLookupClients(name);
+    let lastError: unknown;
+    for (let attempt = 0; attempt < OWNER_OF_RETRY_ATTEMPTS; attempt++) {
+      for (const client of clients) {
+        try {
+          return await client.readContract({
+            address: positionManager,
+            abi,
+            functionName: "ownerOf",
+            args: [tokenId],
+          });
+        } catch (error) {
+          lastError = error;
+          if (!isNotMintedError(error)) throw error;
+        }
+      }
+      if (attempt < OWNER_OF_RETRY_ATTEMPTS - 1) await delay(OWNER_OF_RETRY_DELAY_MS);
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
   async ingestOpenReceipt(name: ChainName, receipt: TransactionReceipt): Promise<PositionRecord[]> {
     const { registry } = this.chains.get(name);
     const hash = receipt.transactionHash;
@@ -494,6 +521,9 @@ export class DiscoveryService {
     const found: PositionRecord[] = [];
     if (v3.length > 0) found.push(...await this.discoverV3Candidates(name, v3));
     if (v4.length > 0) found.push(...await this.discoverV4Candidates(name, v4));
+    for (const position of found) {
+      if (position.protocol === "v3") await this.hydrateV3OpeningCashflowFromReceipt(name, position, receipt);
+    }
     log.info({ chain: name, hash, count: found.length }, "ingested positions from open receipt");
     return found;
   }
@@ -516,15 +546,15 @@ export class DiscoveryService {
     if (fromBlock > latest) return;
     const toBlock = minBigInt(latest, fromBlock + this.config.scanBlockRange - 1n);
 
-    if (!registry.monitoringEnabled && !bootstrap && registry.discoveryProtocols.includes("v3")) {
+    if (registry.autoDiscoverExternalPositions && !registry.monitoringEnabled && !bootstrap && registry.discoveryProtocols.includes("v3")) {
       await this.discoverOwnedV3Positions(name, latest);
       await this.database.markBootstrapComplete(registry.chain.id, "owner_enumeration", latest);
     }
 
-    if (useLimitedRpcFallback) {
+    if (useLimitedRpcFallback && registry.autoDiscoverExternalPositions) {
       log.warn({ chain: name, fromBlock, toBlock }, "Alchemy bootstrap is unavailable; using limited RPC lookback instead of genesis scan");
     }
-    if (registry.discoveryProtocols.includes("v4")) {
+    if (registry.autoDiscoverExternalPositions && registry.discoveryProtocols.includes("v4")) {
       try {
         await this.discoverOwnedV4Positions(name, latest);
       } catch (error) {
@@ -533,22 +563,60 @@ export class DiscoveryService {
     }
     log.info({ chain: name, fromBlock, toBlock }, "syncing discovery range");
     try {
-      if (registry.discoveryProtocols.includes("v2")) {
+      if (registry.autoDiscoverExternalPositions && registry.discoveryProtocols.includes("v2")) {
         const v2Transfers = await this.getWalletTransferLogs(name, fromBlock, toBlock);
         await this.discoverV2(name, v2Transfers);
       }
-      if (registry.discoveryProtocols.includes("v3")) {
+      if (registry.autoDiscoverExternalPositions && registry.discoveryProtocols.includes("v3")) {
         for (const deployment of v3Deployments(registry)) {
           await this.discoverV3(name, fromBlock, toBlock, deployment.dex);
         }
       }
-      if (registry.discoveryProtocols.includes("v4")) await this.discoverV4(name, fromBlock, toBlock);
+      if (registry.autoDiscoverExternalPositions && registry.discoveryProtocols.includes("v4")) await this.discoverV4(name, fromBlock, toBlock);
       if (registry.monitoringEnabled && registry.discoveryProtocols.includes("v3")) await this.syncV3Cashflows(name, fromBlock, toBlock);
       if (registry.monitoringEnabled && registry.discoveryProtocols.includes("v4")) await this.syncV4Cashflows(name, fromBlock, toBlock);
     } catch (error) {
-      log.warn({ err: error, chain: name, fromBlock, toBlock }, "discovery log scan failed; advancing cursor");
+      log.warn({ err: error, chain: name, fromBlock, toBlock }, "discovery log scan failed; cursor left unchanged for retry");
+      return;
     }
     await this.database.saveCursor(registry.chain.id, toBlock);
+  }
+
+  async detectOwnedPositions(name: ChainName): Promise<{ chain: ChainName; discovered: PositionRecord[]; v3: number; v4: number }> {
+    const { client, registry } = this.chains.getForScan(name);
+    const blockNumber = await client.getBlockNumber();
+    const known = new Set(
+      (await this.database.listOpenPositions(registry.chain.id)).map((position) => `${position.protocol}:${position.positionKey}`),
+    );
+    const v3 = registry.discoveryProtocols.includes("v3")
+      ? await this.discoverOwnedV3Positions(name, blockNumber, { trustOwned: true })
+      : [];
+    const v4 = registry.discoveryProtocols.includes("v4")
+      ? await this.discoverOwnedV4Positions(name, blockNumber, true)
+      : [];
+    const discovered = [...v3, ...v4].filter((position) => !known.has(`${position.protocol}:${position.positionKey}`));
+    for (const position of discovered) {
+      if (!position.quoteToken || position.status === "closing" || position.status === "settled" || position.status === "armed") continue;
+      await this.database.setPositionStatus(position.id, "syncing", {
+        source: "manual_detect",
+        reason: null,
+        historyTrusted: true,
+      });
+      position.status = "syncing";
+      if (position.protocol === "v3") {
+        try {
+          await this.retryHydrateV3OpeningCashflow(name, position, true);
+        } catch (error) {
+          log.warn({ err: error, positionId: position.id, positionKey: position.positionKey }, "detect V3 cashflow reconstruct failed");
+        }
+      }
+    }
+    return {
+      chain: name,
+      discovered,
+      v3: discovered.filter((position) => position.protocol === "v3").length,
+      v4: discovered.filter((position) => position.protocol === "v4").length,
+    };
   }
 
   private async getWalletTransferLogs(name: ChainName, fromBlock: bigint, toBlock: bigint): Promise<Log[]> {
@@ -767,9 +835,10 @@ export class DiscoveryService {
     return positions;
   }
 
-  async discoverOwnedV3Positions(name: ChainName, blockNumber: bigint): Promise<PositionRecord[]> {
-    const { client, registry } = this.chains.get(name);
+  async discoverOwnedV3Positions(name: ChainName, blockNumber: bigint, opts?: { trustOwned?: boolean }): Promise<PositionRecord[]> {
+    const { client, registry } = this.chains.getForScan(name);
     const found: PositionRecord[] = [];
+    const trustOwned = opts?.trustOwned === true;
     for (const deployment of v3Deployments(registry)) {
       const balance = await client.readContract({
         address: deployment.contracts.positionManager,
@@ -791,7 +860,7 @@ export class DiscoveryService {
           blockNumber,
           to: this.config.executorAddress,
           tokenId,
-          historyTrusted: false,
+          historyTrusted: trustOwned,
         });
       }
       found.push(...await this.discoverV3Candidates(name, candidates, deployment.dex));
@@ -799,8 +868,8 @@ export class DiscoveryService {
     return found;
   }
 
-  async discoverOwnedV4Positions(name: ChainName, blockNumber: bigint): Promise<PositionRecord[]> {
-    const tokenIds = await this.ownedV4TokenIds(name);
+  async discoverOwnedV4Positions(name: ChainName, blockNumber: bigint, allowHistoricalRecovery = false): Promise<PositionRecord[]> {
+    const tokenIds = await this.ownedV4TokenIds(name, allowHistoricalRecovery);
     const found: PositionRecord[] = [];
     const { registry } = this.chains.get(name);
     for (const tokenId of tokenIds) {
@@ -822,44 +891,88 @@ export class DiscoveryService {
     return found;
   }
 
-  private async ownedV4TokenIds(name: ChainName): Promise<bigint[]> {
+  private async ownedV4TokenIds(name: ChainName, allowHistoricalRecovery = false): Promise<bigint[]> {
     const { client, registry } = this.chains.getForScan(name);
     const manager = registry.contracts.v4.positionManager;
     try {
-      const nextTokenId = await client.readContract({
+      const balance = await client.readContract({
         address: manager,
         abi: v4PositionManagerAbi,
-        functionName: "nextTokenId",
+        functionName: "balanceOf",
+        args: [this.config.executorAddress],
       });
-      const lookback = 800n;
-      const start = nextTokenId > lookback ? nextTokenId - lookback : 1n;
       const ids: bigint[] = [];
-      const batchSize = 15n;
-      for (let tokenId = start; tokenId < nextTokenId; ) {
-        const batch: bigint[] = [];
-        for (let i = 0n; i < batchSize && tokenId < nextTokenId; i += 1n, tokenId += 1n) batch.push(tokenId);
-        const owners = await Promise.all(batch.map(async (id) => {
+      for (let index = 0n; index < balance; index += 1n) {
+        ids.push(await client.readContract({
+          address: manager,
+          abi: v4PositionManagerAbi,
+          functionName: "tokenOfOwnerByIndex",
+          args: [this.config.executorAddress, index],
+        }));
+      }
+      return ids;
+    } catch (error) {
+      // Uniswap's V4 PositionManager is not ERC-721 Enumerable. Recover the
+      // wallet's historical V4 receipts and verify each NFT's current owner.
+      if (!allowHistoricalRecovery) return [];
+      const rpcEndpoint = this.config.rpcHttp?.[name];
+      const endpoint = this.config.alchemyHttp?.[name]
+        ?? (rpcEndpoint?.includes("alchemy.com") ? rpcEndpoint : undefined);
+      if (!endpoint) {
+        log.warn({ err: error, chain: name }, "could not enumerate owned V4 positions");
+        return [];
+      }
+      try {
+        const candidateIds = new Set<bigint>();
+        let pageKey: string | undefined;
+        do {
+          const response = await fetch(endpoint, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "alchemy_getAssetTransfers",
+              params: [{
+                fromBlock: "0x0",
+                toBlock: "latest",
+                toAddress: this.config.executorAddress,
+                category: ["erc721"],
+                contractAddresses: [manager],
+                withMetadata: false,
+                maxCount: "0x3e8",
+                order: "asc",
+                ...(pageKey ? { pageKey } : {}),
+              }],
+            }),
+          });
+          if (!response.ok) throw new Error(`Alchemy V4 NFT lookup failed: HTTP ${response.status}`);
+          const payload = await response.json() as { result?: { pageKey?: string; transfers?: Array<{ tokenId?: string }> } };
+          for (const transfer of payload.result?.transfers ?? []) {
+            if (transfer.tokenId !== undefined) candidateIds.add(BigInt(transfer.tokenId));
+          }
+          pageKey = payload.result?.pageKey;
+        } while (pageKey);
+
+        const ids: bigint[] = [];
+        for (const tokenId of candidateIds) {
           try {
             const owner = await client.readContract({
               address: manager,
               abi: v4PositionManagerAbi,
               functionName: "ownerOf",
-              args: [id],
+              args: [tokenId],
             });
-            return { id, owner };
+            if (owner.toLowerCase() === this.config.executorAddress.toLowerCase()) ids.push(tokenId);
           } catch {
-            return null;
+            // A historical receipt can reference an NFT that has since burned.
           }
-        }));
-        for (const item of owners) {
-          if (item && item.owner.toLowerCase() === this.config.executorAddress.toLowerCase()) ids.push(item.id);
         }
-        await new Promise((resolve) => setTimeout(resolve, 80));
+        return ids;
+      } catch (fallbackError) {
+        log.warn({ err: fallbackError, chain: name }, "could not recover owned V4 positions from NFT transfers");
+        return [];
       }
-      return ids;
-    } catch (error) {
-      log.warn({ err: error, chain: name }, "could not enumerate owned V4 positions");
-      return [];
     }
   }
 
@@ -1028,10 +1141,10 @@ export class DiscoveryService {
           if (burned) {
             const existing = await this.database.findPositionByKey(registry.chain.id, "v4", tokenId.toString());
             if (existing) {
-              const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(existing.id, { reason: "nft_burned_unverified" });
-              log[reviewed ? "warn" : "info"](
+              const settled = await this.database.settleUnverifiedZeroLiquidity(existing.id, "nft_burned");
+              log.info(
                 { chain: name, tokenId: tokenId.toString() },
-                reviewed ? "V4 NFT is burned without a verified settlement" : "V4 NFT is burned but settlement remains pending",
+                settled ? "settled burned V4 NFT without a reconstructed receipt" : "V4 NFT is burned but settlement remains pending",
               );
               continue;
             }
@@ -1142,34 +1255,107 @@ export class DiscoveryService {
 
   async retryHydrateV3OpeningCashflow(name: ChainName, position: PositionRecord, force = false): Promise<void> {
     if (!force && (position.metadata as Record<string, unknown>).openingCashflowHydrated === true) return;
-    if (!position.quoteToken || position.openedAtBlock === null) return;
-    const { registry } = this.chains.get(name);
-    const tokenId = BigInt(position.positionKey);
-    try {
-      const events = await this.getLogsChunked(name, {
-        address: registry.contracts.v3.positionManager,
-        event: v3IncreaseLiquidityEvent,
-        args: { tokenId },
-        fromBlock: position.openedAtBlock,
-        toBlock: position.openedAtBlock,
-      });
-      for (const event of events) {
-        if (!event.transactionHash || !event.blockNumber) continue;
-        const args = logArgs<{ amount0?: bigint; amount1?: bigint }>(event);
-        if (args.amount0 === undefined || args.amount1 === undefined) continue;
-        const quoteValue = await this.quoteV3AmountsAtBlock(position, args.amount0, args.amount1, event.blockNumber);
-        if (quoteValue > 0n) {
-          await this.database.addCashflow(position.id, event.blockNumber, event.transactionHash, "deposit", quoteValue, {
-            protocol: "v3",
-            token0Amount: args.amount0.toString(),
-            token1Amount: args.amount1.toString(),
-          });
+    if (!position.quoteToken) return;
+    let wroteDeposit = false;
+    if (position.openedAtBlock !== null) {
+      const { registry } = this.chains.get(name);
+      const tokenId = BigInt(position.positionKey);
+      const manager = v3ContractsFor(registry, dexNameFromMetadata(position.metadata)).positionManager;
+      try {
+        const events = await this.getLogsChunked(name, {
+          address: manager,
+          event: v3IncreaseLiquidityEvent,
+          args: { tokenId },
+          fromBlock: position.openedAtBlock,
+          toBlock: position.openedAtBlock,
+        });
+        for (const event of events) {
+          if (!event.transactionHash || !event.blockNumber) continue;
+          const args = logArgs<{ amount0?: bigint; amount1?: bigint }>(event);
+          if (args.amount0 === undefined || args.amount1 === undefined) continue;
+          const quoteValue = await this.quoteV3AmountsAtBlock(position, args.amount0, args.amount1, event.blockNumber);
+          if (quoteValue > 0n) {
+            await this.database.addCashflow(position.id, event.blockNumber, event.transactionHash, "deposit", quoteValue, {
+              protocol: "v3",
+              token0Amount: args.amount0.toString(),
+              token1Amount: args.amount1.toString(),
+            });
+            wroteDeposit = true;
+          }
         }
+      } catch (error) {
+        log.warn({ err: error, positionId: position.id }, "V3 opening cashflow retry failed");
       }
-      await this.database.setPositionStatus(position.id, position.status, { openingCashflowHydrated: true });
-    } catch (error) {
-      log.warn({ err: error, positionId: position.id }, "V3 opening cashflow retry failed");
     }
+    if (!wroteDeposit) {
+      await this.reconstructV3OpeningCashflowFromLiveState(name, position);
+      return;
+    }
+    await this.database.setPositionStatus(position.id, position.status, { openingCashflowHydrated: true });
+  }
+
+  private async reconstructV3OpeningCashflowFromLiveState(name: ChainName, position: PositionRecord): Promise<void> {
+    if (!position.quoteToken || !position.poolAddress) return;
+    const { registry } = this.chains.getForScan(name);
+    const client = this.chains.getForScan(name).client;
+    const manager = v3ContractsFor(registry, dexNameFromMetadata(position.metadata)).positionManager;
+    const details = await client.readContract({
+      address: manager,
+      abi: v3PositionManagerAbi,
+      functionName: "positions",
+      args: [BigInt(position.positionKey)],
+    }) as readonly [bigint, Address, Address, Address, number, number, number, bigint, ...bigint[]];
+    const tickLower = Number(details[5]);
+    const tickUpper = Number(details[6]);
+    const liquidity = details[7];
+    if (liquidity <= 0n) return;
+    const slot0 = await client.readContract({ address: position.poolAddress, abi: v3PoolAbi, functionName: "slot0" });
+    const amounts = amountsForLiquidity(slot0[0], tickLower, tickUpper, liquidity);
+    const square = slot0[0] * slot0[0];
+    const q192 = 1n << 192n;
+    const quoteValue = position.quoteToken.toLowerCase() === position.token0.toLowerCase()
+      ? amounts.amount0 + ((amounts.amount1 * q192) / square)
+      : amounts.amount1 + ((amounts.amount0 * square) / q192);
+    if (quoteValue <= 0n) return;
+    const latest = await client.getBlockNumber();
+    await this.database.addCashflow(position.id, latest, `reconstructed:${position.id}`, "deposit", quoteValue, {
+      protocol: "v3",
+      source: "live_liquidity",
+      token0Amount: amounts.amount0.toString(),
+      token1Amount: amounts.amount1.toString(),
+    });
+    await this.database.setPositionStatus(position.id, position.status, { openingCashflowHydrated: true });
+    log.info({ positionId: position.id, positionKey: position.positionKey, quoteValue: quoteValue.toString() }, "reconstructed V3 opening cashflow from live liquidity");
+  }
+
+  private async hydrateV3OpeningCashflowFromReceipt(
+    name: ChainName,
+    position: PositionRecord,
+    receipt: TransactionReceipt,
+  ): Promise<void> {
+    if (!position.quoteToken) return;
+    const tokenId = BigInt(position.positionKey);
+    const { registry } = this.chains.get(name);
+    const manager = v3ContractsFor(registry, dexNameFromMetadata(position.metadata)).positionManager;
+    for (const entry of receipt.logs) {
+      if (entry.address.toLowerCase() !== manager.toLowerCase()) continue;
+      const increase = decodeV3IncreaseLiquidity(entry);
+      if (!increase || increase.tokenId !== tokenId) continue;
+      const quoteValue = await this.quoteV3AmountsAtBlock(
+        position,
+        increase.amount0,
+        increase.amount1,
+        receipt.blockNumber ?? position.openedAtBlock ?? 0n,
+      );
+      if (quoteValue > 0n) {
+        await this.database.addCashflow(position.id, receipt.blockNumber ?? 0n, receipt.transactionHash, "deposit", quoteValue, {
+          protocol: "v3",
+          token0Amount: increase.amount0.toString(),
+          token1Amount: increase.amount1.toString(),
+        });
+      }
+    }
+    await this.database.setPositionStatus(position.id, position.status, { openingCashflowHydrated: true });
   }
 
   private async hydrateV4OpeningCashflow(name: ChainName, position: PositionRecord): Promise<void> {
@@ -1338,6 +1524,10 @@ export class DiscoveryService {
         }
         const receipt = await client.getTransactionReceipt({ hash: event.transactionHash });
         const amounts = receiptTokenTransfers(receipt.logs, position.token0, position.token1, position.owner, registry.contracts.v4.poolManager);
+        if (args.liquidityDelta > 0n) {
+          const tx = await client.getTransaction({ hash: event.transactionHash });
+          applyNativeDepositValue(amounts, position.token0, position.token1, tx.value);
+        }
         const saltKey = args.salt.toLowerCase() as Hex;
         const previousLiquidity = liquidityBySalt.get(saltKey) ?? position.liquidity ?? 0n;
         const newLiquidity = previousLiquidity + args.liquidityDelta;
@@ -1422,8 +1612,8 @@ export class DiscoveryService {
           openedAtBlock: position.openedAtBlock, metadata: position.metadata,
         });
       } else if (net <= 0n) {
-        const reviewed = await this.database.markNeedsReviewIfNoPendingSettlement(position.id, { reason: "liquidity_reconciled_to_zero_unverified" });
-        if (!reviewed) {
+        const settled = await this.database.settleUnverifiedZeroLiquidity(position.id, "externally_closed");
+        if (!settled) {
           log.info({ chain: name, positionKey: position.positionKey }, "V4 liquidity reconciled to zero but settlement remains pending");
           continue;
         }
@@ -1468,6 +1658,8 @@ export class DiscoveryService {
         if (!position) continue;
         const amounts = receiptTokenTransfers(receipt.logs, position.token0, position.token1, position.owner, registry.contracts.v4.poolManager);
         if (modification.liquidityDelta > 0n) {
+          const tx = await client.getTransaction({ hash: activity.transactionHash });
+          applyNativeDepositValue(amounts, position.token0, position.token1, tx.value);
           const quoteValue = await this.quoteV4AmountsAtBlock(position, amounts.intoPool0, amounts.intoPool1, activity.blockNumber);
           if (quoteValue > 0n) {
             await this.database.addCashflow(position.id, activity.blockNumber, activity.transactionHash, "deposit", quoteValue, {
@@ -1510,7 +1702,7 @@ export class DiscoveryService {
     if (!position.quoteToken) throw new Error("V4 position has no quote token");
     const { registry } = this.chains.getById(position.chainId);
     const historicalClient = this.chains.getForLogs(registry.name).client;
-    const metadata = position.metadata as { currency0?: Address; currency1?: Address; fee?: number; tickSpacing?: number; hooks?: Address };
+    const metadata = position.metadata as { currency0?: Address; currency1?: Address; fee?: number; tickSpacing?: number; hooks?: Address; tickLower?: number; tickUpper?: number };
     if (!metadata.currency0 || !metadata.currency1 || metadata.fee === undefined || metadata.tickSpacing === undefined || !metadata.hooks) {
       throw new Error("V4 position metadata is incomplete");
     }
@@ -1522,11 +1714,11 @@ export class DiscoveryService {
       args: [poolId],
       blockNumber,
     });
-    const square = slot0[0] * slot0[0];
-    const q192 = 1n << 192n;
-    return position.quoteToken.toLowerCase() === position.token0.toLowerCase()
-      ? amount0 + ((amount1 * q192) / square)
-      : amount1 + ((amount0 * square) / q192);
+    const quoteIsToken0 = position.quoteToken.toLowerCase() === position.token0.toLowerCase();
+    const sqrtPriceX96 = isUsableSqrtPrice(slot0[0], slot0[1])
+      ? slot0[0]
+      : midRangeSqrtPrice(metadata.tickLower, metadata.tickUpper);
+    return quoteValueAtSqrtPrice(amount0, amount1, quoteIsToken0, sqrtPriceX96);
   }
 
   private findQuoteToken(name: ChainName, token0: Address, token1: Address): Address | null {
@@ -1643,6 +1835,19 @@ function expectedPositionManager(
   if (protocol === "v4") return registry.contracts.v4.positionManager;
   if (stored && stored.toLowerCase() === registry.pancakeV3?.positionManager.toLowerCase()) return stored;
   return registry.contracts.v3.positionManager;
+}
+
+function shouldRetryPendingGroupOpen(group: PositionGroupRecord, now = Date.now()): boolean {
+  if (!group.openTransactionHash || !isHex(group.openTransactionHash) || group.openTransactionHash.length !== 66) return false;
+  if (group.status === "opening") return true;
+  const retryable = (group.status === "needs_review" && group.metadata.reason === OPEN_RECEIPT_CORRELATION_FAILED)
+    || (group.status === "cancelled" && group.metadata.reason === "bid_ask_open_failed");
+  if (!retryable) return false;
+  const retriedAt = typeof group.metadata.openReceiptRetriedAt === "string"
+    ? Date.parse(group.metadata.openReceiptRetriedAt)
+    : Number.NaN;
+  if (Number.isFinite(retriedAt) && now - retriedAt < OPEN_RECEIPT_RETRY_BACKOFF_MS) return false;
+  return true;
 }
 
 function plannedGroupBins(group: PositionGroupRecord, bins: readonly PositionGroupBinRecord[]): PositionGroupBinRecord[] {
@@ -1819,6 +2024,14 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isNotMintedError(error: unknown): boolean {
+  return errorMessage(error).includes("NOT_MINTED");
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function unpackV4PositionInfo(value: bigint): { tickLower: number; tickUpper: number } {
   return {
     tickLower: signed24((value >> 8n) & 0xffffffn),
@@ -1887,6 +2100,22 @@ export function receiptTokenTransfers(logs: readonly { address: Address; data: H
     }
   }
   return { intoPool0, intoPool1, outOfPool0, outOfPool1 };
+}
+
+export function applyNativeDepositValue(
+  amounts: { intoPool0: bigint; intoPool1: bigint },
+  token0: Address,
+  token1: Address,
+  txValue: bigint,
+): void {
+  if (txValue <= 0n) return;
+  if (token0.toLowerCase() === zeroAddress && amounts.intoPool0 === 0n) amounts.intoPool0 = txValue;
+  if (token1.toLowerCase() === zeroAddress && amounts.intoPool1 === 0n) amounts.intoPool1 = txValue;
+}
+
+function midRangeSqrtPrice(tickLower?: number, tickUpper?: number): bigint {
+  if (tickLower === undefined || tickUpper === undefined || tickLower >= tickUpper) return 1n;
+  return sqrtRatioAtTick(Math.floor((tickLower + tickUpper) / 2));
 }
 
 function v4PoolId(currency0: Address, currency1: Address, fee: number, tickSpacing: number, hooks: Address): Hex {

@@ -25,6 +25,22 @@ const TICK_MULTIPLIERS = [
   0x48a170391f7dc42444e8fa2n,
 ] as const;
 
+const Q192 = 1n << 192n;
+
+export function isUsableSqrtPrice(sqrtPriceX96: bigint, tick?: number): boolean {
+  if (sqrtPriceX96 <= 1n) return false;
+  if (tick !== undefined && (tick <= -MAX_TICK + 1 || tick >= MAX_TICK - 1)) return false;
+  return true;
+}
+
+export function quoteValueAtSqrtPrice(amount0: bigint, amount1: bigint, quoteIsToken0: boolean, sqrtPriceX96: bigint): bigint {
+  if (sqrtPriceX96 <= 1n) return quoteIsToken0 ? amount0 : amount1;
+  const square = sqrtPriceX96 * sqrtPriceX96;
+  return quoteIsToken0
+    ? amount0 + (amount1 * Q192) / square
+    : amount1 + (amount0 * square) / Q192;
+}
+
 export function sqrtRatioAtTick(tick: number): bigint {
   if (!Number.isInteger(tick) || tick < -MAX_TICK || tick > MAX_TICK) {
     throw new Error(`Tick ${tick} is outside the supported range`);

@@ -8,11 +8,13 @@ import type { Database } from "../db.js";
 import { log } from "../log.js";
 import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionGroupPnlSnapshot, PositionGroupRecord, PositionRangeInfo, PositionRecord, PositionStatus, Protocol, QuoteToken, RiskSettings } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
-import type { Executor } from "./executor.js";
+import { TransientCloseError, type Executor } from "./executor.js";
+import { isTransientRpcError } from "../rpc.js";
 import type { PnlService } from "./pnl.js";
 import type { PositionOpener, OpenPositionPreview } from "./position-opener.js";
 import { fmtUtc, renderPnlCard } from "./pnl-card.js";
 import { renderPnlCalendarCard } from "./pnl-calendar-card.js";
+import type { DiscoveryService } from "./discovery.js";
 import type { PoolMarketScan, PoolScanFilters, PoolScanner, ScoredPool, InvestigateResult } from "./pool-scanner.js";
 import type { PortfolioService } from "./portfolio.js";
 import type { GemScanner, GemScanResult } from "./gem-scanner.js";
@@ -125,6 +127,8 @@ export class Notifier {
   private scanV2Running = false;
   private gemScanRunning = false;
   private stockScanRunning = false;
+  private detectRunning = false;
+  private discovery?: DiscoveryService;
   private deletionTimer: ReturnType<typeof setInterval> | null = null;
   private readonly openConfirmations = new Map<string, OpenConfirmation>();
   private positionOpener?: PositionOpener;
@@ -157,6 +161,10 @@ export class Notifier {
     this.portfolioService = service;
   }
 
+  setDiscovery(discovery: DiscoveryService): void {
+    this.discovery = discovery;
+  }
+
   registerCommands(database: Database, pnl: PnlService, executor: Executor, scanner: PoolScanner): void {
     if (!this.bot) return;
     void this.bot.api.setMyCommands([
@@ -165,10 +173,11 @@ export class Notifier {
       { command: "scan", description: "Scan token — /scan [base|robinhood|bsc] <contract>" },
       ...(this.config.scanV2Enabled ? [{ command: "scanv2", description: "Scan concentrated yield — /scanv2 [chain] <contract> [range%]" }] : []),
       { command: "scan_pools", description: "Cari pool V3/V4 dengan estimasi yield 1 jam tertinggi" },
-      { command: "scan_stocks", description: "Scan pool tokenized stock (NVDA AAPL TSLA dll) by yield" },
+      { command: "scan_stocks", description: "Scan stock/ETF/komoditas — /scan_stocks [bsc]" },
       { command: "investigate", description: "Cek yield/h pool — /investigate [bsc|bnb] <pool-id atau link Uniswap>" },
+      { command: "detect", description: "Detect posisi NFT owned — /detect [base|robinhood|bsc]" },
       { command: "gem", description: "💎 Hidden gem radar — yield gacor V3/V4" },
-      { command: "history", description: "Tampilkan riwayat posisi close >= ±0.5% PnL" },
+      { command: "history", description: "Tampilkan riwayat posisi close >= ±$0.50 PnL" },
       { command: "calendar", description: "Tampilkan kalender realized PnL UTC" },
     ]).catch((error) => {
       log.warn({ err: error }, "Telegram command registration failed; bot will continue without updated commands");
@@ -200,6 +209,10 @@ export class Notifier {
     this.bot.command("investigate", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleInvestigate(ctx, scanner);
+    });
+    this.bot.command("detect", async (ctx: ChatContext) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
+      await this.handleDetect(ctx);
     });
     this.bot.command("gem", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
@@ -741,9 +754,19 @@ export class Notifier {
       }
       await this.refreshDashboardMessage(database, pnl, chatId, messageId, page);
     } catch (error) {
+      const queued = error instanceof TransientCloseError || isTransientRpcError(error);
       const text = error instanceof Error ? error.message : String(error);
       try {
-        await this.refreshDashboardMessage(database, pnl, chatId, messageId, page, `❌ Close #${position.positionKey} gagal: ${text.slice(0, 400)}`);
+        await this.refreshDashboardMessage(
+          database,
+          pnl,
+          chatId,
+          messageId,
+          page,
+          queued
+            ? `⏳ RPC down, close #${position.positionKey} di-antrikan`
+            : `❌ Close #${position.positionKey} gagal: ${text.slice(0, 400)}`,
+        );
       } catch (editError) {
         log.warn({ error: errorMessage(editError), positionId: position.id }, "could not render dashboard close failure");
       }
@@ -820,7 +843,7 @@ export class Notifier {
     keyboard.row()
       .text("🟢 Open position", dashboardAction("open", page));
     keyboard.row()
-      .text("📚 History ±0.5%", dashboardAction("history", 0))
+      .text("📚 History ±$0.50", dashboardAction("history", 0))
       .text("🖼 PnL card", dashboardAction("pnl_card", 0));
     const now = new Date();
     keyboard.row().text("📅 PnL Calendar", calendarAction(now.getUTCFullYear(), now.getUTCMonth() + 1));
@@ -1288,23 +1311,29 @@ export class Notifier {
       await this.replyTemp(ctx, "📊 Stock scan masih berjalan. Tunggu hasil sebelumnya.");
       return;
     }
+    const raw = (ctx.message?.text ?? "").trim().split(/\s+/).slice(1);
+    const chain = parseChainAlias(raw[0] ?? "") === "bsc" ? "bsc" : "robinhood";
     this.stockScanRunning = true;
-    const progress = await ctx.reply("📊 Memeriksa pool tokenized stock (NVDA AAPL GME TSLA MSFT GOOGL MU SPY SPCX PLTR INTC AMZN AMD) berdasarkan yield 1h...");
+    const progress = await ctx.reply(
+      chain === "bsc"
+        ? "📊 Memuat token *B BSC, saring vol Pancake/Uniswap V3 ≥ $100k, lalu hitung yield 1h..."
+        : "📊 Memuat stock resmi, saring vol Uniswap 24h ≥ $100k, lalu hitung yield 1h...",
+    );
     const messageId = progress.message_id;
     void this.queueTemp(chatId, messageId, 120_000);
-    void this.executeStockScan(scanner, chatId, messageId).catch((error) =>
+    void this.executeStockScan(scanner, chatId, messageId, chain).catch((error) =>
       log.error({ error: errorMessage(error) }, "stock scan background job failed"),
     );
   }
 
-  private async executeStockScan(scanner: PoolScanner, chatId: string, messageId: number): Promise<void> {
+  private async executeStockScan(scanner: PoolScanner, chatId: string, messageId: number, chain: ChainName = "robinhood"): Promise<void> {
     let stage = "Memuat data tokenized stocks...";
     const startedAt = Date.now();
     const heartbeat = setInterval(() => {
       void this.refreshStockScanProgress(chatId, messageId, `${stage}\nElapsed: ${Math.floor((Date.now() - startedAt) / 1_000)}s`);
     }, 20_000);
     try {
-      const scan = await scanner.scanStocks((nextStage) => { stage = nextStage; });
+      const scan = await scanner.scanStocks((nextStage) => { stage = nextStage; }, chain);
       const text = formatStockScan(scan);
       if (!this.bot) return;
       try {
@@ -1374,6 +1403,68 @@ export class Notifier {
       await this.sendTemp(["💎 Gem scan gagal. Coba lagi nanti."], chatId, 120_000);
     } finally {
       this.gemScanRunning = false;
+    }
+  }
+
+  private async handleDetect(ctx: ChatContext): Promise<void> {
+    const chatId = ctx.chat.id.toString();
+    if (!this.authorized(chatId, ctx.from?.id.toString())) return;
+    if (!this.discovery) {
+      await this.replyTemp(ctx, "Detect belum tersedia.");
+      return;
+    }
+    if (this.detectRunning) {
+      await this.replyTemp(ctx, "Detect masih berjalan. Tunggu hasil sebelumnya.");
+      return;
+    }
+    const raw = (ctx.message?.text ?? "").trim().split(/\s+/).slice(1);
+    const parsed = raw[0] ? parseChainAlias(raw[0]) : "robinhood";
+    if (!parsed || !["base", "robinhood", "bsc"].includes(parsed)) {
+      await this.replyTemp(ctx, "Gunakan /detect [base|robinhood|bsc].");
+      return;
+    }
+    if (!this.isEnabledChain(parsed)) {
+      await this.replyTemp(ctx, `Chain ${parsed} tidak aktif.`);
+      return;
+    }
+    this.detectRunning = true;
+    const progress = await ctx.reply(`🔎 Detect ${chainButtonLabel(parsed)}: enumerasi NFT owned...`);
+    void this.queueTemp(chatId, progress.message_id, 120_000);
+    void this.executeDetect(chatId, progress.message_id, parsed).catch((error) =>
+      log.error({ error: errorMessage(error), chain: parsed }, "detect background job failed"),
+    );
+  }
+
+  private async executeDetect(chatId: string, messageId: number, chain: ChainName): Promise<void> {
+    try {
+      const result = await this.discovery!.detectOwnedPositions(chain);
+      const lines = result.discovered.length === 0
+        ? [`Detect ${chainButtonLabel(chain)}: tidak ada posisi baru.`]
+        : [
+          `Detect ${chainButtonLabel(chain)}: +${result.discovered.length} posisi`,
+          `V3 ${result.v3} · V4 ${result.v4}`,
+          ...result.discovered.slice(0, 20).map((position) => `• ${position.protocol.toUpperCase()} #${position.positionKey}`),
+          ...(result.discovered.length > 20 ? [`… +${result.discovered.length - 20} lagi`] : []),
+        ];
+      const text = lines.join("\n");
+      if (!this.bot) return;
+      try {
+        await this.bot.api.editMessageText(chatId, messageId, text);
+      } catch (editError) {
+        if (!errorMessage(editError).includes("message is not modified")) await this.sendTemp([text], chatId, 180_000);
+      }
+      await this.queueTemp(chatId, messageId, 180_000);
+    } catch (error) {
+      const text = `Detect gagal: ${errorMessage(error).slice(0, 180)}`;
+      if (this.bot) {
+        try {
+          await this.bot.api.editMessageText(chatId, messageId, text);
+        } catch {
+          await this.sendTemp([text], chatId, 120_000);
+        }
+      }
+    } finally {
+      this.detectRunning = false;
     }
   }
 
@@ -1898,7 +1989,7 @@ export class Notifier {
   private async showPnlCardSelection(ctx: Context, database: Database, chatId: string, page: number): Promise<void> {
     const history = await database.listCloseHistory(50);
     if (history.length === 0) {
-      await this.replyTemp(ctx, "Tidak ada riwayat posisi close yang lolos ±0.5% untuk dijadikan PnL card.");
+      await this.replyTemp(ctx, "Tidak ada riwayat posisi close yang lolos ±$0.50 untuk dijadikan PnL card.");
       return;
     }
     const pageCount = Math.max(1, Math.ceil(history.length / DASHBOARD_PAGE_SIZE));
@@ -2031,8 +2122,10 @@ export class Notifier {
         await this.replyTemp(ctx, `Posisi ${found.positionKey} — penutupan dimulai.`);
       }
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-      void message;
+      if (error instanceof TransientCloseError || isTransientRpcError(error)) {
+        await this.replyTemp(ctx, `⏳ RPC down, close #${found.positionKey} di-antrikan`);
+        return;
+      }
       await this.replyTemp(ctx, "Close gagal. Periksa restricted service logs.");
     }
   }
@@ -2797,7 +2890,7 @@ export function formatCompactPrice(scaledValue: bigint, quoteSymbol: string): st
 }
 
 export function positionRangeLine(minimum: bigint, maximum: bigint, current: bigint): { bar: string; percent: number | null } {
-  const LEN = 10;
+  const LEN = 14;
   if (maximum <= minimum) return { bar: "│" + "━".repeat(LEN - 1), percent: null };
   if (current <= minimum) return { bar: "│" + "━".repeat(LEN - 1), percent: 0 };
   if (current >= maximum) return { bar: "━".repeat(LEN - 1) + "│", percent: 100 };
@@ -2982,12 +3075,14 @@ function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters): s
 }
 
 function formatStockScan(scan: PoolMarketScan): string {
+  const symbols = scan.stockSymbols?.length ? scan.stockSymbols.join(" ") : "—";
+  const bsc = scan.chain === "bsc";
   const lines = [
     "📊 STOCK POOL YIELD 1H",
-    "Chain: Robinhood | Uniswap V3/V4",
-    `Stocks: NVDA AAPL GME TSLA MSFT GOOGL MU SPY SPCX PLTR INTC AMZN AMD`,
-    `Dievaluasi: ${scan.evaluatedTokens} stocks | Lolos: ${scan.qualifiedTokens}`,
-    `Filter: yield/h > 0.1%`,
+    bsc ? "Chain: BSC | Pancake/Uniswap V3 | *B stock/ETF/komoditas" : "Chain: Robinhood | Uniswap V3/V4",
+    `Vol ≥ $100k/24h: ${symbols}`,
+    `Universe: ${scan.candidateTokens} | Vol lolos: ${scan.evaluatedTokens} | Yield lolos: ${scan.qualifiedTokens}`,
+    bsc ? "Filter: vol Pancake/Uniswap V3 24h ≥ $100k vs USDT/WBNB · yield/h > 0.1%" : "Filter: vol Uniswap 24h ≥ $100k · yield/h > 0.1%",
     "",
   ];
   if (scan.pools.length === 0) {
@@ -2997,7 +3092,7 @@ function formatStockScan(scan: PoolMarketScan): string {
   for (let index = 0; index < scan.pools.length; index++) {
     const pool = scan.pools[index]!;
     const effectiveFee = pool.currentLpFee ?? pool.feeTier;
-    lines.push(`${index + 1}. ${pool.protocol.toUpperCase()} ${pool.pair} | ${(effectiveFee / 10_000).toFixed(2)}%${pool.dynamicFee ? " dynamic" : ""}`);
+    lines.push(`${index + 1}. ${pool.dex === "pancake" ? "PC" : "UNI"} ${pool.protocol.toUpperCase()} ${pool.pair} | ${(effectiveFee / 10_000).toFixed(2)}%${pool.dynamicFee ? " dynamic" : ""}`);
     lines.push(`   Yield/h: ${fmtPercent(pool.estimatedPoolYield1hPercent)} | Vol 1h: $${fmtUsd(pool.volume1hUsd)} | Est. fees 1h: $${fmtUsd(pool.estimatedPoolFees1hUsd)}`);
     lines.push(`   Pool TVL: $${fmtUsd(pool.tvlUsd)} | 6h avg: ${fmtPercent(pool.estimatedPoolYieldHourlyPercent)}/h${pool.warnings.length > 0 ? ` | ${pool.warnings.join(", ")}` : ""}`);
     lines.push(`   ${pool.uniswapUrl}`);

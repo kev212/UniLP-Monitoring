@@ -228,4 +228,57 @@ describe("RPC failover transport", () => {
     await clients.getForScan("bsc").client.getChainId();
     expect(urls[0]).toMatch(/^https:\/\/bsc-dataseed\.bnbchain\.org\/?$/);
   });
+
+  it("uses public Base RPCs for scans without sending reads to Alchemy", async () => {
+    const urls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      if (urls.length === 1) return new Response("rate limited", { status: 429 });
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x2105" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const clients = new ChainClients({
+      chains: ["base"],
+      alchemyHttp: { base: "https://base-mainnet.g.alchemy.com/v2/test" },
+      rpcHttp: { base: "https://mainnet.base.org", robinhood: "https://public.example/rpc", bsc: "https://bsc.example/rpc" },
+      rpcHttpFallback: { base: "https://1rpc.io/base" },
+      rpcHttpScanFallback: {},
+    } as RuntimeConfig);
+
+    await expect(clients.getForScan("base").client.getChainId()).resolves.toBe(8453);
+    expect(urls).toEqual([
+      "https://mainnet.base.org/",
+      "https://1rpc.io/base",
+    ]);
+    expect(urls.some((url) => url.includes("alchemy"))).toBe(false);
+  });
+
+  it("keeps Base normal reads off Alchemy after public fallback", async () => {
+    const urls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      if (urls.length === 1) return new Response("rate limited", { status: 429 });
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x2105" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const clients = new ChainClients({
+      chains: ["base"],
+      alchemyHttp: { base: "https://base-mainnet.g.alchemy.com/v2/test" },
+      rpcHttp: { base: "https://base.gateway.tenderly.co", robinhood: "https://public.example/rpc", bsc: "https://bsc.example/rpc" },
+      rpcHttpFallback: { base: "https://1rpc.io/base" },
+      rpcHttpScanFallback: {},
+    } as RuntimeConfig);
+
+    await expect(clients.get("base").client.getChainId()).resolves.toBe(8453);
+    expect(urls).toEqual(["https://base.gateway.tenderly.co/", "https://1rpc.io/base"]);
+    expect(urls.some((url) => url.includes("alchemy"))).toBe(false);
+  });
 });

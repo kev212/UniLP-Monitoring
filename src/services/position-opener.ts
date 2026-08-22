@@ -160,6 +160,7 @@ type BidAskDatabase = Pick<
   Database,
   | "createPositionGroup"
   | "createPositionGroupBin"
+  | "getPositionGroup"
   | "setPositionGroupStatus"
   | "setPositionGroupOpenTransaction"
   | "recordPositionGroupExecution"
@@ -643,8 +644,10 @@ export class PositionOpener {
       atomicBatch: true,
       noOpeningSwap: true,
     });
+    let openedHash: Hex | null = null;
     try {
       const result = await this.broadcastBidAsk(preview.chain, groupId, batchPlan.to, batchPlan.data, batchPlan.value ?? 0n);
+      openedHash = result.hash;
       if (result.hash) {
         await this.reconcileBidAskOpen(preview.chain, groupId, result.hash, result.receipt);
       } else {
@@ -661,10 +664,13 @@ export class PositionOpener {
         blockGasLimit: gas.blockGasLimit,
       };
     } catch (error) {
-      await this.database.setPositionGroupStatus(groupId, "cancelled", {
-        reason: "bid_ask_open_failed",
-        lastExecutionError: error instanceof Error ? error.message : String(error),
-      });
+      const current = openedHash ? null : await this.database.getPositionGroup(groupId);
+      if (!openedHash && !current?.openTransactionHash) {
+        await this.database.setPositionGroupStatus(groupId, "cancelled", {
+          reason: "bid_ask_open_failed",
+          lastExecutionError: error instanceof Error ? error.message : String(error),
+        });
+      }
       throw error;
     }
   }

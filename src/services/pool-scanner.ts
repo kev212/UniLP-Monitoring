@@ -22,9 +22,27 @@ const DEXSCREENER_BASE = "https://api.dexscreener.com";
 const USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168" as Address;
 const WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73" as Address;
 export const MIN_VOLUME_6H_USD = 100;
+export const STOCK_MIN_VOLUME_24H_USD = 100_000;
 const STOCK_MIN_YIELD_1H_PERCENT = 0.1;
 const STOCK_MAX_RESULTS = 10;
 const STOCK_VERIFY_CONCURRENCY = 3;
+const STOCK_VOLUME_BATCH = 25;
+const STOCK_LIST_MAX_PAGES = 8;
+const BLOCKSCOUT_TOKENS = "https://robinhoodchain.blockscout.com/api/v2/tokens";
+const SPY = "0x117cc2133c37b721f49de2a7a74833232b3b4c0c";
+const STOCK_VOLUME_QUOTES = new Set<string>([USDG, WETH, zeroAddress, SPY]);
+const BSC_USDT = "0x55d398326f99059ff775485246999027b3197955";
+const BSC_USDC = "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d";
+const BSC_WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
+const BSC_STOCK_VOLUME_QUOTES = new Set<string>([BSC_USDT, BSC_USDC, BSC_WBNB, zeroAddress]);
+const BSC_STOCK_DEX_IDS = ["pancakeswap", "uniswap"] as const;
+const BSC_STOCK_MIN_PRICE_USD = 1;
+export const BSC_STOCK_SEEDS: readonly { address: Address; symbol: string }[] = [
+  { address: "0xbe9D156892E55e7154BcD3cB0FEA677F9D3103E1", symbol: "SPCXB" },
+  { address: "0x205812CdBed920aFf76C6580abD681a46D11efc7", symbol: "QQQB" },
+  { address: "0x02Fca66C1D1aFB4E2A7884261eB00F63598a7436", symbol: "NVDAB" },
+  { address: "0x7138b48df7D98D7e3cc221BfE7192D0a178182D8", symbol: "SPYB" },
+];
 
 export const ROBINHOOD_STOCK_TOKENS: readonly { address: Address; symbol: string }[] = [
   { address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC", symbol: "NVDA" },
@@ -40,6 +58,13 @@ export const ROBINHOOD_STOCK_TOKENS: readonly { address: Address; symbol: string
   { address: "0xc72b96e0E48ecd4DC75E1e45396e26300BC39681", symbol: "INTC" },
   { address: "0x12f190a9F9d7D37a250758b26824B97CE941bF54", symbol: "AMZN" },
   { address: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC", symbol: "AMD" },
+];
+
+const BSC_STOCK_TICKERS = [
+  ...new Set([
+    ...ROBINHOOD_STOCK_TOKENS.map((stock) => stock.symbol),
+    "QQQ", "USO", "SLV", "SGOV", "META", "COIN", "COST", "NFLX", "ORCL", "TSM", "BABA", "RDDT", "CRCL", "CRWV", "BE", "SNDK",
+  ]),
 ];
 
 export interface ScoredPool {
@@ -87,6 +112,8 @@ export interface PoolMarketScan {
   qualifiedTokens: number;
   evaluatedTokens: number;
   warming?: boolean;
+  stockSymbols?: string[];
+  chain?: ChainName;
 }
 
 export interface VerifiedPool {
@@ -186,6 +213,7 @@ interface DexScreenerPair {
   labels?: string[];
   baseToken: { address: string; symbol: string };
   quoteToken: { address: string; symbol: string };
+  priceUsd?: string | number;
   volume?: { h1?: number; h6?: number; h24?: number };
   liquidity?: { usd?: number | null };
   marketCap?: number | null;
@@ -363,15 +391,15 @@ export class PoolScanner {
     }
   }
 
-  private async toDexScreenerPool(pair: DexScreenerPair, token: string, geckoTvlFallback?: Map<string, number>): Promise<ScoredPool | null> {
-    const protocol = pair.labels?.includes("v4") ? "v4" : pair.labels?.includes("v3") ? "v3" : null;
+  private async toDexScreenerPool(pair: DexScreenerPair, token: string, geckoTvlFallback?: Map<string, number>, chain: ChainName = "robinhood"): Promise<ScoredPool | null> {
+    const protocol = stockPairProtocol(pair);
     if (!protocol) return null;
     const dexTvl = Number(pair.liquidity?.usd ?? 0);
     const tvlUsd = dexTvl > 0 ? dexTvl : (geckoTvlFallback?.get(pair.pairAddress.toLowerCase()) ?? 0);
     const volume1hUsd = Number(pair.volume?.h1 ?? 0);
     const volume6hUsd = Number(pair.volume?.h6 ?? 0);
     if (!Number.isFinite(tvlUsd) || tvlUsd <= 0 || !Number.isFinite(volume1hUsd) || volume1hUsd < 0 || !Number.isFinite(volume6hUsd) || volume6hUsd < 0) return null;
-    const verified = await this.verifyPool(protocol, pair.pairAddress as Address, token, "robinhood");
+    const verified = await this.verifyPool(protocol, pair.pairAddress as Address, token, chain);
     if (!verified) return null;
     const feeTier = verified.feeTier ?? 0;
     const currentLpFee = verified.currentLpFee;
@@ -390,9 +418,12 @@ export class PoolScanner {
     const safetyFactor = Math.sqrt(tvlUsd / (tvlUsd + K));
     return {
       protocol,
+      dex: verified.dex,
       pair: baseIsToken ? `${pair.baseToken.symbol}/${pair.quoteToken.symbol}` : `${pair.quoteToken.symbol}/${pair.baseToken.symbol}`,
       quoteToken,
-      uniswapUrl: uniswapPoolUrl(pair.pairAddress, "robinhood"),
+      uniswapUrl: verified.dex === "pancake"
+        ? `https://pancakeswap.finance/liquidity/pool/bsc/${pair.pairAddress}`
+        : uniswapPoolUrl(pair.pairAddress, chain),
       activeLiquidity: verified.activeLiquidity,
       feeTier,
       feeRate,
@@ -803,10 +834,31 @@ export class PoolScanner {
     }
   }
 
-  async scanStocks(onProgress?: (stage: string) => void): Promise<PoolMarketScan> {
-    onProgress?.(`Menganalisis ${ROBINHOOD_STOCK_TOKENS.length} tokenized stocks via DexScreener...`);
-    const enriched = await mapWithConcurrency(ROBINHOOD_STOCK_TOKENS, STOCK_VERIFY_CONCURRENCY, (stock) =>
-      this.enrichStockPairs(stock).catch(() => null),
+  async scanStocks(onProgress?: (stage: string) => void, chain: ChainName = "robinhood"): Promise<PoolMarketScan> {
+    const dexLabel = chain === "bsc" ? "Pancake/Uniswap V3" : "Uniswap V3/V4";
+    onProgress?.(chain === "bsc" ? "Memuat token *B (stock/ETF/komoditas) di BSC..." : "Memuat daftar resmi Robinhood Token...");
+    let universe: { address: Address; symbol: string }[] = chain === "bsc" ? [...BSC_STOCK_SEEDS] : [...ROBINHOOD_STOCK_TOKENS];
+    try {
+      const live = chain === "bsc" ? await this.fetchBscStockTokens() : await this.fetchOfficialStockTokens();
+      if (live.length > 0) universe = live;
+    } catch (error) {
+      log.warn({ error: error instanceof Error ? error.message : String(error), chain }, "stock list failed; using fallback");
+    }
+
+    onProgress?.(`Menyaring volume ${dexLabel} 24h ≥ $100k (${universe.length} tokens)...`);
+    const volumes = await this.fetchStockVolumes(universe, chain);
+    const liquid = universe
+      .filter((stock) => (volumes.get(stock.address.toLowerCase()) ?? 0) >= STOCK_MIN_VOLUME_24H_USD)
+      .sort((a, b) => (volumes.get(b.address.toLowerCase()) ?? 0) - (volumes.get(a.address.toLowerCase()) ?? 0));
+    const stockSymbols = liquid.map((stock) => stock.symbol);
+    onProgress?.(
+      liquid.length === 0
+        ? `Tidak ada token dengan volume ${dexLabel} 24h ≥ $100k.`
+        : `Volume lolos: ${liquid.length} (${stockSymbols.join(" ")}). Menghitung yield...`,
+    );
+
+    const enriched = await mapWithConcurrency(liquid, STOCK_VERIFY_CONCURRENCY, (stock) =>
+      this.enrichStockPairs(stock, chain).catch(() => null),
     );
     onProgress?.("Memverifikasi pool on-chain dan menghitung yield...");
     const pools = enriched
@@ -816,19 +868,106 @@ export class PoolScanner {
       .slice(0, STOCK_MAX_RESULTS);
     return {
       pools,
-      candidateTokens: ROBINHOOD_STOCK_TOKENS.length,
+      candidateTokens: universe.length,
       qualifiedTokens: enriched.filter((result) => result && result.length > 0).length,
-      evaluatedTokens: ROBINHOOD_STOCK_TOKENS.length,
+      evaluatedTokens: liquid.length,
+      stockSymbols,
+      chain,
     };
   }
 
-  private async enrichStockPairs(stock: { address: Address; symbol: string }): Promise<ScoredPool[] | null> {
-    const token = stock.address.toLowerCase();
-    const pairs = await this.fetchDexScreenerPairs(token);
-    const relevant = pairs.filter((pair) => {
-      if (pair.chainId !== "robinhood" || pair.dexId !== "uniswap") return false;
-      return pair.labels?.includes("v3") || pair.labels?.includes("v4");
+  private async fetchOfficialStockTokens(): Promise<{ address: Address; symbol: string }[]> {
+    const seen = new Set<string>();
+    const stocks: { address: Address; symbol: string }[] = [];
+    let params = new URLSearchParams({ q: "Robinhood Token" });
+    for (let page = 0; page < STOCK_LIST_MAX_PAGES; page++) {
+      const response = await fetch(`${BLOCKSCOUT_TOKENS}?${params}`, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) break;
+      const body = await response.json() as {
+        items?: { address_hash?: string; name?: string | null; symbol?: string | null; icon_url?: string | null }[];
+        next_page_params?: Record<string, string | number | boolean | null>;
+      };
+      const items = body.items ?? [];
+      const first = items[0]?.address_hash?.toLowerCase();
+      if (page > 0 && first && seen.has(first)) break;
+      for (const item of items) {
+        if (!isOfficialRobinhoodStock(item) || !item.address_hash || !isAddress(item.address_hash)) continue;
+        const address = item.address_hash as Address;
+        const key = address.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        stocks.push({ address, symbol: (item.symbol ?? "STOCK").toUpperCase() });
+      }
+      if (!body.next_page_params || items.length === 0) break;
+      const next = new URLSearchParams();
+      for (const [key, value] of Object.entries(body.next_page_params)) {
+        if (value === null || value === undefined) continue;
+        next.set(key, String(value));
+      }
+      if ([...next.keys()].length === 0 || next.toString() === params.toString()) break;
+      params = next;
+    }
+    return stocks;
+  }
+
+  private async fetchBscStockTokens(): Promise<{ address: Address; symbol: string }[]> {
+    const found = new Map<string, { address: Address; symbol: string }>();
+    for (const seed of BSC_STOCK_SEEDS) found.set(seed.symbol, seed);
+    const pending = BSC_STOCK_TICKERS
+      .map((ticker) => `${ticker}B`)
+      .filter((symbol) => !found.has(symbol));
+    const resolved = await mapWithConcurrency(pending, STOCK_VERIFY_CONCURRENCY, async (symbol) => {
+      try {
+        const response = await fetch(`${DEXSCREENER_BASE}/latest/dex/search?q=${encodeURIComponent(symbol)}`, {
+          headers: { Accept: "application/json" },
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (!response.ok) return null;
+        const body = await response.json() as { pairs?: DexScreenerPair[] };
+        return resolveBscStockToken(symbol, body.pairs ?? []);
+      } catch (error) {
+        log.warn({ error: error instanceof Error ? error.message : String(error), symbol }, "DexScreener BSC stock search failed");
+        return null;
+      }
     });
+    for (const stock of resolved) {
+      if (stock) found.set(stock.symbol, stock);
+    }
+    return [...found.values()];
+  }
+
+  private async fetchStockVolumes(stocks: readonly { address: Address; symbol: string }[], chain: ChainName = "robinhood"): Promise<Map<string, number>> {
+    const volumes = new Map<string, number>();
+    const dsChain = chainRegistry[chain].dexScreenerChain;
+    const volumeOptions = stockVolumeOptions(chain);
+    for (let offset = 0; offset < stocks.length; offset += STOCK_VOLUME_BATCH) {
+      const batch = stocks.slice(offset, offset + STOCK_VOLUME_BATCH);
+      try {
+        const response = await fetch(
+          `${DEXSCREENER_BASE}/tokens/v1/${dsChain}/${batch.map((stock) => stock.address).join(",")}`,
+          { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) },
+        );
+        if (!response.ok) continue;
+        const body = await response.json() as DexScreenerPair[] | { pairs?: DexScreenerPair[] };
+        const pairs = Array.isArray(body) ? body : body.pairs ?? [];
+        for (const stock of batch) {
+          const token = stock.address.toLowerCase();
+          volumes.set(token, (volumes.get(token) ?? 0) + stockUniswapVolume24h(token, pairs, volumeOptions));
+        }
+      } catch (error) {
+        log.warn({ error: error instanceof Error ? error.message : String(error), chain }, "DexScreener stock volume batch failed");
+      }
+    }
+    return volumes;
+  }
+
+  private async enrichStockPairs(stock: { address: Address; symbol: string }, chain: ChainName = "robinhood"): Promise<ScoredPool[] | null> {
+    const token = stock.address.toLowerCase();
+    const pairs = await this.fetchDexScreenerPairs(token, chain);
+    const relevant = pairs.filter((pair) => isStockScanPair(pair, chain));
     if (relevant.length === 0) return null;
 
     const top = [...relevant]
@@ -836,9 +975,9 @@ export class PoolScanner {
       .slice(0, MAX_DEXSCREENER_POOL_VERIFICATIONS);
 
     const hasMissingTvl = top.some((pair) => !Number(pair.liquidity?.usd ?? 0));
-    const geckoTvlFallback = hasMissingTvl ? await this.buildGeckoTvlMap(token) : undefined;
+    const geckoTvlFallback = hasMissingTvl ? await this.buildGeckoTvlMap(token, chain) : undefined;
     const scored = (await mapWithConcurrency(top, STOCK_VERIFY_CONCURRENCY, (pair) =>
-      this.toDexScreenerPool(pair, token, geckoTvlFallback),
+      this.toDexScreenerPool(pair, token, geckoTvlFallback, chain),
     )).filter((pool): pool is ScoredPool => pool !== null && pool.activeLiquidity);
 
     return scored.map((pool) => ({ ...pool, pair: `${pool.pair} [${stock.symbol}]` }));
@@ -1103,6 +1242,85 @@ export class PoolScanner {
       return null;
     }
   }
+}
+
+export function isOfficialRobinhoodStock(token: {
+  name?: string | null;
+  icon_url?: string | null;
+  address_hash?: string | null;
+}): boolean {
+  return Boolean(
+    token.address_hash
+    && isAddress(token.address_hash)
+    && (token.name ?? "").includes("• Robinhood Token")
+    && (token.icon_url ?? "").includes("cdn.robinhood.com"),
+  );
+}
+
+export function stockVolumeOptions(chain: ChainName): { chainId: string; dexIds: readonly string[]; quotes: Set<string> } {
+  if (chain === "bsc") {
+    return { chainId: "bsc", dexIds: BSC_STOCK_DEX_IDS, quotes: BSC_STOCK_VOLUME_QUOTES };
+  }
+  return { chainId: "robinhood", dexIds: ["uniswap"], quotes: STOCK_VOLUME_QUOTES };
+}
+
+export function stockPairProtocol(pair: DexScreenerPair): "v3" | "v4" | null {
+  if (pair.labels?.includes("v2")) return null;
+  if (pair.labels?.includes("v4") || pair.pairAddress.length === 66) return "v4";
+  if (pair.labels?.includes("v3") || pair.pairAddress.length === 42) return "v3";
+  return null;
+}
+
+export function isStockScanPair(pair: DexScreenerPair, chain: ChainName): boolean {
+  const options = stockVolumeOptions(chain);
+  if (pair.chainId && pair.chainId !== options.chainId) return false;
+  if (!options.dexIds.includes(pair.dexId)) return false;
+  return stockPairProtocol(pair) !== null;
+}
+
+export function resolveBscStockToken(symbol: string, pairs: readonly DexScreenerPair[]): { address: Address; symbol: string } | null {
+  const wanted = symbol.toUpperCase();
+  let best: { address: Address; liquidity: number } | null = null;
+  for (const pair of pairs) {
+    if (!isStockScanPair(pair, "bsc")) continue;
+    const price = Number(pair.priceUsd ?? 0);
+    if (!Number.isFinite(price) || price < BSC_STOCK_MIN_PRICE_USD) continue;
+    const baseMatch = pair.baseToken.symbol.toUpperCase() === wanted;
+    const quoteMatch = pair.quoteToken.symbol.toUpperCase() === wanted;
+    if (!baseMatch && !quoteMatch) continue;
+    const address = (baseMatch ? pair.baseToken.address : pair.quoteToken.address) as Address;
+    if (!isAddress(address)) continue;
+    const liquidity = Number(pair.liquidity?.usd ?? 0);
+    if (!best || liquidity > best.liquidity) best = { address, liquidity };
+  }
+  return best ? { address: best.address, symbol: wanted } : null;
+}
+
+export function stockUniswapVolume24h(
+  token: string,
+  pairs: readonly DexScreenerPair[],
+  options: { chainId?: string; dexIds?: readonly string[]; quotes?: Set<string> } = {},
+): number {
+  const address = token.toLowerCase();
+  const chainId = options.chainId ?? "robinhood";
+  const dexIds = options.dexIds ?? ["uniswap"];
+  const quotes = options.quotes ?? STOCK_VOLUME_QUOTES;
+  let total = 0;
+  for (const pair of pairs) {
+    if (pair.chainId && pair.chainId !== chainId) continue;
+    if (!dexIds.includes(pair.dexId)) continue;
+    if (!stockPairProtocol(pair)) continue;
+    const base = pair.baseToken.address.toLowerCase();
+    const quote = pair.quoteToken.address.toLowerCase();
+    const stockIsBase = base === address;
+    const stockIsQuote = quote === address;
+    if (!stockIsBase && !stockIsQuote) continue;
+    const other = stockIsBase ? quote : base;
+    if (!quotes.has(other)) continue;
+    const volume = Number(pair.volume?.h24 ?? 0);
+    if (Number.isFinite(volume) && volume > 0) total += volume;
+  }
+  return total;
 }
 
 export function hasMinimumScanVolume6h(volume6hUsd: number): boolean {

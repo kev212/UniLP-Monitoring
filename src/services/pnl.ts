@@ -105,11 +105,11 @@ export class PnlService {
     ]);
     if (nonQuote.amount > 0n && !route) throw new Error("No safe direct Uniswap route from LP asset to quote token");
 
-    const liquidationQuote = quoteAmount + (route?.minimumOut ?? 0n);
+    const liquidationQuote = quoteAmount + (route?.expectedOut ?? 0n);
     let feeQuote = quoteSideFee;
     let feeNonQuoteConverted = 0n;
     if (nonQuoteFee > 0n) {
-      feeNonQuoteConverted = feeRoute?.minimumOut ?? 0n;
+      feeNonQuoteConverted = feeRoute?.expectedOut ?? 0n;
       feeQuote += feeNonQuoteConverted;
     }
     const totals = await this.database.getCashflowTotals(position.id);
@@ -204,8 +204,8 @@ export class PnlService {
     ]);
     if (nonQuote.amount > 0n && !route) throw new Error("No safe direct Uniswap route from group LP asset to quote token");
 
-    const liquidationQuote = quoteAmount + (route?.minimumOut ?? 0n);
-    const feeQuote = quoteFee + (feeRoute?.minimumOut ?? 0n);
+    const liquidationQuote = quoteAmount + (route?.expectedOut ?? 0n);
+    const feeQuote = quoteFee + (feeRoute?.expectedOut ?? 0n);
     const feeQuoteUsdg = await this.toFeeUsd6(
       group.chainId,
       group.quoteToken,
@@ -365,7 +365,7 @@ export class PnlService {
     chainId: number,
     quoteToken: Address,
     feeQuote: bigint,
-    convert: (stable: Address, amount: bigint) => Promise<{ minimumOut: bigint } | null>,
+    convert: (stable: Address, amount: bigint) => Promise<{ expectedOut: bigint } | null>,
   ): Promise<bigint> {
     const chainName = this.config.chains.find((name) => chainRegistry[name].chain.id === chainId);
     if (!chainName) return feeQuote;
@@ -377,7 +377,7 @@ export class PnlService {
     }
     if (feeQuote <= 0n) return 0n;
     const route = await convert(stable.address, feeQuote);
-    return normalizeToUsd6(route?.minimumOut ?? 0n, decimals);
+    return normalizeToUsd6(route?.expectedOut ?? 0n, decimals);
   }
 }
 

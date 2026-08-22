@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, limitQualifiedPoolsPerToken, MIN_VOLUME_6H_USD, PoolScanner, poolPair, rankPools, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
+import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, isOfficialRobinhoodStock, limitQualifiedPoolsPerToken, MIN_VOLUME_6H_USD, PoolScanner, poolPair, rankPools, resolveBscStockToken, STOCK_MIN_VOLUME_24H_USD, stockUniswapVolume24h, stockVolumeOptions, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
 import { calibrateOhlcvPrices, normalizeOhlcvPrices, overlapFraction, snapRange } from "../src/services/concentrated-yield.js";
 
 describe("pool scoring formula", () => {
@@ -200,6 +200,67 @@ describe("scan pool eligibility", () => {
 
     expect(ranked.active.map(({ pair }) => pair)).toEqual(["B", "C", "D"]);
     expect(ranked.watchlist.map(({ pair }) => pair)).toEqual(["X", "Y"]);
+  });
+});
+
+describe("stock volume prefilter", () => {
+  const nvda = "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC";
+  const usdg = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
+  const pack = "0x0145AcbcceFbEd6F303C420bEeaaAc72E905430b";
+
+  it("accepts official Robinhood Token with CDN logo", () => {
+    expect(isOfficialRobinhoodStock({
+      address_hash: nvda,
+      name: "NVIDIA • Robinhood Token",
+      icon_url: "https://cdn.robinhood.com/ncw_assets/logos/0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec.png",
+    })).toBe(true);
+  });
+
+  it("rejects clones without official CDN logo", () => {
+    expect(isOfficialRobinhoodStock({
+      address_hash: nvda,
+      name: "NVIDIA • Robinhood Token",
+      icon_url: null,
+    })).toBe(false);
+    expect(isOfficialRobinhoodStock({
+      address_hash: nvda,
+      name: "Robinhood Markets (Ondo Tokenized)",
+      icon_url: "https://cdn.robinhood.com/ncw_assets/logos/x.png",
+    })).toBe(false);
+  });
+
+  it("sums Uniswap v3/v4 24h volume against USDG/WETH/ETH/SPY only", () => {
+    const volume = stockUniswapVolume24h(nvda, [
+      { chainId: "robinhood", dexId: "uniswap", pairAddress: "0x1", labels: ["v3"], baseToken: { address: nvda, symbol: "NVDA" }, quoteToken: { address: usdg, symbol: "USDG" }, volume: { h24: 80_000 } },
+      { chainId: "robinhood", dexId: "uniswap", pairAddress: "0x2", labels: ["v4"], baseToken: { address: nvda, symbol: "NVDA" }, quoteToken: { address: "0x0000000000000000000000000000000000000000", symbol: "ETH" }, volume: { h24: 30_000 } },
+      { chainId: "robinhood", dexId: "uniswap", pairAddress: "0x3", labels: ["v4"], baseToken: { address: nvda, symbol: "NVDA" }, quoteToken: { address: pack, symbol: "PACK" }, volume: { h24: 200_000 } },
+      { chainId: "robinhood", dexId: "ramses", pairAddress: "0x4", labels: ["v3"], baseToken: { address: nvda, symbol: "NVDA" }, quoteToken: { address: usdg, symbol: "USDG" }, volume: { h24: 50_000 } },
+    ]);
+    expect(volume).toBe(110_000);
+    expect(volume).toBeGreaterThanOrEqual(STOCK_MIN_VOLUME_24H_USD);
+  });
+
+  it("resolves the liquid BSC *B token and ignores cheap clones", () => {
+    const official = "0xbe9D156892E55e7154BcD3cB0FEA677F9D3103E1";
+    const clone = "0x627D4c16c2AF9e8eC9a275E683e3Ddcc1a3103e1";
+    const usdt = "0x55d398326f99059ff775485246999027b3197955";
+    const resolved = resolveBscStockToken("SPCXB", [
+      { chainId: "bsc", dexId: "pancakeswap", pairAddress: "0x66faad27cf481f82d0089ec8156b3aa3636010c7", labels: ["v3"], baseToken: { address: official, symbol: "SPCXB" }, quoteToken: { address: usdt, symbol: "USDT" }, priceUsd: 144, liquidity: { usd: 2_000_000 } },
+      { chainId: "bsc", dexId: "pancakeswap", pairAddress: "0x605584d41916357d80273dc02b0d6bdc2d044a97", labels: ["v2"], baseToken: { address: clone, symbol: "SPCXB" }, quoteToken: { address: usdt, symbol: "USDT" }, priceUsd: 0.012, liquidity: { usd: 600 } },
+    ]);
+    expect(resolved).toEqual({ address: official, symbol: "SPCXB" });
+  });
+
+  it("sums BSC pancake/uniswap v3 volume against USDT/WBNB", () => {
+    const spcxb = "0xbe9D156892E55e7154BcD3cB0FEA677F9D3103E1";
+    const usdt = "0x55d398326f99059ff775485246999027b3197955";
+    const wbnb = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
+    const volume = stockUniswapVolume24h(spcxb, [
+      { chainId: "bsc", dexId: "pancakeswap", pairAddress: "0x1", labels: ["v3"], baseToken: { address: spcxb, symbol: "SPCXB" }, quoteToken: { address: usdt, symbol: "USDT" }, volume: { h24: 80_000 } },
+      { chainId: "bsc", dexId: "uniswap", pairAddress: "0x51a45a72cc96ca3ba615e25e80a6af2740ae2e2d", baseToken: { address: spcxb, symbol: "SPCXB" }, quoteToken: { address: wbnb, symbol: "WBNB" }, volume: { h24: 30_000 } },
+      { chainId: "bsc", dexId: "pancakeswap", pairAddress: "0x3", labels: ["v2"], baseToken: { address: spcxb, symbol: "SPCXB" }, quoteToken: { address: usdt, symbol: "USDT" }, volume: { h24: 200_000 } },
+    ], stockVolumeOptions("bsc"));
+    expect(volume).toBe(110_000);
   });
 });
 

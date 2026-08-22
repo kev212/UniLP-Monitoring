@@ -17,7 +17,7 @@ try {
     console.log(`${candidate.id} ${candidate.protocol.toUpperCase()} ${candidate.finalPnlBps.toString()}bps ${candidate.settledAt.toISOString()}`);
   }
   if (!apply) {
-    console.log(`dry-run: ${candidates.length} BA history row(s) eligible; rerun with --apply to write`);
+    console.log(`dry-run: ${candidates.length} BA history row(s) eligible (>= ±$0.50); rerun with --apply to write`);
   } else {
     const written = await database.backfillPositionGroupHistory(candidates.map((candidate) => candidate.id));
     console.log(`applied: ${written} BA history row(s)`);
