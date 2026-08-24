@@ -120,7 +120,7 @@ describe("one-sided Bid-Ask planner", () => {
       totalAmount: 10_000n,
     });
     expect(moreThanForty.generatedBinCount).toBe(45);
-    expect(moreThanForty.shapeVersion).toBe("delta-amount-linear-v2");
+    expect(moreThanForty.shapeVersion).toBe("delta-amount-linear-v4");
   });
 
   it("persists exact edge anchors and Bid-Ask weights", () => {
@@ -145,41 +145,46 @@ describe("one-sided Bid-Ask planner", () => {
     ]);
   });
 
-  it("uses a permanent ten-percent anchor for new ladders", () => {
+  it("uses a permanent seven-percent anchor for new ladders", () => {
     expect(calculateBidAskWeights(1, 0)).toEqual([
       { distance: 0, weightMicros: 1_000_000 },
     ]);
     expect(calculateBidAskWeights(2, 0)).toEqual([
-      { distance: 0, weightMicros: 100_000 },
-      { distance: 1, weightMicros: 900_000 },
+      { distance: 0, weightMicros: 70_000 },
+      { distance: 1, weightMicros: 930_000 },
     ]);
     expect(calculateBidAskWeights(3, 0)).toEqual([
-      { distance: 0, weightMicros: 100_000 },
-      { distance: 1, weightMicros: 290_909 },
-      { distance: 2, weightMicros: 609_091 },
+      { distance: 0, weightMicros: 70_000 },
+      { distance: 1, weightMicros: 285_454 },
+      { distance: 2, weightMicros: 644_546 },
     ]);
     expect(calculateBidAskWeights(4, 3)).toEqual([
-      { distance: 3, weightMicros: 446_155 },
-      { distance: 2, weightMicros: 284_615 },
-      { distance: 1, weightMicros: 169_230 },
-      { distance: 0, weightMicros: 100_000 },
+      { distance: 3, weightMicros: 485_386 },
+      { distance: 2, weightMicros: 291_538 },
+      { distance: 1, weightMicros: 153_076 },
+      { distance: 0, weightMicros: 70_000 },
     ]);
     expect(calculateBidAskWeights(5, 0)).toEqual([
-      { distance: 0, weightMicros: 100_000 },
-      { distance: 1, weightMicros: 130_000 },
-      { distance: 2, weightMicros: 180_000 },
-      { distance: 3, weightMicros: 250_000 },
-      { distance: 4, weightMicros: 340_000 },
+      { distance: 0, weightMicros: 70_000 },
+      { distance: 1, weightMicros: 109_000 },
+      { distance: 2, weightMicros: 174_000 },
+      { distance: 3, weightMicros: 265_000 },
+      { distance: 4, weightMicros: 382_000 },
     ]);
     expect(calculateBidAskWeights(5, 4)).toEqual([
-      { distance: 4, weightMicros: 340_000 },
-      { distance: 3, weightMicros: 250_000 },
-      { distance: 2, weightMicros: 180_000 },
-      { distance: 1, weightMicros: 130_000 },
-      { distance: 0, weightMicros: 100_000 },
+      { distance: 4, weightMicros: 382_000 },
+      { distance: 3, weightMicros: 265_000 },
+      { distance: 2, weightMicros: 174_000 },
+      { distance: 1, weightMicros: 109_000 },
+      { distance: 0, weightMicros: 70_000 },
     ]);
-    expect(bidAskShapeVersionForBinCount(10)).toBe("delta-amount-linear-v3");
-    expect(bidAskShapeVersionForBinCount(11)).toBe("delta-amount-linear-v2");
+    expect(bidAskShapeVersionForBinCount(10)).toBe("delta-amount-linear-v4");
+    expect(bidAskShapeVersionForBinCount(11)).toBe("delta-amount-linear-v4");
+
+    const sixteenBins = calculateBidAskWeights(16, 0);
+    expect(sixteenBins[0]?.weightMicros).toBe(70_000);
+    expect(sixteenBins.every((weight) => weight.weightMicros > 0)).toBe(true);
+    expect(sixteenBins.reduce((sum, weight) => sum + weight.weightMicros, 0)).toBe(1_000_000);
 
     const threeBinBudget = planBidAsk({
       currentTick: 0,
@@ -190,8 +195,8 @@ describe("one-sided Bid-Ask planner", () => {
       quoteIsToken0: true,
       totalAmount: 250_000_000n,
     });
-    expect(threeBinBudget.shapeVersion).toBe("delta-amount-linear-v3");
-    expect(threeBinBudget.bins.map((bin) => bin.allocatedAmount0)).toEqual([25_000_000n, 72_727_250n, 152_272_750n]);
+    expect(threeBinBudget.shapeVersion).toBe("delta-amount-linear-v4");
+    expect(threeBinBudget.bins.map((bin) => bin.allocatedAmount0)).toEqual([17_500_000n, 71_363_500n, 161_136_500n]);
 
     const fourBinBudget = planBidAsk({
       currentTick: 0,
@@ -202,8 +207,8 @@ describe("one-sided Bid-Ask planner", () => {
       quoteIsToken0: true,
       totalAmount: 250_000_000n,
     });
-    expect(fourBinBudget.shapeVersion).toBe("delta-amount-linear-v3");
-    expect(fourBinBudget.bins.map((bin) => bin.allocatedAmount0)).toEqual([25_000_000n, 42_307_500n, 71_153_750n, 111_538_750n]);
+    expect(fourBinBudget.shapeVersion).toBe("delta-amount-linear-v4");
+    expect(fourBinBudget.bins.map((bin) => bin.allocatedAmount0)).toEqual([17_500_000n, 38_269_000n, 72_884_500n, 121_346_500n]);
 
     const fiveBinBudget = planBidAsk({
       currentTick: 0,
@@ -214,8 +219,18 @@ describe("one-sided Bid-Ask planner", () => {
       quoteIsToken0: true,
       totalAmount: 250_000_000n,
     });
-    expect(fiveBinBudget.shapeVersion).toBe("delta-amount-linear-v3");
-    expect(fiveBinBudget.bins.map((bin) => bin.allocatedAmount0)).toEqual([25_000_000n, 32_500_000n, 45_000_000n, 62_500_000n, 85_000_000n]);
+    expect(fiveBinBudget.shapeVersion).toBe("delta-amount-linear-v4");
+    expect(fiveBinBudget.bins.map((bin) => bin.allocatedAmount0)).toEqual([17_500_000n, 27_250_000n, 43_500_000n, 66_250_000n, 95_500_000n]);
+  });
+
+  it("preserves the historical ten-percent v3 weighting", () => {
+    expect(calculateBidAskWeights(5, 0, "delta-amount-linear-v3")).toEqual([
+      { distance: 0, weightMicros: 100_000 },
+      { distance: 1, weightMicros: 130_000 },
+      { distance: 2, weightMicros: 180_000 },
+      { distance: 3, weightMicros: 250_000 },
+      { distance: 4, weightMicros: 340_000 },
+    ]);
   });
 
   it("allocates bigint amounts with the final generated bin receiving the remainder", () => {
@@ -228,8 +243,8 @@ describe("one-sided Bid-Ask planner", () => {
       quoteIsToken0: true,
       totalAmount: 100n,
     });
-    expect(plan.shapeVersion).toBe("delta-amount-linear-v3");
-    expect(plan.bins.map((bin) => bin.allocatedAmount0)).toEqual([10n, 29n, 61n]);
+    expect(plan.shapeVersion).toBe("delta-amount-linear-v4");
+    expect(plan.bins.map((bin) => bin.allocatedAmount0)).toEqual([7n, 28n, 65n]);
     expect(plan.bins.map((bin) => bin.allocatedAmount1)).toEqual([0n, 0n, 0n]);
     expect(plan.bins.reduce((sum, bin) => sum + bin.allocatedAmount0, 0n)).toBe(100n);
   });

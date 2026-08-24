@@ -26,7 +26,7 @@ export type PositionGroupStatus =
 export type PositionGroupBinStatus = "planned" | "minted" | "closed" | "skipped" | "needs_review";
 export type PositionGroupBinSide = "token0" | "token1";
 export type PositionGroupShape = "bid_ask";
-export type PositionGroupShapeVersion = "delta-amount-linear-v1" | "delta-amount-linear-v2" | "delta-amount-linear-v3";
+export type PositionGroupShapeVersion = "delta-amount-linear-v1" | "delta-amount-linear-v2" | "delta-amount-linear-v3" | "delta-amount-linear-v4";
 
 export type PositionGroupExecutionStage =
   | "approve_quote"
