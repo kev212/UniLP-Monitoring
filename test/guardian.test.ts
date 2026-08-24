@@ -4,7 +4,7 @@ import { Guardian, shouldResumeExitRetry, shouldWaitForExitRetry } from "../src/
 import { quoteRangeState } from "../src/services/quote-range.js";
 import { sqrtRatioAtTick } from "../src/services/uniswap-math.js";
 import type { RuntimeConfig } from "../src/config.js";
-import type { PnlSnapshot, PositionRecord } from "../src/types.js";
+import type { PnlSnapshot, PositionGroupPnlSnapshot, PositionGroupRecord, PositionRecord } from "../src/types.js";
 
 describe("quote-oriented range triggers", () => {
   const range = (status: "in_range" | "above" | "below", currentTick: number) => ({
@@ -418,6 +418,102 @@ describe("stop-loss local quote validation", () => {
     expect(result).toBeNull();
     expect(database.setPositionStatus).toHaveBeenCalledWith("position", "armed", { slTwapWaitStartedAt: null });
     expect(pnl.valueLocal).toHaveBeenCalledWith(position, 10n);
+  });
+
+  const group = {
+    id: "group",
+    chainId: 4663,
+    protocol: "v3",
+    positionManager: "0x0000000000000000000000000000000000000001",
+    poolKey: "0x0000000000000000000000000000000000000004",
+    owner: "0x0000000000000000000000000000000000000005",
+    token0: "0x0000000000000000000000000000000000000002",
+    token1: "0x0000000000000000000000000000000000000003",
+    quoteToken: "0x0000000000000000000000000000000000000002",
+    shape: "bid_ask",
+    shapeVersion: "delta-amount-linear-v3",
+    requestedBinCount: 5,
+    generatedBinCount: 5,
+    mintableBinCount: 5,
+    outerTickLower: 0,
+    outerTickUpper: 100,
+    anchorBinIndex: 2,
+    totalDeposit: 1_000_000n,
+    deployedCostQuote: 1_000_000n,
+    directCloseAmount0: 0n,
+    directCloseAmount1: 0n,
+    totalReceivedQuote: 0n,
+    status: "active",
+    planHash: "0xplan",
+    planJson: {},
+    referenceBlock: 1n,
+    referenceTick: 50,
+    referencePrice: 1n,
+    openTransactionHash: "0xopen",
+    closeTransactionHash: null,
+    pendingRawTransaction: null,
+    executionLeaseToken: null,
+    executionLeaseUntil: null,
+    finalPnlQuote: null,
+    finalPnlBps: null,
+    finalPnlUsd: null,
+    settledAt: null,
+    metadata: {},
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  } satisfies PositionGroupRecord;
+
+  const groupSnapshot = (pnlBps: bigint): PositionGroupPnlSnapshot => ({
+    groupId: group.id,
+    quoteToken: group.quoteToken,
+    depositsQuote: 1_000_000n,
+    realizedQuote: 0n,
+    liquidationQuote: 1_000_000n + pnlBps,
+    feeQuote: 0n,
+    feeQuoteUsdg: 0n,
+    pnlQuote: pnlBps,
+    pnlBps,
+    blockNumber: 10n,
+    groupGasQuote: 0n,
+  });
+
+  it("cancels an API-triggered group SL when the local quote is above the threshold", async () => {
+    const pnl = {
+      valueGroupLocal: vi.fn().mockResolvedValue({ snapshot: groupSnapshot(-151n) }),
+      shouldTriggerGroup: vi.fn().mockReturnValue(null),
+    };
+    const guardian = new Guardian({} as RuntimeConfig, {} as never, {} as never, {} as never, {} as never, pnl as never, {} as never, {} as never);
+
+    const result = await (guardian as unknown as {
+      validateGroupStopLossWithLocalQuote(
+        value: PositionGroupRecord,
+        blockNumber: bigint,
+        apiSnapshot: PositionGroupPnlSnapshot,
+      ): Promise<PositionGroupPnlSnapshot | null>;
+    }).validateGroupStopLossWithLocalQuote(group, 10n, groupSnapshot(-3_158n));
+
+    expect(result).toBeNull();
+    expect(pnl.valueGroupLocal).toHaveBeenCalledWith(group, 10n);
+    expect(pnl.shouldTriggerGroup).toHaveBeenCalledWith(groupSnapshot(-151n));
+  });
+
+  it("skips a group SL when local quote validation fails", async () => {
+    const pnl = {
+      valueGroupLocal: vi.fn().mockRejectedValue(new Error("RPC rate limited")),
+      shouldTriggerGroup: vi.fn(),
+    };
+    const guardian = new Guardian({} as RuntimeConfig, {} as never, {} as never, {} as never, {} as never, pnl as never, {} as never, {} as never);
+
+    const result = await (guardian as unknown as {
+      validateGroupStopLossWithLocalQuote(
+        value: PositionGroupRecord,
+        blockNumber: bigint,
+        apiSnapshot: PositionGroupPnlSnapshot,
+      ): Promise<PositionGroupPnlSnapshot | null>;
+    }).validateGroupStopLossWithLocalQuote(group, 10n, groupSnapshot(-3_158n));
+
+    expect(result).toBeNull();
+    expect(pnl.shouldTriggerGroup).not.toHaveBeenCalled();
   });
 });
 

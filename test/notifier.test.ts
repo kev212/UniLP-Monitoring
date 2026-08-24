@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { PositionOpener } from "../src/services/position-opener.js";
-import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanV2Input, positionRangeBins, positionRangeLine } from "../src/services/notifier.js";
+import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanPoolsInput, parseScanV2Input, positionRangeBins, positionRangeLine } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -176,8 +176,17 @@ describe("Telegram dashboard callbacks", () => {
 
   it("parses pool-scan dashboard callbacks", () => {
     expect(parseDashboardAction("lp:scan_pools:0")).toEqual({ type: "scan_pools", page: 0 });
+    expect(parseDashboardAction("lp:scan_pools_chain:base:0")).toEqual({ type: "scan_pools_chain", chain: "base", page: 0 });
+    expect(parseDashboardAction("lp:scan_pools_chain:bsc:0")).toEqual({ type: "scan_pools_chain", chain: "bsc", page: 0 });
     expect(parseDashboardAction("lp:cfg:yield")).toEqual({ type: "config_edit", key: "yield" });
     expect(parseDashboardAction("lp:cfgquote:WETH")).toEqual({ type: "config_quote", quote: "WETH" });
+  });
+
+  it("parses optional pool scan chain arguments", () => {
+    expect(parseScanPoolsInput("")).toBe("robinhood");
+    expect(parseScanPoolsInput("base")).toBe("base");
+    expect(parseScanPoolsInput("bnb")).toBe("bsc");
+    expect(parseScanPoolsInput("base extra")).toBeNull();
   });
 
   it("parses global risk-settings callbacks", () => {

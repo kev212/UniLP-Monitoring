@@ -4,6 +4,7 @@ import type { Address } from "viem";
 import { log } from "./log.js";
 import type {
   CloseHistoryRecord,
+  ChainName,
   PnlCalendarMonth,
   PnlCardDetail,
   PnlSnapshot,
@@ -510,10 +511,17 @@ export class Database {
       WHERE a.chat_id = b.chat_id AND a.message_id = b.message_id AND a.id > b.id;
       CREATE UNIQUE INDEX IF NOT EXISTS telegram_deletion_queue_message_idx ON telegram_deletion_queue(chat_id, message_id);
       CREATE TABLE IF NOT EXISTS pool_scan_candidates (
-        token_address TEXT PRIMARY KEY,
+        chain TEXT NOT NULL,
+        token_address TEXT NOT NULL,
         seed_score DOUBLE PRECISION NOT NULL DEFAULT 0,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (chain, token_address)
       );
+      ALTER TABLE pool_scan_candidates ADD COLUMN IF NOT EXISTS chain TEXT;
+      UPDATE pool_scan_candidates SET chain = 'robinhood' WHERE chain IS NULL;
+      ALTER TABLE pool_scan_candidates ALTER COLUMN chain SET NOT NULL;
+      ALTER TABLE pool_scan_candidates DROP CONSTRAINT IF EXISTS pool_scan_candidates_pkey;
+      ALTER TABLE pool_scan_candidates ADD PRIMARY KEY (chain, token_address);
       CREATE INDEX IF NOT EXISTS pool_scan_candidates_updated_idx ON pool_scan_candidates(updated_at DESC);
       CREATE TABLE IF NOT EXISTS close_history (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2135,22 +2143,22 @@ FROM position_groups g
     );
   }
 
-  async replacePoolScanCandidates(candidates: readonly { tokenAddress: string; seedScore: number }[]): Promise<void> {
+  async replacePoolScanCandidates(chain: ChainName, candidates: readonly { tokenAddress: string; seedScore: number }[]): Promise<void> {
     await this.transaction(async (client) => {
-      await client.query("DELETE FROM pool_scan_candidates");
+      await client.query("DELETE FROM pool_scan_candidates WHERE chain = $1", [chain]);
       for (const candidate of candidates) {
         await client.query(
-          "INSERT INTO pool_scan_candidates (token_address, seed_score) VALUES ($1, $2)",
-          [candidate.tokenAddress.toLowerCase(), candidate.seedScore],
+          "INSERT INTO pool_scan_candidates (chain, token_address, seed_score) VALUES ($1, $2, $3)",
+          [chain, candidate.tokenAddress.toLowerCase(), candidate.seedScore],
         );
       }
     });
   }
 
-  async listPoolScanCandidates(limit: number): Promise<{ tokenAddress: string; seedScore: number; updatedAt: Date }[]> {
+  async listPoolScanCandidates(chain: ChainName, limit: number): Promise<{ tokenAddress: string; seedScore: number; updatedAt: Date }[]> {
     const result = await this.pool.query<{ token_address: string; seed_score: number; updated_at: string }>(
-      "SELECT token_address, seed_score, updated_at FROM pool_scan_candidates ORDER BY seed_score DESC LIMIT $1",
-      [limit],
+      "SELECT token_address, seed_score, updated_at FROM pool_scan_candidates WHERE chain = $1 ORDER BY seed_score DESC LIMIT $2",
+      [chain, limit],
     );
     return result.rows.map((row) => ({ tokenAddress: row.token_address, seedScore: row.seed_score, updatedAt: new Date(row.updated_at) }));
   }

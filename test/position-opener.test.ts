@@ -17,7 +17,13 @@ const packAddress = "0x0145AcbcceFbEd6F303C420bEeaaAc72E905430b" as Address;
 const wethAddress = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73" as Address;
 const v3PoolAddress = "0x0000000000000000000000000000000000000044" as Address;
 
-function poolOpener(protocol: "v3" | "v4", tokenA = packAddress, tokenB = nvdaAddress, hooks = zeroAddress) {
+function poolOpener(
+  protocol: "v3" | "v4",
+  tokenA = packAddress,
+  tokenB = nvdaAddress,
+  hooks = zeroAddress,
+  quoteTokens = [{ symbol: "NVDA", address: nvdaAddress }],
+) {
   const poolKey = { currency0: tokenA, currency1: tokenB, fee: 10_000, tickSpacing: 200, hooks };
   const poolId = keccak256(encodeAbiParameters(
     [{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }],
@@ -43,7 +49,7 @@ function poolOpener(protocol: "v3" | "v4", tokenA = packAddress, tokenB = nvdaAd
     getForScan: vi.fn(() => ({ registry: chainRegistry.robinhood, client })),
   };
   const config = {
-    quoteTokens: { robinhood: [{ symbol: "NVDA", address: nvdaAddress }] },
+    quoteTokens: { robinhood: quoteTokens },
     executorAddress: "0x0000000000000000000000000000000000000011",
     bidAskLadderEnabled: true,
     bidAskLadderProtocols: ["v3", "v4"],
@@ -158,6 +164,12 @@ describe("SDK single-side liquidity", () => {
     expect(Ether.onChain(chainId).wrapped.address).toBe(wethAddress);
     expect(openPoolQuoteAddress("v3", chainId, { symbol: "ETH", address: zeroAddress })).toBe(wethAddress);
     expect(openPoolQuoteAddress("v4", chainId, { symbol: "ETH", address: zeroAddress })).toBe(zeroAddress);
+  });
+
+  it("detects native V4 ETH from a wrapped-native allowlist entry", async () => {
+    const { opener, pool } = poolOpener("v4", zeroAddress, packAddress, zeroAddress, [{ symbol: "WETH", address: wethAddress }]);
+
+    await expect(opener.detectQuoteToken(pool, "robinhood")).resolves.toEqual({ symbol: "ETH", address: zeroAddress });
   });
 
   it("wraps only the WETH shortfall required for an open", () => {

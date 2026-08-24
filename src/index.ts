@@ -72,7 +72,9 @@ async function main(): Promise<void> {
     log.warn("invalid global risk settings ignored; using ENV defaults");
   }
   await guardian.validateNetworks();
-  scanner.startCandidateRefresh([...config.quoteTokens.robinhood.map(({ address }) => address), zeroAddress], config.poolScanCandidatePages);
+  for (const chain of config.chains) {
+    scanner.startCandidateRefresh(chain, [...config.quoteTokens[chain].map(({ address }) => address), zeroAddress], config.poolScanCandidatePages);
+  }
   void (async () => {
     try {
       await executor.backfillStaleCloseHistoryUsd();

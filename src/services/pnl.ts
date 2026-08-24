@@ -254,6 +254,14 @@ export class PnlService {
     };
   }
 
+  async valueGroupLocal(
+    group: PositionGroupRecord,
+    blockNumber: bigint,
+    quoteSlippageBps = this.config.maxSwapSlippageBps,
+  ): Promise<ValuedPositionGroup> {
+    return this.valueGroup(group, blockNumber, quoteSlippageBps, false, true);
+  }
+
   shouldTrigger(snapshot: PnlSnapshot, range: PositionRangeInfo | undefined, quoteIsToken0: boolean): ExitTrigger | null {
     const stopLossBps = percentToBps(this.config.stopLossPercent);
     const takeProfitBps = percentToBps(this.config.takeProfitPercent);

@@ -386,7 +386,9 @@ export class PositionOpener {
     const registry = this.chains.getForScan(chain).registry;
     const quote = selectOpenQuoteToken(allowed, token0, token1, registry.quotePriority);
     if (quote) return !isV4 && quote.symbol === registry.wrappedSymbol ? { ...quote, symbol: registry.nativeSymbol } : quote;
-    if ((token0.toLowerCase() === zeroAddress || token1.toLowerCase() === zeroAddress) && allowed.some(({ symbol }) => symbol === registry.nativeSymbol)) {
+    const hasNativeCurrency = token0.toLowerCase() === zeroAddress || token1.toLowerCase() === zeroAddress;
+    const wrappedNativeAllowed = allowed.some(({ address }) => address.toLowerCase() === registry.wrappedNative.toLowerCase());
+    if (hasNativeCurrency && (allowed.some(({ symbol }) => symbol === registry.nativeSymbol) || (isV4 && wrappedNativeAllowed))) {
       return { symbol: registry.nativeSymbol, address: zeroAddress };
     }
     throw new Error("Pool tidak memiliki quote token dari allowlist");

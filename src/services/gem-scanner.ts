@@ -54,7 +54,7 @@ export class GemScanner {
 
   async scan(onProgress?: (stage: string) => void): Promise<GemScanResult> {
     onProgress?.("Memuat kandidat cache...");
-    const candidates = await this.database.listPoolScanCandidates(40);
+    const candidates = await this.database.listPoolScanCandidates("robinhood", 40);
     if (candidates.length === 0) {
       return { candidates: [], evaluatedTokens: 0, qualifiedTokens: 0, warming: true };
     }

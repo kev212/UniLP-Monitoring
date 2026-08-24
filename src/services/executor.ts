@@ -1550,10 +1550,10 @@ export class Executor {
     let localBenchmark = isNativeSettlement
       ? nativeBenchmark
       : await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
-    if (!localBenchmark && !isNativeSettlement && position.chainId === chainRegistry.bsc.chain.id) {
-      if (!this.kyberswapApi) throw new Error("KyberSwap is required to benchmark BSC group settlement swap");
+    if (!localBenchmark && !isNativeSettlement) {
+      if (!this.kyberswapApi) throw new Error("KyberSwap is required to benchmark group settlement swap");
       nativeBenchmark = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
-      if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark BSC group settlement swap");
+      if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark group settlement swap");
       localBenchmark = nativeBenchmark;
     }
     if (!localBenchmark) throw new Error("No safe local route available to benchmark group settlement swap");
@@ -2392,10 +2392,10 @@ export class Executor {
     let localBenchmark = isNativeSettlement
       ? nativeBenchmark
       : await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
-    if (!localBenchmark && !isNativeSettlement && position.chainId === chainRegistry.bsc.chain.id) {
-      if (!this.kyberswapApi) throw new Error("KyberSwap is required to benchmark BSC settlement swap");
+    if (!localBenchmark && !isNativeSettlement) {
+      if (!this.kyberswapApi) throw new Error("KyberSwap is required to benchmark settlement swap");
       nativeBenchmark = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
-      if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark BSC settlement swap");
+      if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark settlement swap");
       localBenchmark = nativeBenchmark;
     }
     if (!localBenchmark) throw new Error("No safe local route available to benchmark settlement swap");

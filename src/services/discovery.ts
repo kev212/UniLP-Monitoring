@@ -582,7 +582,7 @@ export class DiscoveryService {
     await this.database.saveCursor(registry.chain.id, toBlock);
   }
 
-  async detectOwnedPositions(name: ChainName): Promise<{ chain: ChainName; discovered: PositionRecord[]; v3: number; v4: number }> {
+  async detectOwnedPositions(name: ChainName): Promise<{ chain: ChainName; discovered: PositionRecord[]; v3: number; v4: number; v4Error?: string }> {
     const { client, registry } = this.chains.getForScan(name);
     const blockNumber = await client.getBlockNumber();
     const known = new Set(
@@ -591,9 +591,16 @@ export class DiscoveryService {
     const v3 = registry.discoveryProtocols.includes("v3")
       ? await this.discoverOwnedV3Positions(name, blockNumber, { trustOwned: true })
       : [];
-    const v4 = registry.discoveryProtocols.includes("v4")
-      ? await this.discoverOwnedV4Positions(name, blockNumber, true)
-      : [];
+    let v4: PositionRecord[] = [];
+    let v4Error: unknown;
+    if (registry.discoveryProtocols.includes("v4")) {
+      try {
+        v4 = await this.discoverOwnedV4Positions(name, blockNumber, true);
+      } catch (error) {
+        v4Error = error;
+        log.warn({ err: error, chain: name }, "V4 detect failed; returning V3 results");
+      }
+    }
     const discovered = [...v3, ...v4].filter((position) => !known.has(`${position.protocol}:${position.positionKey}`));
     for (const position of discovered) {
       if (!position.quoteToken || position.status === "closing" || position.status === "settled" || position.status === "armed") continue;
@@ -611,11 +618,13 @@ export class DiscoveryService {
         }
       }
     }
+    if (v4Error && discovered.length === 0) throw v4Error;
     return {
       chain: name,
       discovered,
       v3: discovered.filter((position) => position.protocol === "v3").length,
       v4: discovered.filter((position) => position.protocol === "v4").length,
+      ...(v4Error ? { v4Error: v4Error instanceof Error ? v4Error.message : String(v4Error) } : {}),
     };
   }
 
@@ -919,8 +928,9 @@ export class DiscoveryService {
       const endpoint = this.config.alchemyHttp?.[name]
         ?? (rpcEndpoint?.includes("alchemy.com") ? rpcEndpoint : undefined);
       if (!endpoint) {
-        log.warn({ err: error, chain: name }, "could not enumerate owned V4 positions");
-        return [];
+        const message = `V4 detect on ${name} requires ALCHEMY_${name.toUpperCase()}_HTTP (PositionManager is not enumerable)`;
+        log.warn({ err: error, chain: name }, message);
+        throw new Error(message);
       }
       try {
         const candidateIds = new Set<bigint>();
@@ -1373,28 +1383,171 @@ export class DiscoveryService {
 
     const { registry } = this.chains.get(name);
     const historicalClient = this.chains.getForLogs(name).client;
-    const events = await this.getLogsChunked(name, {
+    let events = await this.getLogsChunked(name, {
       address: registry.contracts.v4.poolManager,
       event: v4PoolManagerModifyLiquidityEvent,
       args: { sender: registry.contracts.v4.positionManager },
       fromBlock: position.openedAtBlock,
       toBlock: position.openedAtBlock,
     });
-    const event = events.find((entry) => {
+    let event = events.find((entry) => {
       const args = logArgs<{ salt?: Hex; liquidityDelta?: bigint }>(entry);
       return args.salt?.toLowerCase() === salt.toLowerCase() && (args.liquidityDelta ?? 0n) > 0n;
     });
-    if (!event?.transactionHash || !event.blockNumber) return;
+    if (!event?.transactionHash || !event.blockNumber) {
+      // Manual /detect stores openedAtBlock as detection time, not mint time.
+      // Try a cheap Alchemy history lookup first (one RPC), then bounded log scan as last resort.
+      const rpcEndpoint = this.config.rpcHttp?.[name];
+      const endpoint = this.config.alchemyHttp?.[name] ?? (rpcEndpoint?.includes("alchemy.com") ? rpcEndpoint : undefined);
+      if (endpoint) {
+        try {
+          const tokenId = BigInt(salt);
+          const resp = await fetch(endpoint, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "alchemy_getAssetTransfers",
+              params: [{
+                fromBlock: "0x0",
+                toAddress: this.config.executorAddress,
+                category: ["erc721"],
+                contractAddresses: [registry.contracts.v4.positionManager],
+                withMetadata: false,
+                maxCount: "0x3e8",
+                order: "asc",
+              }],
+            }),
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (resp.ok) {
+            const payload = await resp.json() as { result?: { transfers?: Array<{ tokenId?: string; blockNum?: string; hash?: string }> } };
+            const match = (payload.result?.transfers ?? []).find((t) => {
+              if (!t.tokenId) return false;
+              try { return BigInt(t.tokenId) === tokenId; } catch { return false; }
+            });
+            if (match?.hash && match.blockNum) {
+              const blockNumber = BigInt(match.blockNum);
+              const receipt = await historicalClient.getTransactionReceipt({ hash: match.hash as Hex }).catch(() => null);
+              const decoded = receipt ? this.decodeV4MintLog(receipt.logs as readonly { address: Address; data: Hex; topics: readonly Hex[] }[], registry.contracts.v4.poolManager, tokenId) : null;
+              if (decoded && decoded.liquidityDelta > 0n) {
+                event = { transactionHash: match.hash as Hex, blockNumber } as unknown as typeof event;
+                // Use decoded liquidity directly to avoid second log scan.
+                const poolIdAlt = v4PoolId(currency0, currency1, fee, tickSpacing, hooks);
+                let slot0Alt: readonly [bigint, number, number, number];
+                try {
+                  slot0Alt = await historicalClient.readContract({
+                    address: registry.contracts.v4.stateView,
+                    abi: v4StateViewAbi,
+                    functionName: "getSlot0",
+                    args: [poolIdAlt],
+                    blockNumber,
+                  }) as unknown as readonly [bigint, number, number, number];
+                } catch {
+                  slot0Alt = await this.chains.getForScan(name).client.readContract({
+                    address: registry.contracts.v4.stateView,
+                    abi: v4StateViewAbi,
+                    functionName: "getSlot0",
+                    args: [poolIdAlt],
+                  }) as unknown as readonly [bigint, number, number, number];
+                }
+                const amountsAlt = amountsForLiquidity(slot0Alt[0], tickLower, tickUpper, decoded.liquidityDelta);
+                let quoteValueAlt = await this.quoteV4AmountsAtBlock(position, amountsAlt.amount0, amountsAlt.amount1, blockNumber);
+                if (quoteValueAlt === 0n) {
+                  if (position.quoteToken.toLowerCase() === position.token0.toLowerCase() && amountsAlt.amount0 > 0n) quoteValueAlt = amountsAlt.amount0;
+                  else if (position.quoteToken.toLowerCase() === position.token1.toLowerCase() && amountsAlt.amount1 > 0n) quoteValueAlt = amountsAlt.amount1;
+                }
+                if (quoteValueAlt > 0n) {
+                  await this.database.addCashflow(position.id, blockNumber, match.hash as Hex, "deposit", quoteValueAlt, {
+                    protocol: "v4",
+                    token0Amount: amountsAlt.amount0.toString(),
+                    token1Amount: amountsAlt.amount1.toString(),
+                    source: "position_manager_fallback",
+                  });
+                }
+                await this.database.setPositionStatus(position.id, position.status, { openingCashflowHydrated: true });
+                return;
+              }
+            }
+          }
+        } catch { /* fallback to log scan */ }
+      }
+      const lookback = this.config.rpcBootstrapLookbackBlocks;
+      const fromBlock = position.openedAtBlock > lookback ? position.openedAtBlock - lookback : 0n;
+      const fallbackEvents = await this.getLogsChunked(name, {
+        address: registry.contracts.v4.poolManager,
+        event: v4PoolManagerModifyLiquidityEvent,
+        args: { sender: registry.contracts.v4.positionManager },
+        fromBlock,
+        toBlock: position.openedAtBlock,
+      });
+      event = fallbackEvents
+        .filter((entry) => {
+          const args = logArgs<{ salt?: Hex; liquidityDelta?: bigint }>(entry);
+          return args.salt?.toLowerCase() === salt.toLowerCase() && (args.liquidityDelta ?? 0n) > 0n;
+        })
+        .sort((a, b) => (a.blockNumber ?? 0n) < (b.blockNumber ?? 0n) ? -1 : 1)
+        .at(-1);
+    }
+    if (!event?.transactionHash || !event.blockNumber) {
+      // Last resort: reconstruct from live liquidity (no Alchemy spam, one StateView + one position read).
+      try {
+        const tokenId = BigInt(salt);
+        const liveLiquidity = await this.chains.getForScan(name).client.readContract({
+          address: registry.contracts.v4.positionManager,
+          abi: v4PositionManagerAbi,
+          functionName: "getPositionLiquidity",
+          args: [tokenId],
+        }) as unknown as bigint;
+        if (liveLiquidity > 0n) {
+          const poolIdLive = v4PoolId(currency0, currency1, fee, tickSpacing, hooks);
+          const slot0Live = await this.chains.getForScan(name).client.readContract({
+            address: registry.contracts.v4.stateView,
+            abi: v4StateViewAbi,
+            functionName: "getSlot0",
+            args: [poolIdLive],
+          }) as unknown as readonly [bigint, number, number, number];
+          const amountsLive = amountsForLiquidity(slot0Live[0], tickLower, tickUpper, liveLiquidity);
+          let quoteValueLive = await this.quoteV4AmountsAtBlock(position, amountsLive.amount0, amountsLive.amount1, position.openedAtBlock);
+          if (quoteValueLive === 0n) {
+            if (position.quoteToken.toLowerCase() === position.token0.toLowerCase() && amountsLive.amount0 > 0n) quoteValueLive = amountsLive.amount0;
+            else if (position.quoteToken.toLowerCase() === position.token1.toLowerCase() && amountsLive.amount1 > 0n) quoteValueLive = amountsLive.amount1;
+          }
+          if (quoteValueLive > 0n) {
+            await this.database.addCashflow(position.id, position.openedAtBlock, zeroHash, "deposit", quoteValueLive, {
+              protocol: "v4",
+              token0Amount: amountsLive.amount0.toString(),
+              token1Amount: amountsLive.amount1.toString(),
+              source: "live_liquidity",
+            });
+          }
+        }
+      } catch { /* ignore */ }
+      await this.database.setPositionStatus(position.id, position.status, { openingCashflowHydrated: true });
+      return;
+    }
     const liquidityDelta = logArgs<{ liquidityDelta?: bigint }>(event).liquidityDelta;
     if (!liquidityDelta || liquidityDelta <= 0n) return;
     const poolId = v4PoolId(currency0, currency1, fee, tickSpacing, hooks);
-    const slot0 = await historicalClient.readContract({
-      address: registry.contracts.v4.stateView,
-      abi: v4StateViewAbi,
-      functionName: "getSlot0",
-      args: [poolId],
-      blockNumber: event.blockNumber,
-    });
+    let slot0: readonly [bigint, number, number, number];
+    try {
+      slot0 = await historicalClient.readContract({
+        address: registry.contracts.v4.stateView,
+        abi: v4StateViewAbi,
+        functionName: "getSlot0",
+        args: [poolId],
+        blockNumber: event.blockNumber,
+      }) as unknown as readonly [bigint, number, number, number];
+    } catch {
+      // Archive miss on public RPC — fallback to latest slot without block tag (fallback includes Alchemy if configured).
+      slot0 = await this.chains.getForScan(name).client.readContract({
+        address: registry.contracts.v4.stateView,
+        abi: v4StateViewAbi,
+        functionName: "getSlot0",
+        args: [poolId],
+      }) as unknown as readonly [bigint, number, number, number];
+    }
     const amounts = amountsForLiquidity(slot0[0], tickLower, tickUpper, liquidityDelta);
     let quoteValue = await this.quoteV4AmountsAtBlock(position, amounts.amount0, amounts.amount1, event.blockNumber);
     if (quoteValue === 0n) {

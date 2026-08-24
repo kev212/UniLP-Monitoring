@@ -62,7 +62,7 @@ export class ChainClients {
         config.rpcHttp[name],
         config.rpcHttpScanFallback?.[name],
         config.rpcHttpFallback[name],
-        ...(name === "bsc" && config.alchemyHttp[name] ? [config.alchemyHttp[name]] : []),
+        ...(config.alchemyHttp[name] ? [config.alchemyHttp[name]] : []),
       ]));
       this.scanClients.set(name, {
         registry,
@@ -77,6 +77,7 @@ export class ChainClients {
         config.rpcHttp[name],
         config.rpcHttpScanFallback?.[name],
         config.rpcHttpFallback[name],
+        ...(config.alchemyHttp[name] ? [config.alchemyHttp[name]] : []),
       ]);
       if (logUrls.length > 0) {
         const logTransport = createRpcTransport(logUrls);

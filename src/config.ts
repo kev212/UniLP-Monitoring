@@ -88,7 +88,6 @@ const envSchema = z.object({
   MAX_LOG_BLOCK_RANGE: z.coerce.number().int().min(1).max(100_000).optional(),
   RPC_REQUEST_DELAY_MS: z.coerce.number().int().min(0).max(5_000).optional(),
   RPC_BOOTSTRAP_LOOKBACK_BLOCKS: z.coerce.number().int().min(1_000).max(1_000_000).default(50_000),
-  BLINK_RESCUE_POLL_INTERVAL_MS: z.coerce.number().int().min(5_000).max(300_000).default(15_000),
   START_BLOCK_BASE: z.coerce.bigint().min(0n).default(0n),
   START_BLOCK_ROBINHOOD: z.coerce.bigint().min(0n).default(0n),
   START_BLOCK_BSC: z.coerce.bigint().min(0n).default(0n),
@@ -156,7 +155,6 @@ export interface RuntimeConfig {
   maxLogBlockRange: bigint;
   rpcRequestDelayMs: number;
   rpcBootstrapLookbackBlocks: bigint;
-  blinkRescuePollIntervalMs: number;
   startBlocks: Record<ChainName, bigint>;
   telegram?: { token: string; chatId: string; userId: string };
 }
@@ -362,7 +360,6 @@ export function loadConfig(environment = process.env): RuntimeConfig {
       ? env.RPC_REQUEST_DELAY_MS
       : 0,
     rpcBootstrapLookbackBlocks: BigInt(env.RPC_BOOTSTRAP_LOOKBACK_BLOCKS),
-    blinkRescuePollIntervalMs: env.BLINK_RESCUE_POLL_INTERVAL_MS,
     startBlocks: { base: env.START_BLOCK_BASE, robinhood: env.START_BLOCK_ROBINHOOD, bsc: env.START_BLOCK_BSC },
     telegram,
   };

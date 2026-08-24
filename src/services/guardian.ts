@@ -1,7 +1,7 @@
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, ExitTrigger, PnlSnapshot, PositionGroupRecord, PositionRecord } from "../types.js";
+import type { ChainName, ExitTrigger, PnlSnapshot, PositionGroupPnlSnapshot, PositionGroupRecord, PositionRecord } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { AlchemyBootstrapper } from "./alchemy-bootstrap.js";
 import type { DiscoveryService } from "./discovery.js";
@@ -224,7 +224,13 @@ export class Guardian {
         await this.database.setPositionGroupStatus(group.id, "needs_review", { reason: "trailing_exit_state_missing", settlementRetryDisabled: true });
         return true;
       }
-      log.warn({ groupId: group.id, chain: name, trigger, pnlBps: valued.snapshot.pnlBps, quoteIsToken0 }, "position group exit triggered");
+      let exitSnapshot = valued.snapshot;
+      if (trigger === "stop_loss") {
+        const localSnapshot = await this.validateGroupStopLossWithLocalQuote(group, blockNumber, valued.snapshot);
+        if (!localSnapshot) return true;
+        exitSnapshot = localSnapshot;
+      }
+      log.warn({ groupId: group.id, chain: name, trigger, pnlBps: exitSnapshot.pnlBps, quoteIsToken0 }, "position group exit triggered");
       await this.executor.executeRelatedGroup(group.id, trigger);
       return true;
     } catch (error) {
@@ -530,6 +536,30 @@ export class Guardian {
     } catch (error) {
       await this.database.setPositionStatus(position.id, position.status, { slTwapWaitStartedAt: null });
       log.warn({ err: error, positionId: position.id, positionKey: position.positionKey }, "SL local quote validation failed; skipping exit");
+      return null;
+    }
+  }
+
+  private async validateGroupStopLossWithLocalQuote(
+    group: PositionGroupRecord,
+    blockNumber: bigint,
+    apiSnapshot: PositionGroupPnlSnapshot,
+  ): Promise<PositionGroupPnlSnapshot | null> {
+    try {
+      const localValuation = await this.pnl.valueGroupLocal(group, blockNumber);
+      const localTrigger = this.pnl.shouldTriggerGroup(localValuation.snapshot);
+      if (localTrigger !== "stop_loss") {
+        log.warn({
+          groupId: group.id,
+          apiPnlBps: apiSnapshot.pnlBps,
+          localPnlBps: localValuation.snapshot.pnlBps,
+          localLiquidationQuote: localValuation.snapshot.liquidationQuote,
+        }, "position group SL cancelled by local quote validation");
+        return null;
+      }
+      return localValuation.snapshot;
+    } catch (error) {
+      log.warn({ err: error, groupId: group.id }, "position group SL local quote validation failed; skipping exit");
       return null;
     }
   }

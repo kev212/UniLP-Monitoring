@@ -61,7 +61,6 @@ describe("loadConfig", () => {
     expect(config.discoveryIntervalMs).toBe(30_000);
     expect(config.maxLogBlockRange).toBe(2_000n);
     expect(config.rpcRequestDelayMs).toBe(0);
-    expect(config.blinkRescuePollIntervalMs).toBe(15_000);
     expect(config.oorAboveMinDistancePercent).toBe(10);
     expect(config.oorAboveMinDurationMs).toBe(3_600_000);
     expect(config.oorAboveProfitDurationMs).toBe(300_000);

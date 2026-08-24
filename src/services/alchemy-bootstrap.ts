@@ -40,7 +40,7 @@ export class AlchemyBootstrapper {
   ) {}
 
   isEnabled(name: ChainName): boolean {
-    return Boolean(this.config.alchemyHttp[name] && this.chains.get(name).registry.autoDiscoverExternalPositions);
+    return Boolean(this.config.alchemyHttp[name] && (this.chains.get(name).registry.autoDiscoverExternalPositions || name === "base"));
   }
 
   async bootstrap(name: ChainName): Promise<void> {

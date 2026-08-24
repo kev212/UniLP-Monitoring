@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, isOfficialRobinhoodStock, limitQualifiedPoolsPerToken, MIN_VOLUME_6H_USD, PoolScanner, poolPair, rankPools, resolveBscStockToken, STOCK_MIN_VOLUME_24H_USD, stockUniswapVolume24h, stockVolumeOptions, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
+import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, isMarketScanPair, isOfficialRobinhoodStock, limitQualifiedPoolsPerToken, marketScanDexIds, MIN_VOLUME_6H_USD, PoolScanner, poolPair, rankPools, resolveBscStockToken, STOCK_MIN_VOLUME_24H_USD, stockUniswapVolume24h, stockVolumeOptions, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
 import { calibrateOhlcvPrices, normalizeOhlcvPrices, overlapFraction, snapRange } from "../src/services/concentrated-yield.js";
 
 describe("pool scoring formula", () => {
@@ -128,6 +128,26 @@ describe("scan pool eligibility", () => {
       pool("TOKEN/USDG 3%", "0x5fc5360d0400a0fd4f2af552add042d716f1d168", 8, 200_000),
       pool("TOKEN/USDG 4%", "0x5fc5360d0400a0fd4f2af552add042d716f1d168", 4, 300_000),
     ]).map((item) => item.pair)).toEqual(["TOKEN/USDG 3%"]);
+  });
+
+  it("keeps the best configured quote without Robinhood-specific buckets", () => {
+    const pool = (pair: string, quoteToken: string, estimatedPoolYield1hPercent: number) => ({ pair, quoteToken, estimatedPoolYield1hPercent, tvlUsd: 100_000 }) as ScoredPool;
+    expect(limitQualifiedPoolsPerToken([
+      pool("TOKEN/USDC", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", 3),
+      pool("TOKEN/USDT", "0x55d398326f99059ff775485246999027b3197955", 5),
+    ]).map(({ pair }) => pair)).toEqual(["TOKEN/USDT"]);
+  });
+
+  it("uses Base Uniswap and BSC Uniswap plus Pancake V3 candidate feeds", () => {
+    expect(marketScanDexIds("base")).toEqual(["uniswap-v3-base", "uniswap-v4-base"]);
+    expect(marketScanDexIds("bsc")).toEqual(["uniswap-bsc", "uniswap-v4-bsc", "pancakeswap-v3-bsc"]);
+  });
+
+  it("accepts Pancake V3 but rejects Pancake V4 for BSC market scans", () => {
+    const pair = (dexId: string, labels: string[], pairAddress = "0x0000000000000000000000000000000000000001") => ({ chainId: "bsc", dexId, labels, pairAddress }) as any;
+    expect(isMarketScanPair(pair("pancakeswap", ["v3"]), "bsc")).toBe(true);
+    expect(isMarketScanPair(pair("pancakeswap", ["v4"], `0x${"1".repeat(64)}`), "bsc")).toBe(false);
+    expect(isMarketScanPair(pair("uniswap", ["v4"], `0x${"1".repeat(64)}`), "bsc")).toBe(true);
   });
 
   it("excludes pools with less than $100 of cumulative 6h volume", () => {

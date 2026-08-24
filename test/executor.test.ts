@@ -820,24 +820,31 @@ describe("Executor pending settlement recovery", () => {
     expect(kyberswapApi.createSwap).toHaveBeenCalledTimes(2);
   });
 
-  it("does not use KyberSwap as a non-BSC fallback when the local quote is gone", async () => {
+  it("uses KyberSwap as a non-BSC fallback when the local quote is gone", async () => {
+    const client = {
+      readContract: vi.fn().mockResolvedValue(5n),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
     const kyberswapApi = {
       quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: sender }),
-      approvalSpender: vi.fn(),
-      createSwap: vi.fn(),
+      approvalSpender: vi.fn().mockReturnValue(sender),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: sender, data: "0x22", description: "kyber" }),
     };
     const routes = { quoteDirect: vi.fn().mockResolvedValue(null) };
-    const executor = new Executor({} as never, { getById: vi.fn() } as never, {} as never, routes as never, {} as never, config, undefined, kyberswapApi as never);
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, config, undefined, kyberswapApi as never);
     const position = {
       id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
       token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
       openedAtBlock: null, metadata: {},
     } as PositionRecord;
 
-    await expect((executor as unknown as {
-      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<unknown>;
-    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200)).rejects.toThrow("No safe local route available to benchmark settlement swap");
-    expect(kyberswapApi.quote).not.toHaveBeenCalled();
+    const prepared = await (executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string; expectedOut: bigint }>;
+    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
+
+    expect(prepared).toMatchObject({ provider: "kyberswap", expectedOut: 110n });
+    expect(kyberswapApi.quote).toHaveBeenCalledTimes(1);
   });
 
   it("rejects an aggregator route below the local two-percent minimum floor", async () => {
