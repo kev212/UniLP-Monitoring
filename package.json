@@ -15,8 +15,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "backfill:ba-history": "node dist/commands/backfill-ba-history.js",
-    "repair:close-history-dates": "node dist/commands/repair-close-history-settled-at.js",
-    "rescue:blink": "node dist/commands/blink-rescue.js"
+    "repair:close-history-dates": "node dist/commands/repair-close-history-settled-at.js"
   },
   "dependencies": {
     "@pancakeswap/chains": "^0.7.0",

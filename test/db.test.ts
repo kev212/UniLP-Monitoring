@@ -117,7 +117,7 @@ describe("Database native USD backfill", () => {
     const query = vi.fn().mockResolvedValue({
       rowCount: 1,
       rows: [{
-        id: "blink-rescue",
+        id: "token-rescue",
         chain_id: 4663,
         token_address: "0x0000000000000000000000000000000000000001",
         quote_token: "0x0000000000000000000000000000000000000002",
@@ -132,7 +132,7 @@ describe("Database native USD backfill", () => {
     Object.defineProperty(database, "pool", { value: { query } });
 
     await expect(database.getOrCreateTokenRescueJob({
-      id: "blink-rescue",
+      id: "token-rescue",
       chainId: 4663,
       tokenAddress: "0x0000000000000000000000000000000000000001",
       quoteToken: "0x0000000000000000000000000000000000000002",
