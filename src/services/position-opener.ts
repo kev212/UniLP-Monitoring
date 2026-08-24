@@ -25,7 +25,7 @@ import type { ChainClients } from "./chain-client.js";
 import type { RoutePlanner } from "./route-planner.js";
 import { buildSwapPlan } from "./swap-builder.js";
 import { UNISWAP_API_ROUTER, type UniswapTradingApi } from "./uniswap-trading-api.js";
-import { applySlippage, sqrtRatioAtTick, tickToCeilSpacing, tickToFloorSpacing, ticksForDropPercent, ticksForRisePercent } from "./uniswap-math.js";
+import { applySlippage, nearestSingleSidedTicks, sqrtRatioAtTick, tickToCeilSpacing, tickToFloorSpacing, ticksForDropPercent, ticksForRisePercent } from "./uniswap-math.js";
 import { dexNameFromMetadata, v3ContractsFor, v3Deployments, type DexName } from "./v3-deployment.js";
 
 const require = createRequire(import.meta.url);
@@ -476,12 +476,10 @@ export class PositionOpener {
     if (mode === "dual") {
       tickLower = tickToFloorSpacing(currentTick - ticksForDropPercent(rangePercent), tickSpacing);
       tickUpper = tickToCeilSpacing(currentTick + ticksForRisePercent(rangePercent), tickSpacing);
-    } else if (quoteIsToken0) {
-      tickLower = tickToCeilSpacing(currentTick + tickSpacing, tickSpacing);
-      tickUpper = tickToCeilSpacing(tickLower + ticksForDropPercent(rangePercent), tickSpacing);
     } else {
-      tickUpper = tickToFloorSpacing(currentTick - tickSpacing, tickSpacing);
-      tickLower = tickToFloorSpacing(tickUpper - ticksForDropPercent(rangePercent), tickSpacing);
+      const range = nearestSingleSidedTicks(currentTick, tickSpacing, quoteIsToken0, rangePercent);
+      tickLower = range.tickLower;
+      tickUpper = range.tickUpper;
     }
 
     const position = protocol === "v3"
@@ -1872,14 +1870,8 @@ export function assertMintUtilization(lockedQuote: bigint, depositAmount: bigint
 }
 
 function bidAskOuterTicks(currentTick: number, tickSpacing: number, quoteIsToken0: boolean, rangePercent: number): { lowerTick: number; upperTick: number } {
-  const distance = ticksForDropPercent(rangePercent);
-  if (!Number.isFinite(distance) || distance <= 0) throw new Error("Bid-Ask rangePercent must produce a positive outer range");
-  if (quoteIsToken0) {
-    const lowerTick = tickToCeilSpacing(currentTick + tickSpacing, tickSpacing);
-    return { lowerTick, upperTick: tickToCeilSpacing(lowerTick + distance, tickSpacing) };
-  }
-  const upperTick = tickToFloorSpacing(currentTick - tickSpacing, tickSpacing);
-  return { lowerTick: tickToFloorSpacing(upperTick - distance, tickSpacing), upperTick };
+  const range = nearestSingleSidedTicks(currentTick, tickSpacing, quoteIsToken0, rangePercent);
+  return { lowerTick: range.tickLower, upperTick: range.tickUpper };
 }
 
 function isBidAskNativeFunding(protocol: "v3" | "v4", token: Address, symbol: string): boolean {

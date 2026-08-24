@@ -108,3 +108,25 @@ export function ticksForRisePercent(risePercent: number): number {
   const ratio = 1 + risePercent / 100;
   return Math.round(Math.log(ratio) / Math.log(1.0001));
 }
+
+export function nearestSingleSidedTicks(
+  currentTick: number,
+  tickSpacing: number,
+  quoteIsToken0: boolean,
+  rangePercent: number,
+): { tickLower: number; tickUpper: number } {
+  if (!Number.isInteger(currentTick)) throw new Error("currentTick must be an integer");
+  if (!Number.isInteger(tickSpacing) || tickSpacing <= 0) throw new Error("tickSpacing must be a positive integer");
+  const distance = ticksForDropPercent(rangePercent);
+  if (!Number.isFinite(distance) || distance <= 0) throw new Error("rangePercent must produce a positive range");
+  if (quoteIsToken0) {
+    const tickLower = tickToCeilSpacing(currentTick + 1, tickSpacing);
+    const tickUpper = tickToCeilSpacing(tickLower + distance, tickSpacing);
+    if (tickLower >= tickUpper) throw new Error("Single-sided range collapsed after snapping");
+    return { tickLower, tickUpper };
+  }
+  const tickUpper = tickToFloorSpacing(currentTick, tickSpacing);
+  const tickLower = tickToFloorSpacing(tickUpper - distance, tickSpacing);
+  if (tickLower >= tickUpper) throw new Error("Single-sided range collapsed after snapping");
+  return { tickLower, tickUpper };
+}

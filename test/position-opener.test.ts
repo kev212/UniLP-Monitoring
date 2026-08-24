@@ -6,7 +6,7 @@ import { encodeAbiParameters, keccak256, zeroAddress, type Address, type Hex } f
 
 import { chainRegistry } from "../src/chains.js";
 import { assertMintUtilization, assertSafeOpenMarket, bidAskDirectionForQuote, openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken, wrappedNativeShortfall } from "../src/services/position-opener.js";
-import { ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
+import { nearestSingleSidedTicks, ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
 
 const chainId = 4663;
 const token0 = new Token(chainId, "0x0000000000000000000000000000000000000001", 6, "USDG");
@@ -123,8 +123,8 @@ describe("SDK single-side liquidity", () => {
     expect(preview.quoteToken).toBe(nvdaAddress);
     expect(preview.quoteTokenDecimals).toBe(18);
     expect(preview.quoteIsToken0).toBe(quoteIsToken0);
-    if (quoteIsToken0) expect(preview.tickLower).toBeGreaterThan(preview.currentTick);
-    else expect(preview.tickUpper).toBeLessThanOrEqual(preview.currentTick);
+    if (quoteIsToken0) expect(preview.tickLower).toBe(200);
+    else expect(preview.tickUpper).toBe(0);
     expect(preview.pair).toBe(quoteIsToken0 ? "PACK/NVDA" : "NVDA/PACK");
   });
 
@@ -235,6 +235,8 @@ describe("Bid-Ask NVDA opening", () => {
     expect(preview.bins.every((bin) => quoteIsToken0
       ? bin.allocatedAmount0 > 0n && bin.allocatedAmount1 === 0n
       : bin.allocatedAmount0 === 0n && bin.allocatedAmount1 > 0n)).toBe(true);
+    if (quoteIsToken0) expect(preview.outerTickLower).toBe(200);
+    else expect(preview.outerTickUpper).toBe(0);
   });
 
   it("maps the quote side to its only feasible ladder direction", () => {
@@ -275,6 +277,20 @@ describe("Bid-Ask NVDA opening", () => {
     expect(preview.direction).toBe("above");
     expect(preview.quoteIsToken0).toBe(true);
     expect(preview.bins.every((bin) => bin.allocatedAmount0 > 0n && bin.allocatedAmount1 === 0n)).toBe(true);
+  });
+});
+
+describe("nearest single-sided ticks", () => {
+  it("uses the nearest initialized tick below current for quote token1", () => {
+    expect(nearestSingleSidedTicks(-346215, 902, false, 30)).toMatchObject({ tickUpper: -346368 });
+    expect(nearestSingleSidedTicks(-346368, 902, false, 30).tickUpper).toBe(-346368);
+    expect(nearestSingleSidedTicks(150, 100, false, 30).tickUpper).toBe(100);
+  });
+
+  it("uses the nearest initialized tick above current for quote token0", () => {
+    expect(nearestSingleSidedTicks(0, 200, true, 30).tickLower).toBe(200);
+    expect(nearestSingleSidedTicks(200, 200, true, 30).tickLower).toBe(400);
+    expect(nearestSingleSidedTicks(150, 100, true, 30).tickLower).toBe(200);
   });
 });
 
