@@ -374,9 +374,7 @@ export class PositionOpener {
     let token0: Address;
     let token1: Address;
     if (isV4) {
-      const { registry } = this.chains.getForScan(chain);
-      const bytes25 = normalized.slice(0, 2 + 25 * 2) as Hex;
-      const poolKey = await client.readContract({ address: registry.contracts.v4.positionManager, abi: v4PoolKeysAbi, functionName: "poolKeys", args: [bytes25] }) as unknown as V4PoolKey;
+      const poolKey = await this.resolveV4PoolKey(normalized, chain);
       token0 = poolKey.currency0;
       token1 = poolKey.currency1;
     } else {
@@ -422,18 +420,13 @@ export class PositionOpener {
   private async prepareV4(poolId: Hex, chain: ChainName, rangePercent: number, depositAmount: bigint, quoteToken: QuoteToken, mode: OpenMode): Promise<OpenPositionPreview> {
     const client = this.client(chain);
     const { registry } = this.chains.getForScan(chain);
-    const bytes25 = poolId.slice(0, 2 + 25 * 2) as Hex;
 
-    const [slot0, liquidity, poolKeyResult] = await Promise.all([
+    const [slot0, liquidity, poolKey] = await Promise.all([
       client.readContract({ address: registry.contracts.v4.stateView, abi: v4StateViewAbi, functionName: "getSlot0", args: [poolId] }),
       client.readContract({ address: registry.contracts.v4.stateView, abi: v4StateViewAbi, functionName: "getLiquidity", args: [poolId] }) as Promise<bigint>,
-      client.readContract({ address: registry.contracts.v4.positionManager, abi: v4PoolKeysAbi, functionName: "poolKeys", args: [bytes25] }),
+      this.resolveV4PoolKey(poolId, chain),
     ]);
 
-    const poolKey = poolKeyResult as unknown as V4PoolKey;
-    if (bidAskPoolId(poolKey).toLowerCase() !== poolId.toLowerCase()) {
-      throw new Error("V4 pool key does not match the pool id");
-    }
     return this.buildPreview("v4", chain, poolId, poolKey.currency0, poolKey.currency1, Number(poolKey.fee), poolKey.tickSpacing, slot0[1], slot0[0], liquidity, poolKey.hooks, rangePercent, depositAmount, quoteToken, mode, "uniswap", Number(slot0[3]));
   }
 
@@ -757,17 +750,11 @@ export class PositionOpener {
       };
     }
 
-    const bytes25 = poolAddress.slice(0, 2 + 25 * 2) as Hex;
-    const [slot0, poolLiquidity, poolKeyResult] = await Promise.all([
+    const [slot0, poolLiquidity, poolKey] = await Promise.all([
       client.readContract({ address: registry.contracts.v4.stateView, abi: v4StateViewAbi, functionName: "getSlot0", args: [poolAddress] }),
       client.readContract({ address: registry.contracts.v4.stateView, abi: v4StateViewAbi, functionName: "getLiquidity", args: [poolAddress] }) as Promise<bigint>,
-      client.readContract({ address: registry.contracts.v4.positionManager, abi: v4PoolKeysAbi, functionName: "poolKeys", args: [bytes25] }),
+      this.resolveV4PoolKey(poolAddress, chain),
     ]);
-    const poolKey = poolKeyResult as unknown as V4PoolKey;
-    const derivedPoolId = bidAskPoolId(poolKey);
-    if (derivedPoolId.toLowerCase() !== poolAddress.toLowerCase()) {
-      throw new Error("Bid-Ask V4 pool key does not match the pool id");
-    }
     const typedSlot0 = slot0 as readonly [bigint, number, ...unknown[]];
     return {
       protocol: "v4",
@@ -790,9 +777,23 @@ export class PositionOpener {
       if (!allowed.has(state.fee)) throw new Error(`V3 fee tier ${state.fee} is unsupported by the official SDK`);
       return;
     }
-    if (state.hooks.toLowerCase() !== zeroAddress.toLowerCase()) {
-      throw new Error("Bid-Ask opening supports plain/no-hook V4 pools only");
-    }
+  }
+
+  private async resolveV4PoolKey(poolId: Hex, chain: ChainName): Promise<V4PoolKey> {
+    const { registry } = this.chains.getForScan(chain);
+    const bytes25 = poolId.slice(0, 2 + 25 * 2) as Hex;
+    const candidate = await this.client(chain).readContract({
+      address: registry.contracts.v4.positionManager,
+      abi: v4PoolKeysAbi,
+      functionName: "poolKeys",
+      args: [bytes25],
+    }) as unknown as V4PoolKey;
+    if (bidAskPoolId(candidate).toLowerCase() === poolId.toLowerCase()) return candidate;
+
+    const override = this.config.v4PoolKeyOverrides[chain]?.[poolId.toLowerCase()];
+    if (!override) throw new Error("V4 pool key is unavailable; configure V4_POOL_KEY_OVERRIDES for this pool");
+    log.info({ chain, poolId, hooks: override.hooks }, "resolved V4 pool key from configured override");
+    return override;
   }
 
   private assertBidAskStateMatches(preview: BidAskOpenPreview, state: BidAskPoolState): void {
@@ -1278,10 +1279,11 @@ export class PositionOpener {
         confirmedReceipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
         if (confirmedReceipt.status !== "success") {
           await this.database!.recordPositionGroupExecution(groupId, "open_batch", "failed", hash, undefined, undefined, "transaction reverted");
-          await this.database!.setPositionGroupStatus(groupId, "needs_review", {
+          await this.database!.setPositionGroupStatus(groupId, "cancelled", {
             reason: "bid_ask_open_transaction_reverted",
             openTransactionHash: hash,
             lastExecutionError: `open_batch transaction reverted: ${hash}`,
+            pendingRawTransaction: null,
           });
           throw new Error(`Bid-Ask open transaction reverted: ${hash}`);
         }

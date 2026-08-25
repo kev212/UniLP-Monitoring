@@ -127,4 +127,49 @@ describe("PositionReader block consistency", () => {
     expect(value.unclaimedFees0).toBe(7n);
     expect(value.unclaimedFees1).toBe(9n);
   });
+
+  it("reuses V4 getSlot0 for sibling bins in the same pool and block", async () => {
+    const hooks = "0x0000000000000000000000000000000000000000" as const;
+    const calls: string[] = [];
+    const client = {
+      readContract: async (request: { functionName: string }) => {
+        calls.push(request.functionName);
+        if (request.functionName === "getSlot0") return [1n << 96n, 0, 0, 0] as const;
+        if (request.functionName === "getFeeGrowthInside") return [0n, 0n] as const;
+        if (request.functionName === "getPositionInfo") return [100n, 0n, 0n] as const;
+        throw new Error(`Unexpected function ${request.functionName}`);
+      },
+    };
+    const chains = {
+      getById: () => ({
+        registry: {
+          name: "robinhood",
+          contracts: { v4: { stateView: pair, positionManager: pair } },
+        },
+        client,
+      }),
+      getForScan: () => ({ client }),
+    } as never;
+    const reader = new PositionReader(chains, 100);
+    const metadata = {
+      currency0: token0,
+      currency1: token1,
+      fee: 3000,
+      tickSpacing: 60,
+      hooks,
+      tickLower: -60,
+      tickUpper: 60,
+    };
+    const first: PositionRecord = {
+      id: "bin-a", chainId: 4663, protocol: "v4", positionKey: "1", owner,
+      poolAddress: null, token0, token1, quoteToken: token0, status: "armed",
+      liquidity: 100n, openedAtBlock: 1n, metadata,
+    };
+    const second: PositionRecord = { ...first, id: "bin-b", positionKey: "2" };
+
+    await Promise.all([reader.read(first, 777n), reader.read(second, 777n)]);
+
+    expect(calls.filter((name) => name === "getSlot0")).toHaveLength(1);
+    expect(calls.filter((name) => name === "getPositionInfo")).toHaveLength(2);
+  });
 });

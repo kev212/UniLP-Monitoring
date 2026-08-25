@@ -165,6 +165,7 @@ export class PnlService {
     quoteSlippageBps = this.config.maxSwapSlippageBps,
     recordSnapshot = true,
     localOnly = false,
+    conservative = false,
   ): Promise<ValuedPositionGroup> {
     const childRows = (await this.database.listPositionGroupChildren(group.id))
       .filter((child) => child.bin.status === "minted" && child.position !== null);
@@ -204,8 +205,10 @@ export class PnlService {
     ]);
     if (nonQuote.amount > 0n && !route) throw new Error("No safe direct Uniswap route from group LP asset to quote token");
 
-    const liquidationQuote = quoteAmount + (route?.expectedOut ?? 0n);
-    const feeQuote = quoteFee + (feeRoute?.expectedOut ?? 0n);
+    const routeOutput = route ? (conservative ? route.minimumOut : route.expectedOut) : 0n;
+    const feeRouteOutput = feeRoute ? (conservative ? feeRoute.minimumOut : feeRoute.expectedOut) : 0n;
+    const liquidationQuote = quoteAmount + routeOutput;
+    const feeQuote = quoteFee + feeRouteOutput;
     const feeQuoteUsdg = await this.toFeeUsd6(
       group.chainId,
       group.quoteToken,
@@ -222,7 +225,9 @@ export class PnlService {
     const currentTick = sourceRange?.currentTick ?? group.referenceTick ?? 0;
     const currentSqrtPrice = sourceRange?.currentSqrtPrice ?? group.referencePrice ?? 0n;
     const range = groupRange(group, currentTick, currentSqrtPrice);
-    const twapGuard = await this.recordAndCheckPrice(children[0]!, group.poolKey, values[0]!.priceMarker, blockNumber);
+    const twapGuard = recordSnapshot
+      ? await this.recordAndCheckPrice(children[0]!, group.poolKey, values[0]!.priceMarker, blockNumber)
+      : { ready: true };
     const snapshot: PositionGroupPnlSnapshot = {
       groupId: group.id,
       quoteToken: group.quoteToken,
@@ -245,7 +250,7 @@ export class PnlService {
         token0Amount,
         token1Amount,
         nonQuoteInput: nonQuote.amount > 0n ? nonQuote : null,
-        quoteOutput: route?.expectedOut ?? 0n,
+        quoteOutput: routeOutput,
         route: route?.path ?? [],
         blockNumber,
       },
@@ -260,6 +265,22 @@ export class PnlService {
     quoteSlippageBps = this.config.maxSwapSlippageBps,
   ): Promise<ValuedPositionGroup> {
     return this.valueGroup(group, blockNumber, quoteSlippageBps, false, true);
+  }
+
+  async valueGroupExitEstimate(
+    group: PositionGroupRecord,
+    blockNumber: bigint,
+    quoteSlippageBps = this.config.settlementSwapSlippageBps,
+  ): Promise<ValuedPositionGroup> {
+    return this.valueGroup(group, blockNumber, quoteSlippageBps, false, false, true);
+  }
+
+  async valueGroupLocalExitEstimate(
+    group: PositionGroupRecord,
+    blockNumber: bigint,
+    quoteSlippageBps = this.config.settlementSwapSlippageBps,
+  ): Promise<ValuedPositionGroup> {
+    return this.valueGroup(group, blockNumber, quoteSlippageBps, false, true, true);
   }
 
   shouldTrigger(snapshot: PnlSnapshot, range: PositionRangeInfo | undefined, quoteIsToken0: boolean): ExitTrigger | null {

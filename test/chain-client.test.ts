@@ -3,7 +3,7 @@ import { createPublicClient } from "viem";
 
 import { chainRegistry } from "../src/chains.js";
 import type { RuntimeConfig } from "../src/config.js";
-import { ChainClients, createRpcTransport, ROBINHOOD_READ_CONCURRENCY } from "../src/services/chain-client.js";
+import { ChainClients, createRpcTransport, ROBINHOOD_EXECUTION_CONCURRENCY, ROBINHOOD_READ_CONCURRENCY } from "../src/services/chain-client.js";
 
 describe("RPC failover transport", () => {
   afterEach(() => {
@@ -214,6 +214,60 @@ describe("RPC failover transport", () => {
 
     expect(urls).toEqual(["https://alchemy.example/rpc"]);
     expect(urls.some((url) => url.includes("blockmachine.io"))).toBe(false);
+  });
+
+  it("never sends Robinhood reads to Alchemy after public RPCs fail", async () => {
+    const urls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      return new Response("rate limited", { status: 429 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const clients = new ChainClients({
+      chains: ["robinhood"],
+      alchemyHttp: { base: undefined, robinhood: "https://alchemy.example/rpc", bsc: undefined },
+      rpcHttp: { base: "https://base.example/rpc", robinhood: "https://public.example/rpc", bsc: "https://bsc.example/rpc" },
+      rpcHttpFallback: { robinhood: "https://public-fallback.example/rpc" },
+      rpcHttpScanFallback: { robinhood: "https://rpc-robinhood.blockmachine.io" },
+    } as RuntimeConfig);
+
+    await expect(clients.get("robinhood").client.getChainId()).rejects.toThrow();
+    await expect(clients.getForScan("robinhood").client.getChainId()).rejects.toThrow();
+    await expect(clients.getForLogs("robinhood").client.getChainId()).rejects.toThrow();
+
+    expect(urls.some((url) => url.includes("alchemy.example"))).toBe(false);
+    expect(urls.some((url) => url.includes("public.example"))).toBe(true);
+  });
+
+  it("limits Robinhood execution concurrency separately from reads", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const fetchMock = vi.fn(async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active -= 1;
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x1237" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const clients = new ChainClients({
+      chains: ["robinhood"],
+      alchemyHttp: { robinhood: "https://alchemy.example/rpc" },
+      rpcHttp: { base: "https://base.example/rpc", robinhood: "https://public.example/rpc", bsc: "https://bsc.example/rpc" },
+      rpcHttpFallback: { robinhood: "https://fallback.example/rpc" },
+      rpcHttpScanFallback: { robinhood: "https://rpc-robinhood.blockmachine.io" },
+    } as RuntimeConfig);
+    const execution = clients.getForExecution("robinhood").client;
+
+    await Promise.all(Array.from({ length: 12 }, () => execution.request({ method: "eth_chainId" })));
+
+    expect(fetchMock).toHaveBeenCalledTimes(12);
+    expect(maxActive).toBe(ROBINHOOD_EXECUTION_CONCURRENCY);
   });
 
   it("keeps BSC logs on public RPC and never uses Alchemy", async () => {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { PositionOpener } from "../src/services/position-opener.js";
-import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanPoolsInput, parseScanV2Input, positionRangeBins, positionRangeLine } from "../src/services/notifier.js";
+import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isDashboardVisibleGroup, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanPoolsInput, parseScanV2Input, positionRangeBins, positionRangeLine } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -305,4 +305,18 @@ describe("Telegram dashboard callbacks", () => {
     expect(result.high).toBe("1690");
   });
 
+});
+
+describe("dashboard group visibility", () => {
+  const group = (status: "active" | "settled" | "cancelled", settlementPhase?: string) => ({
+    status,
+    metadata: settlementPhase ? { settlementPhase } : {},
+  }) as never;
+
+  it("hides settled, cancelled, and completed-settlement groups", () => {
+    expect(isDashboardVisibleGroup(group("active"))).toBe(true);
+    expect(isDashboardVisibleGroup(group("settled"))).toBe(false);
+    expect(isDashboardVisibleGroup(group("cancelled"))).toBe(false);
+    expect(isDashboardVisibleGroup(group("active", "complete"))).toBe(false);
+  });
 });

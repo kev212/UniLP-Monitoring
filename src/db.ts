@@ -832,8 +832,9 @@ export class Database {
                ELSE pending_raw_transaction
              END,
              updated_at = NOW()
-         WHERE id = $1
-         RETURNING id
+          WHERE id = $1
+            AND NOT (status IN ('settled', 'cancelled') AND $2::text NOT IN ('settled', 'cancelled'))
+          RETURNING id
       )
       UPDATE positions
          SET status = CASE

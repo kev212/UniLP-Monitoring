@@ -49,6 +49,8 @@ describe("loadConfig", () => {
     expect(config.quoteTokens.base.map((token) => token.symbol)).toEqual(["USDC", "WETH"]);
     expect(config.quoteTokens.base[0]!.address).toBe("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     expect(config.quoteTokens.robinhood.map((token) => token.symbol)).toEqual(["USDG", "WETH", "NVDA", "SPY"]);
+    expect(config.v4PoolKeyOverrides.base?.["0x24ecedb296899f0110dce5cfdd9c9dd74b2b11a21dee752e085f93c700c7fccb"])
+      .toMatchObject({ fee: 0x80_0000, tickSpacing: 200, hooks: "0xBDF938149ac6a781F94FAa0ed45E6A0e984c6544" });
     expect(config.dryRun).toBe(true);
     expect(config.pnlIncludeGas).toBe(false);
     expect(config.trailingStopActivationPercent).toBe(5);

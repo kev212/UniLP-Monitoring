@@ -1077,12 +1077,7 @@ export class DiscoveryService {
     for (const candidate of candidates) {
       const tokenId = candidate.tokenId;
       try {
-        const owner = await client.readContract({
-          address: registry.contracts.v4.positionManager,
-          abi: v4PositionManagerAbi,
-          functionName: "ownerOf",
-          args: [tokenId],
-        });
+        const owner = await this.readMintedNftOwner(name, registry.contracts.v4.positionManager, "v4", tokenId);
         if (owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) continue;
         const receipt = await client.getTransactionReceipt({ hash: candidate.transactionHash });
         const mintEvent = this.decodeV4MintLog(receipt.logs, registry.contracts.v4.poolManager, tokenId);
@@ -1112,7 +1107,7 @@ export class DiscoveryService {
           token1: poolKey.currency1,
           quoteToken,
           status: quoteToken && candidate.historyTrusted ? "syncing" : "needs_review",
-          liquidity: 0n,
+          liquidity: mintEvent.liquidityDelta > 0n ? mintEvent.liquidityDelta : 0n,
           openedAtBlock: candidate.blockNumber,
           metadata: {
             currency0: poolKey.currency0, currency1: poolKey.currency1,

@@ -8,20 +8,25 @@ import type { DiscoveryService } from "./discovery.js";
 import type { Executor } from "./executor.js";
 import type { Notifier } from "./notifier.js";
 import type { PnlService } from "./pnl.js";
+import { isRpcRateLimited } from "../rpc.js";
 import { hasPendingSettlement } from "./pending-settlement.js";
 import { quoteRangeState } from "./quote-range.js";
 
 const POSITION_EVALUATION_TIMEOUT_MS = 60_000;
 const TRAILING_HARD_FLOOR_DROP_BPS = 200n;
 const NEEDS_REVIEW_RETRY_BACKOFF_MS = 5 * 60_000;
+export const ROBINHOOD_RPC_BACKOFF_MS = 20_000;
 
 export class Guardian {
   private readonly lastEvaluatedBlock = new Map<number, bigint>();
+  private readonly evaluatedAtBlock = new Map<string, bigint>();
+  private readonly rpcBackoffUntil = new Map<ChainName, number>();
   private exitQueue: Promise<void> = Promise.resolve();
   private readonly queuedExitPositions = new Set<string>();
   private monitorRunning = false;
   private readonly chainMonitorRunning = new Set<string>();
   private readonly positionEvaluations = new Set<string>();
+  private readonly groupEvaluations = new Set<string>();
   private discoveryRunning = false;
 
   constructor(
@@ -160,35 +165,59 @@ export class Guardian {
   }
 
   private async evaluateChain(name: ChainName): Promise<void> {
+    if (this.isRpcBackedOff(name)) {
+      log.info({ chain: name }, "skipping monitor cycle during RPC backoff");
+      return;
+    }
     const { client, registry } = this.chains.get(name);
     if (!registry.monitoringEnabled) return;
     const blockNumber = await client.getBlockNumber();
     if (this.lastEvaluatedBlock.get(registry.chain.id) === blockNumber) return;
-    const groups = (await this.database.listPositionGroups(registry.chain.id)).filter((group) => group.status === "active");
+    const groups = (await this.database.listPositionGroups(registry.chain.id))
+      .filter((group) => group.status === "active" && !this.alreadyEvaluated(`g:${group.id}`, blockNumber));
     const positions = (await this.database.listOpenPositions(registry.chain.id))
       .filter((position) => !isManagedGroupChild(position)
-        && position.status !== "needs_review" && position.status !== "failed" && position.status !== "paused");
+        && position.status !== "needs_review" && position.status !== "failed" && position.status !== "paused"
+        && !this.alreadyEvaluated(`p:${position.id}`, blockNumber));
+    if (groups.length === 0 && positions.length === 0) {
+      this.lastEvaluatedBlock.set(registry.chain.id, blockNumber);
+      return;
+    }
     const [groupResults, positionResults] = await Promise.all([
-      mapWithConcurrency(groups, this.config.positionMonitorConcurrency, (group) => this.evaluatePositionGroupWithTimeout(name, group, blockNumber)),
-      mapWithConcurrency(positions, this.config.positionMonitorConcurrency, (position) => this.evaluatePositionWithTimeout(name, position, blockNumber)),
+      mapWithConcurrency(groups, this.config.positionMonitorConcurrency, async (group) => {
+        if (this.isRpcBackedOff(name)) return false;
+        const ok = await this.evaluatePositionGroupWithTimeout(name, group, blockNumber);
+        if (ok) this.markEvaluated(`g:${group.id}`, blockNumber);
+        return ok;
+      }),
+      mapWithConcurrency(positions, this.config.positionMonitorConcurrency, async (position) => {
+        if (this.isRpcBackedOff(name)) return false;
+        const ok = await this.evaluatePositionWithTimeout(name, position, blockNumber);
+        if (ok) this.markEvaluated(`p:${position.id}`, blockNumber);
+        return ok;
+      }),
     ]);
-    if ([...groupResults, ...positionResults].every(Boolean)) this.lastEvaluatedBlock.set(registry.chain.id, blockNumber);
+    if (!this.isRpcBackedOff(name) && [...groupResults, ...positionResults].every(Boolean)) {
+      this.lastEvaluatedBlock.set(registry.chain.id, blockNumber);
+    }
   }
 
   private async evaluatePositionGroupWithTimeout(name: ChainName, group: PositionGroupRecord, blockNumber: bigint): Promise<boolean> {
+    if (this.groupEvaluations.has(group.id)) return false;
+    this.groupEvaluations.add(group.id);
     const evaluation = this.evaluatePositionGroup(name, group, blockNumber);
+    void evaluation.finally(() => this.groupEvaluations.delete(group.id)).catch(() => {});
     try {
       return await withTimeout(evaluation, POSITION_EVALUATION_TIMEOUT_MS);
     } catch (error) {
       log.warn({ err: error, groupId: group.id, timeoutMs: POSITION_EVALUATION_TIMEOUT_MS }, "position group valuation timed out; continuing monitor cycle");
-      // Do not advance the chain cursor after an incomplete valuation. The
-      // next cycle must retry the position once the provider recovers.
       return false;
     }
   }
 
   private async evaluatePositionGroup(name: ChainName, group: PositionGroupRecord, blockNumber: bigint): Promise<boolean> {
     try {
+      if (group.status === "settled" || group.metadata.settlementPhase === "complete") return true;
       const valued = await this.pnl.valueGroup(group, blockNumber);
       const syntheticSnapshot: PnlSnapshot = {
         positionId: group.id,
@@ -208,32 +237,114 @@ export class Guardian {
         await this.database.setPositionGroupStatus(group.id, group.status, { trailingStop: null });
       } else if (trailing.action === "activate" || trailing.action === "raise_peak") {
         await this.database.setPositionGroupStatus(group.id, group.status, { trailingStop: trailing.state });
+        group = { ...group, metadata: { ...group.metadata, trailingStop: trailing.state } };
       }
 
       const quoteIsToken0 = group.quoteToken.toLowerCase() === group.token0.toLowerCase();
       const staticTrigger = this.pnl.shouldTriggerGroup(valued.snapshot);
       const oorTrigger = await this.updateGroupOorAboveTimer(group, valued.range);
       const profitOorTrigger = await this.updateGroupProfitOorAboveTimer(group, valued.range, valued.snapshot.pnlBps);
-      const trigger = staticTrigger
+      const liveTrigger = staticTrigger
         ?? (trailing.action === "trigger" ? "trailing_take_profit" : null)
         ?? profitOorTrigger
         ?? oorTrigger;
-      if (!trigger || !valued.twapGuard.ready) return true;
-      if (!this.canAutoExit(name)) return true;
-      if (trigger === "trailing_take_profit" && this.pnl.trailingExitEstimateGateBps(group.metadata) === null) {
-        await this.database.setPositionGroupStatus(group.id, "needs_review", { reason: "trailing_exit_state_missing", settlementRetryDisabled: true });
+      const pendingRetry = parseExitRetry(group.metadata);
+      const retryTrigger = pendingRetry && shouldResumeGroupExitRetry(pendingRetry.reason) ? pendingRetry.reason : null;
+      let trigger: ExitTrigger | null = liveTrigger === "stop_loss"
+        ? liveTrigger
+        : retryTrigger ?? liveTrigger;
+      if (!trigger) {
+        const staleDynamicRetry = pendingRetry && !shouldResumeGroupExitRetry(pendingRetry.reason);
+        if (staleDynamicRetry
+          || group.metadata.slTwapWaitStartedAt !== undefined
+          || group.metadata.trailingTwapWaitStartedAt !== undefined
+          || group.metadata.profitTwapWaitStartedAt !== undefined) {
+          await this.database.setPositionGroupStatus(group.id, group.status, {
+            slTwapWaitStartedAt: null,
+            trailingTwapWaitStartedAt: null,
+            profitTwapWaitStartedAt: null,
+            ...(staleDynamicRetry ? { exitRetry: null, exitTrigger: null } : {}),
+          });
+        }
         return true;
       }
-      let exitSnapshot = valued.snapshot;
-      if (trigger === "stop_loss") {
-        const localSnapshot = await this.validateGroupStopLossWithLocalQuote(group, blockNumber, valued.snapshot);
-        if (!localSnapshot) return true;
-        exitSnapshot = localSnapshot;
+      const nextAttemptAt = retryAt(group.metadata);
+      if (pendingRetry?.reason === trigger && shouldWaitForGroupExitRetry(trigger, nextAttemptAt)) {
+        log.info({ groupId: group.id, trigger, nextAttemptAt: new Date(nextAttemptAt!).toISOString() }, "position group exit retry waiting for backoff");
+        return true;
       }
+      if (!this.canAutoExit(name)) return true;
+      let freshProfitSnapshot: PositionGroupPnlSnapshot | null = null;
+      let promotedStopLossSnapshot: PositionGroupPnlSnapshot | null = null;
+      if (!valued.twapGuard.ready && trigger === "trailing_take_profit") {
+        promotedStopLossSnapshot = await this.detectGroupLocalStopLoss(group, blockNumber);
+        if (promotedStopLossSnapshot) trigger = "stop_loss";
+      } else if (!valued.twapGuard.ready
+        && trigger !== "stop_loss"
+        && trigger !== "trailing_take_profit"
+        && trigger !== "manual") {
+        freshProfitSnapshot = await this.validateGroupProfitExit(group, blockNumber, trigger, valued.snapshot);
+        if (!freshProfitSnapshot) return true;
+        if (this.pnl.shouldTriggerGroup(freshProfitSnapshot) === "stop_loss") {
+          trigger = "stop_loss";
+          promotedStopLossSnapshot = freshProfitSnapshot;
+        }
+      }
+      if (!valued.twapGuard.ready && trigger !== "manual") {
+        if (!(await this.allowGroupAfterTwapWait(group, trigger, valued.twapGuard.deviationBps))) return true;
+      }
+      const triggerBeforeFreshValidation = trigger;
+      let exitSnapshot = promotedStopLossSnapshot ?? freshProfitSnapshot ?? valued.snapshot;
+      if (trigger === "stop_loss") {
+        if (!promotedStopLossSnapshot) {
+          const localSnapshot = await this.validateGroupStopLossWithLocalQuote(group, blockNumber, valued.snapshot);
+          if (!localSnapshot) {
+            if (pendingRetry?.reason === "stop_loss") {
+              await this.database.setPositionGroupStatus(group.id, group.status, { exitRetry: null, exitTrigger: null, slTwapWaitStartedAt: null });
+            }
+            return true;
+          }
+          exitSnapshot = localSnapshot;
+        }
+      } else if (trigger === "trailing_take_profit") {
+        const trailingSnapshot = await this.groupTrailingExitEstimateAllowed(group, blockNumber);
+        if (!trailingSnapshot) return true;
+        exitSnapshot = trailingSnapshot;
+        if (this.pnl.shouldTriggerGroup(exitSnapshot) === "stop_loss") trigger = "stop_loss";
+      } else if (trigger !== "manual" && !freshProfitSnapshot) {
+        const confirmedSnapshot = await this.validateGroupProfitExit(group, blockNumber, trigger, valued.snapshot);
+        if (!confirmedSnapshot) return true;
+        exitSnapshot = confirmedSnapshot;
+        if (this.pnl.shouldTriggerGroup(exitSnapshot) === "stop_loss") trigger = "stop_loss";
+      }
+      if (trigger === "stop_loss" && triggerBeforeFreshValidation !== "stop_loss" && !valued.twapGuard.ready) {
+        const previousWaitStartedAt = triggerBeforeFreshValidation === "trailing_take_profit"
+          ? group.metadata.trailingTwapWaitStartedAt
+          : group.metadata.profitTwapWaitStartedAt;
+        const slGroup = typeof previousWaitStartedAt === "number"
+          ? { ...group, metadata: { ...group.metadata, slTwapWaitStartedAt: previousWaitStartedAt } }
+          : group;
+        if (!(await this.allowGroupAfterTwapWait(slGroup, "stop_loss", valued.twapGuard.deviationBps))) return true;
+      }
+      await this.database.setPositionGroupStatus(group.id, group.status, {
+        exitTrigger: trigger,
+        exitSnapshot: {
+          pnlBps: exitSnapshot.pnlBps.toString(),
+          pnlQuote: exitSnapshot.pnlQuote.toString(),
+          blockNumber: exitSnapshot.blockNumber.toString(),
+        },
+        slTwapWaitStartedAt: null,
+        trailingTwapWaitStartedAt: null,
+        profitTwapWaitStartedAt: null,
+      });
       log.warn({ groupId: group.id, chain: name, trigger, pnlBps: exitSnapshot.pnlBps, quoteIsToken0 }, "position group exit triggered");
       await this.executor.executeRelatedGroup(group.id, trigger);
       return true;
     } catch (error) {
+      if (isRpcRateLimited(error)) {
+        this.noteRpcRateLimit(name);
+        return false;
+      }
       if (error instanceof Error && error.message.includes("cost basis")) {
         log.warn({ err: error, groupId: group.id }, "position group cost basis is not yet available");
         return false;
@@ -439,6 +550,10 @@ export class Guardian {
         return false;
       }
     } catch (error) {
+      if (isRpcRateLimited(error)) {
+        this.noteRpcRateLimit(name);
+        return false;
+      }
       const message = error instanceof Error ? error.message : String(error);
       if (message.includes("cost basis")) {
         log.warn({ positionId: position.id }, "cost basis not yet available — waiting for cashflow sync");
@@ -497,8 +612,34 @@ export class Guardian {
       const pendingSwap = group.metadata.pendingSwap !== null
         && typeof group.metadata.pendingSwap === "object"
         && !Array.isArray(group.metadata.pendingSwap);
-      const groupRetryAt = retryAt(group.metadata);
-      const retryDue = group.status === "active" && groupRetryAt !== null && groupRetryAt <= Date.now();
+      const groupRetry = parseExitRetry(group.metadata);
+      const retryDue = group.status === "active"
+        && groupRetry !== null
+        && shouldResumeGroupExitRetry(groupRetry.reason)
+        && groupRetry.nextAttemptAt <= Date.now();
+      const storedTrigger = validExitTrigger(group.metadata.exitTrigger);
+      const recoveryTrigger = groupRetry && shouldResumeGroupExitRetry(groupRetry.reason)
+        ? groupRetry.reason
+        : storedTrigger ?? groupRetry?.reason;
+      const hasDurableExecution = group.pendingRawTransaction !== null
+        || typeof closeHash === "string"
+        || pendingSwap;
+      if (group.status === "closing"
+        && !hasDurableExecution
+        && recoveryTrigger !== undefined
+        && !shouldResumeGroupExitRetry(recoveryTrigger)) {
+        try {
+          await this.database.setPositionGroupStatus(group.id, "active", {
+            settlementPhase: null,
+            exitTrigger: null,
+            exitRetry: null,
+            reason: "dynamic_exit_revalidation_required_after_restart",
+          });
+        } catch (error) {
+          log.warn({ err: error, groupId: group.id }, "position group dynamic exit recovery reset deferred");
+        }
+        continue;
+      }
       const recoverable = group.status !== "settled"
         && group.status !== "cancelled"
         && (group.status === "closing"
@@ -509,7 +650,7 @@ export class Guardian {
           || retryDue);
       if (!recoverable) continue;
       try {
-        await this.executor.executeGroup(group.id, typeof group.metadata.exitTrigger === "string" ? group.metadata.exitTrigger as import("../types.js").ExitTrigger : undefined);
+        await this.executor.executeGroup(group.id, recoveryTrigger);
       } catch (error) {
         log.warn({ err: error, groupId: group.id }, "position group settlement recovery deferred");
       }
@@ -559,9 +700,98 @@ export class Guardian {
       }
       return localValuation.snapshot;
     } catch (error) {
+      if (isRpcRateLimited(error)) throw error;
       log.warn({ err: error, groupId: group.id }, "position group SL local quote validation failed; skipping exit");
       return null;
     }
+  }
+
+  private async detectGroupLocalStopLoss(group: PositionGroupRecord, blockNumber: bigint): Promise<PositionGroupPnlSnapshot | null> {
+    try {
+      const estimate = await this.pnl.valueGroupLocalExitEstimate(group, blockNumber, this.config.settlementSwapSlippageBps);
+      return this.pnl.shouldTriggerGroup(estimate.snapshot) === "stop_loss" ? estimate.snapshot : null;
+    } catch (error) {
+      if (isRpcRateLimited(error)) throw error;
+      log.warn({ err: error, groupId: group.id }, "position group emergency SL local validation failed");
+      return null;
+    }
+  }
+
+  private async validateGroupProfitExit(
+    group: PositionGroupRecord,
+    blockNumber: bigint,
+    trigger: Exclude<ExitTrigger, "stop_loss" | "trailing_take_profit" | "manual">,
+    apiSnapshot: PositionGroupPnlSnapshot,
+  ): Promise<PositionGroupPnlSnapshot | null> {
+    try {
+      const localValuation = await this.pnl.valueGroupLocalExitEstimate(group, blockNumber, this.config.settlementSwapSlippageBps);
+      const staticTrigger = this.pnl.shouldTriggerGroup(localValuation.snapshot);
+      if (staticTrigger === "stop_loss") return localValuation.snapshot;
+      const localTrigger = trigger === "take_profit"
+        ? staticTrigger
+        : trigger === "profit_oor_above"
+          ? await this.updateGroupProfitOorAboveTimer(group, localValuation.range, localValuation.snapshot.pnlBps)
+          : await this.updateGroupOorAboveTimer(group, localValuation.range);
+      if (localTrigger !== trigger) {
+        log.info({
+          groupId: group.id,
+          trigger,
+          apiPnlBps: apiSnapshot.pnlBps,
+          localPnlBps: localValuation.snapshot.pnlBps,
+        }, "position group profit exit cancelled by fresh local validation");
+        return null;
+      }
+      return localValuation.snapshot;
+    } catch (error) {
+      if (isRpcRateLimited(error)) throw error;
+      log.warn({ err: error, groupId: group.id, trigger }, "position group profit exit local validation failed; skipping exit");
+      return null;
+    }
+  }
+
+  private async allowGroupAfterTwapWait(group: PositionGroupRecord, trigger: ExitTrigger, deviationBps?: bigint): Promise<boolean> {
+    const key = trigger === "stop_loss"
+      ? "slTwapWaitStartedAt"
+      : trigger === "trailing_take_profit"
+        ? "trailingTwapWaitStartedAt"
+        : "profitTwapWaitStartedAt";
+    const maxWaitMs = trigger === "stop_loss"
+      ? this.config.slTwapGuardMaxWaitMs
+      : this.config.trailingTwapGuardMaxWaitMs;
+    if (maxWaitMs === 0) return true;
+    const startedAt = typeof group.metadata[key] === "number" ? group.metadata[key] as number : null;
+    if (startedAt === null) {
+      await this.database.setPositionGroupStatus(group.id, group.status, { [key]: Date.now() });
+      log.warn({ groupId: group.id, trigger, deviationBps }, "position group trigger reached but TWAP not ready; starting guard wait");
+      return false;
+    }
+    const elapsed = Math.max(0, Date.now() - startedAt);
+    if (elapsed < maxWaitMs) {
+      log.info({ groupId: group.id, trigger, elapsed, maxWaitMs, deviationBps }, "position group waiting for TWAP guard to stabilize");
+      return false;
+    }
+    log.warn({ groupId: group.id, trigger, elapsed, maxWaitMs, deviationBps }, "position group executing after TWAP guard max wait override");
+    return true;
+  }
+
+  private async groupTrailingExitEstimateAllowed(group: PositionGroupRecord, blockNumber: bigint): Promise<PositionGroupPnlSnapshot | null> {
+    const gateBps = this.pnl.trailingExitEstimateGateBps(group.metadata);
+    if (gateBps === null) {
+      await this.database.setPositionGroupStatus(group.id, "needs_review", {
+        reason: "trailing_exit_state_missing",
+        settlementRetryDisabled: true,
+      });
+      return null;
+    }
+    const estimate = await this.pnl.valueGroupExitEstimate(group, blockNumber, this.config.settlementSwapSlippageBps);
+    const trailingFloorBps = this.pnl.trailingFloorBps(group.metadata);
+    if (trailingFloorBps !== null && estimate.snapshot.pnlBps <= trailingFloorBps - TRAILING_HARD_FLOOR_DROP_BPS) {
+      log.warn({ groupId: group.id, estimatePnlBps: estimate.snapshot.pnlBps, trailingFloorBps }, "position group trailing exit forced below hard floor");
+      return estimate.snapshot;
+    }
+    if (estimate.snapshot.pnlBps >= gateBps) return estimate.snapshot;
+    log.info({ groupId: group.id, estimatePnlBps: estimate.snapshot.pnlBps, gateBps }, "position group trailing exit deferred below conservative estimate gate");
+    return null;
   }
 
   private async allowTrailingAfterTwapWait(position: PositionRecord, deviationBps?: bigint): Promise<boolean> {
@@ -622,6 +852,23 @@ export class Guardian {
     } finally {
       this.queuedExitPositions.delete(position.id);
     }
+  }
+
+  private noteRpcRateLimit(name: ChainName): void {
+    this.rpcBackoffUntil.set(name, Date.now() + ROBINHOOD_RPC_BACKOFF_MS);
+    log.warn({ chain: name, backoffMs: ROBINHOOD_RPC_BACKOFF_MS }, "RPC rate limited; backing off monitor cycle");
+  }
+
+  private isRpcBackedOff(name: ChainName): boolean {
+    return (this.rpcBackoffUntil.get(name) ?? 0) > Date.now();
+  }
+
+  private alreadyEvaluated(key: string, blockNumber: bigint): boolean {
+    return this.evaluatedAtBlock.get(key) === blockNumber;
+  }
+
+  private markEvaluated(key: string, blockNumber: bigint): void {
+    this.evaluatedAtBlock.set(key, blockNumber);
   }
 
   private canAutoExit(name: ChainName): boolean {
@@ -844,6 +1091,25 @@ export function shouldWaitForExitRetry(trigger: ExitTrigger, nextAttemptAt: numb
 
 export function shouldResumeExitRetry(trigger: ExitTrigger): boolean {
   return trigger === "stop_loss" || trigger === "take_profit" || trigger === "manual";
+}
+
+export function shouldResumeGroupExitRetry(trigger: ExitTrigger): boolean {
+  return trigger === "stop_loss" || trigger === "manual";
+}
+
+export function shouldWaitForGroupExitRetry(trigger: ExitTrigger, nextAttemptAt: number | null, now = Date.now()): boolean {
+  return trigger !== "stop_loss" && nextAttemptAt !== null && now < nextAttemptAt;
+}
+
+function validExitTrigger(value: unknown): ExitTrigger | undefined {
+  return value === "stop_loss"
+    || value === "take_profit"
+    || value === "trailing_take_profit"
+    || value === "profit_oor_above"
+    || value === "out_of_range_above"
+    || value === "manual"
+    ? value
+    : undefined;
 }
 
 function isInactiveReviewReason(reason: unknown): boolean {

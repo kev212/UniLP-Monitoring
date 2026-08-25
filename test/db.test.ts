@@ -153,6 +153,7 @@ describe("Database native USD backfill", () => {
 
     expect(query.mock.calls[0]![0]).toContain("metadata = metadata || $3::jsonb");
     expect(query.mock.calls[0]![0]).toContain("pending_raw_transaction = CASE");
+    expect(query.mock.calls[0]![0]).toContain("AND NOT (status IN ('settled', 'cancelled') AND $2::text NOT IN ('settled', 'cancelled'))");
     expect(query.mock.calls[0]![1]).toEqual(["group", "settling", JSON.stringify(metadata)]);
   });
 

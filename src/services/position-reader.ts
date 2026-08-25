@@ -41,7 +41,11 @@ export interface PositionValue {
   observedBlock: bigint;
 }
 
+type V4Slot0 = readonly [bigint, number, number, number];
+
 export class PositionReader {
+  private readonly v4Slot0Cache = new Map<string, Promise<V4Slot0>>();
+
   constructor(private readonly chains: ChainClients, private readonly slippageBps: number) {}
 
   async read(position: PositionRecord, blockNumber?: bigint, removeSlippageBps?: number, rpc: "scan" | "execution" = "scan"): Promise<PositionValue> {
@@ -161,7 +165,7 @@ export class PositionReader {
       [poolKey.currency0, poolKey.currency1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks],
     ));
     const [slot0, feeGrowthInside, storedPosition] = await Promise.all([
-      client.readContract({ address: registry.contracts.v4.stateView, abi: v4StateViewAbi, functionName: "getSlot0", args: [poolId], blockNumber }),
+      this.readV4Slot0(client, registry.contracts.v4.stateView, poolId, blockNumber, rpc, position.chainId),
       client.readContract({ address: registry.contracts.v4.stateView, abi: v4StateViewAbi, functionName: "getFeeGrowthInside", args: [poolId, tickLower, tickUpper], blockNumber }),
       client.readContract({
         address: registry.contracts.v4.stateView,
@@ -193,6 +197,35 @@ export class PositionReader {
       range: rangeInfo(slot0[1], tickLower, tickUpper, slot0[0]),
       observedBlock: blockNumber,
     };
+  }
+
+  private readV4Slot0(
+    client: PublicClient,
+    stateView: Address,
+    poolId: `0x${string}`,
+    blockNumber: bigint,
+    rpc: "scan" | "execution",
+    chainId: number,
+  ): Promise<V4Slot0> {
+    const key = `${chainId}:${rpc}:${poolId}:${blockNumber}`;
+    const cached = this.v4Slot0Cache.get(key);
+    if (cached) return cached;
+    const pending = (client.readContract({
+      address: stateView,
+      abi: v4StateViewAbi,
+      functionName: "getSlot0",
+      args: [poolId],
+      blockNumber,
+    }) as Promise<V4Slot0>).catch((error: unknown) => {
+      this.v4Slot0Cache.delete(key);
+      throw error;
+    });
+    this.v4Slot0Cache.set(key, pending);
+    if (this.v4Slot0Cache.size > 48) {
+      const oldest = this.v4Slot0Cache.keys().next().value;
+      if (oldest && oldest !== key) this.v4Slot0Cache.delete(oldest);
+    }
+    return pending;
   }
 
   private rpcClient(chainId: number, source: "scan" | "execution" = "scan") {

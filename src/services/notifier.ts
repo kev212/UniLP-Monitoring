@@ -843,7 +843,7 @@ export class Notifier {
       ]);
       const normalPositions = positions.filter((position) => !isManagedGroupChild(position));
       const groupParents = groups
-        .filter((group) => group.status !== "settled" && group.status !== "cancelled")
+        .filter((group) => isDashboardVisibleGroup(group))
         .map((group) => groupDashboardPosition(group));
       return { chainId: registry.chain.id, positions: [...normalPositions, ...groupParents], block };
     }));
@@ -2585,6 +2585,12 @@ function groupDashboardPosition(group: PositionGroupRecord): PositionRecord {
       outerTickUpper: group.outerTickUpper,
     },
   };
+}
+
+export function isDashboardVisibleGroup(group: PositionGroupRecord): boolean {
+  return group.status !== "settled"
+    && group.status !== "cancelled"
+    && group.metadata.settlementPhase !== "complete";
 }
 
 function groupPositionStatus(status: PositionGroupRecord["status"]): PositionStatus {

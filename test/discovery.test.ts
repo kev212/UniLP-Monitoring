@@ -142,6 +142,53 @@ function groupDatabase(bins: PositionGroupBinRecord[]) {
 }
 
 describe("historical discovery reads", () => {
+  it("records positive V4 mint liquidity from the receipt instead of settling it as zero", async () => {
+    const manager = chainRegistry.robinhood.contracts.v4.positionManager;
+    const poolManager = chainRegistry.robinhood.contracts.v4.poolManager;
+    const tokenId = 910_656n;
+    const poolId = `0x${"b".repeat(64)}` as Hex;
+    const liquidity = 123_456n;
+    const receipt = {
+      transactionHash: openHash,
+      blockNumber: 123n,
+      logs: [
+        transferLog(manager, tokenId),
+        modifyLiquidityLog(poolManager, poolId, manager, -200, 200, liquidity, indexed(tokenId)),
+      ],
+    };
+    const upsertPosition = vi.fn(async (value: Record<string, unknown>) => ({ id: "position", ...value }));
+    const client = {
+      readContract: vi.fn(async ({ functionName }: { functionName: string }) => {
+        if (functionName === "ownerOf") return owner;
+        if (functionName === "poolKeys") return { currency0: token0, currency1: token1, fee: 500, tickSpacing: 10, hooks: zeroAddress };
+        throw new Error(`unexpected ${functionName}`);
+      }),
+      getTransactionReceipt: vi.fn().mockResolvedValue(receipt),
+    };
+    const discovery = new DiscoveryService(
+      { upsertPosition } as never,
+      { get: vi.fn(() => ({ client, registry: chainRegistry.robinhood })) } as never,
+      { executorAddress: owner, quoteTokens: { robinhood: [{ symbol: "USDG", address: token0 }] } } as never,
+    );
+    (discovery as any).hydrateV4OpeningCashflow = vi.fn().mockResolvedValue(undefined);
+
+    await (discovery as any).discoverV4Candidates("robinhood", [{
+      asset: manager,
+      transactionHash: openHash,
+      blockNumber: 123n,
+      from: zeroAddress,
+      to: owner,
+      tokenId,
+      historyTrusted: true,
+    }]);
+
+    expect(upsertPosition).toHaveBeenCalledWith(expect.objectContaining({
+      positionKey: tokenId.toString(),
+      liquidity,
+      status: "syncing",
+    }));
+  });
+
   it("uses the archive scan client for V4 historical price reads", async () => {
     const regularClient = { readContract: vi.fn() };
     const archiveClient = { readContract: vi.fn().mockResolvedValue([1n << 96n, 0, 0, 0]) };

@@ -330,16 +330,18 @@ export class Executor {
     };
 
     if (isRelatedPairTarget(origin)) addTarget(origin);
-    for (const group of groups) {
-      if (!isCascadeGroup(group) || group.owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) continue;
-      if (this.relatedPairKey(group.chainId, group.token0, group.token1) !== pairKey) continue;
-      addTarget({ kind: "group", value: group });
-    }
-    for (const position of positions) {
-      if (!isCascadePosition(position) || isManagedGroupChild(position)) continue;
-      if (position.owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) continue;
-      if (this.relatedPairKey(position.chainId, position.token0, position.token1) !== pairKey) continue;
-      addTarget({ kind: "position", value: position });
+    if (trigger === "stop_loss" || trigger === "manual") {
+      for (const group of groups) {
+        if (!isCascadeGroup(group) || group.owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) continue;
+        if (this.relatedPairKey(group.chainId, group.token0, group.token1) !== pairKey) continue;
+        addTarget({ kind: "group", value: group });
+      }
+      for (const position of positions) {
+        if (!isCascadePosition(position) || isManagedGroupChild(position)) continue;
+        if (position.owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) continue;
+        if (this.relatedPairKey(position.chainId, position.token0, position.token1) !== pairKey) continue;
+        addTarget({ kind: "position", value: position });
+      }
     }
 
     const failures: string[] = [];
@@ -511,6 +513,7 @@ export class Executor {
     let group = await this.database.getPositionGroup(groupId);
     if (!group) throw new Error(`Position group ${groupId} was not found`);
     if (group.status === "settled" || group.status === "cancelled") return;
+    trigger = this.groupExitTrigger(group, trigger);
 
     let groupFailureRecorded = false;
     try {
@@ -551,7 +554,7 @@ export class Executor {
           await this.markGroupRetryable(group, trigger, errorMessage(error), true);
           return;
         }
-        if (group.protocol !== "v4") {
+        if (group.protocol !== "v4" || !allowsZeroMinimumGroupClose(trigger)) {
           await this.recordGroupExecutionFailure(group.id, "close_batch", errorMessage(error));
           groupFailureRecorded = true;
           await this.markGroupRetryable(group, trigger, errorMessage(error));
@@ -1179,16 +1182,18 @@ export class Executor {
   }
 
   private async markGroupCloseConfirmed(group: PositionGroupRecord, hash: Hex, trigger?: ExitTrigger): Promise<void> {
+    const exitTrigger = this.groupExitTrigger(group, trigger);
     this.confirmedGroupCloses.set(group.id, hash);
     await this.setGroupStatus(group.id, "settling", {
       closeTransactionHash: hash,
-      exitTrigger: trigger ?? "manual",
+      exitTrigger,
       settlementPhase: "accounting",
       closeReceiptAccounted: false,
     });
   }
 
   private async accountGroupCloseReceipt(group: PositionGroupRecord, hash: Hex, childCount?: number, trigger?: ExitTrigger): Promise<void> {
+    const exitTrigger = this.groupExitTrigger(group, trigger);
     if (this.accountedGroupCloses.has(group.id)) return;
     const receipt = await this.getConfirmedReceipt(group.chainId, hash);
     if (receipt.status !== "success") throw new Error(`Close receipt is not successful: ${hash}`);
@@ -1213,7 +1218,7 @@ export class Executor {
       {
         protocol: group.protocol,
         childCount: childCount ?? null,
-        trigger: trigger ?? "manual",
+        trigger: exitTrigger,
         source: "atomic_group_close",
       },
     );
@@ -1226,11 +1231,11 @@ export class Executor {
       const realized = totals.realized;
       const finalPnlQuote = realized - deposits;
       const finalPnlBps = deposits > 0n ? (finalPnlQuote * 10_000n) / deposits : 0n;
-      if (!(await this.unwrapGroupQuote(group, quoteAmount, hash, trigger ?? "manual"))) return;
+      if (!(await this.unwrapGroupQuote(group, quoteAmount, hash, exitTrigger))) return;
       const finalize = this.groupDatabase().finalizePositionGroup;
       if (typeof finalize === "function") {
         const finalPnlUsd = await this.computeGroupFinalPnlUsd(group, quoteAmount, finalPnlQuote);
-        const settled = await finalize.call(this.database, group.id, hash, quoteAmount, finalPnlQuote, finalPnlBps, trigger ?? "manual", finalPnlUsd);
+        const settled = await finalize.call(this.database, group.id, hash, quoteAmount, finalPnlQuote, finalPnlBps, exitTrigger, finalPnlUsd);
         if (!settled) throw new Error("position group could not be finalized after close receipt");
         this.accountedGroupCloses.add(group.id);
         this.confirmedReceipts.delete(hash);
@@ -1373,6 +1378,7 @@ export class Executor {
   }
 
   private async finalizeGroupFromCloseProceeds(group: PositionGroupRecord, closeHash: Hex, trigger?: ExitTrigger, reason?: string): Promise<void> {
+    const exitTrigger = this.groupExitTrigger(group, trigger);
     if (reason) {
       log.warn({ groupId: group.id, closeHash, reason }, "position group settling from close proceeds without an aggregate swap");
     }
@@ -1383,16 +1389,16 @@ export class Executor {
     const deposits = totals.deposits > 0n ? totals.deposits : group.deployedCostQuote;
     const finalPnlQuote = totals.realized - deposits;
     const finalPnlBps = deposits > 0n ? (finalPnlQuote * 10_000n) / deposits : 0n;
-    if (!(await this.unwrapGroupQuote(group, quoteAmount, closeHash, trigger))) return;
+    if (!(await this.unwrapGroupQuote(group, quoteAmount, closeHash, exitTrigger))) return;
      const finalize = this.groupDatabase().finalizePositionGroup;
      if (typeof finalize !== "function") throw new GroupIntegrityError("Position group settlement finalizer is unavailable");
-     const exitTrigger = typeof group.metadata.exitTrigger === "string" ? group.metadata.exitTrigger : "manual";
      const finalPnlUsd = await this.computeGroupFinalPnlUsd(group, quoteAmount, finalPnlQuote);
-     const settled = await finalize.call(this.database, group.id, closeHash, quoteAmount, finalPnlQuote, finalPnlBps, trigger ?? exitTrigger, finalPnlUsd);
+     const settled = await finalize.call(this.database, group.id, closeHash, quoteAmount, finalPnlQuote, finalPnlBps, exitTrigger, finalPnlUsd);
      if (!settled) throw new Error("position group settlement finalization failed");
    }
 
   private async unwrapGroupQuote(group: PositionGroupRecord, amount: bigint, closeHash: string, trigger?: ExitTrigger): Promise<boolean> {
+    const exitTrigger = this.groupExitTrigger(group, trigger);
     const { registry } = this.chains.getById(group.chainId);
     const meta = chainMeta(registry);
     const wrapped = this.config.quoteTokens[registry.name]?.find((token) => token.symbol === meta.wrappedSymbol);
@@ -1448,7 +1454,7 @@ export class Executor {
       const receipt = await this.getConfirmedReceipt(group.chainId, hash);
       await this.database.addPositionGroupCashflow(group.id, receipt.blockNumber, hash, "unwrap_quote", amountToUnwrap, 0n, 0n, {
         source: "group_quote_unwrap",
-        trigger: trigger ?? (typeof metadata.exitTrigger === "string" ? metadata.exitTrigger : "manual"),
+        trigger: exitTrigger,
       });
     } catch (error) {
       log.warn({ error: errorMessage(error), groupId: group.id, hash }, "position group unwrap cashflow deferred");
@@ -1734,13 +1740,14 @@ export class Executor {
   }
 
   private async reconcileGroupSettlementSwap(group: PositionGroupRecord, hash: Hex, trigger?: ExitTrigger): Promise<void> {
+    const exitTrigger = this.groupExitTrigger(group, trigger);
     const receipt = await this.getConfirmedReceipt(group.chainId, hash);
     if (receipt.status !== "success") throw new RevertedExecutionError("settlement_swap", `settlement_swap transaction reverted: ${hash}`);
     const output = await this.assetReceivedFromReceipt(group.chainId, group.quoteToken, group.owner, hash, receipt);
     if (output <= 0n) throw new Error(`Aggregate settlement swap produced no quote-token output: ${hash}`);
     await this.database.addPositionGroupCashflow(group.id, receipt.blockNumber, hash, "settlement_swap", output, 0n, 0n, {
       source: "aggregate_group_settlement",
-      trigger: trigger ?? group.metadata.exitTrigger ?? "manual",
+      trigger: exitTrigger,
     });
     const closeQuote = group.totalReceivedQuote > 0n
       ? group.totalReceivedQuote
@@ -1756,9 +1763,9 @@ export class Executor {
      if (typeof finalize !== "function") throw new GroupIntegrityError("Position group settlement finalizer is unavailable");
     const storedCloseHash = group.closeTransactionHash
       ?? (typeof group.metadata.closeTransactionHash === "string" ? group.metadata.closeTransactionHash : hash);
-     if (!(await this.unwrapGroupQuote(group, totalReceivedQuote, storedCloseHash, trigger))) return;
+     if (!(await this.unwrapGroupQuote(group, totalReceivedQuote, storedCloseHash, exitTrigger))) return;
      const finalPnlUsd = await this.computeGroupFinalPnlUsd(group, totalReceivedQuote, finalPnlQuote);
-     const settled = await finalize.call(this.database, group.id, storedCloseHash, totalReceivedQuote, finalPnlQuote, finalPnlBps, trigger ?? "manual", finalPnlUsd);
+     const settled = await finalize.call(this.database, group.id, storedCloseHash, totalReceivedQuote, finalPnlQuote, finalPnlBps, exitTrigger, finalPnlUsd);
      if (!settled) throw new Error("position group settlement finalization failed");
     this.accountedGroupCloses.add(group.id);
     this.confirmedReceipts.delete(hash);
@@ -1776,10 +1783,13 @@ export class Executor {
       settlementPhase: null,
       reason,
       exitRetry: retry,
+      exitTrigger: trigger ?? this.groupExitTrigger(group),
       ...(transient ? { settlementRetryDisabled: null } : {}),
       ...(exhausted ? { settlementRetryDisabled: true } : {}),
     });
-    if (transient) this.scheduleGroupExitRetry(group.id, retry, trigger);
+    if (transient && (trigger === "stop_loss" || trigger === "manual")) {
+      this.scheduleGroupExitRetry(group.id, retry, trigger);
+    }
   }
 
   private scheduleGroupExitRetry(groupId: string, retry: Record<string, unknown>, trigger?: ExitTrigger): void {
@@ -3246,6 +3256,27 @@ export class Executor {
     return "settled";
   }
 
+  private groupExitTrigger(group: PositionGroupRecord, trigger?: ExitTrigger): ExitTrigger {
+    if (trigger) return trigger;
+    const retryTrigger = group.metadata.exitRetry
+      && typeof group.metadata.exitRetry === "object"
+      && !Array.isArray(group.metadata.exitRetry)
+      ? (group.metadata.exitRetry as Record<string, unknown>).reason
+      : undefined;
+    const candidates = retryTrigger === "stop_loss" || retryTrigger === "manual"
+      ? [retryTrigger, group.metadata.exitTrigger]
+      : [group.metadata.exitTrigger, retryTrigger];
+    for (const candidate of candidates) {
+      if (candidate === "stop_loss"
+        || candidate === "take_profit"
+        || candidate === "trailing_take_profit"
+        || candidate === "profit_oor_above"
+        || candidate === "out_of_range_above"
+        || candidate === "manual") return candidate;
+    }
+    return "manual";
+  }
+
   private finalizeCloseHistory(position: PositionRecord): void {
     void this.database.finalizeCloseHistory(position.id, this.closeTrigger(position)).catch((error) => {
       log.error({ err: error, positionId: position.id, positionKey: position.positionKey }, "close-history finalization failed");
@@ -3741,6 +3772,10 @@ export function nextExitRetry(metadata: Record<string, unknown>, trigger?: ExitT
     lastFailedAt: new Date().toISOString(),
     nextAttemptAt: new Date(Date.now() + delaySeconds * 1_000).toISOString(),
   };
+}
+
+export function allowsZeroMinimumGroupClose(trigger: ExitTrigger): boolean {
+  return trigger === "stop_loss" || trigger === "manual";
 }
 
 function exitRetryAttempts(metadata: Record<string, unknown>): number {

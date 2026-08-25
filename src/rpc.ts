@@ -21,3 +21,17 @@ export function isTransientRpcError(error: unknown): boolean {
   const message = values.map((value) => String(value.message ?? "")).join(" ");
   return /\b(?:408|425|429|500|502|503|504|520|521|522|523|524|525|526|527|530)\b|too many requests|rate limit|timed out|timeout|aborted|econnreset|econnrefused|enotfound|network|fetch failed|service unavailable|gateway|origin (?:is )?(?:unreachable|down)|unsupported block number|header not found|block(?:\s+number)?\s+(?:is\s+)?(?:not found|unavailable)|missing trie node/i.test(message);
 }
+
+export function isRpcRateLimited(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current; depth += 1) {
+    if (typeof current !== "object") {
+      return /429|too many requests|rate.?limit/i.test(String(current));
+    }
+    const value = current as { code?: unknown; status?: unknown; message?: unknown; cause?: unknown };
+    if (value.code === 429 || value.status === 429) return true;
+    if (/429|too many requests|rate.?limit/i.test(String(value.message ?? ""))) return true;
+    current = value.cause;
+  }
+  return false;
+}

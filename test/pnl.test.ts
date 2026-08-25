@@ -590,4 +590,35 @@ describe("position group valuation fees", () => {
     expect(valued.snapshot.feeQuote).toBe(fee * 2n);
     expect(valued.snapshot.feeQuoteUsdg).toBe(240n);
   });
+
+  it("uses minimum output for conservative group exit estimates", async () => {
+    const { pnl, group } = setup(token, stable, stable, 500n, 0n, 0n, 0n, [{ symbol: "USDC", address: stable }]);
+
+    const live = await pnl.valueGroup(group, 10n);
+    const estimate = await pnl.valueGroupExitEstimate(group, 10n, 200);
+
+    expect(live.snapshot.liquidationQuote).toBe(1_000n);
+    expect(estimate.snapshot.liquidationQuote).toBe(980n);
+    expect(estimate.liquidation.quoteOutput).toBe(980n);
+  });
+
+  it("does not write TWAP observations during local group validation", async () => {
+    const { pnl, database, group } = setup(token, stable, stable, 500n, 0n, 0n, 0n, [{ symbol: "USDC", address: stable }]);
+
+    await pnl.valueGroupLocal(group, 10n);
+
+    expect(database.getPoolObservationAtOrBefore).not.toHaveBeenCalled();
+    expect(database.recordPoolObservation).not.toHaveBeenCalled();
+    expect(database.addPositionGroupPnlSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("combines local routing with minimum output for profit confirmation", async () => {
+    const { pnl, database, group } = setup(token, stable, stable, 500n, 0n, 0n, 0n, [{ symbol: "USDC", address: stable }]);
+
+    const estimate = await pnl.valueGroupLocalExitEstimate(group, 10n, 200);
+
+    expect(estimate.snapshot.liquidationQuote).toBe(980n);
+    expect(database.recordPoolObservation).not.toHaveBeenCalled();
+    expect(database.addPositionGroupPnlSnapshot).not.toHaveBeenCalled();
+  });
 });

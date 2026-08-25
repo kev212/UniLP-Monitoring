@@ -12,6 +12,7 @@ export interface ChainClient {
 
 const RPC_TIMEOUT_MS = 20_000;
 export const ROBINHOOD_READ_CONCURRENCY = 12;
+export const ROBINHOOD_EXECUTION_CONCURRENCY = 4;
 
 class AsyncLimiter {
   private active = 0;
@@ -81,13 +82,17 @@ export class ChainClients {
     for (const name of ["base", "robinhood", "bsc"] as const) {
       const registry = chainRegistry[name];
       const readLimiter = name === "robinhood" ? new AsyncLimiter(ROBINHOOD_READ_CONCURRENCY) : undefined;
+      const executionLimiter = name === "robinhood" ? new AsyncLimiter(ROBINHOOD_EXECUTION_CONCURRENCY) : undefined;
       const publicEndpoints = uniqueUrls([
         config.rpcHttp[name],
         config.rpcHttpFallback[name],
       ]);
+      const alchemyLastResort = name !== "base" && name !== "robinhood" && config.alchemyHttp[name]
+        ? [config.alchemyHttp[name]]
+        : [];
       const normalTransport = createRpcTransport([
         ...publicEndpoints,
-        ...(name !== "base" && config.alchemyHttp[name] ? [config.alchemyHttp[name]] : []),
+        ...alchemyLastResort,
       ], readLimiter);
       this.clients.set(name, {
         registry,
@@ -102,7 +107,7 @@ export class ChainClients {
         config.rpcHttp[name],
         config.rpcHttpScanFallback?.[name],
         config.rpcHttpFallback[name],
-        ...(config.alchemyHttp[name] ? [config.alchemyHttp[name]] : []),
+        ...alchemyLastResort,
       ]), readLimiter);
       this.scanClients.set(name, {
         registry,
@@ -130,7 +135,7 @@ export class ChainClients {
         config.rpcHttp[name],
         config.rpcHttpScanFallback?.[name],
         config.rpcHttpFallback[name],
-        ...(config.alchemyHttp[name] ? [config.alchemyHttp[name]] : []),
+        ...alchemyLastResort,
       ]);
       if (logUrls.length > 0) {
         const logTransport = createRpcTransport(logUrls, readLimiter);
@@ -147,7 +152,7 @@ export class ChainClients {
       const executionTransport = createRpcTransport(uniqueUrls([
         config.alchemyHttp[name],
         ...publicEndpoints,
-      ]));
+      ]), executionLimiter);
       this.executionClients.set(name, {
         registry,
         transport: executionTransport,

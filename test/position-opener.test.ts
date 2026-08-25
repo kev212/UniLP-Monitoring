@@ -148,13 +148,34 @@ describe("SDK single-side liquidity", () => {
     await expect(opener.prepareOpen(pool, "robinhood", 30, 3n * 10n ** 18n, quoteTokens[0]!, "dual")).resolves.toMatchObject({ hooks: hook, mode: "dual" });
   });
 
-  it("keeps hooked V4 Bid-Ask opens blocked", async () => {
+  it("allows hooked V4 Bid-Ask opens with empty hook data", async () => {
     const hook = "0x0000000000000000000000000000000000000001" as Address;
     const quote = { symbol: "PACK", address: packAddress };
     const { opener, pool } = poolOpener("v4", packAddress, nvdaAddress, hook, [quote]);
 
     await expect(opener.prepareBidAskOpen(pool, "robinhood", 30, 3n * 10n ** 18n, quote, 3))
-      .rejects.toThrow("Bid-Ask opening supports plain/no-hook V4 pools only");
+      .resolves.toMatchObject({ hooks: hook, protocol: "v4" });
+  });
+
+  it("resolves a configured V4 key override when PositionManager has no key", async () => {
+    const hook = "0x0000000000000000000000000000000000000001" as Address;
+    const { opener, pool, client } = poolOpener("v4", packAddress, nvdaAddress, hook, [{ symbol: "PACK", address: packAddress }]);
+    client.readContract = vi.fn(async ({ functionName }: { functionName: string }) => {
+      if (functionName === "getSlot0") return [1n << 96n, 0, 0, 3_000];
+      if (functionName === "getLiquidity") return 10n ** 30n;
+      if (functionName === "poolKeys") return { currency0: zeroAddress, currency1: zeroAddress, fee: 0, tickSpacing: 0, hooks: zeroAddress };
+      if (functionName === "decimals") return 18;
+      if (functionName === "symbol") return "PACK";
+      throw new Error(`unexpected ${functionName}`);
+    });
+    (opener as any).config.v4PoolKeyOverrides = {
+      robinhood: {
+        [pool.toLowerCase()]: { currency0: packAddress, currency1: nvdaAddress, fee: 10_000, tickSpacing: 200, hooks: hook },
+      },
+    };
+
+    await expect(opener.prepareBidAskOpen(pool, "robinhood", 30, 3n * 10n ** 18n, { symbol: "PACK", address: packAddress }, 3))
+      .resolves.toMatchObject({ poolKey: { currency0: packAddress, currency1: nvdaAddress, fee: 10_000, tickSpacing: 200, hooks: hook } });
   });
 
   it("displays the current LP fee for dynamic-fee V4 pools", async () => {
@@ -234,6 +255,44 @@ describe("SDK single-side liquidity", () => {
 });
 
 describe("Bid-Ask NVDA opening", () => {
+  it("cancels a Bid-Ask group when its confirmed open receipt reverted", async () => {
+    const database = {
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      recordPositionGroupExecution: vi.fn().mockResolvedValue(undefined),
+      setPositionGroupOpenTransaction: vi.fn().mockResolvedValue(true),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+      withExecutionLock: vi.fn(async (_chainId: number, _owner: Address, work: () => Promise<unknown>) => work()),
+    };
+    const client = {
+      call: vi.fn().mockResolvedValue(undefined),
+      waitForTransactionReceipt: vi.fn().mockResolvedValue({ status: "reverted" }),
+    };
+    const chains = {
+      getForScan: vi.fn(() => ({ registry: chainRegistry.robinhood, client })),
+      getForExecution: vi.fn(() => ({ registry: chainRegistry.robinhood, client, transport: {} })),
+    };
+    const opener = new PositionOpener({ executorAddress: owner, confirmations: 2, dryRun: false } as never, chains as never, undefined, undefined, database as never);
+    const signed = "0x1234" as Hex;
+    const expectedHash = keccak256(signed);
+    (opener as any).account = {};
+    (opener as any).executionClient = vi.fn().mockReturnValue(client);
+    (opener as any).walletClient = vi.fn().mockReturnValue({
+      prepareTransactionRequest: vi.fn().mockResolvedValue({ nonce: 7n }),
+      signTransaction: vi.fn().mockResolvedValue(signed),
+      sendRawTransaction: vi.fn().mockResolvedValue(expectedHash),
+    });
+
+    await expect((opener as any).broadcastBidAsk("robinhood", "group", v3PoolAddress, "0x1234", 0n))
+      .rejects.toThrow(`Bid-Ask open transaction reverted: ${expectedHash}`);
+
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith("group", "cancelled", {
+      reason: "bid_ask_open_transaction_reverted",
+      openTransactionHash: expectedHash,
+      lastExecutionError: `open_batch transaction reverted: ${expectedHash}`,
+      pendingRawTransaction: null,
+    });
+  });
+
   it("returns pending reconciliation after the batch broadcast is accepted but confirmation RPC fails", async () => {
     const database = {
       hasPendingRawTransaction: vi.fn().mockResolvedValue(false),

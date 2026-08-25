@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { Guardian, shouldResumeExitRetry, shouldWaitForExitRetry } from "../src/services/guardian.js";
+import { Guardian, ROBINHOOD_RPC_BACKOFF_MS, shouldResumeExitRetry, shouldResumeGroupExitRetry, shouldWaitForExitRetry, shouldWaitForGroupExitRetry } from "../src/services/guardian.js";
 import { quoteRangeState } from "../src/services/quote-range.js";
 import { sqrtRatioAtTick } from "../src/services/uniswap-math.js";
 import type { RuntimeConfig } from "../src/config.js";
@@ -497,14 +497,14 @@ describe("stop-loss local quote validation", () => {
     expect(pnl.shouldTriggerGroup).toHaveBeenCalledWith(groupSnapshot(-151n));
   });
 
-  it("skips a group SL when local quote validation fails", async () => {
+  it("propagates a group SL rate limit so chain backoff can activate", async () => {
     const pnl = {
       valueGroupLocal: vi.fn().mockRejectedValue(new Error("RPC rate limited")),
       shouldTriggerGroup: vi.fn(),
     };
     const guardian = new Guardian({} as RuntimeConfig, {} as never, {} as never, {} as never, {} as never, pnl as never, {} as never, {} as never);
 
-    const result = await (guardian as unknown as {
+    const result = (guardian as unknown as {
       validateGroupStopLossWithLocalQuote(
         value: PositionGroupRecord,
         blockNumber: bigint,
@@ -512,7 +512,7 @@ describe("stop-loss local quote validation", () => {
       ): Promise<PositionGroupPnlSnapshot | null>;
     }).validateGroupStopLossWithLocalQuote(group, 10n, groupSnapshot(-3_158n));
 
-    expect(result).toBeNull();
+    await expect(result).rejects.toThrow("RPC rate limited");
     expect(pnl.shouldTriggerGroup).not.toHaveBeenCalled();
   });
 });
@@ -554,5 +554,530 @@ describe("position monitor timeouts", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("monitor RPC backoff", () => {
+  const group = (id: string): PositionGroupRecord => ({
+    id,
+    chainId: 4663,
+    protocol: "v4",
+    positionManager: "0x0000000000000000000000000000000000000001",
+    poolKey: "0x0000000000000000000000000000000000000004",
+    owner: "0x0000000000000000000000000000000000000005",
+    token0: "0x0000000000000000000000000000000000000002",
+    token1: "0x0000000000000000000000000000000000000003",
+    quoteToken: "0x0000000000000000000000000000000000000002",
+    shape: "bid_ask",
+    shapeVersion: "delta-amount-linear-v3",
+    requestedBinCount: 5,
+    generatedBinCount: 5,
+    mintableBinCount: 5,
+    outerTickLower: 0,
+    outerTickUpper: 100,
+    anchorBinIndex: 2,
+    totalDeposit: 1_000_000n,
+    deployedCostQuote: 1_000_000n,
+    directCloseAmount0: 0n,
+    directCloseAmount1: 0n,
+    totalReceivedQuote: 0n,
+    status: "active",
+    planHash: "0xplan",
+    planJson: {},
+    referenceBlock: 1n,
+    referenceTick: 50,
+    referencePrice: 1n,
+    openTransactionHash: "0xopen",
+    closeTransactionHash: null,
+    pendingRawTransaction: null,
+    executionLeaseToken: null,
+    executionLeaseUntil: null,
+    finalPnlQuote: null,
+    finalPnlBps: null,
+    finalPnlUsd: null,
+    settledAt: null,
+    metadata: {},
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  });
+
+  const valued = {
+    snapshot: {
+      groupId: "g1",
+      quoteToken: "0x0000000000000000000000000000000000000002",
+      depositsQuote: 1_000_000n,
+      realizedQuote: 0n,
+      liquidationQuote: 1_000_000n,
+      feeQuote: 0n,
+      feeQuoteUsdg: 0n,
+      pnlQuote: 0n,
+      pnlBps: 0n,
+      blockNumber: 10n,
+      groupGasQuote: 0n,
+    },
+    twapGuard: { ready: false },
+    range: undefined,
+  };
+
+  it("skips remaining groups after a 429 and does not revalue successes on the same block", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-26T00:00:00Z"));
+    try {
+      const rateLimit = Object.assign(new Error("HTTP request failed.\nStatus: 429\nToo Many Requests"), { status: 429 });
+      let g2Attempts = 0;
+      const pnl = {
+        valueGroup: vi.fn(async (item: PositionGroupRecord) => {
+          if (item.id === "g2" && g2Attempts === 0) {
+            g2Attempts += 1;
+            throw rateLimit;
+          }
+          return { ...valued, snapshot: { ...valued.snapshot, groupId: item.id } };
+        }),
+        evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+        shouldTriggerGroup: vi.fn().mockReturnValue(null),
+      };
+      const database = {
+        listPositionGroups: vi.fn().mockResolvedValue([group("g1"), group("g2"), group("g3")]),
+        listOpenPositions: vi.fn().mockResolvedValue([]),
+        setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+      };
+      const chains = {
+        get: () => ({
+          client: { getBlockNumber: vi.fn().mockResolvedValue(10n) },
+          registry: { chain: { id: 4663 }, monitoringEnabled: true },
+        }),
+      };
+      const guardian = new Guardian(
+        { positionMonitorConcurrency: 1 } as RuntimeConfig,
+        database as never,
+        chains as never,
+        {} as never,
+        {} as never,
+        pnl as never,
+        {} as never,
+        {} as never,
+      );
+      const evaluate = (guardian as unknown as { evaluateChain(name: "robinhood"): Promise<void> }).evaluateChain.bind(guardian);
+
+      await evaluate("robinhood");
+      expect(pnl.valueGroup.mock.calls.map((call) => call[0].id)).toEqual(["g1", "g2"]);
+
+      await evaluate("robinhood");
+      expect(pnl.valueGroup).toHaveBeenCalledTimes(2);
+
+      vi.advanceTimersByTime(ROBINHOOD_RPC_BACKOFF_MS);
+      await evaluate("robinhood");
+      expect(pnl.valueGroup.mock.calls.map((call) => call[0].id)).toEqual(["g1", "g2", "g2", "g3"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds TWAP waits for every automatic group trigger", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-26T00:00:00Z"));
+    try {
+      const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+      const guardian = new Guardian(
+        { slTwapGuardMaxWaitMs: 15_000, trailingTwapGuardMaxWaitMs: 15_000 } as RuntimeConfig,
+        database as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+      );
+      const allow = (guardian as unknown as {
+        allowGroupAfterTwapWait(value: PositionGroupRecord, trigger: import("../src/types.js").ExitTrigger): Promise<boolean>;
+      }).allowGroupAfterTwapWait.bind(guardian);
+      const cases = [
+        ["stop_loss", "slTwapWaitStartedAt"],
+        ["trailing_take_profit", "trailingTwapWaitStartedAt"],
+        ["take_profit", "profitTwapWaitStartedAt"],
+        ["profit_oor_above", "profitTwapWaitStartedAt"],
+        ["out_of_range_above", "profitTwapWaitStartedAt"],
+      ] as const;
+
+      for (const [trigger, key] of cases) {
+        const value = group(trigger);
+        await expect(allow(value, trigger)).resolves.toBe(false);
+        expect(database.setPositionGroupStatus).toHaveBeenLastCalledWith(value.id, "active", { [key]: Date.now() });
+        await expect(allow({ ...value, metadata: { [key]: Date.now() - 15_000 } }, trigger)).resolves.toBe(true);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("executes group SL after the TWAP wait with local validation", async () => {
+    const value = {
+      ...valued,
+      snapshot: { ...valued.snapshot, pnlBps: -3_000n, pnlQuote: -300_000n },
+    };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(value),
+      valueGroupLocal: vi.fn().mockResolvedValue({ ...value, twapGuard: { ready: true } }),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTriggerGroup: vi.fn().mockReturnValue("stop_loss"),
+    };
+    const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+    const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      { slTwapGuardMaxWaitMs: 15_000, trailingTwapGuardMaxWaitMs: 15_000 } as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+
+    await expect(evaluate("robinhood", { ...group("sl"), metadata: { slTwapWaitStartedAt: Date.now() - 15_001 } }, 10n)).resolves.toBe(true);
+
+    expect(executor.executeRelatedGroup).toHaveBeenCalledWith("sl", "stop_loss");
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith("sl", "active", expect.objectContaining({ exitTrigger: "stop_loss" }));
+  });
+
+  it("revalidates TP locally and persists its trigger before group execution", async () => {
+    const value = {
+      ...valued,
+      snapshot: { ...valued.snapshot, pnlBps: 2_500n, pnlQuote: 250_000n },
+    };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(value),
+      valueGroupLocalExitEstimate: vi.fn().mockResolvedValue({ ...value, twapGuard: { ready: true } }),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTriggerGroup: vi.fn().mockReturnValue("take_profit"),
+    };
+    const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+    const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      { slTwapGuardMaxWaitMs: 15_000, trailingTwapGuardMaxWaitMs: 15_000 } as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+
+    await expect(evaluate("robinhood", { ...group("tp"), metadata: { profitTwapWaitStartedAt: Date.now() - 15_001 } }, 10n)).resolves.toBe(true);
+
+    expect(pnl.valueGroupLocalExitEstimate).toHaveBeenCalledWith(expect.anything(), 10n, undefined);
+    expect(executor.executeRelatedGroup).toHaveBeenCalledWith("tp", "take_profit");
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith("tp", "active", expect.objectContaining({
+      exitTrigger: "take_profit",
+      exitSnapshot: expect.objectContaining({ pnlBps: "2500" }),
+    }));
+  });
+
+  it("upgrades a profit exit to SL when the conservative local quote has crossed SL", async () => {
+    const main = {
+      ...valued,
+      twapGuard: { ready: true },
+      snapshot: { ...valued.snapshot, pnlBps: 2_500n, pnlQuote: 250_000n },
+    };
+    const local = {
+      ...main,
+      snapshot: { ...main.snapshot, pnlBps: -3_000n, pnlQuote: -300_000n },
+    };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(main),
+      valueGroupLocalExitEstimate: vi.fn().mockResolvedValue(local),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTriggerGroup: vi.fn((snapshot: PositionGroupPnlSnapshot) => snapshot.pnlBps < 0n ? "stop_loss" : "take_profit"),
+    };
+    const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+    const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      { settlementSwapSlippageBps: 200 } as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+
+    await expect(evaluate("robinhood", group("tp-to-sl"), 10n)).resolves.toBe(true);
+
+    expect(executor.executeRelatedGroup).toHaveBeenCalledWith("tp-to-sl", "stop_loss");
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith("tp-to-sl", "active", expect.objectContaining({ exitTrigger: "stop_loss" }));
+  });
+
+  it("uses the SL timeout when a TWAP-blocked profit exit is promoted to SL", async () => {
+    const main = {
+      ...valued,
+      snapshot: { ...valued.snapshot, pnlBps: 2_500n, pnlQuote: 250_000n },
+    };
+    const local = {
+      ...main,
+      snapshot: { ...main.snapshot, pnlBps: -3_000n, pnlQuote: -300_000n },
+    };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(main),
+      valueGroupLocalExitEstimate: vi.fn().mockResolvedValue(local),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTriggerGroup: vi.fn((snapshot: PositionGroupPnlSnapshot) => snapshot.pnlBps < 0n ? "stop_loss" : "take_profit"),
+    };
+    const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+    const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      { settlementSwapSlippageBps: 200, trailingTwapGuardMaxWaitMs: 0, slTwapGuardMaxWaitMs: 15_000 } as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+
+    await expect(evaluate("robinhood", group("promoted-sl-wait"), 10n)).resolves.toBe(true);
+
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith("promoted-sl-wait", "active", { slTwapWaitStartedAt: expect.any(Number) });
+    expect(executor.executeRelatedGroup).not.toHaveBeenCalled();
+  });
+
+  it("keeps a due manual retry ahead of a newly observed TP", async () => {
+    const main = {
+      ...valued,
+      twapGuard: { ready: true },
+      snapshot: { ...valued.snapshot, pnlBps: 2_500n, pnlQuote: 250_000n },
+    };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(main),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTriggerGroup: vi.fn().mockReturnValue("take_profit"),
+    };
+    const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+    const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      {} as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+    const retryGroup = {
+      ...group("manual-retry"),
+      metadata: {
+        exitRetry: { reason: "manual", attempts: 1, nextAttemptAt: new Date(Date.now() - 1_000).toISOString() },
+      },
+    };
+
+    await expect(evaluate("robinhood", retryGroup, 10n)).resolves.toBe(true);
+
+    expect(executor.executeRelatedGroup).toHaveBeenCalledWith("manual-retry", "manual");
+  });
+
+  it("applies a conservative estimate gate to group trailing exits", async () => {
+    const value = { ...valued, snapshot: { ...valued.snapshot, pnlBps: 450n, pnlQuote: 45_000n } };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(value),
+      valueGroupLocalExitEstimate: vi.fn().mockResolvedValue({ ...value, twapGuard: { ready: true } }),
+      valueGroupExitEstimate: vi.fn().mockResolvedValue({ ...value, twapGuard: { ready: true } }),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "trigger" }),
+      shouldTriggerGroup: vi.fn().mockReturnValue(null),
+      trailingExitEstimateGateBps: vi.fn().mockReturnValue(400n),
+      trailingFloorBps: vi.fn().mockReturnValue(350n),
+    };
+    const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+    const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      { settlementSwapSlippageBps: 200, slTwapGuardMaxWaitMs: 15_000, trailingTwapGuardMaxWaitMs: 15_000 } as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+    const trailingGroup = {
+      ...group("trail"),
+      metadata: {
+        trailingStop: { peakPnlBps: "600", activatedAtBlock: "1" },
+        trailingTwapWaitStartedAt: Date.now() - 15_001,
+      },
+    };
+
+    await expect(evaluate("robinhood", trailingGroup, 10n)).resolves.toBe(true);
+
+    expect(pnl.valueGroupExitEstimate).toHaveBeenCalledWith(trailingGroup, 10n, 200);
+    expect(executor.executeRelatedGroup).toHaveBeenCalledWith("trail", "trailing_take_profit");
+  });
+
+  it.each(["profit_oor_above", "out_of_range_above"] as const)("revalidates %s against fresh local state", async (trigger) => {
+    const local = { ...valued, twapGuard: { ready: true } };
+    const pnl = {
+      valueGroupLocalExitEstimate: vi.fn().mockResolvedValue(local),
+      shouldTriggerGroup: vi.fn().mockReturnValue(null),
+    };
+    const guardian = new Guardian(
+      {} as RuntimeConfig,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      {} as never,
+      {} as never,
+    );
+    if (trigger === "profit_oor_above") {
+      vi.spyOn(guardian as never, "updateGroupProfitOorAboveTimer" as never).mockResolvedValue(trigger as never);
+    } else {
+      vi.spyOn(guardian as never, "updateGroupOorAboveTimer" as never).mockResolvedValue(trigger as never);
+    }
+    const validate = (guardian as unknown as {
+      validateGroupProfitExit(
+        value: PositionGroupRecord,
+        block: bigint,
+        reason: "profit_oor_above" | "out_of_range_above",
+        snapshot: PositionGroupPnlSnapshot,
+      ): Promise<PositionGroupPnlSnapshot | null>;
+    }).validateGroupProfitExit.bind(guardian);
+
+    await expect(validate(group(trigger), 10n, trigger, valued.snapshot)).resolves.toEqual(valued.snapshot);
+    expect(pnl.valueGroupLocalExitEstimate).toHaveBeenCalled();
+  });
+
+  it("keeps only SL and manual group retries sticky", () => {
+    expect(shouldResumeGroupExitRetry("stop_loss")).toBe(true);
+    expect(shouldResumeGroupExitRetry("manual")).toBe(true);
+    expect(shouldResumeGroupExitRetry("take_profit")).toBe(false);
+    expect(shouldResumeGroupExitRetry("trailing_take_profit")).toBe(false);
+    expect(shouldResumeGroupExitRetry("profit_oor_above")).toBe(false);
+    expect(shouldResumeGroupExitRetry("out_of_range_above")).toBe(false);
+    expect(shouldWaitForGroupExitRetry("manual", Date.now() + 1_000)).toBe(true);
+    expect(shouldWaitForGroupExitRetry("stop_loss", Date.now() + 1_000)).toBe(false);
+  });
+
+  it("clears a sticky SL retry when fresh local validation no longer confirms SL", async () => {
+    const main = {
+      ...valued,
+      twapGuard: { ready: true },
+      snapshot: { ...valued.snapshot, pnlBps: 2_500n, pnlQuote: 250_000n },
+    };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(main),
+      valueGroupLocal: vi.fn().mockResolvedValue(main),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTriggerGroup: vi.fn().mockReturnValue("take_profit"),
+    };
+    const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+    const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      {} as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+    const retryGroup = {
+      ...group("stale-sl"),
+      metadata: {
+        exitTrigger: "stop_loss",
+        exitRetry: { reason: "stop_loss", attempts: 1, nextAttemptAt: new Date(Date.now() - 1_000).toISOString() },
+      },
+    };
+
+    await expect(evaluate("robinhood", retryGroup, 10n)).resolves.toBe(true);
+
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith("stale-sl", "active", expect.objectContaining({
+      exitRetry: null,
+      exitTrigger: null,
+    }));
+    expect(executor.executeRelatedGroup).not.toHaveBeenCalled();
+  });
+
+  it("returns an unbroadcast dynamic close to active state after restart", async () => {
+    const closing = {
+      ...group("restart-profit"),
+      status: "closing" as const,
+      metadata: { exitTrigger: "trailing_take_profit", settlementPhase: "group_close" },
+    };
+    const database = {
+      listPendingSwapPositions: vi.fn().mockResolvedValue([]),
+      listPositionGroups: vi.fn().mockResolvedValue([closing]),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+    };
+    const executor = { executeGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      {} as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      executor as never,
+      {} as never,
+    );
+
+    await (guardian as unknown as { resumeClosingPositions(): Promise<void> }).resumeClosingPositions();
+
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith("restart-profit", "active", expect.objectContaining({
+      exitTrigger: null,
+      exitRetry: null,
+    }));
+    expect(executor.executeGroup).not.toHaveBeenCalled();
+  });
+
+  it("contains a failed dynamic recovery reset without stopping recovery", async () => {
+    const closing = {
+      ...group("restart-db-error"),
+      status: "closing" as const,
+      metadata: { exitTrigger: "take_profit", settlementPhase: "group_close" },
+    };
+    const database = {
+      listPendingSwapPositions: vi.fn().mockResolvedValue([]),
+      listPositionGroups: vi.fn().mockResolvedValue([closing]),
+      setPositionGroupStatus: vi.fn().mockRejectedValue(new Error("database unavailable")),
+    };
+    const executor = { executeGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      {} as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      executor as never,
+      {} as never,
+    );
+
+    await expect((guardian as unknown as { resumeClosingPositions(): Promise<void> }).resumeClosingPositions()).resolves.toBeUndefined();
+    expect(executor.executeGroup).not.toHaveBeenCalled();
   });
 });

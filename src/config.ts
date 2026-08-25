@@ -5,9 +5,19 @@ import { getAddress, isAddress, type Address, type Hex } from "viem";
 import { z } from "zod";
 
 import type { ChainName, PoolScanSettings, QuoteToken } from "./types.js";
+import { v4PoolId, type V4PoolKey } from "./services/v4-pool.js";
 
 export const PUBLIC_ROBINHOOD_RPC_HTTP = "https://rpc.mainnet.chain.robinhood.com";
 export const PUBLIC_ROBINHOOD_SCAN_RPC_HTTP = "https://rpc-robinhood.blockmachine.io";
+const DEFAULT_V4_POOL_KEY_OVERRIDES = [{
+  chain: "base",
+  poolId: "0x24ecedb296899f0110dce5cfdd9c9dd74b2b11a21dee752e085f93c700c7fccb",
+  currency0: "0x4200000000000000000000000000000000000006",
+  currency1: "0x9E00FC92493451EBA1c63DD3880D68b622037bA3",
+  fee: 0x80_0000,
+  tickSpacing: 200,
+  hooks: "0xBDF938149ac6a781F94FAa0ed45E6A0e984c6544",
+}];
 
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
@@ -31,6 +41,7 @@ const envSchema = z.object({
   QUOTE_TOKEN_ALLOWLIST_BASE: z.string().default(""),
   QUOTE_TOKEN_ALLOWLIST_ROBINHOOD: z.string().default(""),
   QUOTE_TOKEN_ALLOWLIST_BSC: z.string().default("USDT:0x55d398326f99059fF775485246999027B3197955,WBNB:0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c,BNB:0x0000000000000000000000000000000000000000"),
+  V4_POOL_KEY_OVERRIDES: z.string().default(""),
   AUTO_EXIT_CHAINS: z.string().default("base,robinhood,bsc"),
   STOP_LOSS_PERCENT: z.coerce.number().negative(),
   TAKE_PROFIT_PERCENT: z.coerce.number().positive(),
@@ -107,6 +118,7 @@ export interface RuntimeConfig {
   rpcHttpScanFallback: Partial<Record<ChainName, string>>;
   alchemyHttp: Partial<Record<ChainName, string>>;
   quoteTokens: Record<ChainName, QuoteToken[]>;
+  v4PoolKeyOverrides: Partial<Record<ChainName, Record<string, V4PoolKey>>>;
   stopLossPercent: number;
   takeProfitPercent: number;
   trailingStopActivationPercent: number;
@@ -229,6 +241,45 @@ function loadPrivateKey(file?: string, direct?: string): Hex | undefined {
   return value as Hex;
 }
 
+function parseV4PoolKeyOverrides(value: string): Partial<Record<ChainName, Record<string, V4PoolKey>>> {
+  let configuredEntries: unknown[] = [];
+  if (value.trim()) {
+    try {
+      configuredEntries = JSON.parse(value);
+    } catch {
+      throw new Error("V4_POOL_KEY_OVERRIDES must be valid JSON");
+    }
+    if (!Array.isArray(configuredEntries)) throw new Error("V4_POOL_KEY_OVERRIDES must be a JSON array");
+  }
+  const overrides: Partial<Record<ChainName, Record<string, V4PoolKey>>> = {};
+  for (const entry of [...DEFAULT_V4_POOL_KEY_OVERRIDES, ...configuredEntries]) {
+    if (!entry || typeof entry !== "object") throw new Error("V4_POOL_KEY_OVERRIDES entries must be objects");
+    const record = entry as Record<string, unknown>;
+    const chain = record.chain;
+    const poolId = record.poolId;
+    const { currency0, currency1, fee, tickSpacing, hooks } = record;
+    if ((chain !== "base" && chain !== "robinhood" && chain !== "bsc")
+      || typeof poolId !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(poolId)
+      || typeof currency0 !== "string" || !isAddress(currency0)
+      || typeof currency1 !== "string" || !isAddress(currency1)
+      || typeof hooks !== "string" || !isAddress(hooks)
+      || typeof fee !== "number"
+      || !Number.isInteger(fee) || fee < 0 || fee > 0xff_ff_ff
+      || typeof tickSpacing !== "number"
+      || !Number.isInteger(tickSpacing) || tickSpacing < -8_388_608 || tickSpacing > 8_388_607) {
+      throw new Error("V4_POOL_KEY_OVERRIDES contains an invalid pool key");
+    }
+    const key: V4PoolKey = { currency0: getAddress(currency0), currency1: getAddress(currency1), fee, tickSpacing, hooks: getAddress(hooks) };
+    const normalizedPoolId = poolId.toLowerCase();
+    if (v4PoolId(key).toLowerCase() !== normalizedPoolId) throw new Error(`V4_POOL_KEY_OVERRIDES key does not match pool ${poolId}`);
+    const chainOverrides = overrides[chain] ?? {};
+    if (chainOverrides[normalizedPoolId]) throw new Error(`V4_POOL_KEY_OVERRIDES contains duplicate pool ${poolId}`);
+    chainOverrides[normalizedPoolId] = key;
+    overrides[chain] = chainOverrides;
+  }
+  return overrides;
+}
+
 export function loadConfig(environment = process.env): RuntimeConfig {
   const env = envSchema.parse(environment);
   const alchemyBase = env.ALCHEMY_BASE_HTTP || undefined;
@@ -296,6 +347,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
       robinhood: parseQuoteTokens(env.QUOTE_TOKEN_ALLOWLIST_ROBINHOOD, "QUOTE_TOKEN_ALLOWLIST_ROBINHOOD"),
       bsc: parseQuoteTokens(env.QUOTE_TOKEN_ALLOWLIST_BSC, "QUOTE_TOKEN_ALLOWLIST_BSC"),
     },
+    v4PoolKeyOverrides: parseV4PoolKeyOverrides(env.V4_POOL_KEY_OVERRIDES),
     stopLossPercent: env.STOP_LOSS_PERCENT,
     takeProfitPercent: env.TAKE_PROFIT_PERCENT,
     trailingStopActivationPercent: env.TRAILING_STOP_ACTIVATION_PERCENT,

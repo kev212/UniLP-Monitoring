@@ -4,7 +4,8 @@ import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, keccak256
 import { v3PositionManagerAbi, v4PositionManagerAbi } from "../src/abi.js";
 import type { RuntimeConfig } from "../src/config.js";
 import { PANCAKE_PERMIT2 } from "../src/services/pancake-universal-router.js";
-import { bufferedGasLimit, Executor, TransientCloseError, effectiveRemoveSlippageBps, effectiveSettlementSlippageBps, groupSettlementPosition, isTransientRpcError, nextExitRetry, nextSwapRetry, permit2AllowanceReady, receiptErc20NetReceived } from "../src/services/executor.js";
+import { isRpcRateLimited } from "../src/rpc.js";
+import { allowsZeroMinimumGroupClose, bufferedGasLimit, Executor, TransientCloseError, effectiveRemoveSlippageBps, effectiveSettlementSlippageBps, groupSettlementPosition, isTransientRpcError, nextExitRetry, nextSwapRetry, permit2AllowanceReady, receiptErc20NetReceived } from "../src/services/executor.js";
 import type { PositionGroupBinRecord, PositionGroupRecord, PositionRecord } from "../src/types.js";
 
 const usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as const;
@@ -655,6 +656,9 @@ describe("Executor pending settlement recovery", () => {
     expect(isTransientRpcError(new Error("HTTP request failed.\nStatus: 530"))).toBe(true);
     expect(isTransientRpcError({ status: 530, message: "origin is unreachable" })).toBe(true);
     expect(isTransientRpcError(new Error("Execution reverted for an unknown reason"))).toBe(false);
+    expect(isRpcRateLimited(new Error("HTTP request failed: Status: 429 Too Many Requests"))).toBe(true);
+    expect(isRpcRateLimited({ status: 429, message: "rate limited" })).toBe(true);
+    expect(isRpcRateLimited(new Error("The operation was aborted due to timeout"))).toBe(false);
   });
 
   it("quotes providers in parallel and selects the best simulated output", async () => {
@@ -1701,6 +1705,15 @@ describe("Executor pending settlement recovery", () => {
     }));
   });
 
+  it("only allows zero-minimum group closes for SL and manual exits", () => {
+    expect(allowsZeroMinimumGroupClose("stop_loss")).toBe(true);
+    expect(allowsZeroMinimumGroupClose("manual")).toBe(true);
+    expect(allowsZeroMinimumGroupClose("take_profit")).toBe(false);
+    expect(allowsZeroMinimumGroupClose("trailing_take_profit")).toBe(false);
+    expect(allowsZeroMinimumGroupClose("profit_oor_above")).toBe(false);
+    expect(allowsZeroMinimumGroupClose("out_of_range_above")).toBe(false);
+  });
+
   it("resumes the aggregate settlement swap after the close receipt was accounted in the same process", async () => {
     const group = {
       ...groupRecord(),
@@ -2372,7 +2385,50 @@ describe("Executor pending settlement recovery", () => {
     }
   });
 
-  it("cascades a normal-position trigger to the matching Bid-Ask group and normal siblings", async () => {
+  it("does not directly retry a stale dynamic group trigger", async () => {
+    vi.useFakeTimers();
+    try {
+      const group = { ...groupRecord(), metadata: {} };
+      const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+      const executor = new Executor(database as never, {} as never, {} as never, {} as never, {} as never, config);
+      const execute = vi.spyOn(executor, "executeGroup").mockResolvedValue(undefined);
+
+      await (executor as any).markGroupRetryable(group, "trailing_take_profit", "HTTP 429 Too Many Requests", true);
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(execute).not.toHaveBeenCalled();
+      expect(database.setPositionGroupStatus).toHaveBeenCalledWith(group.id, "active", expect.objectContaining({
+        exitRetry: expect.objectContaining({ reason: "trailing_take_profit" }),
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers the durable group trigger from retry metadata", () => {
+    const executor = new Executor({} as never, {} as never, {} as never, {} as never, {} as never, config);
+    const group = {
+      ...groupRecord(),
+      metadata: { exitRetry: { reason: "take_profit", attempts: 1 } },
+    };
+
+    expect((executor as any).groupExitTrigger(group)).toBe("take_profit");
+  });
+
+  it("prioritizes a sticky SL retry over an older profit trigger", () => {
+    const executor = new Executor({} as never, {} as never, {} as never, {} as never, {} as never, config);
+    const group = {
+      ...groupRecord(),
+      metadata: {
+        exitTrigger: "take_profit",
+        exitRetry: { reason: "stop_loss", attempts: 1 },
+      },
+    };
+
+    expect((executor as any).groupExitTrigger(group)).toBe("stop_loss");
+  });
+
+  it("keeps a profit trigger scoped to the independently-qualified origin", async () => {
     const source = relatedPosition("source", token, usdg, usdg);
     const sibling = relatedPosition("sibling", usdg, token, usdg);
     const group = groupRecord();
@@ -2391,14 +2447,14 @@ describe("Executor pending settlement recovery", () => {
     await executor.executeRelatedPosition(source, "take_profit");
 
     expect(executePosition).toHaveBeenCalledWith(source, "take_profit");
-    expect(executePosition).toHaveBeenCalledWith(sibling, "take_profit");
+    expect(executePosition).not.toHaveBeenCalledWith(sibling, "take_profit");
     expect(executePosition).not.toHaveBeenCalledWith(child, "take_profit");
     expect(executePosition).not.toHaveBeenCalledWith(protectedPosition, "take_profit");
     expect(executePosition).not.toHaveBeenCalledWith(differentPair, "take_profit");
-    expect(executeGroup).toHaveBeenCalledWith(group.id, "take_profit");
+    expect(executeGroup).not.toHaveBeenCalled();
   });
 
-  it("matches native ETH and WETH exposures across a Bid-Ask group and a normal position", async () => {
+  it("does not cascade an OOR group trigger to a matching WETH position", async () => {
     const group = {
       ...groupRecord("v4"),
       id: "eth-group",
@@ -2420,7 +2476,7 @@ describe("Executor pending settlement recovery", () => {
     await executor.executeRelatedGroup(group.id, "out_of_range_above");
 
     expect(executeGroup).toHaveBeenCalledWith(group.id, "out_of_range_above");
-    expect(executePosition).toHaveBeenCalledWith(wethPosition, "out_of_range_above");
+    expect(executePosition).not.toHaveBeenCalled();
   });
 
   it("deduplicates simultaneous related-pair close requests", async () => {
