@@ -11,6 +11,37 @@ export interface ChainClient {
 }
 
 const RPC_TIMEOUT_MS = 20_000;
+export const ROBINHOOD_READ_CONCURRENCY = 12;
+
+class AsyncLimiter {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private readonly limit: number) {}
+
+  async run<T>(work: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await work();
+    } finally {
+      this.release();
+    }
+  }
+
+  private async acquire(): Promise<void> {
+    if (this.active < this.limit) {
+      this.active += 1;
+      return;
+    }
+    await new Promise<void>((resolve) => this.waiters.push(resolve));
+  }
+
+  private release(): void {
+    const next = this.waiters.shift();
+    if (next) next();
+    else this.active -= 1;
+  }
+}
 
 function uniqueUrls(urls: readonly (string | undefined)[]): string[] {
   return [...new Set(urls.filter((url): url is string => Boolean(url)))];
@@ -21,17 +52,25 @@ function uniqueUrls(urls: readonly (string | undefined)[]): string[] {
  * must reach the next provider immediately instead of retrying the same
  * throttled endpoint before fallback gets a chance.
  */
-export function createRpcTransport(urls: readonly string[]): Transport {
+export function createRpcTransport(urls: readonly string[], limiter?: AsyncLimiter): Transport {
   const endpoints = uniqueUrls(urls);
   if (endpoints.length === 0) throw new Error("At least one RPC endpoint is required");
   const transports = endpoints.map((url) => http(url, { retryCount: 0, timeout: RPC_TIMEOUT_MS }));
-  if (transports.length === 1) return transports[0]!;
-  return fallback(transports as [Transport, ...Transport[]], { retryCount: 0 });
+  const transport = transports.length === 1
+    ? transports[0]!
+    : fallback(transports as [Transport, ...Transport[]], { retryCount: 0 });
+  if (!limiter) return transport;
+  return ((options) => {
+    const inner = transport(options);
+    const request = ((args, requestOptions) => limiter.run(() => inner.request(args, requestOptions))) as typeof inner.request;
+    return { ...inner, config: { ...inner.config, request }, request };
+  }) as Transport;
 }
 
 export class ChainClients {
   private readonly clients = new Map<ChainName, ChainClient>();
   private readonly scanClients = new Map<ChainName, ChainClient>();
+  private readonly scanFallbackClients = new Map<ChainName, ChainClient>();
   private readonly logClients = new Map<ChainName, ChainClient>();
   private readonly executionClients = new Map<ChainName, ChainClient>();
   private readonly enabledChains: Set<ChainName>;
@@ -41,6 +80,7 @@ export class ChainClients {
     this.enabledChains = new Set(config.chains);
     for (const name of ["base", "robinhood", "bsc"] as const) {
       const registry = chainRegistry[name];
+      const readLimiter = name === "robinhood" ? new AsyncLimiter(ROBINHOOD_READ_CONCURRENCY) : undefined;
       const publicEndpoints = uniqueUrls([
         config.rpcHttp[name],
         config.rpcHttpFallback[name],
@@ -48,7 +88,7 @@ export class ChainClients {
       const normalTransport = createRpcTransport([
         ...publicEndpoints,
         ...(name !== "base" && config.alchemyHttp[name] ? [config.alchemyHttp[name]] : []),
-      ]);
+      ], readLimiter);
       this.clients.set(name, {
         registry,
         transport: normalTransport,
@@ -63,7 +103,7 @@ export class ChainClients {
         config.rpcHttpScanFallback?.[name],
         config.rpcHttpFallback[name],
         ...(config.alchemyHttp[name] ? [config.alchemyHttp[name]] : []),
-      ]));
+      ]), readLimiter);
       this.scanClients.set(name, {
         registry,
         transport: scanTransport,
@@ -73,6 +113,19 @@ export class ChainClients {
           pollingInterval: 4_000,
         }),
       });
+      const scanFallbackUrl = config.rpcHttpScanFallback?.[name];
+      if (scanFallbackUrl) {
+        const scanFallbackTransport = createRpcTransport([scanFallbackUrl], readLimiter);
+        this.scanFallbackClients.set(name, {
+          registry,
+          transport: scanFallbackTransport,
+          client: createPublicClient({
+            chain: registry.chain,
+            transport: scanFallbackTransport,
+            pollingInterval: 4_000,
+          }),
+        });
+      }
       const logUrls = uniqueUrls([
         config.rpcHttp[name],
         config.rpcHttpScanFallback?.[name],
@@ -80,7 +133,7 @@ export class ChainClients {
         ...(config.alchemyHttp[name] ? [config.alchemyHttp[name]] : []),
       ]);
       if (logUrls.length > 0) {
-        const logTransport = createRpcTransport(logUrls);
+        const logTransport = createRpcTransport(logUrls, readLimiter);
         this.logClients.set(name, {
           registry,
           transport: logTransport,
@@ -117,6 +170,10 @@ export class ChainClients {
     const item = this.scanClients.get(name);
     if (!item) throw new Error(`Chain ${name} is not configured for scanning`);
     return item;
+  }
+
+  getForScanFallback(name: ChainName): ChainClient | undefined {
+    return this.scanFallbackClients.get(name);
   }
 
   getForLogs(name: ChainName): ChainClient {

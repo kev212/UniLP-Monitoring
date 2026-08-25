@@ -24,7 +24,6 @@ import { log } from "../log.js";
 import type { ChainName, PositionGroupBinRecord, PositionGroupRecord, PositionRecord, PositionStatus, Protocol } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import { getLogsChunked } from "./log-query.js";
-import { hasV4Hooks } from "./v4-pool.js";
 import { dexNameFromMetadata, isKnownV3PositionManager, resolveV3Dex, v3ContractsFor, v3Deployments, type DexName } from "./v3-deployment.js";
 import { isTransientRpcError } from "../rpc.js";
 import type { Notifier } from "./notifier.js";
@@ -1103,7 +1102,6 @@ export class DiscoveryService {
           address: registry.contracts.v4.positionManager, abi: v4PoolKeysAbi, functionName: "poolKeys", args: [bytes25],
         });
         const quoteToken = this.findQuoteToken(name, poolKey.currency0, poolKey.currency1);
-        const hooked = hasV4Hooks(poolKey.hooks);
         const position = await this.database.upsertPosition({
           chainId: registry.chain.id,
           protocol: "v4",
@@ -1113,7 +1111,7 @@ export class DiscoveryService {
           token0: poolKey.currency0,
           token1: poolKey.currency1,
           quoteToken,
-          status: !hooked && quoteToken && candidate.historyTrusted ? "syncing" : "needs_review",
+          status: quoteToken && candidate.historyTrusted ? "syncing" : "needs_review",
           liquidity: 0n,
           openedAtBlock: candidate.blockNumber,
           metadata: {
@@ -1125,7 +1123,10 @@ export class DiscoveryService {
             source: "pool_manager_event",
             historyTrusted: candidate.historyTrusted,
             dex: registry.dex,
-            ...(hooked ? { reason: "unsupported_v4_hooks" } : candidate.historyTrusted ? {} : { reason: "v4_position_transferred_or_history_unavailable" }),
+            hookData: "0x",
+            addLiquidityHookData: "0x",
+            removeLiquidityHookData: "0x",
+            reason: candidate.historyTrusted ? null : "v4_position_transferred_or_history_unavailable",
           },
         });
         try {
@@ -1219,7 +1220,6 @@ export class DiscoveryService {
     });
     const { tickLower, tickUpper } = unpackV4PositionInfo(packedPositionInfo);
     const quoteToken = this.findQuoteToken(name, poolKey.currency0, poolKey.currency1);
-    const hooked = hasV4Hooks(poolKey.hooks);
     const refreshed = await this.database.upsertPosition({
       chainId: registry.chain.id,
       protocol: "v4",
@@ -1229,7 +1229,7 @@ export class DiscoveryService {
       token0: poolKey.currency0,
       token1: poolKey.currency1,
       quoteToken,
-      status: !hooked && quoteToken && historyTrusted ? "syncing" : "needs_review",
+      status: quoteToken && historyTrusted ? "syncing" : "needs_review",
       liquidity,
       openedAtBlock,
       metadata: {
@@ -1245,7 +1245,10 @@ export class DiscoveryService {
         positionManager: registry.contracts.v4.positionManager,
         historyTrusted,
         dex: registry.dex,
-        ...(hooked ? { reason: "unsupported_v4_hooks" } : {}),
+        hookData: "0x",
+        addLiquidityHookData: "0x",
+        removeLiquidityHookData: "0x",
+        ...(historyTrusted ? { reason: null } : {}),
       },
     });
     try {

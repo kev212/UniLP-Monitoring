@@ -693,7 +693,11 @@ export class Notifier {
           if (confirmation.kind === "bid_ask") {
             const result = await this.executeBidAskLadder(confirmation.preview);
             const hashLabel = result.hash ? `\ntx: ${shortHash(result.hash)}` : "";
-            await this.replyTemp(ctx, `🟢 BID-ASK LADDER OPENED\n${formatBidAskLadderTarget(confirmation.preview, confirmation.request)}\nAtomic: one transaction for all mintable bins${hashLabel}`);
+            if (result.pendingReconciliation) {
+              await this.replyTemp(ctx, `🟡 BID-ASK TX TERKIRIM\n${formatBidAskLadderTarget(confirmation.preview, confirmation.request)}\nRekonsiliasi posisi sedang diproses otomatis. Jangan open ulang.${hashLabel}`);
+            } else {
+              await this.replyTemp(ctx, `🟢 BID-ASK LADDER OPENED\n${formatBidAskLadderTarget(confirmation.preview, confirmation.request)}\nAtomic: one transaction for all mintable bins${hashLabel}`);
+            }
             return;
           }
           const result = await this.positionOpener.executeOpen(confirmation.preview);
@@ -1801,7 +1805,7 @@ export class Notifier {
     await this.replyTemp(ctx, formatBidAskLadderReview(preview, request), { reply_markup: keyboard as any }, 120_000);
   }
 
-  private async executeBidAskLadder(preview: BidAskLadderPreview): Promise<{ hash: string | null }> {
+  private async executeBidAskLadder(preview: BidAskLadderPreview): Promise<{ hash: string | null; pendingReconciliation?: boolean }> {
     if (!this.positionOpener) throw new Error("Position opener is not configured");
     const execute = optionalPositionOpenerMethod(this.positionOpener, ["executeBidAskLadder", "executeBidAskOpen", "executeBidAsk"]);
     if (!execute) throw new Error("Bid-Ask Ladder execution is not available yet");
@@ -1809,7 +1813,10 @@ export class Notifier {
     if (typeof result === "string") return { hash: result };
     if (!isRecord(result)) return { hash: null };
     const hash = stringValue(result.hash);
-    return { hash: hash ?? null };
+    return {
+      hash: hash ?? null,
+      ...(result.pendingReconciliation === true ? { pendingReconciliation: true } : {}),
+    };
   }
 
   private async poolScanSettings(database: Database, chatId: string): Promise<PoolScanSettings> {

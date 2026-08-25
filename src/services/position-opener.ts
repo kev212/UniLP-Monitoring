@@ -27,6 +27,7 @@ import { buildSwapPlan } from "./swap-builder.js";
 import { UNISWAP_API_ROUTER, type UniswapTradingApi } from "./uniswap-trading-api.js";
 import { applySlippage, nearestSingleSidedTicks, sqrtRatioAtTick, tickToCeilSpacing, tickToFloorSpacing, ticksForDropPercent, ticksForRisePercent } from "./uniswap-math.js";
 import { dexNameFromMetadata, v3ContractsFor, v3Deployments, type DexName } from "./v3-deployment.js";
+import { isDynamicFee } from "./v4-pool.js";
 
 const require = createRequire(import.meta.url);
 const { Ether, Percent, Token } = require("@uniswap/sdk-core") as typeof import("@uniswap/sdk-core");
@@ -71,6 +72,7 @@ export interface OpenPositionPreview {
   sqrtPriceX96: bigint;
   poolLiquidity: bigint;
   hooks: Address;
+  currentLpFee?: number;
   liquidity: bigint;
   depositAmount: bigint;
   lowerPrice: string;
@@ -142,6 +144,7 @@ export interface BidAskOpenExecution {
   plan: TransactionPlan;
   estimatedGas: bigint;
   blockGasLimit: bigint | null;
+  pendingReconciliation?: boolean;
 }
 
 const Q192 = 1n << 192n;
@@ -431,11 +434,7 @@ export class PositionOpener {
     if (bidAskPoolId(poolKey).toLowerCase() !== poolId.toLowerCase()) {
       throw new Error("V4 pool key does not match the pool id");
     }
-    if (poolKey.hooks.toLowerCase() !== zeroAddress.toLowerCase()) {
-      throw new Error("Normal opening supports plain/no-hook V4 pools only");
-    }
-
-    return this.buildPreview("v4", chain, poolId, poolKey.currency0, poolKey.currency1, Number(poolKey.fee), poolKey.tickSpacing, slot0[1], slot0[0], liquidity, poolKey.hooks, rangePercent, depositAmount, quoteToken, mode);
+    return this.buildPreview("v4", chain, poolId, poolKey.currency0, poolKey.currency1, Number(poolKey.fee), poolKey.tickSpacing, slot0[1], slot0[0], liquidity, poolKey.hooks, rangePercent, depositAmount, quoteToken, mode, "uniswap", Number(slot0[3]));
   }
 
   private async buildPreview(
@@ -455,6 +454,7 @@ export class PositionOpener {
     quoteToken: QuoteToken,
     mode: OpenMode,
     dex: DexName = "uniswap",
+    currentLpFee?: number,
   ): Promise<OpenPositionPreview> {
     const client = this.client(chain);
     const quoteAddr = openPoolQuoteAddress(protocol, this.chains.getForScan(chain).registry.chain.id, quoteToken).toLowerCase() as Address;
@@ -511,10 +511,11 @@ export class PositionOpener {
     const token1Symbol = quoteIsToken0 ? baseSymbol : quoteToken.symbol;
     const basePreview: OpenPositionPreview = {
       protocol, dex: protocol === "v3" ? dex : "uniswap", chain, poolAddress: pool, pair, feeTier: fee,
-      feeLabel: hooks !== zeroAddress ? `${(fee / 10_000).toFixed(2)}% dynamic` : `${(fee / 10_000).toFixed(2)}%`,
+      feeLabel: isDynamicFee(fee) ? `${((currentLpFee ?? 0) / 10_000).toFixed(2)}% dynamic` : `${(fee / 10_000).toFixed(2)}%`,
       quoteToken: quoteToken.address, quoteTokenSymbol: quoteToken.symbol,
       quoteIsToken0, token0, token1, token0Symbol, token1Symbol, token0Decimals, token1Decimals,
-      quoteTokenDecimals: quoteDecimals, currentTick, tickSpacing, tickLower, tickUpper, sqrtPriceX96, poolLiquidity, hooks, liquidity, depositAmount,
+      quoteTokenDecimals: quoteDecimals, currentTick, tickSpacing, tickLower, tickUpper, sqrtPriceX96, poolLiquidity, hooks,
+      ...(currentLpFee !== undefined ? { currentLpFee } : {}), liquidity, depositAmount,
       lowerPrice, upperPrice, currentPrice, dropPercent: rangePercent, mode,
     };
 
@@ -531,7 +532,7 @@ export class PositionOpener {
     const deadline = BigInt(Math.floor(Date.now() / 1_000) + 600);
     assertSafeOpenMarket(preview.currentTick, preview.poolLiquidity);
     const refreshed = await this.prepareOpen(preview.poolAddress, preview.chain, preview.dropPercent, preview.depositAmount, { address: preview.quoteToken, symbol: preview.quoteTokenSymbol }, preview.mode);
-    const merged = { ...preview, ...refreshed, tickLower: preview.tickLower, tickUpper: preview.tickUpper };
+    let merged = { ...preview, ...refreshed, tickLower: preview.tickLower, tickUpper: preview.tickUpper };
 
     if (preview.mode === "single") {
       if (!this.isStillSingleSided(preview, refreshed.currentTick)) throw new Error("Pool price moved into the requested range; review and confirm again");
@@ -539,16 +540,28 @@ export class PositionOpener {
       return this.executeV4(merged, deadline);
     }
 
+    merged = this.recomputeDualPreviewForConfirmedRange(preview, refreshed);
     if (!this.isStillStraddling(preview, refreshed.currentTick)) throw new Error("Pool price moved outside the dual-side range; review and confirm again");
 
     await this.ensureWrappedNativeFunding(this.executionClient(preview.chain), preview.chain, preview.quoteToken, preview.depositAmount, this.config.executorAddress);
     const swapResult = await this.swapQuoteForBase(merged);
     const baseAmount = swapResult.actualBaseOut;
     const quoteSideAmount = merged.quoteSideAmount ?? 0n;
+    const postSwap = await this.prepareOpen(preview.poolAddress, preview.chain, preview.dropPercent, preview.depositAmount, { address: preview.quoteToken, symbol: preview.quoteTokenSymbol }, preview.mode);
+    this.assertSameOpenPool(merged, postSwap);
+    if (!this.isStillStraddling(preview, postSwap.currentTick)) throw new Error("Dual-side swap moved the pool outside the confirmed range; mint was not broadcast");
+    const mintPreview = {
+      ...merged,
+      currentTick: postSwap.currentTick,
+      sqrtPriceX96: postSwap.sqrtPriceX96,
+      poolLiquidity: postSwap.poolLiquidity,
+      hooks: postSwap.hooks,
+      ...(postSwap.currentLpFee !== undefined ? { currentLpFee: postSwap.currentLpFee } : {}),
+    };
     if (preview.protocol === "v3") {
-      return { ...(await this.executeV3Dual(merged, deadline, quoteSideAmount, baseAmount)), swapHash: swapResult.hash };
+      return { ...(await this.executeV3Dual(mintPreview, deadline, quoteSideAmount, baseAmount)), swapHash: swapResult.hash };
     }
-    return { ...(await this.executeV4Dual(merged, deadline, quoteSideAmount, baseAmount)), swapHash: swapResult.hash };
+    return { ...(await this.executeV4Dual(mintPreview, deadline, quoteSideAmount, baseAmount)), swapHash: swapResult.hash };
   }
 
   async executeBidAskOpen(preview: BidAskOpenPreview): Promise<BidAskOpenExecution> {
@@ -648,8 +661,17 @@ export class PositionOpener {
     try {
       const result = await this.broadcastBidAsk(preview.chain, groupId, batchPlan.to, batchPlan.data, batchPlan.value ?? 0n);
       openedHash = result.hash;
+      let pendingReconciliation = result.pendingReconciliation === true;
       if (result.hash) {
-        await this.reconcileBidAskOpen(preview.chain, groupId, result.hash, result.receipt);
+        if (result.receipt) {
+          try {
+            await this.reconcileBidAskOpen(preview.chain, groupId, result.hash, result.receipt);
+            pendingReconciliation = false;
+          } catch (error) {
+            pendingReconciliation = true;
+            log.warn({ err: error, chain: preview.chain, groupId, transactionHash: result.hash }, "Bid-Ask open confirmed; receipt reconciliation deferred");
+          }
+        }
       } else {
         await this.database.setPositionGroupStatus(groupId, "cancelled", {
           reason: "bid_ask_open_no_transaction",
@@ -662,6 +684,7 @@ export class PositionOpener {
         plan: batchPlan,
         estimatedGas: gas.estimatedGas,
         blockGasLimit: gas.blockGasLimit,
+        ...(pendingReconciliation ? { pendingReconciliation: true } : {}),
       };
     } catch (error) {
       const current = openedHash ? null : await this.database.getPositionGroup(groupId);
@@ -1216,10 +1239,10 @@ export class PositionOpener {
     return group.id;
   }
 
-  private async broadcastBidAsk(chain: ChainName, groupId: string, to: Address, data: Hex, value = 0n): Promise<{ hash: Hex | null; receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>> }> {
+  private async broadcastBidAsk(chain: ChainName, groupId: string, to: Address, data: Hex, value = 0n): Promise<{ hash: Hex | null; receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>; pendingReconciliation?: boolean }> {
     if (!this.database) throw new Error("Bid-Ask group database is not configured");
     const chainId = this.chains.getForScan(chain).registry.chain.id;
-    const run = async (): Promise<{ hash: Hex | null; receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>> }> => {
+    const run = async (): Promise<{ hash: Hex | null; receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>; pendingReconciliation?: boolean }> => {
       if (await this.database!.hasPendingRawTransaction(chainId)) throw new Error(`Chain ${chainId} has an unresolved signed transaction`);
       const client = this.executionClient(chain);
       const executor = this.config.executorAddress;
@@ -1239,6 +1262,8 @@ export class PositionOpener {
       const serializedTransaction = await wallet.signTransaction(preparedRequest);
       const hash = keccak256(serializedTransaction);
       const nonce = preparedRequest.nonce === undefined ? undefined : BigInt(preparedRequest.nonce);
+      let broadcastAccepted = false;
+      let confirmedReceipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>> | undefined;
 
       await this.database!.recordPositionGroupExecution(groupId, "open_batch", "submitted", hash, serializedTransaction, nonce, undefined, {
         description: "atomic_bid_ask_open",
@@ -1249,8 +1274,9 @@ export class PositionOpener {
       try {
         const broadcastHash = await wallet.sendRawTransaction({ serializedTransaction });
         if (broadcastHash.toLowerCase() !== hash.toLowerCase()) throw new Error("Bid-Ask open broadcast returned an unexpected transaction hash");
-        const receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
-        if (receipt.status !== "success") {
+        broadcastAccepted = true;
+        confirmedReceipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
+        if (confirmedReceipt.status !== "success") {
           await this.database!.recordPositionGroupExecution(groupId, "open_batch", "failed", hash, undefined, undefined, "transaction reverted");
           await this.database!.setPositionGroupStatus(groupId, "needs_review", {
             reason: "bid_ask_open_transaction_reverted",
@@ -1260,9 +1286,13 @@ export class PositionOpener {
           throw new Error(`Bid-Ask open transaction reverted: ${hash}`);
         }
         await this.database!.recordPositionGroupExecution(groupId, "open_batch", "confirmed", hash);
-        return { hash, receipt };
+        return { hash, receipt: confirmedReceipt };
       } catch (error) {
         if (error instanceof Error && error.message.includes("reverted")) throw error;
+        if (broadcastAccepted) {
+          log.warn({ err: error, chain, groupId, transactionHash: hash }, "Bid-Ask open broadcast accepted; confirmation deferred to reconciliation");
+          return { hash, ...(confirmedReceipt ? { receipt: confirmedReceipt } : {}), pendingReconciliation: true };
+        }
         throw new Error(`open_batch transaction ${hash} is pending reconciliation: ${error instanceof Error ? error.message : String(error)}`);
       }
     };
@@ -1562,6 +1592,45 @@ export class PositionOpener {
     return currentTick > preview.tickLower && currentTick < preview.tickUpper;
   }
 
+  private recomputeDualPreviewForConfirmedRange(original: OpenPositionPreview, refreshed: OpenPositionPreview): OpenPositionPreview {
+    this.assertSameOpenPool(original, refreshed);
+    const position = refreshed.protocol === "v3"
+      ? this.v3Position(
+        refreshed.chain, refreshed.token0, refreshed.token1, refreshed.token0Decimals, refreshed.token1Decimals,
+        refreshed.feeTier, refreshed.sqrtPriceX96, refreshed.poolLiquidity, refreshed.currentTick,
+        original.tickLower, original.tickUpper, refreshed.depositAmount, refreshed.quoteIsToken0, "dual", refreshed.dex,
+      )
+      : this.v4Position(
+        refreshed.chain, refreshed.token0, refreshed.token1, refreshed.token0Decimals, refreshed.token1Decimals,
+        refreshed.feeTier, refreshed.tickSpacing, refreshed.hooks, refreshed.sqrtPriceX96, refreshed.poolLiquidity,
+        refreshed.currentTick, original.tickLower, original.tickUpper, refreshed.depositAmount, refreshed.quoteIsToken0, "dual",
+      );
+    this.assertDualSidePosition(position, refreshed.quoteIsToken0);
+    const split = this.computeDualSplit(position, refreshed.quoteIsToken0, refreshed.depositAmount, refreshed.sqrtPriceX96);
+    assertMintUtilization(split.quoteSideAmount + split.swapAmount, refreshed.depositAmount);
+    return {
+      ...original,
+      ...refreshed,
+      tickLower: original.tickLower,
+      tickUpper: original.tickUpper,
+      lowerPrice: original.lowerPrice,
+      upperPrice: original.upperPrice,
+      ...split,
+    };
+  }
+
+  private assertSameOpenPool(expected: OpenPositionPreview, actual: OpenPositionPreview): void {
+    if (expected.protocol !== actual.protocol
+      || expected.poolAddress.toLowerCase() !== actual.poolAddress.toLowerCase()
+      || expected.token0.toLowerCase() !== actual.token0.toLowerCase()
+      || expected.token1.toLowerCase() !== actual.token1.toLowerCase()
+      || expected.feeTier !== actual.feeTier
+      || expected.tickSpacing !== actual.tickSpacing
+      || expected.hooks.toLowerCase() !== actual.hooks.toLowerCase()) {
+      throw new Error("Pool configuration changed after confirmation; open was cancelled");
+    }
+  }
+
   private assertSingleSideSpend(position: V3Position | V4Position, quoteIsToken0: boolean, depositAmount: bigint): void {
     const { amount0, amount1 } = position.mintAmounts;
     const quoteAmount = BigInt((quoteIsToken0 ? amount0 : amount1).toString());
@@ -1670,10 +1739,31 @@ export class PositionOpener {
       }
     }
 
-    if (preview.quoteToken === zeroAddress) throw new Error("No Trading API route is available for native-ETH dual-side open");
     if (!this.routes) throw new Error("No swap route available for dual-side open");
+    const routePosition: PositionRecord = {
+      id: `open:${preview.poolAddress}`,
+      chainId: this.chains.getForScan(preview.chain).registry.chain.id,
+      protocol: preview.protocol,
+      positionKey: preview.poolAddress,
+      owner: executor,
+      poolAddress: preview.protocol === "v3" ? preview.poolAddress as Address : null,
+      token0: preview.token0,
+      token1: preview.token1,
+      quoteToken: preview.quoteToken,
+      status: "discovered",
+      liquidity: null,
+      openedAtBlock: null,
+      metadata: {
+        dex: preview.dex,
+        currency0: preview.token0,
+        currency1: preview.token1,
+        fee: preview.feeTier,
+        tickSpacing: preview.tickSpacing,
+        hooks: preview.hooks,
+      },
+    };
     const swapRoute = await this.routes.quoteDirect(
-      { chainId: this.chains.getForScan(preview.chain).registry.chain.id } as PositionRecord,
+      routePosition,
       preview.quoteToken,
       swapAmount,
       preview.baseToken,
@@ -1691,9 +1781,14 @@ export class PositionOpener {
     }
 
     if (swapRoute.protocol === "v4") {
-      await this.ensureApproval(client, preview.quoteToken, registry.contracts.v4.permit2, swapAmount, executor, preview.chain);
-      await this.ensurePermit2Approval(client, preview.quoteToken, swapRoute.router, swapAmount, executor, preview.chain);
+      if (preview.quoteToken.toLowerCase() === zeroAddress) {
+        await this.ensureNativeBalance(client, executor, swapAmount);
+      } else {
+        await this.ensureApproval(client, preview.quoteToken, registry.contracts.v4.permit2, swapAmount, executor, preview.chain);
+        await this.ensurePermit2Approval(client, preview.quoteToken, swapRoute.router, swapAmount, executor, preview.chain);
+      }
     } else {
+      if (preview.quoteToken.toLowerCase() === zeroAddress) throw new Error("Local native-ETH dual-side swaps require a direct V4 route");
       await this.ensureApproval(client, preview.quoteToken, swapRoute.router, swapAmount, executor, preview.chain);
     }
     const before = await this.tokenBalance(client, preview.baseToken, executor);

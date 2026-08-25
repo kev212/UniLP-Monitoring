@@ -9,6 +9,52 @@ const usdg = "0x5fc5360d0400a0fd4f2af552add042d716f1d168" as Address;
 const v3Pool = "0x0000000000000000000000000000000000000010" as Address;
 
 describe("V4 route quotes", () => {
+  it("quotes native ETH directly through the supplied V4 pool key", async () => {
+    const simulateContract = vi.fn().mockResolvedValue({ result: [500n, 10n] });
+    const universalRouter = "0x0000000000000000000000000000000000000002" as Address;
+    const contracts = { v4: { quoter: "0x0000000000000000000000000000000000000001", universalRouter } };
+    const chains = {
+      getById: vi.fn(() => ({ client: { simulateContract }, registry: { name: "robinhood", contracts } })),
+      getForScan: vi.fn(() => ({ client: { simulateContract }, registry: { name: "robinhood", contracts } })),
+    };
+    const planner = new RoutePlanner(chains as never, 100, { base: [], robinhood: [] });
+    const position: PositionRecord = {
+      id: "open:pool-id",
+      chainId: 4663,
+      protocol: "v4",
+      positionKey: "pool-id",
+      owner: "0x0000000000000000000000000000000000000003",
+      poolAddress: null,
+      token0: zeroAddress,
+      token1: phood,
+      quoteToken: zeroAddress,
+      status: "discovered",
+      liquidity: null,
+      openedAtBlock: null,
+      metadata: { currency0: zeroAddress, currency1: phood, fee: 10_000, tickSpacing: 200, hooks: zeroAddress },
+    };
+
+    const route = await planner.quoteDirect(position, zeroAddress, 1_000n, phood);
+
+    expect(route).toMatchObject({
+      protocol: "v4",
+      router: universalRouter,
+      tokenIn: zeroAddress,
+      tokenOut: phood,
+      amountIn: 1_000n,
+      expectedOut: 500n,
+    });
+    expect(simulateContract).toHaveBeenCalledWith(expect.objectContaining({
+      functionName: "quoteExactInputSingle",
+      args: [{
+        poolKey: { currency0: zeroAddress, currency1: phood, fee: 10_000, tickSpacing: 200, hooks: zeroAddress },
+        zeroForOne: true,
+        exactAmount: 1_000n,
+        hookData: "0x",
+      }],
+    }));
+  });
+
   it("retries a transient V4 quoter failure before rejecting the route", async () => {
     const simulateContract = vi.fn()
       .mockRejectedValueOnce(new Error("temporary RPC failure"))

@@ -3,7 +3,7 @@ import { createPublicClient } from "viem";
 
 import { chainRegistry } from "../src/chains.js";
 import type { RuntimeConfig } from "../src/config.js";
-import { ChainClients, createRpcTransport } from "../src/services/chain-client.js";
+import { ChainClients, createRpcTransport, ROBINHOOD_READ_CONCURRENCY } from "../src/services/chain-client.js";
 
 describe("RPC failover transport", () => {
   afterEach(() => {
@@ -61,6 +61,40 @@ describe("RPC failover transport", () => {
     await expect(client.getChainId()).resolves.toBe(4663);
     expect(urls).toHaveLength(2);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("shares the Robinhood read concurrency limit across normal and scan clients", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const fetchMock = vi.fn(async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active -= 1;
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x2b2f955" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const clients = new ChainClients({
+      chains: ["robinhood"],
+      alchemyHttp: { robinhood: "https://alchemy.example/rpc" },
+      rpcHttp: { base: "https://base.example/rpc", robinhood: "https://public.example/rpc", bsc: "https://bsc.example/rpc" },
+      rpcHttpFallback: { robinhood: "https://fallback.example/rpc" },
+      rpcHttpScanFallback: { robinhood: "https://rpc-robinhood.blockmachine.io" },
+    } as RuntimeConfig);
+    const normal = clients.get("robinhood").client;
+    const scan = clients.getForScan("robinhood").client;
+
+    await Promise.all(Array.from({ length: 20 }, (_, index) => {
+      const client = index % 2 === 0 ? normal : scan;
+      return client.request({ method: "eth_blockNumber" });
+    }));
+
+    expect(fetchMock).toHaveBeenCalledTimes(20);
+    expect(maxActive).toBe(ROBINHOOD_READ_CONCURRENCY);
   });
 
   it("uses the same fallback for signed transaction submission", async () => {
@@ -121,18 +155,18 @@ describe("RPC failover transport", () => {
         bsc: "https://bsc-fallback.example/rpc",
       },
       rpcHttpScanFallback: {
-        robinhood: "https://rpc.arrowrpc.com",
+        robinhood: "https://rpc-robinhood.blockmachine.io",
       },
     } as RuntimeConfig);
 
     await expect(clients.getForLogs("robinhood").client.getChainId()).resolves.toBe(4663);
     expect(urls).toEqual([
       "https://public.example/rpc",
-      "https://rpc.arrowrpc.com/",
+      "https://rpc-robinhood.blockmachine.io/",
     ]);
   });
 
-  it("keeps heavy scans on public and Arrow RPCs", async () => {
+  it("keeps heavy scans on public RPCs", async () => {
     const urls: string[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       urls.push(String(input));
@@ -148,7 +182,7 @@ describe("RPC failover transport", () => {
       alchemyHttp: { base: undefined, robinhood: "https://alchemy.example/rpc", bsc: undefined },
       rpcHttp: { base: "https://base.example/rpc", robinhood: "https://public.example/rpc", bsc: "https://bsc.example/rpc" },
       rpcHttpFallback: { robinhood: "https://public-fallback.example/rpc" },
-      rpcHttpScanFallback: { robinhood: "https://rpc.arrowrpc.com" },
+      rpcHttpScanFallback: { robinhood: "https://rpc-robinhood.blockmachine.io" },
     } as RuntimeConfig);
 
     await clients.getForScan("robinhood").client.getChainId();
@@ -157,7 +191,7 @@ describe("RPC failover transport", () => {
     expect(urls.some((url) => url.includes("alchemy.example"))).toBe(false);
   });
 
-  it("uses Alchemy first for execution and never uses Arrow", async () => {
+  it("uses Alchemy first for execution and never uses the scan fallback", async () => {
     const urls: string[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       urls.push(String(input));
@@ -173,13 +207,13 @@ describe("RPC failover transport", () => {
       alchemyHttp: { base: undefined, robinhood: "https://alchemy.example/rpc", bsc: undefined },
       rpcHttp: { base: "https://base.example/rpc", robinhood: "https://public.example/rpc", bsc: "https://bsc.example/rpc" },
       rpcHttpFallback: { robinhood: "https://public-fallback.example/rpc" },
-      rpcHttpScanFallback: { robinhood: "https://rpc.arrowrpc.com" },
+      rpcHttpScanFallback: { robinhood: "https://rpc-robinhood.blockmachine.io" },
     } as RuntimeConfig);
 
     await clients.getForExecution("robinhood").client.getChainId();
 
     expect(urls).toEqual(["https://alchemy.example/rpc"]);
-    expect(urls.some((url) => url.includes("arrowrpc.com"))).toBe(false);
+    expect(urls.some((url) => url.includes("blockmachine.io"))).toBe(false);
   });
 
   it("keeps BSC logs on public RPC and never uses Alchemy", async () => {

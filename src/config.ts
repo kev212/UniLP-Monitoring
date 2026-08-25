@@ -7,7 +7,7 @@ import { z } from "zod";
 import type { ChainName, PoolScanSettings, QuoteToken } from "./types.js";
 
 export const PUBLIC_ROBINHOOD_RPC_HTTP = "https://rpc.mainnet.chain.robinhood.com";
-export const PUBLIC_ROBINHOOD_SCAN_RPC_HTTP = "https://rpc.arrowrpc.com";
+export const PUBLIC_ROBINHOOD_SCAN_RPC_HTTP = "https://rpc-robinhood.blockmachine.io";
 
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1),

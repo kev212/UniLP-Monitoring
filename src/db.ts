@@ -2377,7 +2377,10 @@ FROM position_groups g
     if (!closeTx) return false;
     const metadataCloseTx = typeof meta.closeTransactionHash === "string" ? meta.closeTransactionHash : null;
     if (metadataCloseTx && metadataCloseTx.toLowerCase() !== closeTx.toLowerCase()) return false;
-    const swapTx = attempts.rows.find((attempt) => attempt.stage === "swap_to_quote")?.transaction_hash ?? null;
+    const attemptedSwapTx = attempts.rows.find((attempt) => attempt.stage === "swap_to_quote")?.transaction_hash ?? null;
+    const metadataSwapTx = typeof meta.swapTransactionHash === "string" ? meta.swapTransactionHash : null;
+    if (attemptedSwapTx && metadataSwapTx && attemptedSwapTx.toLowerCase() !== metadataSwapTx.toLowerCase()) return false;
+    const swapTx = attemptedSwapTx ?? metadataSwapTx;
     const closeSettlement = typeof meta.settlementQuoteFromClose === "string" ? BigInt(meta.settlementQuoteFromClose) : null;
     if (swapTx && closeSettlement !== null && totalReceived <= closeSettlement) {
       await this.pool.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);

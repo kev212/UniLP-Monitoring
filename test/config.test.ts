@@ -201,9 +201,9 @@ describe("loadConfig", () => {
   });
 
   it("allows an explicit heavy-scan fallback without changing transaction fallback", () => {
-    const config = loadConfig(environment({ ROBINHOOD_SCAN_RPC_HTTP: "https://rpc.arrowrpc.com" }));
+    const config = loadConfig(environment({ ROBINHOOD_SCAN_RPC_HTTP: "https://rpc-robinhood.blockmachine.io" }));
 
-    expect(config.rpcHttpScanFallback.robinhood).toBe("https://rpc.arrowrpc.com");
+    expect(config.rpcHttpScanFallback.robinhood).toBe("https://rpc-robinhood.blockmachine.io");
     expect(config.rpcHttpFallback.robinhood).toBe(PUBLIC_ROBINHOOD_RPC_HTTP);
   });
 

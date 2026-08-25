@@ -16,6 +16,7 @@ const nvdaAddress = "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC" as Address;
 const packAddress = "0x0145AcbcceFbEd6F303C420bEeaaAc72E905430b" as Address;
 const wethAddress = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73" as Address;
 const v3PoolAddress = "0x0000000000000000000000000000000000000044" as Address;
+const owner = "0x0000000000000000000000000000000000000011" as Address;
 
 function poolOpener(
   protocol: "v3" | "v4",
@@ -23,8 +24,10 @@ function poolOpener(
   tokenB = nvdaAddress,
   hooks = zeroAddress,
   quoteTokens = [{ symbol: "NVDA", address: nvdaAddress }],
+  fee = 10_000,
+  currentLpFee = fee,
 ) {
-  const poolKey = { currency0: tokenA, currency1: tokenB, fee: 10_000, tickSpacing: 200, hooks };
+  const poolKey = { currency0: tokenA, currency1: tokenB, fee, tickSpacing: 200, hooks };
   const poolId = keccak256(encodeAbiParameters(
     [{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }],
     [poolKey.currency0, poolKey.currency1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks],
@@ -33,10 +36,11 @@ function poolOpener(
     readContract: vi.fn(async ({ functionName, address }: { functionName: string; address: Address }) => {
       if (functionName === "token0") return tokenA;
       if (functionName === "token1") return tokenB;
-      if (functionName === "fee") return 10_000;
+      if (functionName === "fee") return fee;
       if (functionName === "tickSpacing") return 200;
       if (functionName === "liquidity" || functionName === "getLiquidity") return 10n ** 30n;
-      if (functionName === "slot0" || functionName === "getSlot0") return [1n << 96n, 0, 0, 0, 0, 0, true];
+      if (functionName === "slot0") return [1n << 96n, 0, 0, 0, 0, 0, true];
+      if (functionName === "getSlot0") return [1n << 96n, 0, 0, currentLpFee];
       if (functionName === "getPool") return v3PoolAddress;
       if (functionName === "poolKeys") return poolKey;
       if (functionName === "decimals") return 18;
@@ -135,11 +139,34 @@ describe("SDK single-side liquidity", () => {
       .rejects.toThrow("single-side normal opens only");
   });
 
-  it("rejects hooked V4 pools before preparing a normal open", async () => {
-    const { opener, pool } = poolOpener("v4", packAddress, nvdaAddress, "0x0000000000000000000000000000000000000001");
+  it("allows hooked V4 pools for normal single and dual opens", async () => {
+    const hook = "0x0000000000000000000000000000000000000001" as Address;
+    const quoteTokens = [{ symbol: "PACK", address: packAddress }];
+    const { opener, pool } = poolOpener("v4", packAddress, nvdaAddress, hook, quoteTokens);
 
-    await expect(opener.prepareOpen(pool, "robinhood", 30, 3n * 10n ** 18n, { symbol: "NVDA", address: nvdaAddress }))
-      .rejects.toThrow("plain/no-hook V4 pools only");
+    await expect(opener.prepareOpen(pool, "robinhood", 30, 3n * 10n ** 18n, quoteTokens[0]!)).resolves.toMatchObject({ hooks: hook, mode: "single" });
+    await expect(opener.prepareOpen(pool, "robinhood", 30, 3n * 10n ** 18n, quoteTokens[0]!, "dual")).resolves.toMatchObject({ hooks: hook, mode: "dual" });
+  });
+
+  it("keeps hooked V4 Bid-Ask opens blocked", async () => {
+    const hook = "0x0000000000000000000000000000000000000001" as Address;
+    const quote = { symbol: "PACK", address: packAddress };
+    const { opener, pool } = poolOpener("v4", packAddress, nvdaAddress, hook, [quote]);
+
+    await expect(opener.prepareBidAskOpen(pool, "robinhood", 30, 3n * 10n ** 18n, quote, 3))
+      .rejects.toThrow("Bid-Ask opening supports plain/no-hook V4 pools only");
+  });
+
+  it("displays the current LP fee for dynamic-fee V4 pools", async () => {
+    const quote = { symbol: "PACK", address: packAddress };
+    const hook = "0x0000000000000000000000000000000000000001" as Address;
+    const { opener, pool } = poolOpener("v4", packAddress, nvdaAddress, hook, [quote], 0x80_0000, 3_000);
+
+    await expect(opener.prepareOpen(pool, "robinhood", 30, 3n * 10n ** 18n, quote)).resolves.toMatchObject({
+      feeTier: 0x80_0000,
+      feeLabel: "0.30% dynamic",
+      currentLpFee: 3_000,
+    });
   });
 
   it("fails closed when ERC-20 decimals cannot be read", async () => {
@@ -207,6 +234,42 @@ describe("SDK single-side liquidity", () => {
 });
 
 describe("Bid-Ask NVDA opening", () => {
+  it("returns pending reconciliation after the batch broadcast is accepted but confirmation RPC fails", async () => {
+    const database = {
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      recordPositionGroupExecution: vi.fn(),
+      setPositionGroupOpenTransaction: vi.fn().mockResolvedValue(true),
+      setPositionGroupStatus: vi.fn(),
+      withExecutionLock: vi.fn(async (_chainId: number, _owner: Address, work: () => Promise<unknown>) => work()),
+    };
+    const client = {
+      call: vi.fn().mockResolvedValue(undefined),
+      waitForTransactionReceipt: vi.fn().mockRejectedValue(new Error("Missing or invalid parameters")),
+    };
+    const chains = {
+      getForScan: vi.fn(() => ({ registry: chainRegistry.robinhood, client })),
+      getForExecution: vi.fn(() => ({ registry: chainRegistry.robinhood, client, transport: {} })),
+    };
+    const opener = new PositionOpener({ executorAddress: owner, confirmations: 2, dryRun: false } as never, chains as never, undefined, undefined, database as never);
+    const signed = "0x1234" as Hex;
+    const expectedHash = keccak256(signed);
+    (opener as any).account = {};
+    (opener as any).executionClient = vi.fn().mockReturnValue(client);
+    (opener as any).walletClient = vi.fn().mockReturnValue({
+      prepareTransactionRequest: vi.fn().mockResolvedValue({ nonce: 7n }),
+      signTransaction: vi.fn().mockResolvedValue(signed),
+      sendRawTransaction: vi.fn().mockResolvedValue(expectedHash),
+    });
+
+    await expect((opener as any).broadcastBidAsk("robinhood", "group", v3PoolAddress, "0x1234", 0n)).resolves.toEqual({
+      hash: expectedHash,
+      pendingReconciliation: true,
+    });
+    expect(database.recordPositionGroupExecution).toHaveBeenCalledWith(
+      "group", "open_batch", "submitted", expectedHash, signed, 7n, undefined, { description: "atomic_bid_ask_open" },
+    );
+  });
+
   it.each([
     ["v3", false],
     ["v3", true],
@@ -295,6 +358,82 @@ describe("nearest single-sided ticks", () => {
 });
 
 describe("SDK dual-side liquidity", () => {
+  it("falls back to the exact V4 pool for a native-ETH dual-side swap", async () => {
+    const swapAmount = 40_000_000_000_000_000n;
+    const hooks = "0x0000000000000000000000000000000000000001" as Address;
+    const route = {
+      protocol: "v4",
+      pool: zeroAddress,
+      pools: [],
+      router: chainRegistry.robinhood.contracts.v4.universalRouter,
+      tokenIn: zeroAddress,
+      tokenOut: packAddress,
+      path: [zeroAddress, packAddress],
+      amountIn: swapAmount,
+      expectedOut: 123n,
+      minimumOut: 120n,
+      fees: [10_000],
+      v4PoolKey: { currency0: zeroAddress, currency1: packAddress, fee: 10_000, tickSpacing: 200, hooks },
+    };
+    const routes = { quoteDirect: vi.fn().mockResolvedValue(route) };
+    const client = {};
+    const chains = {
+      getForScan: vi.fn(() => ({ registry: chainRegistry.robinhood, client })),
+    };
+    const opener = new PositionOpener({
+      executorAddress: owner,
+      maxSwapSlippageBps: 200,
+      dryRun: false,
+    } as never, chains as never, routes as never);
+    const harness = opener as any;
+    harness.executionClient = vi.fn().mockReturnValue(client);
+    harness.ensureNativeBalance = vi.fn().mockResolvedValue(undefined);
+    harness.ensureApproval = vi.fn().mockResolvedValue(undefined);
+    harness.ensurePermit2Approval = vi.fn().mockResolvedValue(undefined);
+    harness.tokenBalance = vi.fn().mockResolvedValueOnce(10n).mockResolvedValueOnce(133n);
+    harness.broadcast = vi.fn().mockResolvedValue({ hash: "0x1234" });
+    const preview = {
+      protocol: "v4",
+      dex: "uniswap",
+      chain: "robinhood",
+      poolAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      quoteToken: zeroAddress,
+      baseToken: packAddress,
+      token0: zeroAddress,
+      token1: packAddress,
+      feeTier: 10_000,
+      tickSpacing: 200,
+      hooks,
+      swapAmount,
+    };
+
+    await expect(harness.swapQuoteForBase(preview)).resolves.toEqual({ hash: "0x1234", actualBaseOut: 123n });
+
+    expect(routes.quoteDirect).toHaveBeenCalledWith(expect.objectContaining({
+      protocol: "v4",
+      poolAddress: null,
+      token0: zeroAddress,
+      token1: packAddress,
+      metadata: {
+        dex: "uniswap",
+        currency0: zeroAddress,
+        currency1: packAddress,
+        fee: 10_000,
+        tickSpacing: 200,
+        hooks,
+      },
+    }), zeroAddress, swapAmount, packAddress);
+    expect(harness.ensureNativeBalance).toHaveBeenCalledWith(client, owner, swapAmount);
+    expect(harness.ensureApproval).not.toHaveBeenCalled();
+    expect(harness.ensurePermit2Approval).not.toHaveBeenCalled();
+    expect(harness.broadcast).toHaveBeenCalledWith(
+      "robinhood",
+      chainRegistry.robinhood.contracts.v4.universalRouter,
+      expect.any(String),
+      swapAmount,
+    );
+  });
+
   it("wraps V3 WETH funding before swapping the quote side", async () => {
     const executor = "0x0000000000000000000000000000000000000011" as Address;
     const client = {};
@@ -319,6 +458,8 @@ describe("SDK dual-side liquidity", () => {
     const swap = vi.fn().mockResolvedValue({ hash: null, actualBaseOut: 1n });
 
     harness.prepareOpen = vi.fn().mockResolvedValue(preview);
+    harness.recomputeDualPreviewForConfirmedRange = vi.fn((_original: unknown, refreshed: unknown) => refreshed);
+    harness.assertSameOpenPool = vi.fn();
     harness.isStillStraddling = vi.fn().mockReturnValue(true);
     harness.executionClient = vi.fn().mockReturnValue(client);
     harness.ensureWrappedNativeFunding = wrap;

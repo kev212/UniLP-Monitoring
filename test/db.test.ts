@@ -636,6 +636,54 @@ describe("Database native USD backfill", () => {
     ]);
   });
 
+  it("finalizes history from the metadata swap hash when the confirmed attempt is missing", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{
+        chain_id: 4663, protocol: "v4", position_key: "872988", status: "settled",
+        token0: "0xtoken", token1: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        quote_token: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        metadata: {
+          totalReceived: "811163424",
+          settlementQuoteFromClose: "1776326",
+          closeTransactionHash: "0xclose",
+          swapTransactionHash: "0xswap",
+        },
+        opened_at_block: "45030148",
+        updated_at: "2026-08-25T00:41:29Z",
+      }] })
+      .mockResolvedValueOnce({ rows: [{ stage: "remove_liquidity", transaction_hash: "0xclose" }] })
+      .mockResolvedValueOnce({ rows: [{ deposits: "807975499", realized: "0" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.finalizeCloseHistory("position", "manual")).resolves.toBe(true);
+
+    expect(query.mock.calls[2]![1]).toEqual(["position", ["0xclose", "0xswap"]]);
+    expect(query.mock.calls[3]![1].slice(0, 7)).toEqual([
+      "position", "39", "3187925", "3187925", "0xclose", "0xswap", "45030148",
+    ]);
+  });
+
+  it("rejects conflicting confirmed and metadata settlement swap hashes", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{
+        chain_id: 4663, protocol: "v4", position_key: "position", status: "settled",
+        token0: "0xtoken", token1: "0xquote", quote_token: "0xquote",
+        metadata: { totalReceived: "20", closeTransactionHash: "0xclose", swapTransactionHash: "0xmetadata" },
+        opened_at_block: null, updated_at: "2026-08-25T00:41:29Z",
+      }] })
+      .mockResolvedValueOnce({ rows: [
+        { stage: "remove_liquidity", transaction_hash: "0xclose" },
+        { stage: "swap_to_quote", transaction_hash: "0xattempt" },
+      ] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.finalizeCloseHistory("position", "manual")).resolves.toBe(false);
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
   it("removes history when a confirmed swap is missing from the settlement total", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn()

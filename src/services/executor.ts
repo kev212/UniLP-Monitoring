@@ -102,6 +102,7 @@ export interface SwapRetryState {
 }
 
 const SWAP_RETRY_CYCLE_DELAY_MS = 3_000;
+const PENDING_RECEIPT_REVIEW_MS = 5 * 60_000;
 const API_SETTLEMENT_MINIMUM_FLOOR_BPS = 200;
 const MAX_UINT256 = (1n << 256n) - 1n;
 const MAX_UINT160 = (1n << 160n) - 1n;
@@ -664,7 +665,6 @@ export class Executor {
     if (!quoteToken) return;
 
     let retry = swapRetryState(position.metadata);
-    let droppedStaleSwap = false;
     const submittedSwap = await this.database.getSubmittedSwapAttempt(position.id);
     if (submittedSwap) {
       let receipt: TransactionReceipt | undefined;
@@ -674,20 +674,26 @@ export class Executor {
         const pendingRaw = parsePendingRawTransaction(position.metadata.pendingRawTransaction);
         const pendingMatches = pendingRaw !== null && pendingRaw.hash.toLowerCase() === submittedSwap.toLowerCase();
         if (pendingMatches && await this.pendingRawIsStale(position, pendingRaw)) {
-          await this.database.recordExecution(position.id, "swap_to_quote", "failed", submittedSwap, "signed swap was dropped before confirmation");
-          await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
-            pendingRawTransaction: null,
-            lastExecutionError: `swap_to_quote dropped before confirmation: ${submittedSwap}`,
-          });
-          position = { ...position, metadata: { ...position.metadata, pendingRawTransaction: null } };
-          droppedStaleSwap = true;
+          const submittedAt = pendingRaw.submittedAt ? Date.parse(pendingRaw.submittedAt) : Number.NaN;
+          const ageMs = Number.isFinite(submittedAt) ? Date.now() - submittedAt : 0;
+          if (ageMs >= PENDING_RECEIPT_REVIEW_MS) {
+            await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
+              reason: `swap receipt unavailable after nonce advanced: ${submittedSwap}`,
+              settlementRetryDisabled: true,
+              settlementSwapCandidateHash: submittedSwap,
+            });
+            log.warn({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap, ageMs }, "swap nonce advanced but receipt stayed unavailable; manual review required");
+          } else {
+            log.warn({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap, ageMs }, "swap nonce advanced; waiting for receipt providers to catch up");
+          }
+          return;
         } else {
           await this.rebroadcastPendingTransaction(position, submittedSwap as Hex);
           log.info({ positionId: position.id, positionKey: position.positionKey, swapHash: submittedSwap }, "swap was broadcast but receipt is not yet available");
           return;
         }
       }
-      if (!droppedStaleSwap && receipt) {
+      if (receipt) {
       if (receipt.status === "success") {
         await this.database.recordExecution(position.id, "swap_to_quote", "confirmed", submittedSwap);
         await this.completeSettlement(position, 0n, submittedSwap as Hex, submittedSwap);
@@ -730,11 +736,6 @@ export class Executor {
 
     const actualBalance = await this.tokenBalance(position.chainId, pending.token);
     if (actualBalance < pending.amount) {
-      if (droppedStaleSwap && position.metadata.closeReceiptAccounted === true) {
-        log.info({ positionId: position.id, positionKey: position.positionKey, pendingAmount: pending.amount.toString(), actualBalance: actualBalance.toString() }, "leftover swap token missing after dropped swap; settling from close receipt");
-        await this.completeSettlement(position);
-        return;
-      }
       const closeReceiptTrusted = position.metadata.closeReceiptAccounted === true
         && retry.broadcastAttempts === 0
         && retry.planningFailures === 0
@@ -1998,8 +1999,12 @@ export class Executor {
   private async completeSettlement(position: PositionRecord, swapExpectedOut = 0n, swapTransactionHash?: Hex, swapHash?: string): Promise<void> {
     const durableMeta = await this.database.getPositionMetadata(position.id);
     const storedTotal = typeof durableMeta?.settlementTotalReceived === "string" ? durableMeta.settlementTotalReceived : null;
+    const storedSwapHash = typeof durableMeta?.swapTransactionHash === "string" ? durableMeta.swapTransactionHash : null;
+    if (storedSwapHash && swapHash && storedSwapHash.toLowerCase() !== swapHash.toLowerCase()) {
+      throw new Error("Stored settlement swap hash does not match the confirmed transaction");
+    }
     let totalReceived: bigint;
-    if (storedTotal) {
+    if (storedTotal && (!swapTransactionHash || storedSwapHash)) {
       totalReceived = BigInt(storedTotal);
     } else {
       totalReceived = await this.saveSettlementBalance(position, swapExpectedOut, swapTransactionHash);
@@ -2008,7 +2013,13 @@ export class Executor {
         ...(swapHash ? { swapTransactionHash: swapHash } : {}),
       });
     }
-    await this.database.setPositionStatusUnlessSettled(position.id, "closing", { pendingSwap: null });
+    if (swapHash && !storedSwapHash) {
+      await this.database.setPositionStatusUnlessSettled(position.id, "closing", { swapTransactionHash: swapHash });
+    }
+    await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+      pendingSwap: null,
+      ...((swapHash || storedSwapHash) ? { pendingRawTransaction: null } : {}),
+    });
     if (!(await this.unwrapWethQuote(position, totalReceived))) return;
     await this.database.setPositionStatus(position.id, "settled", {
       pendingSwap: null,
@@ -2153,7 +2164,9 @@ export class Executor {
     if (cached) return cached;
     const nativeClient = this.chains.getById(chainId).client;
     const executorClient = this.executorClient(chainId);
-    const clients = executorClient === nativeClient ? [executorClient] : [executorClient, nativeClient];
+    const registry = this.chains.getById(chainId).registry;
+    const scanFallbackClient = this.chains.getForScanFallback?.(registry.name)?.client;
+    const clients = [...new Set([executorClient, scanFallbackClient, nativeClient].filter((client): client is PublicClient => Boolean(client)))];
     let lastError: unknown;
     for (let attempt = 0; attempt < 4; attempt += 1) {
       for (const client of clients) {
@@ -2868,9 +2881,14 @@ export class Executor {
       };
     }
     if (!value.v4PoolKey) throw new Error("V4 pool key is unavailable");
+    const removeHookData = typeof position.metadata.removeLiquidityHookData === "string" && isHex(position.metadata.removeLiquidityHookData)
+      ? position.metadata.removeLiquidityHookData
+      : typeof position.metadata.hookData === "string" && isHex(position.metadata.hookData)
+        ? position.metadata.hookData
+        : "0x";
     const burnParams = encodeAbiParameters(
       [{ type: "uint256" }, { type: "uint128" }, { type: "uint128" }, { type: "bytes" }],
-      [BigInt(position.positionKey), value.minAmount0, value.minAmount1, "0x"],
+      [BigInt(position.positionKey), value.minAmount0, value.minAmount1, removeHookData],
     );
     const takePairParams = encodeAbiParameters(
       [{ type: "address" }, { type: "address" }, { type: "address" }],

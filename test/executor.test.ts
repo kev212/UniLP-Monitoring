@@ -234,6 +234,25 @@ function v4GroupValue(lower: number, upper: number, liquidity = 10n) {
 }
 
 describe("Executor pending settlement recovery", () => {
+  it("encodes stored remove-liquidity hook data for a hooked V4 close", () => {
+    const executor = new Executor({} as never, { getById: vi.fn(() => ({ registry: { contracts: { v4: { positionManager: groupManager } } } })) } as never, {} as never, {} as never, {} as never, config);
+    const hookData = "0x1234" as Hex;
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "123", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "armed", liquidity: 10n, openedAtBlock: 1n,
+      metadata: { removeLiquidityHookData: hookData },
+    } as PositionRecord;
+    const plan = (executor as any).closePlan(position, v4GroupValue(-100, 100));
+    const decoded = decodeFunctionData({ abi: v4PositionManagerAbi, data: plan.data });
+    const [, inputs] = decodeAbiParameters([{ type: "bytes" }, { type: "bytes[]" }], decoded.args[0]);
+    const [, , , encodedHookData] = decodeAbiParameters(
+      [{ type: "uint256" }, { type: "uint128" }, { type: "uint128" }, { type: "bytes" }],
+      inputs[0]!,
+    );
+
+    expect(encodedHookData).toBe(hookData);
+  });
+
   it("unwraps only a WETH quote settlement and leaves USDG and native ETH unchanged", async () => {
     const database = {
       getPositionMetadata: vi.fn().mockResolvedValue({}),
@@ -355,6 +374,27 @@ describe("Executor pending settlement recovery", () => {
     await assertion;
     expect(client.getTransactionReceipt).toHaveBeenCalledTimes(4);
     vi.useRealTimers();
+  });
+
+  it("uses the dedicated scan fallback when execution and normal receipt providers lag", async () => {
+    const receipt = { status: "success", blockNumber: 100n, logs: [] };
+    const executionClient = { getTransactionReceipt: vi.fn().mockRejectedValue(new Error("invalid params")) };
+    const normalClient = { getTransactionReceipt: vi.fn().mockRejectedValue(new Error("lagging RPC")) };
+    const fallbackClient = { getTransactionReceipt: vi.fn().mockResolvedValue(receipt) };
+    const chains = {
+      getById: vi.fn(() => ({ client: normalClient, registry: { name: "robinhood" } })),
+      getForExecution: vi.fn(() => ({ client: executionClient, registry: { name: "robinhood" } })),
+      getForScanFallback: vi.fn(() => ({ client: fallbackClient, registry: { name: "robinhood" } })),
+    };
+    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, { ...config, confirmations: 1 });
+
+    await expect((executor as unknown as {
+      getConfirmedReceipt(chainId: number, transactionHash: Hex): Promise<unknown>;
+    }).getConfirmedReceipt(4663, hash)).resolves.toBe(receipt);
+
+    expect(executionClient.getTransactionReceipt).toHaveBeenCalledOnce();
+    expect(fallbackClient.getTransactionReceipt).toHaveBeenCalledOnce();
+    expect(normalClient.getTransactionReceipt).not.toHaveBeenCalled();
   });
 
   it("derives native proceeds at the receipt block and restores transaction gas", async () => {
@@ -1300,7 +1340,7 @@ describe("Executor pending settlement recovery", () => {
     expect(routes.quoteDirect).not.toHaveBeenCalled();
   });
 
-  it("settles from the close receipt when a submitted swap is dropped and leftover is gone", async () => {
+  it("waits for receipt providers when a submitted swap nonce was consumed recently", async () => {
     const serialized = stringToHex("pending-swap-tx");
     const swapHash = keccak256(serialized);
     const metadata = {
@@ -1308,7 +1348,7 @@ describe("Executor pending settlement recovery", () => {
       closeReceiptAccounted: true,
       settlementQuoteFromClose: "1982164029",
       settlementPhase: "pending_swap",
-      pendingRawTransaction: { stage: "swap_to_quote", hash: swapHash, serializedTransaction: serialized },
+      pendingRawTransaction: { stage: "swap_to_quote", hash: swapHash, serializedTransaction: serialized, submittedAt: new Date().toISOString() },
     };
     const database = {
       claimSettlementLease: vi.fn().mockResolvedValue(true),
@@ -1318,13 +1358,10 @@ describe("Executor pending settlement recovery", () => {
       getConfirmedSwapAttempt: vi.fn().mockResolvedValue(null),
       recordExecution: vi.fn(),
       setPositionStatusUnlessSettled: vi.fn(),
-      setPositionStatus: vi.fn(),
-      finalizeCloseHistory: vi.fn().mockResolvedValue(true),
     };
     const client = { readContract: vi.fn().mockResolvedValue(0n) };
     const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
-    const notifier = { settled: vi.fn() };
-    const executor = new Executor(database as never, chains as never, {} as never, { quoteDirect: vi.fn() } as never, notifier as never, config);
+    const executor = new Executor(database as never, chains as never, {} as never, { quoteDirect: vi.fn() } as never, {} as never, config);
     vi.spyOn(executor as any, "getConfirmedReceipt").mockRejectedValue(new Error("not found"));
     vi.spyOn(executor as any, "pendingRawIsStale").mockResolvedValue(true);
     const rebroadcast = vi.spyOn(executor as any, "rebroadcastPendingTransaction").mockResolvedValue(undefined);
@@ -1337,13 +1374,52 @@ describe("Executor pending settlement recovery", () => {
     await executor.resume(position);
 
     expect(rebroadcast).not.toHaveBeenCalled();
-    expect(database.recordExecution).toHaveBeenCalledWith("position", "swap_to_quote", "failed", swapHash, "signed swap was dropped before confirmation");
-    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "settled", expect.objectContaining({
-      pendingSwap: null,
-      settlementPhase: "settled",
-      pendingRawTransaction: null,
-    }));
-    expect(notifier.settled).toHaveBeenCalled();
+    expect(database.recordExecution).not.toHaveBeenCalledWith("position", "swap_to_quote", "failed", expect.anything(), expect.anything());
+    expect(database.setPositionStatusUnlessSettled).not.toHaveBeenCalledWith("position", "needs_review", expect.anything());
+  });
+
+  it("requires review instead of discarding swap output when its receipt stays unavailable", async () => {
+    const serialized = stringToHex("old-pending-swap-tx");
+    const swapHash = keccak256(serialized);
+    const metadata = {
+      pendingSwap: { token, amount: "5" },
+      closeReceiptAccounted: true,
+      settlementQuoteFromClose: "10",
+      settlementPhase: "pending_swap",
+      pendingRawTransaction: {
+        stage: "swap_to_quote",
+        hash: swapHash,
+        serializedTransaction: serialized,
+        submittedAt: new Date(Date.now() - 6 * 60_000).toISOString(),
+      },
+    };
+    const database = {
+      claimSettlementLease: vi.fn().mockResolvedValue(true),
+      releaseSettlementLease: vi.fn(),
+      getPositionMetadata: vi.fn().mockResolvedValue(metadata),
+      getSubmittedSwapAttempt: vi.fn().mockResolvedValue(swapHash),
+      getConfirmedSwapAttempt: vi.fn().mockResolvedValue(null),
+      recordExecution: vi.fn(),
+      setPositionStatusUnlessSettled: vi.fn(),
+    };
+    const chains = { getById: vi.fn(() => ({ client: {}, registry: { name: "robinhood" } })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
+    vi.spyOn(executor as any, "getConfirmedReceipt").mockRejectedValue(new Error("not found"));
+    vi.spyOn(executor as any, "pendingRawIsStale").mockResolvedValue(true);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "872988", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata,
+    } as PositionRecord;
+
+    await executor.resume(position);
+
+    expect(database.recordExecution).not.toHaveBeenCalledWith("position", "swap_to_quote", "failed", expect.anything(), expect.anything());
+    expect(database.setPositionStatusUnlessSettled).toHaveBeenCalledWith("position", "needs_review", {
+      reason: `swap receipt unavailable after nonce advanced: ${swapHash}`,
+      settlementRetryDisabled: true,
+      settlementSwapCandidateHash: swapHash,
+    });
   });
 
   it("rebroadcasts a submitted swap while its nonce is still pending", async () => {
@@ -1418,6 +1494,37 @@ describe("Executor pending settlement recovery", () => {
       .saveSettlementBalance(position, 0n, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
       .rejects.toThrow("no quote-token output");
     expect(database.setPositionStatus).not.toHaveBeenCalled();
+  });
+
+  it("recomputes a close-only stored total when a confirmed swap hash arrives", async () => {
+    const database = {
+      getPositionMetadata: vi.fn().mockResolvedValue({ settlementTotalReceived: "10" }),
+      setPositionStatusUnlessSettled: vi.fn(),
+      setPositionStatus: vi.fn(),
+      finalizeCloseHistory: vi.fn().mockResolvedValue(true),
+    };
+    const notifier = { settled: vi.fn() };
+    const executor = new Executor(database as never, {} as never, {} as never, {} as never, notifier as never, config);
+    vi.spyOn(executor as any, "saveSettlementBalance").mockResolvedValue(20n);
+    vi.spyOn(executor as any, "unwrapWethQuote").mockResolvedValue(true);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "872988", owner, poolAddress: null,
+      token0: token, token1: usdg, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    await (executor as any).completeSettlement(position, 0n, hash, hash);
+
+    expect((executor as any).saveSettlementBalance).toHaveBeenCalledWith(position, 0n, hash);
+    expect(database.setPositionStatusUnlessSettled).toHaveBeenCalledWith("position", "closing", {
+      settlementTotalReceived: "20",
+      swapTransactionHash: hash,
+    });
+    expect(database.setPositionStatusUnlessSettled).toHaveBeenCalledWith("position", "closing", {
+      pendingSwap: null,
+      pendingRawTransaction: null,
+    });
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "settled", expect.anything());
   });
 
   it("persists each confirmed native settlement gas cost", async () => {
