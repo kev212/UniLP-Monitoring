@@ -42,13 +42,14 @@ export interface PositionValue {
 }
 
 type V4Slot0 = readonly [bigint, number, number, number];
+type RpcSource = "scan" | "monitoring" | "execution";
 
 export class PositionReader {
   private readonly v4Slot0Cache = new Map<string, Promise<V4Slot0>>();
 
   constructor(private readonly chains: ChainClients, private readonly slippageBps: number) {}
 
-  async read(position: PositionRecord, blockNumber?: bigint, removeSlippageBps?: number, rpc: "scan" | "execution" = "scan"): Promise<PositionValue> {
+  async read(position: PositionRecord, blockNumber?: bigint, removeSlippageBps?: number, rpc: RpcSource = "scan"): Promise<PositionValue> {
     const observedBlock = blockNumber ?? await this.rpcClient(position.chainId, rpc).getBlockNumber();
     const effective = removeSlippageBps ?? this.slippageBps;
     if (position.protocol === "v2") return this.readV2(position, observedBlock, effective, rpc);
@@ -56,7 +57,7 @@ export class PositionReader {
     return this.readV4(position, observedBlock, effective, rpc);
   }
 
-  private async readV2(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: "scan" | "execution" = "scan"): Promise<PositionValue> {
+  private async readV2(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: RpcSource = "scan"): Promise<PositionValue> {
     if (!position.poolAddress) throw new Error("V2 position has no pair address");
     const client = this.rpcClient(position.chainId, rpc);
     const [balance, totalSupply, reserves] = await Promise.all([
@@ -87,7 +88,7 @@ export class PositionReader {
     };
   }
 
-  private async readV3(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: "scan" | "execution" = "scan"): Promise<PositionValue> {
+  private async readV3(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: RpcSource = "scan"): Promise<PositionValue> {
     const registry = this.chains.getById(position.chainId).registry;
     const client = this.rpcClient(position.chainId, rpc);
     const contracts = v3ContractsFor(registry, dexNameFromMetadata(position.metadata));
@@ -143,7 +144,7 @@ export class PositionReader {
     };
   }
 
-  private async readV4(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: "scan" | "execution" = "scan"): Promise<PositionValue> {
+  private async readV4(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: RpcSource = "scan"): Promise<PositionValue> {
     const registry = this.chains.getById(position.chainId).registry;
     const client = this.rpcClient(position.chainId, rpc);
     const tokenId = BigInt(position.positionKey);
@@ -204,7 +205,7 @@ export class PositionReader {
     stateView: Address,
     poolId: `0x${string}`,
     blockNumber: bigint,
-    rpc: "scan" | "execution",
+    rpc: RpcSource,
     chainId: number,
   ): Promise<V4Slot0> {
     const key = `${chainId}:${rpc}:${poolId}:${blockNumber}`;
@@ -228,8 +229,9 @@ export class PositionReader {
     return pending;
   }
 
-  private rpcClient(chainId: number, source: "scan" | "execution" = "scan") {
+  private rpcClient(chainId: number, source: RpcSource = "scan") {
     const { registry } = this.chains.getById(chainId);
+    if (source === "monitoring") return this.chains.getForMonitoring(registry.name).client;
     if (source === "execution") {
       const clients = this.chains as unknown as { getForExecution?: (name: typeof registry.name) => { client: PublicClient } };
       if (typeof clients.getForExecution === "function") return clients.getForExecution(registry.name).client;

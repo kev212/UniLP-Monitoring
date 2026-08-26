@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { Guardian, ROBINHOOD_RPC_BACKOFF_MS, shouldResumeExitRetry, shouldResumeGroupExitRetry, shouldWaitForExitRetry, shouldWaitForGroupExitRetry } from "../src/services/guardian.js";
+import { Guardian, shouldResumeExitRetry, shouldResumeGroupExitRetry, shouldWaitForExitRetry, shouldWaitForGroupExitRetry } from "../src/services/guardian.js";
 import { quoteRangeState } from "../src/services/quote-range.js";
 import { sqrtRatioAtTick } from "../src/services/uniswap-math.js";
 import type { RuntimeConfig } from "../src/config.js";
@@ -51,8 +51,8 @@ describe("profit + OOR above timer", () => {
   const config = {
     trailingStopActivationPercent: 5,
     profitOorAboveThresholdPercent: 3,
-    slTwapGuardMaxWaitMs: 15_000,
-    trailingTwapGuardMaxWaitMs: 15_000,
+    slTwapGuardMaxWaitMs: 5_000,
+    trailingTwapGuardMaxWaitMs: 5_000,
     oorAboveProfitDurationMs: 300_000,
     oorAutoCloseEnabled: true,
     oorAboveMinDistancePercent: 10,
@@ -497,7 +497,7 @@ describe("stop-loss local quote validation", () => {
     expect(pnl.shouldTriggerGroup).toHaveBeenCalledWith(groupSnapshot(-151n));
   });
 
-  it("propagates a group SL rate limit so chain backoff can activate", async () => {
+  it("propagates a group SL rate limit so the group can retry next cycle", async () => {
     const pnl = {
       valueGroupLocal: vi.fn().mockRejectedValue(new Error("RPC rate limited")),
       shouldTriggerGroup: vi.fn(),
@@ -557,7 +557,7 @@ describe("position monitor timeouts", () => {
   });
 });
 
-describe("monitor RPC backoff", () => {
+describe("monitor RPC retries", () => {
   const group = (id: string): PositionGroupRecord => ({
     id,
     chainId: 4663,
@@ -619,7 +619,7 @@ describe("monitor RPC backoff", () => {
     range: undefined,
   };
 
-  it("skips remaining groups after a 429 and does not revalue successes on the same block", async () => {
+  it("continues monitoring after a 429 and retries only the failed group on the same block", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-26T00:00:00Z"));
     try {
@@ -660,14 +660,10 @@ describe("monitor RPC backoff", () => {
       const evaluate = (guardian as unknown as { evaluateChain(name: "robinhood"): Promise<void> }).evaluateChain.bind(guardian);
 
       await evaluate("robinhood");
-      expect(pnl.valueGroup.mock.calls.map((call) => call[0].id)).toEqual(["g1", "g2"]);
+      expect(pnl.valueGroup.mock.calls.map((call) => call[0].id)).toEqual(["g1", "g2", "g3"]);
 
       await evaluate("robinhood");
-      expect(pnl.valueGroup).toHaveBeenCalledTimes(2);
-
-      vi.advanceTimersByTime(ROBINHOOD_RPC_BACKOFF_MS);
-      await evaluate("robinhood");
-      expect(pnl.valueGroup.mock.calls.map((call) => call[0].id)).toEqual(["g1", "g2", "g2", "g3"]);
+      expect(pnl.valueGroup.mock.calls.map((call) => call[0].id)).toEqual(["g1", "g2", "g3", "g2"]);
     } finally {
       vi.useRealTimers();
     }
@@ -679,7 +675,7 @@ describe("monitor RPC backoff", () => {
     try {
       const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
       const guardian = new Guardian(
-        { slTwapGuardMaxWaitMs: 15_000, trailingTwapGuardMaxWaitMs: 15_000 } as RuntimeConfig,
+        { slTwapGuardMaxWaitMs: 5_000, trailingTwapGuardMaxWaitMs: 5_000 } as RuntimeConfig,
         database as never,
         {} as never,
         {} as never,
@@ -702,8 +698,8 @@ describe("monitor RPC backoff", () => {
       for (const [trigger, key] of cases) {
         const value = group(trigger);
         await expect(allow(value, trigger)).resolves.toBe(false);
-        expect(database.setPositionGroupStatus).toHaveBeenLastCalledWith(value.id, "active", { [key]: Date.now() });
-        await expect(allow({ ...value, metadata: { [key]: Date.now() - 15_000 } }, trigger)).resolves.toBe(true);
+        expect(database.setPositionGroupStatus).toHaveBeenLastCalledWith(value.id, "active", { [key]: Date.now() }, "active");
+        await expect(allow({ ...value, metadata: { [key]: Date.now() - 5_000 } }, trigger)).resolves.toBe(true);
       }
     } finally {
       vi.useRealTimers();
@@ -724,7 +720,7 @@ describe("monitor RPC backoff", () => {
     const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
     const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
     const guardian = new Guardian(
-      { slTwapGuardMaxWaitMs: 15_000, trailingTwapGuardMaxWaitMs: 15_000 } as RuntimeConfig,
+      { slTwapGuardMaxWaitMs: 5_000, trailingTwapGuardMaxWaitMs: 5_000 } as RuntimeConfig,
       database as never,
       {} as never,
       {} as never,
@@ -737,10 +733,49 @@ describe("monitor RPC backoff", () => {
       evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
     }).evaluatePositionGroup.bind(guardian);
 
-    await expect(evaluate("robinhood", { ...group("sl"), metadata: { slTwapWaitStartedAt: Date.now() - 15_001 } }, 10n)).resolves.toBe(true);
+    await expect(evaluate("robinhood", { ...group("sl"), metadata: { slTwapWaitStartedAt: Date.now() - 5_001 } }, 10n)).resolves.toBe(true);
 
     expect(executor.executeRelatedGroup).toHaveBeenCalledWith("sl", "stop_loss");
-    expect(database.setPositionGroupStatus).toHaveBeenCalledWith("sl", "active", expect.objectContaining({ exitTrigger: "stop_loss" }));
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith("sl", "active", expect.objectContaining({ exitTrigger: "stop_loss" }), "active");
+  });
+
+  it("does not execute a stale SL after a manual close changed the group status", async () => {
+    const value = {
+      ...valued,
+      twapGuard: { ready: true },
+      snapshot: { ...valued.snapshot, pnlBps: -3_000n, pnlQuote: -300_000n },
+    };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(value),
+      valueGroupLocal: vi.fn().mockResolvedValue(value),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTriggerGroup: vi.fn().mockReturnValue("stop_loss"),
+    };
+    const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(false) };
+    const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      { slTwapGuardMaxWaitMs: 5_000 } as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+
+    await expect(evaluate("robinhood", group("manual-race"), 10n)).resolves.toBe(true);
+
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith(
+      "manual-race",
+      "active",
+      expect.objectContaining({ exitTrigger: "stop_loss" }),
+      "active",
+    );
+    expect(executor.executeRelatedGroup).not.toHaveBeenCalled();
   });
 
   it("revalidates TP locally and persists its trigger before group execution", async () => {
@@ -757,7 +792,7 @@ describe("monitor RPC backoff", () => {
     const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
     const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
     const guardian = new Guardian(
-      { slTwapGuardMaxWaitMs: 15_000, trailingTwapGuardMaxWaitMs: 15_000 } as RuntimeConfig,
+      { slTwapGuardMaxWaitMs: 5_000, trailingTwapGuardMaxWaitMs: 5_000 } as RuntimeConfig,
       database as never,
       {} as never,
       {} as never,
@@ -770,14 +805,14 @@ describe("monitor RPC backoff", () => {
       evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
     }).evaluatePositionGroup.bind(guardian);
 
-    await expect(evaluate("robinhood", { ...group("tp"), metadata: { profitTwapWaitStartedAt: Date.now() - 15_001 } }, 10n)).resolves.toBe(true);
+    await expect(evaluate("robinhood", { ...group("tp"), metadata: { profitTwapWaitStartedAt: Date.now() - 5_001 } }, 10n)).resolves.toBe(true);
 
     expect(pnl.valueGroupLocalExitEstimate).toHaveBeenCalledWith(expect.anything(), 10n, undefined);
     expect(executor.executeRelatedGroup).toHaveBeenCalledWith("tp", "take_profit");
     expect(database.setPositionGroupStatus).toHaveBeenCalledWith("tp", "active", expect.objectContaining({
       exitTrigger: "take_profit",
       exitSnapshot: expect.objectContaining({ pnlBps: "2500" }),
-    }));
+    }), "active");
   });
 
   it("upgrades a profit exit to SL when the conservative local quote has crossed SL", async () => {
@@ -815,7 +850,7 @@ describe("monitor RPC backoff", () => {
     await expect(evaluate("robinhood", group("tp-to-sl"), 10n)).resolves.toBe(true);
 
     expect(executor.executeRelatedGroup).toHaveBeenCalledWith("tp-to-sl", "stop_loss");
-    expect(database.setPositionGroupStatus).toHaveBeenCalledWith("tp-to-sl", "active", expect.objectContaining({ exitTrigger: "stop_loss" }));
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith("tp-to-sl", "active", expect.objectContaining({ exitTrigger: "stop_loss" }), "active");
   });
 
   it("uses the SL timeout when a TWAP-blocked profit exit is promoted to SL", async () => {
@@ -836,7 +871,7 @@ describe("monitor RPC backoff", () => {
     const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
     const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
     const guardian = new Guardian(
-      { settlementSwapSlippageBps: 200, trailingTwapGuardMaxWaitMs: 0, slTwapGuardMaxWaitMs: 15_000 } as RuntimeConfig,
+      { settlementSwapSlippageBps: 200, trailingTwapGuardMaxWaitMs: 0, slTwapGuardMaxWaitMs: 5_000 } as RuntimeConfig,
       database as never,
       {} as never,
       {} as never,
@@ -851,7 +886,7 @@ describe("monitor RPC backoff", () => {
 
     await expect(evaluate("robinhood", group("promoted-sl-wait"), 10n)).resolves.toBe(true);
 
-    expect(database.setPositionGroupStatus).toHaveBeenCalledWith("promoted-sl-wait", "active", { slTwapWaitStartedAt: expect.any(Number) });
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith("promoted-sl-wait", "active", { slTwapWaitStartedAt: expect.any(Number) }, "active");
     expect(executor.executeRelatedGroup).not.toHaveBeenCalled();
   });
 
@@ -907,7 +942,7 @@ describe("monitor RPC backoff", () => {
     const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
     const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
     const guardian = new Guardian(
-      { settlementSwapSlippageBps: 200, slTwapGuardMaxWaitMs: 15_000, trailingTwapGuardMaxWaitMs: 15_000 } as RuntimeConfig,
+      { settlementSwapSlippageBps: 200, slTwapGuardMaxWaitMs: 5_000, trailingTwapGuardMaxWaitMs: 5_000 } as RuntimeConfig,
       database as never,
       {} as never,
       {} as never,
@@ -923,7 +958,7 @@ describe("monitor RPC backoff", () => {
       ...group("trail"),
       metadata: {
         trailingStop: { peakPnlBps: "600", activatedAtBlock: "1" },
-        trailingTwapWaitStartedAt: Date.now() - 15_001,
+        trailingTwapWaitStartedAt: Date.now() - 5_001,
       },
     };
 
@@ -1018,7 +1053,7 @@ describe("monitor RPC backoff", () => {
     expect(database.setPositionGroupStatus).toHaveBeenCalledWith("stale-sl", "active", expect.objectContaining({
       exitRetry: null,
       exitTrigger: null,
-    }));
+    }), "active");
     expect(executor.executeRelatedGroup).not.toHaveBeenCalled();
   });
 

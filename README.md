@@ -41,6 +41,7 @@ Mulai dengan `DRY_RUN=true`. Ubah ke `false` hanya setelah cashflow, PnL, dan si
 | `TRAILING_STOP_ACTIVATION_PERCENT` | PnL minimum untuk mengaktifkan trailing stop. |
 | `TRAILING_STOP_DRAWDOWN_PERCENT` | Drawdown dari peak trailing stop. |
 | `TRAILING_EXIT_ESTIMATE_BUFFER_PERCENT` | Buffer estimasi sebelum close trailing; default 10% di bawah trailing floor. |
+| `SL_TWAP_GUARD_MAX_WAIT_MS` | Batas waktu guard stop-loss sebelum validasi lokal dan exit dilanjutkan. Default `5000`. |
 | `TRAILING_TWAP_GUARD_MAX_WAIT_MS` | Batas waktu guard trailing sebelum exit dilanjutkan. Default `5000`. |
 | `MAX_TWAP_DEVIATION_BPS` | Deviasi maksimum harga spot dari rolling TWAP. Default `250` (2.5%). |
 | `TWAP_WINDOW_SECONDS` | Durasi rolling TWAP. Default `60` detik. |
@@ -54,7 +55,8 @@ Mulai dengan `DRY_RUN=true`. Ubah ke `false` hanya setelah cashflow, PnL, dan si
 | `ALCHEMY_BSC_HTTP` | Endpoint Alchemy BSC untuk archive/log, bootstrap NFT, dan execution. |
 | `AUTO_EXIT_CHAINS` | Chain yang boleh auto-exit. Default `base,robinhood,bsc`. |
 | `BSC_POSITION_MONITOR_INTERVAL_MS` | Interval monitoring BSC. Default `10000`. |
-| `ALCHEMY_BASE_HTTP`, `ALCHEMY_ROBINHOOD_HTTP` | Endpoint RPC execution dan one-time wallet bootstrap. Alchemy bukan primary untuk monitoring atau scan. |
+| `ALCHEMY_BASE_HTTP`, `ALCHEMY_ROBINHOOD_HTTP` | Endpoint RPC execution dan one-time wallet bootstrap. `ALCHEMY_ROBINHOOD_HTTP` khusus execution. |
+| `ALCHEMY_ROBINHOOD_MONITOR_HTTP` | Endpoint Alchemy khusus fallback monitoring Robinhood setelah public RPC dan BlockMachine gagal; tidak dipakai execution atau scan/discovery. |
 | `TELEGRAM_CHAT_ID`, `TELEGRAM_USER_ID` | Chat dan user yang diizinkan mengakses bot. |
 
 Lihat `.env.example` untuk seluruh variable dan nilai default.

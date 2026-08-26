@@ -16,12 +16,13 @@ export const ROBINHOOD_EXECUTION_CONCURRENCY = 4;
 
 class AsyncLimiter {
   private active = 0;
+  private readonly priorityWaiters: Array<() => void> = [];
   private readonly waiters: Array<() => void> = [];
 
   constructor(private readonly limit: number) {}
 
-  async run<T>(work: () => Promise<T>): Promise<T> {
-    await this.acquire();
+  async run<T>(work: () => Promise<T>, priority = false): Promise<T> {
+    await this.acquire(priority);
     try {
       return await work();
     } finally {
@@ -29,16 +30,16 @@ class AsyncLimiter {
     }
   }
 
-  private async acquire(): Promise<void> {
+  private async acquire(priority: boolean): Promise<void> {
     if (this.active < this.limit) {
       this.active += 1;
       return;
     }
-    await new Promise<void>((resolve) => this.waiters.push(resolve));
+    await new Promise<void>((resolve) => (priority ? this.priorityWaiters : this.waiters).push(resolve));
   }
 
   private release(): void {
-    const next = this.waiters.shift();
+    const next = this.priorityWaiters.shift() ?? this.waiters.shift();
     if (next) next();
     else this.active -= 1;
   }
@@ -53,7 +54,7 @@ function uniqueUrls(urls: readonly (string | undefined)[]): string[] {
  * must reach the next provider immediately instead of retrying the same
  * throttled endpoint before fallback gets a chance.
  */
-export function createRpcTransport(urls: readonly string[], limiter?: AsyncLimiter): Transport {
+export function createRpcTransport(urls: readonly string[], limiter?: AsyncLimiter, priority = false): Transport {
   const endpoints = uniqueUrls(urls);
   if (endpoints.length === 0) throw new Error("At least one RPC endpoint is required");
   const transports = endpoints.map((url) => http(url, { retryCount: 0, timeout: RPC_TIMEOUT_MS }));
@@ -63,13 +64,14 @@ export function createRpcTransport(urls: readonly string[], limiter?: AsyncLimit
   if (!limiter) return transport;
   return ((options) => {
     const inner = transport(options);
-    const request = ((args, requestOptions) => limiter.run(() => inner.request(args, requestOptions))) as typeof inner.request;
+    const request = ((args, requestOptions) => limiter.run(() => inner.request(args, requestOptions), priority)) as typeof inner.request;
     return { ...inner, config: { ...inner.config, request }, request };
   }) as Transport;
 }
 
 export class ChainClients {
   private readonly clients = new Map<ChainName, ChainClient>();
+  private readonly monitoringClients = new Map<ChainName, ChainClient>();
   private readonly scanClients = new Map<ChainName, ChainClient>();
   private readonly scanFallbackClients = new Map<ChainName, ChainClient>();
   private readonly logClients = new Map<ChainName, ChainClient>();
@@ -101,6 +103,19 @@ export class ChainClients {
         client: createPublicClient({
           chain: registry.chain,
           transport: normalTransport,
+          pollingInterval: 4_000,
+        }),
+      });
+      const monitoringTransport = createRpcTransport(uniqueUrls([
+        ...publicEndpoints,
+        ...(name === "robinhood" ? [config.alchemyMonitoringHttp?.[name]] : alchemyLastResort),
+      ]), readLimiter, true);
+      this.monitoringClients.set(name, {
+        registry,
+        transport: monitoringTransport,
+        client: createPublicClient({
+          chain: registry.chain,
+          transport: monitoringTransport,
           pollingInterval: 4_000,
         }),
       });
@@ -177,6 +192,12 @@ export class ChainClients {
   getForScan(name: ChainName): ChainClient {
     const item = this.scanClients.get(name);
     if (!item) throw new Error(`Chain ${name} is not configured for scanning`);
+    return item;
+  }
+
+  getForMonitoring(name: ChainName): ChainClient {
+    const item = this.monitoringClients.get(name);
+    if (!item || !this.enabledChains.has(name)) throw new Error(`Chain ${name} is not enabled for monitoring`);
     return item;
   }
 

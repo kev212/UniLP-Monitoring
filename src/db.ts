@@ -789,8 +789,13 @@ export class Database {
     return result.rows.map(mapPositionGroup);
   }
 
-  async setPositionGroupStatus(groupId: string, status: PositionGroupStatus, metadata: Record<string, unknown> = {}): Promise<void> {
-    await this.pool.query(
+  async setPositionGroupStatus(
+    groupId: string,
+    status: PositionGroupStatus,
+    metadata: Record<string, unknown> = {},
+    expectedStatus?: PositionGroupStatus,
+  ): Promise<boolean> {
+    const result = await this.pool.query<{ updated: boolean }>(
       `WITH updated_group AS (
         UPDATE position_groups
          SET status = $2,
@@ -832,10 +837,11 @@ export class Database {
                ELSE pending_raw_transaction
              END,
              updated_at = NOW()
-          WHERE id = $1
-            AND NOT (status IN ('settled', 'cancelled') AND $2::text NOT IN ('settled', 'cancelled'))
-          RETURNING id
-      )
+           WHERE id = $1
+             AND NOT (status IN ('settled', 'cancelled') AND $2::text NOT IN ('settled', 'cancelled'))
+             AND ($4::text IS NULL OR status = $4::text)
+           RETURNING id
+      ), updated_positions AS (
       UPDATE positions
          SET status = CASE
                WHEN $2 = 'settled' THEN 'settled'
@@ -844,14 +850,18 @@ export class Database {
              END,
              metadata = metadata || jsonb_build_object('positionGroupStatus', $2::text, 'autoExitDisabled', true),
              updated_at = NOW()
-       WHERE EXISTS (SELECT 1 FROM updated_group WHERE id = $1)
+        WHERE EXISTS (SELECT 1 FROM updated_group WHERE id = $1)
          AND EXISTS (
            SELECT 1 FROM position_group_bins
             WHERE position_group_bins.group_id = $1
               AND position_group_bins.position_id = positions.id
-         )`,
-      [groupId, status, stringifyJson(metadata)],
+          )
+        RETURNING id
+      )
+      SELECT EXISTS (SELECT 1 FROM updated_group) AS updated`,
+      [groupId, status, stringifyJson(metadata), expectedStatus ?? null],
     );
+    return result.rows[0]?.updated === true;
   }
 
   async finalizePositionGroup(

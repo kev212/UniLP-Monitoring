@@ -40,6 +40,7 @@ export interface SwapRoute {
 interface QuoteOptions {
   excludedPool?: Address | null;
   includeV4?: boolean;
+  rpc?: "scan" | "monitoring";
 }
 
 export class RoutePlanner {
@@ -58,11 +59,11 @@ export class RoutePlanner {
     const { registry } = this.chains.getById(position.chainId);
     const paths = this.candidatePaths(registry.name, tokenIn, tokenOut);
     const [v2Quotes, v3Quotes, v4Quote] = await Promise.all([
-      isProtocolDeployed(registry, "v2") ? this.quoteV2(position, paths, amountIn, opts?.excludedPool) : Promise.resolve([]),
-      isProtocolDeployed(registry, "v3") ? this.quoteV3(position, paths, amountIn, opts?.excludedPool) : Promise.resolve([]),
+      isProtocolDeployed(registry, "v2") ? this.quoteV2(position, paths, amountIn, opts?.excludedPool, opts?.rpc) : Promise.resolve([]),
+      isProtocolDeployed(registry, "v3") ? this.quoteV3(position, paths, amountIn, opts?.excludedPool, opts?.rpc) : Promise.resolve([]),
       opts?.includeV4 === false || !isProtocolDeployed(registry, "v4")
         ? Promise.resolve(null)
-        : this.quoteV4(position, tokenIn, amountIn, tokenOut),
+        : this.quoteV4(position, tokenIn, amountIn, tokenOut, opts?.rpc),
     ]);
     const quotes = [...v2Quotes, ...v3Quotes, ...(v4Quote ? [v4Quote] : [])];
 
@@ -78,12 +79,12 @@ export class RoutePlanner {
     return [[tokenIn, tokenOut], ...intermediaries.map((intermediate) => [tokenIn, intermediate, tokenOut])];
   }
 
-  private async quoteV2(position: PositionRecord, paths: Address[][], amountIn: bigint, excludedPool?: Address | null): Promise<SwapRoute[]> {
-    const { client, registry } = this.scanChain(position);
+  private async quoteV2(position: PositionRecord, paths: Address[][], amountIn: bigint, excludedPool?: Address | null, rpc: "scan" | "monitoring" = "scan"): Promise<SwapRoute[]> {
+    const { client, registry } = this.readChain(position, rpc);
     const excluded = excludedPool?.toLowerCase();
     const quotes = await Promise.all(paths.map(async (path) => {
       try {
-        const pools = await Promise.all(path.slice(1).map((token, index) => this.getV2Pair(position, path[index]!, token)));
+        const pools = await Promise.all(path.slice(1).map((token, index) => this.getV2Pair(position, path[index]!, token, rpc)));
         if (pools.some((pool) => pool === zeroAddress || pool.toLowerCase() === excluded)) return null;
         const amounts = await client.readContract({
           address: registry.contracts.v2.router,
@@ -112,13 +113,13 @@ export class RoutePlanner {
     return quotes.filter((quote) => quote !== null) as SwapRoute[];
   }
 
-  private async quoteV3(position: PositionRecord, paths: Address[][], amountIn: bigint, excludedPool?: Address | null): Promise<SwapRoute[]> {
-    const { client, registry } = this.scanChain(position);
+  private async quoteV3(position: PositionRecord, paths: Address[][], amountIn: bigint, excludedPool?: Address | null, rpc: "scan" | "monitoring" = "scan"): Promise<SwapRoute[]> {
+    const { client, registry } = this.readChain(position, rpc);
     const excluded = excludedPool?.toLowerCase();
     const candidates = paths.flatMap((path) => feeCombinations(path.length - 1).map((fees) => ({ path, fees })));
     const quotes = await Promise.all(candidates.map(({ path, fees }) => this.quoteLimiter.run(async () => {
         try {
-          const pools = await Promise.all(fees.map((fee, index) => this.getV3Pool(position, path[index]!, path[index + 1]!, fee)));
+          const pools = await Promise.all(fees.map((fee, index) => this.getV3Pool(position, path[index]!, path[index + 1]!, fee, rpc)));
           if (pools.some((pool) => pool === zeroAddress || pool.toLowerCase() === excluded)) return null;
           const encodedPath = encodeV3Path(path, fees);
           const contracts = v3ContractsFor(registry, dexNameFromMetadata(position.metadata));
@@ -151,12 +152,12 @@ export class RoutePlanner {
     return quotes.filter((quote) => quote !== null) as SwapRoute[];
   }
 
-  private async getV3Pool(position: PositionRecord, tokenA: Address, tokenB: Address, fee: number): Promise<Address> {
+  private async getV3Pool(position: PositionRecord, tokenA: Address, tokenB: Address, fee: number, rpc: "scan" | "monitoring" = "scan"): Promise<Address> {
     const tokens = [tokenA.toLowerCase(), tokenB.toLowerCase()].sort();
     const dex = dexNameFromMetadata(position.metadata);
-    const key = `v3:${dex}:${position.chainId}:${tokens[0]}:${tokens[1]}:${fee}`;
+    const key = `v3:${rpc}:${dex}:${position.chainId}:${tokens[0]}:${tokens[1]}:${fee}`;
     return this.getCachedPool(key, async () => {
-      const { client, registry } = this.scanChain(position);
+      const { client, registry } = this.readChain(position, rpc);
       return client.readContract({
         address: v3ContractsFor(registry, dex).factory,
         abi: v3FactoryAbi,
@@ -166,11 +167,11 @@ export class RoutePlanner {
     });
   }
 
-  private async getV2Pair(position: PositionRecord, tokenA: Address, tokenB: Address): Promise<Address> {
+  private async getV2Pair(position: PositionRecord, tokenA: Address, tokenB: Address, rpc: "scan" | "monitoring" = "scan"): Promise<Address> {
     const tokens = [tokenA.toLowerCase(), tokenB.toLowerCase()].sort();
-    const key = `v2:${position.chainId}:${tokens[0]}:${tokens[1]}`;
+    const key = `v2:${rpc}:${position.chainId}:${tokens[0]}:${tokens[1]}`;
     return this.getCachedPool(key, async () => {
-      const { client, registry } = this.scanChain(position);
+      const { client, registry } = this.readChain(position, rpc);
       return client.readContract({
         address: registry.contracts.v2.factory,
         abi: v2FactoryAbi,
@@ -198,13 +199,17 @@ export class RoutePlanner {
     return lookup;
   }
 
-  private scanChain(position: PositionRecord): ChainClient {
+  private readChain(position: PositionRecord, rpc: "scan" | "monitoring" = "scan"): ChainClient {
     const chain = this.chains.getById(position.chainId);
-    const clients = this.chains as unknown as { getForScan?: (name: typeof chain.registry.name) => ChainClient };
+    const clients = this.chains as unknown as {
+      getForMonitoring?: (name: typeof chain.registry.name) => ChainClient;
+      getForScan?: (name: typeof chain.registry.name) => ChainClient;
+    };
+    if (rpc === "monitoring" && typeof clients.getForMonitoring === "function") return clients.getForMonitoring(chain.registry.name);
     return typeof clients.getForScan === "function" ? clients.getForScan(chain.registry.name) : chain;
   }
 
-  private async quoteV4(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address): Promise<SwapRoute | null> {
+  private async quoteV4(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address, rpc: "scan" | "monitoring" = "scan"): Promise<SwapRoute | null> {
     if (position.protocol !== "v4") return null;
     const meta = position.metadata as Record<string, unknown>;
     const currency0 = meta.currency0 as Address | undefined;
@@ -219,7 +224,7 @@ export class RoutePlanner {
     const zeroForOne = tokenInL === currency0.toLowerCase() && tokenOutL === currency1.toLowerCase();
     if (!zeroForOne && (tokenInL !== currency1.toLowerCase() || tokenOutL !== currency0.toLowerCase())) return null;
 
-    const { client, registry } = this.scanChain(position);
+    const { client, registry } = this.readChain(position, rpc);
     const poolKey: V4PoolKey = { currency0, currency1, fee, tickSpacing, hooks };
     for (let attempt = 1; attempt <= V4_QUOTE_ATTEMPTS; attempt += 1) {
       try {

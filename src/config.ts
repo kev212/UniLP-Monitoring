@@ -37,6 +37,7 @@ const envSchema = z.object({
   BSC_RPC_HTTP_FALLBACK: z.string().url().optional().or(z.literal("")),
   ALCHEMY_BASE_HTTP: z.string().url().optional().or(z.literal("")),
   ALCHEMY_ROBINHOOD_HTTP: z.string().url().optional().or(z.literal("")),
+  ALCHEMY_ROBINHOOD_MONITOR_HTTP: z.string().url().optional().or(z.literal("")),
   ALCHEMY_BSC_HTTP: z.string().url().optional().or(z.literal("")),
   QUOTE_TOKEN_ALLOWLIST_BASE: z.string().default(""),
   QUOTE_TOKEN_ALLOWLIST_ROBINHOOD: z.string().default(""),
@@ -49,7 +50,7 @@ const envSchema = z.object({
   TRAILING_STOP_DRAWDOWN_PERCENT: z.coerce.number().positive().default(1.5),
   TRAILING_EXIT_ESTIMATE_BUFFER_PERCENT: z.coerce.number().nonnegative().max(50).default(10),
   PROFIT_OOR_ABOVE_THRESHOLD_PERCENT: z.coerce.number().positive().default(3),
-  SL_TWAP_GUARD_MAX_WAIT_MS: z.coerce.number().int().min(0).max(300_000).default(15_000),
+  SL_TWAP_GUARD_MAX_WAIT_MS: z.coerce.number().int().min(0).max(300_000).default(5_000),
   TRAILING_TWAP_GUARD_MAX_WAIT_MS: z.coerce.number().int().min(0).max(300_000).default(5_000),
   POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).default(5_000),
   BASE_POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).optional(),
@@ -117,6 +118,7 @@ export interface RuntimeConfig {
   rpcHttpFallback: Partial<Record<ChainName, string>>;
   rpcHttpScanFallback: Partial<Record<ChainName, string>>;
   alchemyHttp: Partial<Record<ChainName, string>>;
+  alchemyMonitoringHttp: Partial<Record<ChainName, string>>;
   quoteTokens: Record<ChainName, QuoteToken[]>;
   v4PoolKeyOverrides: Partial<Record<ChainName, Record<string, V4PoolKey>>>;
   stopLossPercent: number;
@@ -284,6 +286,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
   const env = envSchema.parse(environment);
   const alchemyBase = env.ALCHEMY_BASE_HTTP || undefined;
   const alchemyRobinhood = env.ALCHEMY_ROBINHOOD_HTTP || undefined;
+  const alchemyRobinhoodMonitor = env.ALCHEMY_ROBINHOOD_MONITOR_HTTP || undefined;
   const alchemyBsc = env.ALCHEMY_BSC_HTTP || undefined;
   const telegram = env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID
     ? {
@@ -341,6 +344,9 @@ export function loadConfig(environment = process.env): RuntimeConfig {
       ...(alchemyBase ? { base: alchemyBase } : {}),
       ...(alchemyRobinhood ? { robinhood: alchemyRobinhood } : {}),
       ...(alchemyBsc ? { bsc: alchemyBsc } : {}),
+    },
+    alchemyMonitoringHttp: {
+      ...(alchemyRobinhoodMonitor ? { robinhood: alchemyRobinhoodMonitor } : {}),
     },
     quoteTokens: {
       base: parseQuoteTokens(env.QUOTE_TOKEN_ALLOWLIST_BASE, "QUOTE_TOKEN_ALLOWLIST_BASE"),

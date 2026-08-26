@@ -63,7 +63,7 @@ describe("RPC failover transport", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("shares the Robinhood read concurrency limit across normal and scan clients", async () => {
+  it("shares the Robinhood read concurrency limit across normal, scan, and monitoring clients", async () => {
     let active = 0;
     let maxActive = 0;
     const fetchMock = vi.fn(async () => {
@@ -87,9 +87,10 @@ describe("RPC failover transport", () => {
     } as RuntimeConfig);
     const normal = clients.get("robinhood").client;
     const scan = clients.getForScan("robinhood").client;
+    const monitoring = clients.getForMonitoring("robinhood").client;
 
     await Promise.all(Array.from({ length: 20 }, (_, index) => {
-      const client = index % 2 === 0 ? normal : scan;
+      const client = [normal, scan, monitoring][index % 3]!;
       return client.request({ method: "eth_blockNumber" });
     }));
 
@@ -179,7 +180,7 @@ describe("RPC failover transport", () => {
 
     const clients = new ChainClients({
       chains: ["robinhood"],
-      alchemyHttp: { base: undefined, robinhood: "https://alchemy.example/rpc", bsc: undefined },
+      alchemyHttp: { base: undefined, robinhood: "https://alchemy.example/rpc" },
       rpcHttp: { base: "https://base.example/rpc", robinhood: "https://public.example/rpc", bsc: "https://bsc.example/rpc" },
       rpcHttpFallback: { robinhood: "https://public-fallback.example/rpc" },
       rpcHttpScanFallback: { robinhood: "https://rpc-robinhood.blockmachine.io" },
@@ -267,6 +268,37 @@ describe("RPC failover transport", () => {
     expect(urls.some((url) => url.includes("alchemy.example"))).toBe(false);
     expect(urls.some((url) => url.includes("public.example"))).toBe(true);
     expect(urls.some((url) => url.includes("blockmachine.io"))).toBe(true);
+  });
+
+  it("uses Alchemy only as the last resort for Robinhood monitoring", async () => {
+    const urls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      urls.push(url);
+      if (!url.includes("monitoring-alchemy.example")) return new Response("rate limited", { status: 429 });
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x1237" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const clients = new ChainClients({
+      chains: ["robinhood"],
+      alchemyHttp: { base: undefined, robinhood: "https://execution-alchemy.example/rpc", bsc: undefined },
+      alchemyMonitoringHttp: { robinhood: "https://monitoring-alchemy.example/rpc" },
+      rpcHttp: { base: "https://base.example/rpc", robinhood: "https://public.example/rpc", bsc: "https://bsc.example/rpc" },
+      rpcHttpFallback: { robinhood: "https://rpc-robinhood.blockmachine.io" },
+      rpcHttpScanFallback: { robinhood: "https://rpc-robinhood.blockmachine.io" },
+    } as RuntimeConfig);
+
+    await expect(clients.getForMonitoring("robinhood").client.getChainId()).resolves.toBe(4663);
+    expect(urls).toEqual([
+      "https://public.example/rpc",
+      "https://rpc-robinhood.blockmachine.io/",
+      "https://monitoring-alchemy.example/rpc",
+    ]);
+    expect(urls.some((url) => url.includes("execution-alchemy.example"))).toBe(false);
   });
 
   it("falls back Robinhood normal reads to BlockMachine when the public RPC returns 429", async () => {

@@ -12,6 +12,8 @@ function environment(overrides: Record<string, string> = {}): NodeJS.ProcessEnv 
     ROBINHOOD_RPC_HTTP: "https://rpc.mainnet.chain.robinhood.com",
     ROBINHOOD_RPC_WSS: "",
     BSC_RPC_HTTP: "https://bsc-dataseed.bnbchain.org",
+    ALCHEMY_ROBINHOOD_HTTP: "https://robinhood-execution.example/rpc",
+    ALCHEMY_ROBINHOOD_MONITOR_HTTP: "https://robinhood-monitor.example/rpc",
     QUOTE_TOKEN_ALLOWLIST_BASE: "USDC:0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913,WETH:0x4200000000000000000000000000000000000006",
     QUOTE_TOKEN_ALLOWLIST_ROBINHOOD: "USDG:0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168,WETH:0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73,NVDA:0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC,SPY:0x117cc2133c37B721F49dE2A7a74833232B3B4C0C",
     QUOTE_TOKEN_ALLOWLIST_BSC: "USDT:0x55d398326f99059fF775485246999027B3197955,WBNB:0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c,BNB:0x0000000000000000000000000000000000000000",
@@ -55,9 +57,11 @@ describe("loadConfig", () => {
     expect(config.pnlIncludeGas).toBe(false);
     expect(config.trailingStopActivationPercent).toBe(5);
     expect(config.trailingStopDrawdownPercent).toBe(1.5);
+    expect(config.alchemyHttp.robinhood).toBe("https://robinhood-execution.example/rpc");
+    expect(config.alchemyMonitoringHttp.robinhood).toBe("https://robinhood-monitor.example/rpc");
     expect(config.trailingExitEstimateBufferPercent).toBe(10);
     expect(config.profitOorAboveThresholdPercent).toBe(3);
-    expect(config.slTwapGuardMaxWaitMs).toBe(15_000);
+    expect(config.slTwapGuardMaxWaitMs).toBe(5_000);
     expect(config.trailingTwapGuardMaxWaitMs).toBe(5_000);
     expect(config.positionMonitorIntervalMs).toBe(5_000);
     expect(config.twapWindowSeconds).toBe(60);

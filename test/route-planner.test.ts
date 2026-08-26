@@ -16,6 +16,7 @@ describe("V4 route quotes", () => {
     const chains = {
       getById: vi.fn(() => ({ client: { simulateContract }, registry: { name: "robinhood", contracts } })),
       getForScan: vi.fn(() => ({ client: { simulateContract }, registry: { name: "robinhood", contracts } })),
+      getForMonitoring: vi.fn(() => ({ client: { simulateContract }, registry: { name: "robinhood", contracts } })),
     };
     const planner = new RoutePlanner(chains as never, 100, { base: [], robinhood: [] });
     const position: PositionRecord = {
@@ -34,7 +35,7 @@ describe("V4 route quotes", () => {
       metadata: { currency0: zeroAddress, currency1: phood, fee: 10_000, tickSpacing: 200, hooks: zeroAddress },
     };
 
-    const route = await planner.quoteDirect(position, zeroAddress, 1_000n, phood);
+    const route = await planner.quoteDirect(position, zeroAddress, 1_000n, phood, { rpc: "monitoring" });
 
     expect(route).toMatchObject({
       protocol: "v4",
@@ -53,6 +54,8 @@ describe("V4 route quotes", () => {
         hookData: "0x",
       }],
     }));
+    expect(chains.getForMonitoring).toHaveBeenCalledWith("robinhood");
+    expect(chains.getForScan).not.toHaveBeenCalled();
   });
 
   it("retries a transient V4 quoter failure before rejecting the route", async () => {
@@ -94,7 +97,7 @@ describe("V4 route quotes", () => {
 });
 
 describe("V3 route quotes", () => {
-  it("caches factory pool lookups across repeated valuations", async () => {
+  it("caches repeated lookups without sharing in-flight scan work with monitoring", async () => {
     const readContract = vi.fn(async ({ functionName, args }: { functionName: string; args: readonly unknown[] }) => {
       if (functionName === "getPair") return zeroAddress;
       if (functionName === "getPool") return args[2] === 500 ? v3Pool : zeroAddress;
@@ -113,6 +116,16 @@ describe("V3 route quotes", () => {
         },
       })),
       getForScan: vi.fn(() => ({
+        client: { readContract, simulateContract },
+        registry: {
+          name: "robinhood",
+          contracts: {
+            v2: { factory: "0x0000000000000000000000000000000000000001", router: "0x0000000000000000000000000000000000000002" },
+            v3: { factory: "0x0000000000000000000000000000000000000003", quoter: "0x0000000000000000000000000000000000000004", swapRouter: "0x0000000000000000000000000000000000000005" },
+          },
+        },
+      })),
+      getForMonitoring: vi.fn(() => ({
         client: { readContract, simulateContract },
         registry: {
           name: "robinhood",
@@ -145,11 +158,12 @@ describe("V3 route quotes", () => {
       planner.quoteDirect(position, phood, 2_000n, usdg),
     ]);
     await planner.quoteDirect(position, phood, 3_000n, usdg);
+    await planner.quoteDirect(position, phood, 4_000n, usdg, { rpc: "monitoring" });
 
     const getPoolCalls = readContract.mock.calls.filter(([request]) => request.functionName === "getPool");
     const getPairCalls = readContract.mock.calls.filter(([request]) => request.functionName === "getPair");
-    expect(getPoolCalls).toHaveLength(5);
-    expect(getPairCalls).toHaveLength(1);
-    expect(simulateContract).toHaveBeenCalledTimes(3);
+    expect(getPoolCalls).toHaveLength(10);
+    expect(getPairCalls).toHaveLength(2);
+    expect(simulateContract).toHaveBeenCalledTimes(4);
   });
 });

@@ -72,7 +72,7 @@ export class PnlService {
     if (!position.quoteToken) throw new Error("Position has no eligible quote token");
     const quoteToken = position.quoteToken;
     const value = await withTimeout(
-      this.reader.read(position, blockNumber),
+      this.reader.read(position, blockNumber, undefined, "monitoring"),
       POSITION_READ_TIMEOUT_MS,
       "position read",
     );
@@ -173,7 +173,7 @@ export class PnlService {
     const children = childRows.map((child) => child.position!);
     if (children.length === 0) throw new Error("Position group has no active children to value");
 
-    const values = await Promise.all(children.map((position) => this.reader.read(position, blockNumber)));
+    const values = await Promise.all(children.map((position) => this.reader.read(position, blockNumber, undefined, "monitoring")));
     for (let index = 0; index < values.length; index += 1) {
       const value = values[index]!;
       const bin = childRows[index]!.bin;
@@ -368,7 +368,7 @@ export class PnlService {
 
     if (tokenIn.toLowerCase() === zeroAddress || tokenOut.toLowerCase() === zeroAddress) return null;
     const route = await withTimeout(
-      this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut),
+      this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut, { rpc: "monitoring" }),
       ROUTE_QUOTE_TIMEOUT_MS,
       "local route quote",
     );

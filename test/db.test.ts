@@ -145,16 +145,32 @@ describe("Database native USD backfill", () => {
 
   it("merges group status metadata and clears a pending signed transaction when requested", async () => {
     const database = new Database("postgres://unused");
-    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [] });
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ updated: true }] });
     Object.defineProperty(database, "pool", { value: { query } });
     const metadata = { pendingRawTransaction: null, settlementPhase: "accounting" };
 
-    await database.setPositionGroupStatus("group", "settling", metadata);
+    await expect(database.setPositionGroupStatus("group", "settling", metadata)).resolves.toBe(true);
 
     expect(query.mock.calls[0]![0]).toContain("metadata = metadata || $3::jsonb");
     expect(query.mock.calls[0]![0]).toContain("pending_raw_transaction = CASE");
     expect(query.mock.calls[0]![0]).toContain("AND NOT (status IN ('settled', 'cancelled') AND $2::text NOT IN ('settled', 'cancelled'))");
-    expect(query.mock.calls[0]![1]).toEqual(["group", "settling", JSON.stringify(metadata)]);
+    expect(query.mock.calls[0]![0]).toContain("AND ($4::text IS NULL OR status = $4::text)");
+    expect(query.mock.calls[0]![1]).toEqual(["group", "settling", JSON.stringify(metadata), null]);
+  });
+
+  it("atomically rejects a stale group update after its status changed", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ updated: false }] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.setPositionGroupStatus("group", "active", { slTwapWaitStartedAt: 123 }, "active")).resolves.toBe(false);
+
+    expect(query.mock.calls[0]![1]).toEqual([
+      "group",
+      "active",
+      JSON.stringify({ slTwapWaitStartedAt: 123 }),
+      "active",
+    ]);
   });
 
   it("keeps group finalization numeric parameters consistently typed", async () => {

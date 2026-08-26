@@ -20,7 +20,7 @@ const config: RuntimeConfig = {
   trailingStopDrawdownPercent: 1.5,
   trailingExitEstimateBufferPercent: 10,
   profitOorAboveThresholdPercent: 3,
-  slTwapGuardMaxWaitMs: 15_000,
+  slTwapGuardMaxWaitMs: 5_000,
   positionMonitorIntervalMs: 5_000,
   discoveryIntervalMs: 30_000,
   positionMonitorConcurrency: 2,
@@ -223,6 +223,7 @@ describe("fresh valuation quotes", () => {
 
     const valued = await pnl.value(position, 1n);
 
+    expect(reader.read).toHaveBeenCalledWith(position, 1n, undefined, "monitoring");
     expect(tradingApi.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg);
     expect(routes.quoteDirect).not.toHaveBeenCalled();
     expect(valued.snapshot.liquidationQuote).toBe(1_100_000n);
@@ -276,7 +277,7 @@ describe("fresh valuation quotes", () => {
     const valued = await pnl.valueLocal(position, 1n);
 
     expect(tradingApi.quote).not.toHaveBeenCalled();
-    expect(routes.quoteDirect).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg);
+    expect(routes.quoteDirect).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg, { rpc: "monitoring" });
     expect(valued.snapshot.liquidationQuote).toBe(1_100_000n);
   });
 

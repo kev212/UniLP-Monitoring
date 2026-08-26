@@ -15,12 +15,10 @@ import { quoteRangeState } from "./quote-range.js";
 const POSITION_EVALUATION_TIMEOUT_MS = 60_000;
 const TRAILING_HARD_FLOOR_DROP_BPS = 200n;
 const NEEDS_REVIEW_RETRY_BACKOFF_MS = 5 * 60_000;
-export const ROBINHOOD_RPC_BACKOFF_MS = 20_000;
 
 export class Guardian {
   private readonly lastEvaluatedBlock = new Map<number, bigint>();
   private readonly evaluatedAtBlock = new Map<string, bigint>();
-  private readonly rpcBackoffUntil = new Map<ChainName, number>();
   private exitQueue: Promise<void> = Promise.resolve();
   private readonly queuedExitPositions = new Set<string>();
   private monitorRunning = false;
@@ -165,11 +163,10 @@ export class Guardian {
   }
 
   private async evaluateChain(name: ChainName): Promise<void> {
-    if (this.isRpcBackedOff(name)) {
-      log.info({ chain: name }, "skipping monitor cycle during RPC backoff");
-      return;
-    }
-    const { client, registry } = this.chains.get(name);
+    const monitoringClients = this.chains as unknown as { getForMonitoring?: (chain: ChainName) => ReturnType<ChainClients["get"]> };
+    const { client, registry } = typeof monitoringClients.getForMonitoring === "function"
+      ? monitoringClients.getForMonitoring(name)
+      : this.chains.get(name);
     if (!registry.monitoringEnabled) return;
     const blockNumber = await client.getBlockNumber();
     if (this.lastEvaluatedBlock.get(registry.chain.id) === blockNumber) return;
@@ -185,19 +182,17 @@ export class Guardian {
     }
     const [groupResults, positionResults] = await Promise.all([
       mapWithConcurrency(groups, this.config.positionMonitorConcurrency, async (group) => {
-        if (this.isRpcBackedOff(name)) return false;
         const ok = await this.evaluatePositionGroupWithTimeout(name, group, blockNumber);
         if (ok) this.markEvaluated(`g:${group.id}`, blockNumber);
         return ok;
       }),
       mapWithConcurrency(positions, this.config.positionMonitorConcurrency, async (position) => {
-        if (this.isRpcBackedOff(name)) return false;
         const ok = await this.evaluatePositionWithTimeout(name, position, blockNumber);
         if (ok) this.markEvaluated(`p:${position.id}`, blockNumber);
         return ok;
       }),
     ]);
-    if (!this.isRpcBackedOff(name) && [...groupResults, ...positionResults].every(Boolean)) {
+    if ([...groupResults, ...positionResults].every(Boolean)) {
       this.lastEvaluatedBlock.set(registry.chain.id, blockNumber);
     }
   }
@@ -234,9 +229,9 @@ export class Guardian {
       };
       const trailing = this.pnl.evaluateTrailingStop(group.metadata, syntheticSnapshot);
       if (trailing.action === "reset") {
-        await this.database.setPositionGroupStatus(group.id, group.status, { trailingStop: null });
+        await this.database.setPositionGroupStatus(group.id, group.status, { trailingStop: null }, group.status);
       } else if (trailing.action === "activate" || trailing.action === "raise_peak") {
-        await this.database.setPositionGroupStatus(group.id, group.status, { trailingStop: trailing.state });
+        await this.database.setPositionGroupStatus(group.id, group.status, { trailingStop: trailing.state }, group.status);
         group = { ...group, metadata: { ...group.metadata, trailingStop: trailing.state } };
       }
 
@@ -264,7 +259,7 @@ export class Guardian {
             trailingTwapWaitStartedAt: null,
             profitTwapWaitStartedAt: null,
             ...(staleDynamicRetry ? { exitRetry: null, exitTrigger: null } : {}),
-          });
+          }, group.status);
         }
         return true;
       }
@@ -300,7 +295,7 @@ export class Guardian {
           const localSnapshot = await this.validateGroupStopLossWithLocalQuote(group, blockNumber, valued.snapshot);
           if (!localSnapshot) {
             if (pendingRetry?.reason === "stop_loss") {
-              await this.database.setPositionGroupStatus(group.id, group.status, { exitRetry: null, exitTrigger: null, slTwapWaitStartedAt: null });
+              await this.database.setPositionGroupStatus(group.id, group.status, { exitRetry: null, exitTrigger: null, slTwapWaitStartedAt: null }, group.status);
             }
             return true;
           }
@@ -326,7 +321,7 @@ export class Guardian {
           : group;
         if (!(await this.allowGroupAfterTwapWait(slGroup, "stop_loss", valued.twapGuard.deviationBps))) return true;
       }
-      await this.database.setPositionGroupStatus(group.id, group.status, {
+      const stillActive = await this.database.setPositionGroupStatus(group.id, group.status, {
         exitTrigger: trigger,
         exitSnapshot: {
           pnlBps: exitSnapshot.pnlBps.toString(),
@@ -336,13 +331,17 @@ export class Guardian {
         slTwapWaitStartedAt: null,
         trailingTwapWaitStartedAt: null,
         profitTwapWaitStartedAt: null,
-      });
+      }, group.status);
+      if (stillActive === false) {
+        log.info({ groupId: group.id, trigger }, "position group changed status during evaluation; skipping stale exit");
+        return true;
+      }
       log.warn({ groupId: group.id, chain: name, trigger, pnlBps: exitSnapshot.pnlBps, quoteIsToken0 }, "position group exit triggered");
       await this.executor.executeRelatedGroup(group.id, trigger);
       return true;
     } catch (error) {
       if (isRpcRateLimited(error)) {
-        this.noteRpcRateLimit(name);
+        log.warn({ err: error, chain: name, groupId: group.id }, "position group RPC limited; retrying next monitor cycle");
         return false;
       }
       if (error instanceof Error && error.message.includes("cost basis")) {
@@ -356,7 +355,7 @@ export class Guardian {
           reason: "position_group_child_integrity_changed",
           correlationError: reason,
           settlementRetryDisabled: true,
-        });
+        }, group.status);
         return true;
       }
       log.warn({ err: error, groupId: group.id }, "could not value position group");
@@ -551,7 +550,7 @@ export class Guardian {
       }
     } catch (error) {
       if (isRpcRateLimited(error)) {
-        this.noteRpcRateLimit(name);
+        log.warn({ err: error, chain: name, positionId: position.id, positionKey: position.positionKey }, "position RPC limited; retrying next monitor cycle");
         return false;
       }
       const message = error instanceof Error ? error.message : String(error);
@@ -761,7 +760,8 @@ export class Guardian {
     if (maxWaitMs === 0) return true;
     const startedAt = typeof group.metadata[key] === "number" ? group.metadata[key] as number : null;
     if (startedAt === null) {
-      await this.database.setPositionGroupStatus(group.id, group.status, { [key]: Date.now() });
+      const stillActive = await this.database.setPositionGroupStatus(group.id, group.status, { [key]: Date.now() }, group.status);
+      if (stillActive === false) return false;
       log.warn({ groupId: group.id, trigger, deviationBps }, "position group trigger reached but TWAP not ready; starting guard wait");
       return false;
     }
@@ -780,7 +780,7 @@ export class Guardian {
       await this.database.setPositionGroupStatus(group.id, "needs_review", {
         reason: "trailing_exit_state_missing",
         settlementRetryDisabled: true,
-      });
+      }, group.status);
       return null;
     }
     const estimate = await this.pnl.valueGroupExitEstimate(group, blockNumber, this.config.settlementSwapSlippageBps);
@@ -852,15 +852,6 @@ export class Guardian {
     } finally {
       this.queuedExitPositions.delete(position.id);
     }
-  }
-
-  private noteRpcRateLimit(name: ChainName): void {
-    this.rpcBackoffUntil.set(name, Date.now() + ROBINHOOD_RPC_BACKOFF_MS);
-    log.warn({ chain: name, backoffMs: ROBINHOOD_RPC_BACKOFF_MS }, "RPC rate limited; backing off monitor cycle");
-  }
-
-  private isRpcBackedOff(name: ChainName): boolean {
-    return (this.rpcBackoffUntil.get(name) ?? 0) > Date.now();
   }
 
   private alreadyEvaluated(key: string, blockNumber: bigint): boolean {
@@ -958,7 +949,7 @@ export class Guardian {
         oorAboveSeenAt: Date.now(),
         oorAboveDistanceBps: Number(state.aboveDistanceBps),
         oorStatus: state.status,
-      });
+      }, group.status);
       return null;
     }
     if (!active && typeof meta.oorAboveSeenAt === "number") {
@@ -966,7 +957,7 @@ export class Guardian {
         oorAboveSeenAt: null,
         oorAboveDistanceBps: null,
         oorStatus: state.status,
-      });
+      }, group.status);
       return null;
     }
     const seenAt = meta.oorAboveSeenAt;
@@ -1014,14 +1005,14 @@ export class Guardian {
       await this.database.setPositionGroupStatus(group.id, group.status, {
         profitOorAboveSeenAt: Date.now(),
         profitOorAbovePnlBps: Number(pnlBps),
-      });
+      }, group.status);
       return null;
     }
     if (!active && typeof meta.profitOorAboveSeenAt === "number") {
       await this.database.setPositionGroupStatus(group.id, group.status, {
         profitOorAboveSeenAt: null,
         profitOorAbovePnlBps: null,
-      });
+      }, group.status);
       return null;
     }
     const seenAt = meta.profitOorAboveSeenAt;
