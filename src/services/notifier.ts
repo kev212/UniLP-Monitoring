@@ -1035,7 +1035,8 @@ export class Notifier {
     const feeUsdg = snapshot.feeQuoteUsdg ?? 0n;
     const sign = snapshot.pnlBps >= 0n ? "+" : "";
     const arrow = snapshot.pnlBps > 0n ? "📈" : snapshot.pnlBps < 0n ? "📉" : "➖";
-    const valueLine = `   💰 ${value} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${arrow} ${sign}${formatBps(snapshot.pnlBps)}%`;
+    const trailingPeak = trailingPeakDisplay(position.metadata);
+    const valueLine = `   💰 ${value} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${arrow} ${sign}${formatBps(snapshot.pnlBps)}%${trailingPeak}`;
     const rangeLine = await this.formatGroupPositionRange(position, snapshot, bins);
     return `${base}\n${valueLine}${rangeLine}\n`;
   }
@@ -2881,7 +2882,7 @@ function pnlEmoji(pnlBps: bigint): string {
   return "➖";
 }
 
-function trailingPeakDisplay(metadata: Record<string, unknown>): string {
+export function trailingPeakDisplay(metadata: Record<string, unknown>): string {
   const raw = metadata.trailingStop;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return "";
   const peak = (raw as Record<string, unknown>).peakPnlBps;

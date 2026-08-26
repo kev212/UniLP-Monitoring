@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { PositionOpener } from "../src/services/position-opener.js";
-import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isDashboardVisibleGroup, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanPoolsInput, parseScanV2Input, positionRangeBins, positionRangeLine } from "../src/services/notifier.js";
+import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isDashboardVisibleGroup, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanPoolsInput, parseScanV2Input, positionRangeBins, positionRangeLine, trailingPeakDisplay } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -318,5 +318,10 @@ describe("dashboard group visibility", () => {
     expect(isDashboardVisibleGroup(group("settled"))).toBe(false);
     expect(isDashboardVisibleGroup(group("cancelled"))).toBe(false);
     expect(isDashboardVisibleGroup(group("active", "complete"))).toBe(false);
+  });
+
+  it("formats Bid-Ask trailing peak from group metadata", () => {
+    expect(trailingPeakDisplay({})).toBe("");
+    expect(trailingPeakDisplay({ trailingStop: { peakPnlBps: "687" } })).toBe(" | 🎯 Peak 6.87%");
   });
 });
