@@ -216,6 +216,34 @@ describe("RPC failover transport", () => {
     expect(urls.some((url) => url.includes("blockmachine.io"))).toBe(false);
   });
 
+  it("uses Alchemy, then BlockMachine, then public RPC for Robinhood execution", async () => {
+    const urls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes("alchemy.example")) return new Response("rate limited", { status: 429 });
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x1237" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const clients = new ChainClients({
+      chains: ["robinhood"],
+      alchemyHttp: { base: undefined, robinhood: "https://alchemy.example/rpc", bsc: undefined },
+      rpcHttp: { base: "https://base.example/rpc", robinhood: "https://public.example/rpc", bsc: "https://bsc.example/rpc" },
+      rpcHttpFallback: { robinhood: "https://public-fallback.example/rpc" },
+      rpcHttpScanFallback: { robinhood: "https://rpc-robinhood.blockmachine.io" },
+    } as RuntimeConfig);
+
+    await expect(clients.getForExecution("robinhood").client.getChainId()).resolves.toBe(4663);
+    expect(urls).toEqual([
+      "https://alchemy.example/rpc",
+      "https://rpc-robinhood.blockmachine.io/",
+    ]);
+  });
+
   it("never sends Robinhood reads to Alchemy after public RPCs fail", async () => {
     const urls: string[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -238,6 +266,35 @@ describe("RPC failover transport", () => {
 
     expect(urls.some((url) => url.includes("alchemy.example"))).toBe(false);
     expect(urls.some((url) => url.includes("public.example"))).toBe(true);
+    expect(urls.some((url) => url.includes("blockmachine.io"))).toBe(true);
+  });
+
+  it("falls back Robinhood normal reads to BlockMachine when the public RPC returns 429", async () => {
+    const urls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      if (String(input).includes("public.example")) return new Response("rate limited", { status: 429 });
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x1237" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const clients = new ChainClients({
+      chains: ["robinhood"],
+      alchemyHttp: { base: undefined, robinhood: "https://alchemy.example/rpc", bsc: undefined },
+      rpcHttp: { base: "https://base.example/rpc", robinhood: "https://public.example/rpc", bsc: "https://bsc.example/rpc" },
+      rpcHttpFallback: { robinhood: "https://public.example/rpc" },
+      rpcHttpScanFallback: { robinhood: "https://rpc-robinhood.blockmachine.io" },
+    } as RuntimeConfig);
+
+    await expect(clients.get("robinhood").client.getChainId()).resolves.toBe(4663);
+    expect(urls).toEqual([
+      "https://public.example/rpc",
+      "https://rpc-robinhood.blockmachine.io/",
+    ]);
+    expect(urls.some((url) => url.includes("alchemy.example"))).toBe(false);
   });
 
   it("limits Robinhood execution concurrency separately from reads", async () => {

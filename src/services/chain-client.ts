@@ -85,6 +85,7 @@ export class ChainClients {
       const executionLimiter = name === "robinhood" ? new AsyncLimiter(ROBINHOOD_EXECUTION_CONCURRENCY) : undefined;
       const publicEndpoints = uniqueUrls([
         config.rpcHttp[name],
+        config.rpcHttpScanFallback?.[name],
         config.rpcHttpFallback[name],
       ]);
       const alchemyLastResort = name !== "base" && name !== "robinhood" && config.alchemyHttp[name]
@@ -151,7 +152,9 @@ export class ChainClients {
       }
       const executionTransport = createRpcTransport(uniqueUrls([
         config.alchemyHttp[name],
-        ...publicEndpoints,
+        config.rpcHttpScanFallback?.[name],
+        config.rpcHttp[name],
+        config.rpcHttpFallback[name],
       ]), executionLimiter);
       this.executionClients.set(name, {
         registry,

@@ -51,6 +51,7 @@ function poolOpener(
   const chains = {
     get: vi.fn(() => ({ registry: chainRegistry.robinhood, client })),
     getForScan: vi.fn(() => ({ registry: chainRegistry.robinhood, client })),
+    getForExecution: vi.fn(() => ({ registry: chainRegistry.robinhood, client, transport: {} })),
   };
   const config = {
     quoteTokens: { robinhood: quoteTokens },
@@ -63,6 +64,7 @@ function poolOpener(
     opener: new PositionOpener(config as never, chains as never),
     pool: protocol === "v3" ? v3PoolAddress as Hex : poolId,
     client,
+    chains,
   };
 }
 
@@ -255,6 +257,14 @@ describe("SDK single-side liquidity", () => {
 });
 
 describe("Bid-Ask NVDA opening", () => {
+  it("uses the execution client for Bid-Ask pool reads", async () => {
+    const { opener, pool, chains } = poolOpener("v4");
+
+    await opener.prepareBidAskOpen(pool, "robinhood", 30, 3n * 10n ** 18n, { symbol: "NVDA", address: nvdaAddress }, 3);
+
+    expect(chains.getForExecution).toHaveBeenCalled();
+  });
+
   it("cancels a Bid-Ask group when its confirmed open receipt reverted", async () => {
     const database = {
       hasPendingRawTransaction: vi.fn().mockResolvedValue(false),

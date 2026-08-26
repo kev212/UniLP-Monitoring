@@ -225,7 +225,7 @@ export class PositionOpener {
   }
 
   private client(chain: ChainName): PublicClient {
-    return this.chains.getForScan(chain).client;
+    return this.chains.getForExecution(chain).client;
   }
 
   private executionClient(chain: ChainName): PublicClient {
