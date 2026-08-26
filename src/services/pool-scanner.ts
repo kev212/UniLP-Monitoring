@@ -248,7 +248,7 @@ export class PoolScanner {
 
     const dexTvlMap = await this.buildDexScreenerTvlMap(normalized, chain);
     const scored = (await mapWithConcurrency(pools, TOKEN_SCAN_VERIFY_CONCURRENCY, (raw) =>
-      this.toScoredPool(raw, normalized, true, chain, dexTvlMap),
+      this.toScoredPool(raw, normalized, true, chain, dexTvlMap, "execution"),
     )).filter((pool): pool is ScoredPool => pool !== null);
     const result = rankPools(scored);
     log.info({ token: normalized, rawPools: pools.length, scoredPools: scored.length, active: result.active.length, watchlist: result.watchlist.length, durationMs: Date.now() - startedAt }, "token pool scan completed");
@@ -531,7 +531,7 @@ export class PoolScanner {
     return map;
   }
 
-  private async toScoredPool(raw: GeckoPool, token: string, requireMinimumVolume6h: boolean, chain: ChainName, dexScreenerTvls?: Map<string, number>): Promise<ScoredPool | null> {
+  private async toScoredPool(raw: GeckoPool, token: string, requireMinimumVolume6h: boolean, chain: ChainName, dexScreenerTvls?: Map<string, number>, rpc: "scan" | "execution" = "scan"): Promise<ScoredPool | null> {
     const dexId = raw.relationships.dex.data.id;
     const protocol = dexId.startsWith("uniswap-v4") ? "v4" : "v3";
     const poolAddress = raw.attributes.address;
@@ -550,7 +550,7 @@ export class PoolScanner {
     const volume24hUsd = Number(raw.attributes.volume_usd?.h24 || "0");
     const stale = volume24hUsd > 0 && volume6hUsd <= 0;
 
-    const verified = await this.verifyPool(protocol, poolAddress as Address, token, chain);
+    const verified = await this.verifyPool(protocol, poolAddress as Address, token, chain, rpc);
     if (!verified) return null;
 
     let feeTier = verified.feeTier ?? 0;
@@ -697,13 +697,18 @@ export class PoolScanner {
     poolAddress: Address,
     searchToken: string,
     chain: ChainName,
+    rpc: "scan" | "execution" = "scan",
   ): Promise<VerifiedPool | null> {
-    if (protocol === "v3") return this.verifyV3Pool(poolAddress, searchToken, chain);
-    return this.verifyV4Pool(poolAddress, searchToken, chain);
+    if (protocol === "v3") return this.verifyV3Pool(poolAddress, searchToken, chain, rpc);
+    return this.verifyV4Pool(poolAddress, searchToken, chain, rpc);
   }
 
-  private async matchV3Factory(chain: ChainName, pool: Address, token0: Address, token1: Address, fee: number): Promise<DexName | null> {
-    const { client, registry } = this.chains.getForScan(chain);
+  private rpcClient(chain: ChainName, rpc: "scan" | "execution" = "scan") {
+    return rpc === "execution" ? this.chains.getForExecution(chain) : this.chains.getForScan(chain);
+  }
+
+  private async matchV3Factory(chain: ChainName, pool: Address, token0: Address, token1: Address, fee: number, rpc: "scan" | "execution" = "scan"): Promise<DexName | null> {
+    const { client, registry } = this.rpcClient(chain, rpc);
     for (const deployment of v3Deployments(registry)) {
       try {
         const factoryPool = await client.readContract({
@@ -722,8 +727,8 @@ export class PoolScanner {
     return null;
   }
 
-  async verifyV3Pool(pool: Address, searchToken: string, chain: ChainName): Promise<VerifiedPool | null> {
-    const { client } = this.chains.getForScan(chain);
+  async verifyV3Pool(pool: Address, searchToken: string, chain: ChainName, rpc: "scan" | "execution" = "scan"): Promise<VerifiedPool | null> {
+    const { client } = this.rpcClient(chain, rpc);
     try {
       const [token0, token1, fee, liquidity] = await Promise.all([
         client.readContract({
@@ -748,7 +753,7 @@ export class PoolScanner {
       const t1 = (token1 as string).toLowerCase();
       if (t0 !== searchToken && t1 !== searchToken) return null;
 
-      const matched = await this.matchV3Factory(chain, pool, token0 as Address, token1 as Address, Number(fee));
+      const matched = await this.matchV3Factory(chain, pool, token0 as Address, token1 as Address, Number(fee), rpc);
       if (!matched) return null;
 
       return { feeTier: Number(fee), activeLiquidity: liquidity > 0n, dex: matched };
@@ -761,10 +766,11 @@ export class PoolScanner {
     poolId: Address,
     searchToken: string,
     chain: ChainName,
+    rpc: "scan" | "execution" = "scan",
   ): Promise<VerifiedPool | null> {
     if (!isHex(poolId) || poolId.length !== 66) return null;
 
-    const { client, registry } = this.chains.getForScan(chain);
+    const { client, registry } = this.rpcClient(chain, rpc);
     const { stateView, positionManager } = registry.contracts.v4;
 
     try {

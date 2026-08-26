@@ -363,3 +363,25 @@ describe("investigate Gecko fallback", () => {
     expect(result.dexScreenerFound).toBe(true);
   });
 });
+
+describe("token scan RPC", () => {
+  it("verifies /scan pools on execution RPC and leaves default verifies on scan RPC", async () => {
+    const getForExecution = vi.fn(() => ({ client: { readContract: vi.fn() }, registry: { contracts: { v4: {} } } }));
+    const getForScan = vi.fn(() => ({ client: { readContract: vi.fn() }, registry: { contracts: { v4: {} } } }));
+    const scanner = new PoolScanner({ getForExecution, getForScan } as never, {} as never, 0);
+    vi.spyOn(scanner as never as { fetchUniswapPools: () => Promise<unknown[]> }, "fetchUniswapPools").mockResolvedValue([{
+      attributes: { address: "0x0000000000000000000000000000000000000002", reserve_in_usd: "1000", volume_usd: { h6: "200", h24: "200" } },
+      relationships: { dex: { data: { id: "uniswap_v3" } } },
+    }]);
+    vi.spyOn(scanner as never as { buildDexScreenerTvlMap: () => Promise<Map<string, number>> }, "buildDexScreenerTvlMap").mockResolvedValue(new Map());
+    const verify = vi.spyOn(scanner, "verifyPool").mockResolvedValue(null);
+
+    await scanner.scan("0x0000000000000000000000000000000000000001");
+    expect(verify).toHaveBeenCalledWith("v3", "0x0000000000000000000000000000000000000002", "0x0000000000000000000000000000000000000001", "robinhood", "execution");
+
+    verify.mockRestore();
+    await scanner.verifyPool("v3", "0x0000000000000000000000000000000000000002", "0x0000000000000000000000000000000000000001", "robinhood");
+    expect(getForScan).toHaveBeenCalled();
+    expect(getForExecution).not.toHaveBeenCalled();
+  });
+});
