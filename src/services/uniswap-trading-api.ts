@@ -7,6 +7,8 @@ const UNIVERSAL_ROUTER_VERSION = "2.1.1";
 export const UNISWAP_API_ROUTER = "0x02E5be68D46DAc0B524905bfF209cf47EE6dB2a9" as Address;
 const QUOTE_VALIDITY_MS = 10_000;
 const QUOTE_RATE_LIMIT_COOLDOWN_MS = 60_000;
+const QUOTE_BUDGET_WINDOW_MS = 60_000;
+const QUOTE_BUDGET_PER_MINUTE = 20;
 const TRADING_API_UNIVERSAL_ROUTERS: Readonly<Record<number, Address>> = {
   56: "0x8b844f885672f333bc0042cb669255f93a4c1e6b",
   4663: "0x8876789976decbfcbbbe364623c63652db8c0904",
@@ -40,17 +42,44 @@ interface TradingApiTransaction {
 
 export class UniswapTradingApi {
   private quoteRateLimitedUntil = 0;
+  private readonly pairRateLimitedUntil = new Map<string, number>();
+  private readonly inFlight = new Map<string, Promise<TradingApiQuote | null>>();
+  private readonly budgetedCalls: number[] = [];
 
   constructor(
     private readonly apiKey: string,
     private readonly slippageBps: number,
     private readonly request: typeof fetch = globalThis.fetch,
     private readonly timeoutMs = 2_500,
+    private readonly budgetPerMinute = QUOTE_BUDGET_PER_MINUTE,
   ) {}
 
-  async quote(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address, slippageBps = this.slippageBps): Promise<TradingApiQuote | null> {
+  async quote(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address, slippageBps = this.slippageBps, opts?: { budget?: boolean }): Promise<TradingApiQuote | null> {
     if (!Number.isSafeInteger(slippageBps) || slippageBps < 1 || slippageBps > 2_000) throw new Error("Trading API slippage must be between 1 and 2000 bps");
     if (Date.now() < this.quoteRateLimitedUntil) return null;
+    const pairKey = `${position.chainId}:${tokenIn.toLowerCase()}:${tokenOut.toLowerCase()}`;
+    if ((this.pairRateLimitedUntil.get(pairKey) ?? 0) > Date.now()) return null;
+    const budgeted = opts?.budget === true;
+    if (budgeted && this.budgetExhausted()) return null;
+    const requestKey = `${pairKey}:${amountIn}:${slippageBps}`;
+    const existing = this.inFlight.get(requestKey);
+    if (existing) return existing;
+    const pending = this.quoteUncached(position, tokenIn, amountIn, tokenOut, slippageBps, pairKey, budgeted)
+      .finally(() => this.inFlight.delete(requestKey));
+    this.inFlight.set(requestKey, pending);
+    return pending;
+  }
+
+  private async quoteUncached(
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    slippageBps: number,
+    pairKey: string,
+    budgeted: boolean,
+  ): Promise<TradingApiQuote | null> {
+    if (budgeted) this.budgetedCalls.push(Date.now());
     let response: Json | null;
     try {
       response = await this.post("/quote", {
@@ -68,6 +97,7 @@ export class UniswapTradingApi {
     } catch (error) {
       if (error instanceof Error && error.message.includes("failed (429)")) {
         this.quoteRateLimitedUntil = Date.now() + QUOTE_RATE_LIMIT_COOLDOWN_MS;
+        this.pairRateLimitedUntil.set(pairKey, Date.now() + QUOTE_RATE_LIMIT_COOLDOWN_MS * 2);
       }
       throw error;
     }
@@ -109,6 +139,12 @@ export class UniswapTradingApi {
       slippageBps,
       validUntilMs: Date.now() + QUOTE_VALIDITY_MS,
     };
+  }
+
+  private budgetExhausted(): boolean {
+    const now = Date.now();
+    while (this.budgetedCalls.length > 0 && this.budgetedCalls[0]! < now - QUOTE_BUDGET_WINDOW_MS) this.budgetedCalls.shift();
+    return this.budgetedCalls.length >= this.budgetPerMinute;
   }
 
   async approval(position: PositionRecord, token: Address, amount: bigint): Promise<TradingApiTransaction | null> {

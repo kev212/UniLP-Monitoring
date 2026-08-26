@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { encodeAbiParameters, keccak256 } from "viem";
 
 import type { PositionRecord } from "../src/types.js";
 import { PositionReader } from "../src/services/position-reader.js";
@@ -171,5 +172,122 @@ describe("PositionReader block consistency", () => {
 
     expect(calls.filter((name) => name === "getSlot0")).toHaveLength(1);
     expect(calls.filter((name) => name === "getPositionInfo")).toHaveLength(2);
+  });
+
+  it("batches V4 group children into one pinned Multicall with shared slot0", async () => {
+    const hooks = "0x0000000000000000000000000000000000000000" as const;
+    const manager = "0x0000000000000000000000000000000000000006" as const;
+    const stateView = "0x0000000000000000000000000000000000000007" as const;
+    const poolId = keccak256(encodeAbiParameters(
+      [{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }],
+      [token0, token1, 3000, 60, hooks],
+    ));
+    const multicallCalls: Array<{ functionName: string; blockNumber?: bigint }> = [];
+    const client = {
+      multicall: async (request: { contracts: Array<{ functionName: string }>; blockNumber?: bigint }) => {
+        for (const contract of request.contracts) multicallCalls.push({ functionName: contract.functionName, blockNumber: request.blockNumber });
+        return [
+          [1n << 96n, 0, 0, 0],
+          [0n, 0n],
+          [0n, 0n],
+          [100n, 0n, 0n],
+          [100n, 0n, 0n],
+        ];
+      },
+    };
+    const chains = {
+      getById: () => ({ registry: { name: "robinhood", contracts: { v4: { stateView, positionManager: manager } } }, client }),
+      getForMonitoring: () => ({ client }),
+      getForScan: () => ({ client }),
+    } as never;
+    const reader = new PositionReader(chains, 100);
+    const baseMetadata = {
+      currency0: token0, currency1: token1, fee: 3000, tickSpacing: 60, hooks,
+      tickLower: -60, tickUpper: 0,
+    };
+    const group = {
+      id: "group", chainId: 4663, protocol: "v4", positionManager: manager,
+      poolKey: poolId, token0, token1, quoteToken: token0,
+    } as never;
+    const first: PositionRecord = {
+      id: "bin-a", chainId: 4663, protocol: "v4", positionKey: "1", owner,
+      poolAddress: null, token0, token1, quoteToken: token0, status: "armed",
+      liquidity: 100n, openedAtBlock: 1n, metadata: baseMetadata,
+    };
+    const second: PositionRecord = {
+      ...first, id: "bin-b", positionKey: "2",
+      metadata: { ...baseMetadata, tickLower: 0, tickUpper: 60 },
+    };
+
+    const values = await reader.readGroup(group, [first, second], 777n, undefined, "monitoring");
+
+    expect(values).toHaveLength(2);
+    expect(values.every((value) => value.observedBlock === 777n)).toBe(true);
+    expect(values[0]!.range!.tickLower).toBe(-60);
+    expect(values[1]!.range!.tickUpper).toBe(60);
+    expect(multicallCalls).toHaveLength(5);
+    expect(multicallCalls.filter((call) => call.functionName === "getSlot0")).toHaveLength(1);
+    expect(multicallCalls.filter((call) => call.functionName === "getPositionInfo")).toHaveLength(2);
+    expect(multicallCalls.every((call) => call.blockNumber === 777n)).toBe(true);
+  });
+
+  it("deduplicates shared V3 pool state and tick boundaries across group children", async () => {
+    const manager = "0x0000000000000000000000000000000000000006" as const;
+    const factory = "0x0000000000000000000000000000000000000007" as const;
+    const pool = "0x0000000000000000000000000000000000000008" as const;
+    const multicallCalls: Array<{ functionName: string; blockNumber?: bigint }> = [];
+    const client = {
+      multicall: async (request: { contracts: Array<{ functionName: string }>; blockNumber?: bigint }) => {
+        for (const contract of request.contracts) multicallCalls.push({ functionName: contract.functionName, blockNumber: request.blockNumber });
+        return [
+          [0n, owner, token0, token1, 3000, -60, 0, 100n, 0n, 0n, 0n, 0n],
+          [0n, owner, token0, token1, 3000, 0, 60, 100n, 0n, 0n, 0n, 0n],
+          pool,
+          [1n << 96n, 0],
+          0n,
+          0n,
+          [0n, 0n, 0n, 0n],
+          [0n, 0n, 0n, 0n],
+          [0n, 0n, 0n, 0n],
+        ];
+      },
+    };
+    const chains = {
+      getById: () => ({
+        registry: {
+          name: "base",
+          contracts: { v3: { positionManager: manager, factory } },
+        },
+        client,
+      }),
+      getForMonitoring: () => ({ client }),
+      getForScan: () => ({ client }),
+    } as never;
+    const reader = new PositionReader(chains, 100);
+    const group = {
+      id: "group", chainId: 8453, protocol: "v3", positionManager: manager,
+      poolKey: pool, token0, token1, quoteToken: token0,
+      metadata: { dex: "uniswap" },
+    } as never;
+    const base = {
+      id: "bin-a", chainId: 8453, protocol: "v3", positionKey: "1", owner,
+      poolAddress: pool, token0, token1, quoteToken: token0, status: "armed",
+      liquidity: 100n, openedAtBlock: 1n, metadata: { fee: 3000, tickLower: -60, tickUpper: 0 },
+    } as PositionRecord;
+    const second = {
+      ...base, id: "bin-b", positionKey: "2",
+      metadata: { fee: 3000, tickLower: 0, tickUpper: 60 },
+    } as PositionRecord;
+
+    const values = await reader.readGroup(group, [base, second], 777n, undefined, "monitoring");
+
+    expect(values).toHaveLength(2);
+    expect(values.every((value) => value.observedBlock === 777n)).toBe(true);
+    expect(multicallCalls).toHaveLength(9);
+    expect(multicallCalls.filter((call) => call.functionName === "positions")).toHaveLength(2);
+    expect(multicallCalls.filter((call) => call.functionName === "slot0")).toHaveLength(1);
+    expect(multicallCalls.filter((call) => call.functionName === "feeGrowthGlobal0X128")).toHaveLength(1);
+    expect(multicallCalls.filter((call) => call.functionName === "ticks")).toHaveLength(3);
+    expect(multicallCalls.every((call) => call.blockNumber === 777n)).toBe(true);
   });
 });

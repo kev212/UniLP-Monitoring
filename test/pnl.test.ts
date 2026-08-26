@@ -147,7 +147,7 @@ describe("fresh valuation quotes", () => {
     vi.useFakeTimers();
     try {
       const reader = { read: vi.fn(() => new Promise(() => {})) };
-      const pnl = new PnlService({} as never, reader as never, {} as never, config);
+      const pnl = new PnlService({ getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 1n, realized: 0n }) } as never, reader as never, {} as never, config);
       const position = {
         id: "position",
         chainId: 8453,
@@ -215,16 +215,20 @@ describe("fresh valuation quotes", () => {
         observedBlock: 1n,
       }),
     };
-    const routes = { quoteDirect: vi.fn() };
+    const routes = {
+      quoteSourcePool: vi.fn().mockResolvedValue({ expectedOut: 90_000n, minimumOut: 89_000n, path: [token, usdg] }),
+      quoteDirect: vi.fn(),
+    };
     const tradingApi = {
       quote: vi.fn().mockResolvedValue({ expectedOut: 100_000n, minimumOut: 99_000n }),
     };
     const pnl = new PnlService(database as never, reader as never, routes as never, config, tradingApi as never);
 
-    const valued = await pnl.value(position, 1n);
+    const valued = await pnl.valueExactProbe(position, 1n);
 
     expect(reader.read).toHaveBeenCalledWith(position, 1n, undefined, "monitoring");
-    expect(tradingApi.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg);
+    expect(tradingApi.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg, 100, { budget: true });
+    expect(routes.quoteSourcePool).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg, expect.objectContaining({ rpc: "monitoring", blockNumber: 1n }));
     expect(routes.quoteDirect).not.toHaveBeenCalled();
     expect(valued.snapshot.liquidationQuote).toBe(1_100_000n);
   });
@@ -277,7 +281,7 @@ describe("fresh valuation quotes", () => {
     const valued = await pnl.valueLocal(position, 1n);
 
     expect(tradingApi.quote).not.toHaveBeenCalled();
-    expect(routes.quoteDirect).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg, { rpc: "monitoring" });
+    expect(routes.quoteDirect).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg, { rpc: "monitoring", blockNumber: 1n });
     expect(valued.snapshot.liquidationQuote).toBe(1_100_000n);
   });
 
@@ -409,14 +413,66 @@ describe("fresh valuation quotes", () => {
         minAmount0: 0n, minAmount1: 0n, unclaimedFees0: 0n, unclaimedFees1: 0n, observedBlock: 1n,
       }),
     };
-    const routes = { quoteDirect: vi.fn() };
+    const routes = {
+      quoteSourcePool: vi.fn().mockResolvedValue(null),
+      quoteDirect: vi.fn(),
+    };
     const tradingApi = { quote: vi.fn().mockResolvedValue({ expectedOut: 2n * 10n ** 18n, minimumOut: 0n }) };
     const pnl = new PnlService(database as never, reader as never, routes as never, config, tradingApi as never);
 
-    await pnl.value(position, 1n);
+    await pnl.valueExactProbe(position, 1n);
 
-    expect(tradingApi.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, zeroAddress);
+    expect(tradingApi.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, zeroAddress, 100, { budget: true });
     expect(routes.quoteDirect).not.toHaveBeenCalled();
+  });
+
+  it("keeps the baseline direct-pool quote separate from the budgeted exact probe", async () => {
+    const stable = "0x0000000000000000000000000000000000000001" as Address;
+    const token = "0x0000000000000000000000000000000000000002" as Address;
+    const position = {
+      id: "position",
+      chainId: 8453,
+      protocol: "v4",
+      positionKey: "1",
+      owner: "0x0000000000000000000000000000000000000003" as Address,
+      poolAddress: null,
+      token0: stable,
+      token1: token,
+      quoteToken: stable,
+      status: "armed",
+      liquidity: 1n,
+      openedAtBlock: 1n,
+      metadata: {},
+    } as const;
+    const database = {
+      recordPositionObservation: vi.fn(),
+      getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 1_000_000n, realized: 0n }),
+      getPoolObservationsForTwap: vi.fn().mockResolvedValue([]),
+      recordPoolObservation: vi.fn(),
+    };
+    const reader = {
+      read: vi.fn().mockResolvedValue({
+        protocol: "v4", poolKey: "pool", sourcePool: null,
+        token0: { token: stable, amount: 1_000_000n },
+        token1: { token, amount: 10n ** 18n }, liquidity: 1n, priceMarker: 1n,
+        minAmount0: 0n, minAmount1: 0n, unclaimedFees0: 0n, unclaimedFees1: 0n, observedBlock: 1n,
+      }),
+    };
+    const routes = {
+      quoteSourcePool: vi.fn().mockResolvedValue({ expectedOut: 90_000n, minimumOut: 89_000n, path: [token, stable] }),
+      quoteDirect: vi.fn(),
+    };
+    const tradingApi = { quote: vi.fn().mockResolvedValue({ expectedOut: 100_000n, minimumOut: 99_000n }) };
+    const pnl = new PnlService(database as never, reader as never, routes as never, config, tradingApi as never);
+
+    const baseline = await pnl.value(position, 1n);
+    const probe = await pnl.valueExactProbe(position, 1n);
+
+    expect(tradingApi.quote).toHaveBeenCalledTimes(1);
+    expect(tradingApi.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, stable, 100, { budget: true });
+    expect(reader.read).toHaveBeenCalledTimes(1);
+    expect(baseline.snapshot.liquidationQuote).toBe(1_090_000n);
+    expect(probe.snapshot.liquidationQuote).toBe(1_100_000n);
   });
 });
 
@@ -463,6 +519,7 @@ describe("rolling TWAP guard", () => {
       }),
     };
     const routes = {
+      quoteSourcePool: vi.fn().mockResolvedValue({ expectedOut: 100n, minimumOut: 99n, path: [token, stable] }),
       quoteDirect: vi.fn().mockResolvedValue({ expectedOut: 100n, path: [token, stable] }),
     };
     return {
@@ -610,7 +667,7 @@ describe("position group valuation fees", () => {
       recordPoolObservation: vi.fn().mockResolvedValue(undefined),
     };
     const reader = {
-      read: vi.fn(async (position: { positionKey: string }) => {
+      readGroup: vi.fn(async (_group: never, positions: Array<{ positionKey: string }>) => positions.map((position) => {
         const lower = position.positionKey === "10" ? -100 : 0;
         const upper = position.positionKey === "10" ? 0 : 100;
         return {
@@ -628,16 +685,20 @@ describe("position group valuation fees", () => {
           unclaimedFees1: fee1,
           observedBlock: 10n,
         };
-      }),
+      })),
     };
     const routes = {
       quoteDirect: vi.fn(async (_position: never, tokenIn: Address, amountIn: bigint, tokenOut: Address) => ({
         expectedOut: amountIn,
         path: [tokenIn, tokenOut],
       })),
+      quoteSourcePool: vi.fn(async (_position: never, tokenIn: Address, amountIn: bigint, tokenOut: Address) => ({
+        expectedOut: amountIn,
+        path: [tokenIn, tokenOut],
+      })),
     };
     const pnl = new PnlService(database as never, reader as never, routes as never, baseConfig as unknown as RuntimeConfig);
-    return { pnl, database, routes, group: groupRecord(quoteToken, token0, token1) };
+    return { pnl, database, routes, reader, group: groupRecord(quoteToken, token0, token1) };
   }
 
   it("converts WETH group fees into the chain stable token", async () => {
@@ -710,5 +771,37 @@ describe("position group valuation fees", () => {
     expect(estimate.snapshot.liquidationQuote).toBe(980n);
     expect(database.recordPoolObservation).not.toHaveBeenCalled();
     expect(database.addPositionGroupPnlSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("reuses one same-block group read across live and conservative valuation", async () => {
+    const { pnl, reader, group } = setup(token, stable, stable, 500n, 0n, 0n, 0n, [{ symbol: "USDC", address: stable }]);
+
+    await pnl.valueGroup(group, 10n);
+    await pnl.valueGroupExitEstimate(group, 10n, 200);
+
+    expect(reader.readGroup).toHaveBeenCalledTimes(1);
+    expect(reader.readGroup).toHaveBeenCalledWith(group, expect.any(Array), 10n, undefined, "monitoring");
+
+    await pnl.valueGroupExitEstimate(group, 11n, 200);
+
+    expect(reader.readGroup).toHaveBeenCalledTimes(2);
+    expect(reader.readGroup).toHaveBeenLastCalledWith(group, expect.any(Array), 11n, undefined, "monitoring");
+  });
+
+  it("keeps the prepared group read while an exact route quote retries at the same block", async () => {
+    const { pnl, database, routes, reader, group } = setup(token, stable, stable, 500n, 0n, 0n, 0n, [{ symbol: "USDC", address: stable }]);
+    routes.quoteDirect
+      .mockRejectedValueOnce(new Error("HTTP request failed. Status: 429"))
+      .mockImplementationOnce(async (_position: never, tokenIn: Address, amountIn: bigint, tokenOut: Address) => ({
+        expectedOut: amountIn,
+        path: [tokenIn, tokenOut],
+      }));
+
+    await expect(pnl.valueGroupLocal(group, 10n)).rejects.toThrow();
+    const valued = await pnl.valueGroupLocal(group, 10n);
+
+    expect(reader.readGroup).toHaveBeenCalledTimes(1);
+    expect(routes.quoteDirect).toHaveBeenCalledTimes(2);
+    expect(valued.snapshot.liquidationQuote).toBe(1_000n);
   });
 });

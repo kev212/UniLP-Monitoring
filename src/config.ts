@@ -58,6 +58,7 @@ const envSchema = z.object({
   BSC_POSITION_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1_000).max(60_000).optional(),
   DISCOVERY_INTERVAL_MS: z.coerce.number().int().min(5_000).max(300_000).default(30_000),
   POSITION_MONITOR_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(2),
+  POSITION_EVALUATION_STAGGER_MS: z.coerce.number().int().min(0).max(2_000).default(120),
   MAX_SWAP_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(100),
   SETTLEMENT_SWAP_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(200),
   SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(500),
@@ -134,6 +135,7 @@ export interface RuntimeConfig {
   chainMonitorIntervalMs: Partial<Record<ChainName, number>>;
   autoExitChains: ChainName[];
   positionMonitorConcurrency: number;
+  positionEvaluationStaggerMs: number;
   maxSwapSlippageBps: number;
   settlementSwapSlippageBps: number;
   settlementSwapMaxSlippageBps: number;
@@ -371,6 +373,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     },
     autoExitChains: parseChains(env.AUTO_EXIT_CHAINS),
     positionMonitorConcurrency: env.POSITION_MONITOR_CONCURRENCY,
+    positionEvaluationStaggerMs: env.POSITION_EVALUATION_STAGGER_MS,
     maxSwapSlippageBps: env.MAX_SWAP_SLIPPAGE_BPS,
     settlementSwapSlippageBps: env.SETTLEMENT_SWAP_SLIPPAGE_BPS,
     settlementSwapMaxSlippageBps: env.SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS,

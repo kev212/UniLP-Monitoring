@@ -6,6 +6,7 @@ import {
   toHex,
   zeroAddress,
   type Address,
+  type ContractFunctionParameters,
   type PublicClient,
 } from "viem";
 
@@ -18,7 +19,7 @@ import {
   v4PositionManagerAbi,
   v4StateViewAbi,
 } from "../abi.js";
-import type { PositionRangeInfo, PositionRecord, Protocol, TokenAmount } from "../types.js";
+import type { PositionGroupRecord, PositionRangeInfo, PositionRecord, Protocol, TokenAmount } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import { amountsForLiquidity, applySlippage, sqrtRatioAtTick } from "./uniswap-math.js";
 import { dexNameFromMetadata, v3ContractsFor } from "./v3-deployment.js";
@@ -43,6 +44,12 @@ export interface PositionValue {
 
 type V4Slot0 = readonly [bigint, number, number, number];
 type RpcSource = "scan" | "monitoring" | "execution";
+type V3PositionDetails = readonly [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint];
+type V3TickData = readonly [bigint, bigint, bigint, bigint, bigint, bigint, bigint, boolean];
+type V4FeeGrowthInside = readonly [bigint, bigint];
+type V4StoredPosition = readonly [bigint, bigint, bigint];
+
+const MULTICALL3 = "0xca11bde05977b3631167028862be2a173976ca11" as Address;
 
 export class PositionReader {
   private readonly v4Slot0Cache = new Map<string, Promise<V4Slot0>>();
@@ -55,6 +62,192 @@ export class PositionReader {
     if (position.protocol === "v2") return this.readV2(position, observedBlock, effective, rpc);
     if (position.protocol === "v3") return this.readV3(position, observedBlock, effective, rpc);
     return this.readV4(position, observedBlock, effective, rpc);
+  }
+
+  async readGroup(
+    group: PositionGroupRecord,
+    positions: readonly PositionRecord[],
+    blockNumber: bigint,
+    removeSlippageBps?: number,
+    rpc: RpcSource = "monitoring",
+  ): Promise<PositionValue[]> {
+    if (positions.length === 0) return [];
+    if (positions.some((position) => position.protocol !== group.protocol || position.chainId !== group.chainId)) {
+      throw new Error("Position group children do not match the parent protocol and chain");
+    }
+    const effective = removeSlippageBps ?? this.slippageBps;
+    if (group.protocol === "v3") return this.readV3Group(group, positions, blockNumber, effective, rpc);
+    if (group.protocol === "v4") return this.readV4Group(group, positions, blockNumber, effective, rpc);
+    return Promise.all(positions.map((position) => this.read(position, blockNumber, effective, rpc)));
+  }
+
+  private async readV3Group(
+    group: PositionGroupRecord,
+    positions: readonly PositionRecord[],
+    blockNumber: bigint,
+    removeSlippageBps: number,
+    rpc: RpcSource,
+  ): Promise<PositionValue[]> {
+    const registry = this.chains.getById(group.chainId).registry;
+    const client = this.rpcClient(group.chainId, rpc);
+    const dex = dexNameFromMetadata(group.metadata) ?? dexNameFromMetadata(positions[0]!.metadata);
+    const contracts = v3ContractsFor(registry, dex);
+    const fee = numberMetadata(positions[0]!.metadata, "fee");
+    const ranges = positions.map((position) => ({
+      tickLower: numberMetadata(position.metadata, "tickLower"),
+      tickUpper: numberMetadata(position.metadata, "tickUpper"),
+    }));
+    const boundaries = [...new Set(ranges.flatMap(({ tickLower, tickUpper }) => [tickLower, tickUpper]))].sort((a, b) => a - b);
+    const calls: ContractFunctionParameters[] = [
+      ...positions.map((position) => ({
+        address: group.positionManager,
+        abi: v3PositionManagerAbi,
+        functionName: "positions",
+        args: [BigInt(position.positionKey)],
+      } as const)),
+      {
+        address: contracts.factory,
+        abi: v3FactoryAbi,
+        functionName: "getPool",
+        args: [group.token0, group.token1, fee],
+      } as const,
+      { address: group.poolKey as Address, abi: v3PoolAbi, functionName: "slot0" } as const,
+      { address: group.poolKey as Address, abi: v3PoolAbi, functionName: "feeGrowthGlobal0X128" } as const,
+      { address: group.poolKey as Address, abi: v3PoolAbi, functionName: "feeGrowthGlobal1X128" } as const,
+      ...boundaries.map((tick) => ({ address: group.poolKey as Address, abi: v3PoolAbi, functionName: "ticks", args: [tick] } as const)),
+    ];
+    const results = await this.multicall(client, calls, blockNumber);
+    const details = results.slice(0, positions.length) as V3PositionDetails[];
+    const sharedOffset = positions.length;
+    const poolAddress = results[sharedOffset] as Address;
+    const slot0 = results[sharedOffset + 1] as readonly [bigint, number, ...unknown[]];
+    const feeGrowthGlobal0 = results[sharedOffset + 2] as bigint;
+    const feeGrowthGlobal1 = results[sharedOffset + 3] as bigint;
+    const tickData = new Map<number, V3TickData>();
+    for (let index = 0; index < boundaries.length; index += 1) {
+      tickData.set(boundaries[index]!, results[sharedOffset + 4 + index] as V3TickData);
+    }
+    if (poolAddress.toLowerCase() !== group.poolKey.toLowerCase()) throw new Error("V3 position group resolves to a different pool");
+
+    return details.map((positionDetails, index) => {
+      const position = positions[index]!;
+      const expectedRange = ranges[index]!;
+      const [, , token0, token1, positionFee, tickLower, tickUpper, liquidity, feeGrowthInside0Last, feeGrowthInside1Last, tokensOwed0, tokensOwed1] = positionDetails;
+      if (token0.toLowerCase() !== group.token0.toLowerCase()
+        || token1.toLowerCase() !== group.token1.toLowerCase()
+        || Number(positionFee) !== fee
+        || tickLower !== expectedRange.tickLower
+        || tickUpper !== expectedRange.tickUpper) {
+        throw new Error(`V3 position group child ${position.positionKey} differs from persisted metadata`);
+      }
+      if (liquidity === 0n) throw new Error(`V3 position group child ${position.positionKey} has zero liquidity`);
+      const lower = tickData.get(tickLower);
+      const upper = tickData.get(tickUpper);
+      if (!lower || !upper) throw new Error(`V3 position group child ${position.positionKey} has incomplete tick state`);
+      const currentTick = slot0[1];
+      const feeGrowthInside0 = v3FeeGrowthInside(feeGrowthGlobal0, currentTick, tickLower, tickUpper, lower[2], upper[2]);
+      const feeGrowthInside1 = v3FeeGrowthInside(feeGrowthGlobal1, currentTick, tickLower, tickUpper, lower[3], upper[3]);
+      const principal = amountsForLiquidity(slot0[0], tickLower, tickUpper, liquidity);
+      return {
+        protocol: "v3",
+        poolKey: poolAddress.toLowerCase(),
+        sourcePool: poolAddress,
+        token0: { token: token0, amount: principal.amount0 },
+        token1: { token: token1, amount: principal.amount1 },
+        liquidity,
+        priceMarker: (slot0[0] * slot0[0]) >> 96n,
+        v3Fee: fee,
+        minAmount0: applySlippage(principal.amount0, removeSlippageBps),
+        minAmount1: applySlippage(principal.amount1, removeSlippageBps),
+        unclaimedFees0: tokensOwed0 + feeOwed(liquidity, feeGrowthInside0, feeGrowthInside0Last),
+        unclaimedFees1: tokensOwed1 + feeOwed(liquidity, feeGrowthInside1, feeGrowthInside1Last),
+        range: rangeInfo(currentTick, tickLower, tickUpper, slot0[0]),
+        observedBlock: blockNumber,
+      } satisfies PositionValue;
+    });
+  }
+
+  private async readV4Group(
+    group: PositionGroupRecord,
+    positions: readonly PositionRecord[],
+    blockNumber: bigint,
+    removeSlippageBps: number,
+    rpc: RpcSource,
+  ): Promise<PositionValue[]> {
+    const registry = this.chains.getById(group.chainId).registry;
+    const client = this.rpcClient(group.chainId, rpc);
+    const firstMetadata = positions[0]!.metadata as Record<string, unknown>;
+    const poolKey = v4PoolKeyFromMetadata(firstMetadata);
+    const poolId = keccak256(encodeAbiParameters(
+      [
+        { type: "address" },
+        { type: "address" },
+        { type: "uint24" },
+        { type: "int24" },
+        { type: "address" },
+      ],
+      [poolKey.currency0, poolKey.currency1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks],
+    ));
+    if (poolId.toLowerCase() !== group.poolKey.toLowerCase()) throw new Error("V4 position group resolves to a different pool");
+    const ranges = positions.map((position) => ({
+      tickLower: numberMetadata(position.metadata, "tickLower"),
+      tickUpper: numberMetadata(position.metadata, "tickUpper"),
+    }));
+    const calls: ContractFunctionParameters[] = [
+      { address: registry.contracts.v4.stateView, abi: v4StateViewAbi, functionName: "getSlot0", args: [poolId] } as const,
+      ...ranges.map(({ tickLower, tickUpper }) => ({
+        address: registry.contracts.v4.stateView,
+        abi: v4StateViewAbi,
+        functionName: "getFeeGrowthInside",
+        args: [poolId, tickLower, tickUpper],
+      } as const)),
+      ...positions.map((position, index) => ({
+        address: registry.contracts.v4.stateView,
+        abi: v4StateViewAbi,
+        functionName: "getPositionInfo",
+        args: [poolId, v4PositionId(group.positionManager, ranges[index]!.tickLower, ranges[index]!.tickUpper, BigInt(position.positionKey))],
+      } as const)),
+    ];
+    const results = await this.multicall(client, calls, blockNumber);
+    const slot0 = results[0] as V4Slot0;
+    const feeGrowthResults = results.slice(1, 1 + positions.length) as V4FeeGrowthInside[];
+    const storedPositions = results.slice(1 + positions.length) as V4StoredPosition[];
+
+    return positions.map((position, index) => {
+      const { tickLower, tickUpper } = ranges[index]!;
+      const metadataPoolKey = v4PoolKeyFromMetadata(position.metadata as Record<string, unknown>);
+      if (!sameV4PoolKey(poolKey, metadataPoolKey)) throw new Error(`V4 position group child ${position.positionKey} resolves to a different pool`);
+      const feeGrowthInside = feeGrowthResults[index]!;
+      const storedPosition = storedPositions[index]!;
+      const liquidity = storedPosition[0];
+      if (liquidity === 0n) throw new Error(`V4 position group child ${position.positionKey} has zero liquidity`);
+      const principal = amountsForLiquidity(slot0[0], tickLower, tickUpper, liquidity);
+      return {
+        protocol: "v4",
+        poolKey: poolId,
+        sourcePool: null,
+        token0: { token: poolKey.currency0, amount: principal.amount0 },
+        token1: { token: poolKey.currency1, amount: principal.amount1 },
+        liquidity,
+        priceMarker: (slot0[0] * slot0[0]) >> 96n,
+        minAmount0: applySlippage(principal.amount0, removeSlippageBps),
+        minAmount1: applySlippage(principal.amount1, removeSlippageBps),
+        v4PoolKey: poolKey,
+        unclaimedFees0: feeOwed(liquidity, feeGrowthInside[0], storedPosition[1]),
+        unclaimedFees1: feeOwed(liquidity, feeGrowthInside[1], storedPosition[2]),
+        range: rangeInfo(slot0[1], tickLower, tickUpper, slot0[0]),
+        observedBlock: blockNumber,
+      } satisfies PositionValue;
+    });
+  }
+
+  private async multicall(client: PublicClient, contracts: ContractFunctionParameters[], blockNumber: bigint): Promise<unknown[]> {
+    return client.multicall({
+      allowFailure: false,
+      blockNumber,
+      contracts,
+      multicallAddress: MULTICALL3,
+    }) as Promise<unknown[]>;
   }
 
   private async readV2(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: RpcSource = "scan"): Promise<PositionValue> {
@@ -250,6 +443,39 @@ function unpackV4PositionInfo(value: bigint): { tickLower: number; tickUpper: nu
 
 function signed24(value: bigint): number {
   return Number(value >= 0x800000n ? value - 0x1000000n : value);
+}
+
+function numberMetadata(metadata: Record<string, unknown>, key: string): number {
+  const value = metadata[key];
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`Position metadata ${key} is missing`);
+  return value;
+}
+
+function v4PoolKeyFromMetadata(metadata: Record<string, unknown>): NonNullable<PositionValue["v4PoolKey"]> {
+  const currency0 = metadata.currency0;
+  const currency1 = metadata.currency1;
+  const hooks = metadata.hooks;
+  if (typeof currency0 !== "string" || typeof currency1 !== "string" || typeof hooks !== "string") {
+    throw new Error("V4 position metadata is missing its pool currencies or hooks");
+  }
+  return {
+    currency0: currency0 as Address,
+    currency1: currency1 as Address,
+    fee: numberMetadata(metadata, "fee"),
+    tickSpacing: numberMetadata(metadata, "tickSpacing"),
+    hooks: hooks as Address,
+  };
+}
+
+function sameV4PoolKey(
+  left: NonNullable<PositionValue["v4PoolKey"]>,
+  right: NonNullable<PositionValue["v4PoolKey"]>,
+): boolean {
+  return left.currency0.toLowerCase() === right.currency0.toLowerCase()
+    && left.currency1.toLowerCase() === right.currency1.toLowerCase()
+    && left.fee === right.fee
+    && left.tickSpacing === right.tickSpacing
+    && left.hooks.toLowerCase() === right.hooks.toLowerCase();
 }
 
 function v4PositionId(positionManager: Address, tickLower: number, tickUpper: number, tokenId: bigint): `0x${string}` {

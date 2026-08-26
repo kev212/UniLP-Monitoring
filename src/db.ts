@@ -483,6 +483,13 @@ export class Database {
         observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS pool_observations_lookup_idx ON pool_observations(chain_id, protocol, pool_key, observed_at DESC);
+      DELETE FROM pool_observations AS duplicate USING pool_observations AS kept
+        WHERE duplicate.id > kept.id
+          AND duplicate.chain_id = kept.chain_id
+          AND duplicate.protocol = kept.protocol
+          AND duplicate.pool_key = kept.pool_key
+          AND duplicate.block_number = kept.block_number;
+      CREATE UNIQUE INDEX IF NOT EXISTS pool_observations_unique_idx ON pool_observations(chain_id, protocol, pool_key, block_number);
       CREATE TABLE IF NOT EXISTS telegram_pool_scan_settings (
         chat_id TEXT PRIMARY KEY,
         settings JSONB NOT NULL,
@@ -2108,7 +2115,9 @@ FROM position_groups g
 
   async recordPoolObservation(chainId: number, protocol: Protocol, poolKey: string, priceMarker: bigint, blockNumber: bigint): Promise<void> {
     await this.pool.query(
-      "INSERT INTO pool_observations (chain_id, protocol, pool_key, price_marker, block_number) VALUES ($1, $2, $3, $4, $5)",
+      `INSERT INTO pool_observations (chain_id, protocol, pool_key, price_marker, block_number)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (chain_id, protocol, pool_key, block_number) DO NOTHING`,
       [chainId, protocol, poolKey, priceMarker.toString(), blockNumber.toString()],
     );
   }

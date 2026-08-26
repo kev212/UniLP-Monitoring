@@ -270,12 +270,12 @@ describe("RPC failover transport", () => {
     expect(urls.some((url) => url.includes("blockmachine.io"))).toBe(true);
   });
 
-  it("uses Alchemy only as the last resort for Robinhood monitoring", async () => {
+  it("routes Robinhood monitoring through Alchemy first with public RPC fallback", async () => {
     const urls: string[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       urls.push(url);
-      if (!url.includes("monitoring-alchemy.example")) return new Response("rate limited", { status: 429 });
+      if (url.includes("monitoring-alchemy.example") || url.includes("public.example")) return new Response("rate limited", { status: 429 });
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x1237" }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -294,9 +294,9 @@ describe("RPC failover transport", () => {
 
     await expect(clients.getForMonitoring("robinhood").client.getChainId()).resolves.toBe(4663);
     expect(urls).toEqual([
+      "https://monitoring-alchemy.example/rpc",
       "https://public.example/rpc",
       "https://rpc-robinhood.blockmachine.io/",
-      "https://monitoring-alchemy.example/rpc",
     ]);
     expect(urls.some((url) => url.includes("execution-alchemy.example"))).toBe(false);
   });

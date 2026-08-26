@@ -659,8 +659,10 @@ describe("monitor RPC retries", () => {
           }
           return { ...valued, snapshot: { ...valued.snapshot, groupId: item.id } };
         }),
+        valueGroupExactProbe: vi.fn(async (item: PositionGroupRecord) => ({ ...valued, snapshot: { ...valued.snapshot, groupId: item.id } })),
         evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
         shouldTriggerGroup: vi.fn().mockReturnValue(null),
+        isNearExactThreshold: vi.fn().mockReturnValue(false),
       };
       const database = {
         listPositionGroups: vi.fn().mockResolvedValue([group("g1"), group("g2"), group("g3")]),
@@ -674,7 +676,7 @@ describe("monitor RPC retries", () => {
         }),
       };
       const guardian = new Guardian(
-        { positionMonitorConcurrency: 1 } as RuntimeConfig,
+        { positionMonitorConcurrency: 1, positionEvaluationStaggerMs: 0 } as RuntimeConfig,
         database as never,
         chains as never,
         {} as never,

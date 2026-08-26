@@ -15,6 +15,8 @@ import { quoteRangeState } from "./quote-range.js";
 const POSITION_EVALUATION_TIMEOUT_MS = 60_000;
 const TRAILING_HARD_FLOOR_DROP_BPS = 200n;
 const NEEDS_REVIEW_RETRY_BACKOFF_MS = 5 * 60_000;
+const EXACT_PROBE_REFRESH_MS = 60_000;
+const EXACT_PROBE_GUARD_BPS = 100n;
 
 export class Guardian {
   private readonly lastEvaluatedBlock = new Map<number, bigint>();
@@ -25,6 +27,8 @@ export class Guardian {
   private readonly chainMonitorRunning = new Set<string>();
   private readonly positionEvaluations = new Set<string>();
   private readonly groupEvaluations = new Set<string>();
+  private readonly groupExactEvaluatedAt = new Map<string, number>();
+  private readonly positionExactEvaluatedAt = new Map<string, number>();
   private discoveryRunning = false;
 
   constructor(
@@ -117,8 +121,9 @@ export class Guardian {
 
     for (const position of positions) {
       let candidate = position;
-      if (candidate.protocol === "v4" && await this.executor.settleExternallyClosedV4(candidate)) continue;
-      if (isInactiveReviewReason(candidate.metadata.reason)) {
+      if (candidate.protocol === "v4") {
+        if (await this.executor.settleExternallyClosedV4(candidate)) continue;
+      } else if (isInactiveReviewReason(candidate.metadata.reason)) {
         const settled = await this.database.settleUnverifiedZeroLiquidity(candidate.id, "externally_closed");
         if (settled) {
           log.info({ positionId: candidate.id, positionKey: candidate.positionKey }, "settled inactive needs_review position with zero on-chain liquidity");
@@ -133,12 +138,7 @@ export class Guardian {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           if (message.includes("NOT_MINTED")) {
-            if (await this.executor.settleExternallyClosedV4(candidate)) continue;
-            const settled = await this.database.settleUnverifiedZeroLiquidity(candidate.id, "nft_burned");
-            log.info(
-              { positionId: candidate.id, positionKey: candidate.positionKey },
-              settled ? "settled burned V4 NFT without a reconstructed receipt" : "V4 NFT is burned but settlement remains pending",
-            );
+            log.info({ positionId: candidate.id, positionKey: candidate.positionKey }, "V4 NFT burn is not confirmed; leaving position in needs_review");
           }
           continue;
         }
@@ -180,13 +180,23 @@ export class Guardian {
       this.lastEvaluatedBlock.set(registry.chain.id, blockNumber);
       return;
     }
+    let stagger = 0;
+    const staggerDelay = (): number => {
+      const delay = Math.min(stagger, 10) * this.config.positionEvaluationStaggerMs;
+      stagger += 1;
+      return delay;
+    };
     const [groupResults, positionResults] = await Promise.all([
       mapWithConcurrency(groups, this.config.positionMonitorConcurrency, async (group) => {
+        const delay = staggerDelay();
+        if (delay > 0) await sleep(delay);
         const ok = await this.evaluatePositionGroupWithTimeout(name, group, blockNumber);
         if (ok) this.markEvaluated(`g:${group.id}`, blockNumber);
         return ok;
       }),
       mapWithConcurrency(positions, this.config.positionMonitorConcurrency, async (position) => {
+        const delay = staggerDelay();
+        if (delay > 0) await sleep(delay);
         const ok = await this.evaluatePositionWithTimeout(name, position, blockNumber);
         if (ok) this.markEvaluated(`p:${position.id}`, blockNumber);
         return ok;
@@ -236,7 +246,22 @@ export class Guardian {
       }
 
       const quoteIsToken0 = group.quoteToken.toLowerCase() === group.token0.toLowerCase();
-      const staticTrigger = this.pnl.shouldTriggerGroup(valued.snapshot);
+      const directStaticTrigger = this.pnl.shouldTriggerGroup(valued.snapshot);
+      let exactStaticTrigger: ExitTrigger | null = null;
+      const now = Date.now();
+      const exactDue = now - (this.groupExactEvaluatedAt.get(group.id) ?? 0) >= EXACT_PROBE_REFRESH_MS;
+      if (exactDue || this.pnl.isNearExactThreshold(group.metadata, valued.snapshot, EXACT_PROBE_GUARD_BPS)) {
+        try {
+          const exact = await this.pnl.valueGroupExactProbe(group, blockNumber);
+          this.groupExactEvaluatedAt.set(group.id, now);
+          exactStaticTrigger = this.pnl.shouldTriggerGroup(exact.snapshot);
+        } catch (error) {
+          log.warn({ err: error, groupId: group.id, exactDue }, "position group exact quote refresh deferred");
+        }
+      }
+      const staticTrigger = directStaticTrigger === "stop_loss" || exactStaticTrigger === "stop_loss"
+        ? "stop_loss"
+        : directStaticTrigger ?? exactStaticTrigger;
       const oorTrigger = await this.updateGroupOorAboveTimer(group, valued.range);
       const profitOorTrigger = await this.updateGroupProfitOorAboveTimer(group, valued.range, valued.snapshot.pnlBps);
       const liveTrigger = staticTrigger
@@ -448,7 +473,22 @@ export class Guardian {
 
       const quoteIsToken0 = position.quoteToken?.toLowerCase() === position.token0.toLowerCase();
       const quoteRange = quoteRangeState(valued.range, quoteIsToken0);
-      const staticTrigger = this.pnl.shouldTrigger(valued.snapshot, valued.range, quoteIsToken0);
+      const directStaticTrigger = this.pnl.shouldTrigger(valued.snapshot, valued.range, quoteIsToken0);
+      let exactStaticTrigger: ExitTrigger | null = null;
+      const now = Date.now();
+      const exactDue = now - (this.positionExactEvaluatedAt.get(position.id) ?? 0) >= EXACT_PROBE_REFRESH_MS;
+      if (exactDue || this.pnl.isNearExactThreshold(position.metadata, valued.snapshot, EXACT_PROBE_GUARD_BPS)) {
+        try {
+          const exact = await this.pnl.valueExactProbe(position, blockNumber);
+          this.positionExactEvaluatedAt.set(position.id, now);
+          exactStaticTrigger = this.pnl.shouldTrigger(exact.snapshot, exact.range, quoteIsToken0);
+        } catch (error) {
+          log.warn({ err: error, positionId: position.id, exactDue }, "position exact quote refresh deferred");
+        }
+      }
+      const staticTrigger = directStaticTrigger === "stop_loss" || exactStaticTrigger === "stop_loss"
+        ? "stop_loss"
+        : directStaticTrigger ?? exactStaticTrigger;
       if (!staticTrigger && (trailing.action === "activate" || trailing.action === "raise_peak")) {
         await this.database.setTrailingStopState(position.id, trailing.state);
         log.info({
@@ -828,7 +868,7 @@ export class Guardian {
         const latestMetadata = await this.database.getPositionMetadata(position.id);
         const latestPosition = latestMetadata ? { ...position, metadata: latestMetadata } : position;
         const latestBlock = await this.chains.getById(position.chainId).client.getBlockNumber();
-        const latestValuation = await this.pnl.value(latestPosition, latestBlock, this.config.settlementSwapSlippageBps, false);
+        const latestValuation = await this.pnl.valueExactProbe(latestPosition, latestBlock, this.config.settlementSwapSlippageBps);
         const quoteIsToken0 = latestPosition.quoteToken?.toLowerCase() === latestPosition.token0.toLowerCase();
         const latestStaticTrigger = this.pnl.shouldTrigger(latestValuation.snapshot, latestValuation.range, quoteIsToken0);
         if (latestStaticTrigger === "stop_loss") {
@@ -877,11 +917,10 @@ export class Guardian {
       return null;
     }
 
-    const exitEstimate = valued ?? await this.pnl.value(
+    const exitEstimate = valued ?? await this.pnl.valueExitEstimate(
       position,
       blockNumber,
       this.config.settlementSwapSlippageBps,
-      false,
     );
 
     const trailingFloorBps = this.pnl.trailingFloorBps(position.metadata);

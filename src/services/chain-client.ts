@@ -107,8 +107,9 @@ export class ChainClients {
         }),
       });
       const monitoringTransport = createRpcTransport(uniqueUrls([
+        ...(name === "robinhood" ? [config.alchemyMonitoringHttp?.[name]] : []),
         ...publicEndpoints,
-        ...(name === "robinhood" ? [config.alchemyMonitoringHttp?.[name]] : alchemyLastResort),
+        ...(name === "robinhood" ? [] : alchemyLastResort),
       ]), readLimiter, true);
       this.monitoringClients.set(name, {
         registry,

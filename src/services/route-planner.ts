@@ -41,6 +41,7 @@ interface QuoteOptions {
   excludedPool?: Address | null;
   includeV4?: boolean;
   rpc?: "scan" | "monitoring";
+  blockNumber?: bigint;
 }
 
 export class RoutePlanner {
@@ -59,15 +60,28 @@ export class RoutePlanner {
     const { registry } = this.chains.getById(position.chainId);
     const paths = this.candidatePaths(registry.name, tokenIn, tokenOut);
     const [v2Quotes, v3Quotes, v4Quote] = await Promise.all([
-      isProtocolDeployed(registry, "v2") ? this.quoteV2(position, paths, amountIn, opts?.excludedPool, opts?.rpc) : Promise.resolve([]),
-      isProtocolDeployed(registry, "v3") ? this.quoteV3(position, paths, amountIn, opts?.excludedPool, opts?.rpc) : Promise.resolve([]),
+      isProtocolDeployed(registry, "v2") ? this.quoteV2(position, paths, amountIn, opts?.excludedPool, opts?.rpc, opts?.blockNumber) : Promise.resolve([]),
+      isProtocolDeployed(registry, "v3") ? this.quoteV3(position, paths, amountIn, opts?.excludedPool, opts?.rpc, opts?.blockNumber) : Promise.resolve([]),
       opts?.includeV4 === false || !isProtocolDeployed(registry, "v4")
         ? Promise.resolve(null)
-        : this.quoteV4(position, tokenIn, amountIn, tokenOut, opts?.rpc),
+        : this.quoteV4(position, tokenIn, amountIn, tokenOut, opts?.rpc, opts?.blockNumber),
     ]);
     const quotes = [...v2Quotes, ...v3Quotes, ...(v4Quote ? [v4Quote] : [])];
 
     return quotes.sort(compareQuote)[0] ?? null;
+  }
+
+  async quoteSourcePool(
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    opts: Pick<QuoteOptions, "rpc" | "blockNumber"> = {},
+  ): Promise<SwapRoute | null> {
+    if (amountIn === 0n || tokenIn.toLowerCase() === tokenOut.toLowerCase()) return null;
+    if (position.protocol === "v3") return this.quoteV3SourcePool(position, tokenIn, amountIn, tokenOut, opts.rpc, opts.blockNumber);
+    if (position.protocol === "v4") return this.quoteV4SourcePool(position, tokenIn, amountIn, tokenOut, opts.rpc, opts.blockNumber);
+    return null;
   }
 
   private candidatePaths(name: ChainName, tokenIn: Address, tokenOut: Address): Address[][] {
@@ -79,7 +93,7 @@ export class RoutePlanner {
     return [[tokenIn, tokenOut], ...intermediaries.map((intermediate) => [tokenIn, intermediate, tokenOut])];
   }
 
-  private async quoteV2(position: PositionRecord, paths: Address[][], amountIn: bigint, excludedPool?: Address | null, rpc: "scan" | "monitoring" = "scan"): Promise<SwapRoute[]> {
+  private async quoteV2(position: PositionRecord, paths: Address[][], amountIn: bigint, excludedPool?: Address | null, rpc: "scan" | "monitoring" = "scan", blockNumber?: bigint): Promise<SwapRoute[]> {
     const { client, registry } = this.readChain(position, rpc);
     const excluded = excludedPool?.toLowerCase();
     const quotes = await Promise.all(paths.map(async (path) => {
@@ -91,6 +105,7 @@ export class RoutePlanner {
           abi: v2RouterAbi,
           functionName: "getAmountsOut",
           args: [amountIn, path],
+          blockNumber,
         });
         const expectedOut = amounts[amounts.length - 1] ?? 0n;
         if (expectedOut === 0n) return null;
@@ -113,7 +128,7 @@ export class RoutePlanner {
     return quotes.filter((quote) => quote !== null) as SwapRoute[];
   }
 
-  private async quoteV3(position: PositionRecord, paths: Address[][], amountIn: bigint, excludedPool?: Address | null, rpc: "scan" | "monitoring" = "scan"): Promise<SwapRoute[]> {
+  private async quoteV3(position: PositionRecord, paths: Address[][], amountIn: bigint, excludedPool?: Address | null, rpc: "scan" | "monitoring" = "scan", blockNumber?: bigint): Promise<SwapRoute[]> {
     const { client, registry } = this.readChain(position, rpc);
     const excluded = excludedPool?.toLowerCase();
     const candidates = paths.flatMap((path) => feeCombinations(path.length - 1).map((fees) => ({ path, fees })));
@@ -128,6 +143,7 @@ export class RoutePlanner {
             abi: v3QuoterAbi,
             functionName: "quoteExactInput",
             args: [encodedPath, amountIn],
+            blockNumber,
           });
           const expectedOut = simulation.result[0];
           if (expectedOut === 0n) return null;
@@ -150,6 +166,46 @@ export class RoutePlanner {
         }
     })));
     return quotes.filter((quote) => quote !== null) as SwapRoute[];
+  }
+
+  private async quoteV3SourcePool(
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    rpc: "scan" | "monitoring" = "monitoring",
+    blockNumber?: bigint,
+  ): Promise<SwapRoute | null> {
+    if (!position.poolAddress) throw new Error("V3 source-pool quote requires a pool address");
+    const fee = Number((position.metadata as Record<string, unknown>).fee);
+    if (!Number.isInteger(fee) || fee < 0) throw new Error("V3 source-pool quote requires a fee tier");
+    const { client, registry } = this.readChain(position, rpc);
+    const path = [tokenIn, tokenOut];
+    const encodedPath = encodeV3Path(path, [fee]);
+    const contracts = v3ContractsFor(registry, dexNameFromMetadata(position.metadata));
+    const simulation = await client.simulateContract({
+      address: contracts.quoter,
+      abi: v3QuoterAbi,
+      functionName: "quoteExactInput",
+      args: [encodedPath, amountIn],
+      blockNumber,
+    });
+    const expectedOut = simulation.result[0];
+    if (expectedOut === 0n) return null;
+    return {
+      protocol: "v3",
+      pool: position.poolAddress,
+      pools: [position.poolAddress],
+      router: contracts.swapRouter,
+      tokenIn,
+      tokenOut,
+      path,
+      amountIn,
+      expectedOut,
+      minimumOut: applySlippage(expectedOut, this.slippageBps),
+      fees: [fee],
+      encodedPath,
+    };
   }
 
   private async getV3Pool(position: PositionRecord, tokenA: Address, tokenB: Address, fee: number, rpc: "scan" | "monitoring" = "scan"): Promise<Address> {
@@ -209,7 +265,7 @@ export class RoutePlanner {
     return typeof clients.getForScan === "function" ? clients.getForScan(chain.registry.name) : chain;
   }
 
-  private async quoteV4(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address, rpc: "scan" | "monitoring" = "scan"): Promise<SwapRoute | null> {
+  private async quoteV4(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address, rpc: "scan" | "monitoring" = "scan", blockNumber?: bigint): Promise<SwapRoute | null> {
     if (position.protocol !== "v4") return null;
     const meta = position.metadata as Record<string, unknown>;
     const currency0 = meta.currency0 as Address | undefined;
@@ -233,6 +289,7 @@ export class RoutePlanner {
           abi: v4QuoterAbi,
           functionName: "quoteExactInputSingle",
           args: [{ poolKey, zeroForOne, exactAmount: amountIn, hookData: "0x" }],
+          blockNumber,
         });
         const expectedOut = simulation.result[0];
         if (expectedOut === 0n) return null;
@@ -257,6 +314,50 @@ export class RoutePlanner {
       }
     }
     return null;
+  }
+
+  private async quoteV4SourcePool(
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    rpc: "scan" | "monitoring" = "monitoring",
+    blockNumber?: bigint,
+  ): Promise<SwapRoute | null> {
+    const meta = position.metadata as Record<string, unknown>;
+    const currency0 = meta.currency0 as Address | undefined;
+    const currency1 = meta.currency1 as Address | undefined;
+    const fee = meta.fee as number | undefined;
+    const tickSpacing = meta.tickSpacing as number | undefined;
+    const hooks = (meta.hooks as Address | undefined) ?? zeroAddress;
+    if (!currency0 || !currency1 || fee === undefined || tickSpacing === undefined || amountIn > (1n << 128n) - 1n) return null;
+    const zeroForOne = tokenIn.toLowerCase() === currency0.toLowerCase() && tokenOut.toLowerCase() === currency1.toLowerCase();
+    if (!zeroForOne && (tokenIn.toLowerCase() !== currency1.toLowerCase() || tokenOut.toLowerCase() !== currency0.toLowerCase())) return null;
+    const { client, registry } = this.readChain(position, rpc);
+    const poolKey: V4PoolKey = { currency0, currency1, fee, tickSpacing, hooks };
+    const simulation = await client.simulateContract({
+      address: registry.contracts.v4.quoter,
+      abi: v4QuoterAbi,
+      functionName: "quoteExactInputSingle",
+      args: [{ poolKey, zeroForOne, exactAmount: amountIn, hookData: "0x" }],
+      blockNumber,
+    });
+    const expectedOut = simulation.result[0];
+    if (expectedOut === 0n) return null;
+    return {
+      protocol: "v4",
+      pool: zeroAddress,
+      pools: [],
+      router: registry.contracts.v4.universalRouter,
+      tokenIn,
+      tokenOut,
+      path: [tokenIn, tokenOut],
+      amountIn,
+      expectedOut,
+      minimumOut: applySlippage(expectedOut, this.slippageBps),
+      fees: [fee],
+      v4PoolKey: poolKey,
+    };
   }
 }
 

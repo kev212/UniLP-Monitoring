@@ -166,4 +166,45 @@ describe("V3 route quotes", () => {
     expect(getPairCalls).toHaveLength(2);
     expect(simulateContract).toHaveBeenCalledTimes(4);
   });
+
+  it("quotes through the V3 source pool directly without factory discovery", async () => {
+    const readContract = vi.fn().mockRejectedValue(new Error("unexpected factory read"));
+    const simulateContract = vi.fn().mockResolvedValue({ result: [432n] });
+    const contracts = {
+      v3: { factory: "0x0000000000000000000000000000000000000003", quoter: "0x0000000000000000000000000000000000000004", swapRouter: "0x0000000000000000000000000000000000000005" },
+    };
+    const chains = {
+      getById: vi.fn(() => ({ client: { readContract, simulateContract }, registry: { name: "robinhood", contracts } })),
+      getForScan: vi.fn(() => ({ client: { readContract, simulateContract }, registry: { name: "robinhood", contracts } })),
+      getForMonitoring: vi.fn(() => ({ client: { readContract, simulateContract }, registry: { name: "robinhood", contracts } })),
+    };
+    const planner = new RoutePlanner(chains as never, 100, { base: [], robinhood: [] });
+    const position: PositionRecord = {
+      id: "position",
+      chainId: 4663,
+      protocol: "v3",
+      positionKey: "1",
+      owner: "0x0000000000000000000000000000000000000006",
+      poolAddress: v3Pool,
+      token0: phood,
+      token1: usdg,
+      quoteToken: usdg,
+      status: "armed",
+      liquidity: 1n,
+      openedAtBlock: 1n,
+      metadata: { fee: 500 },
+    };
+
+    const route = await planner.quoteSourcePool(position, phood, 1_000n, usdg, { rpc: "monitoring", blockNumber: 42n });
+
+    expect(route).toMatchObject({ protocol: "v3", pool: v3Pool, expectedOut: 432n });
+    expect(simulateContract).toHaveBeenCalledTimes(1);
+    expect(simulateContract).toHaveBeenCalledWith(expect.objectContaining({
+      functionName: "quoteExactInput",
+      args: [expect.any(String), 1_000n],
+      blockNumber: 42n,
+    }));
+    expect(readContract).not.toHaveBeenCalled();
+    expect(chains.getForMonitoring).toHaveBeenCalledWith("robinhood");
+  });
 });

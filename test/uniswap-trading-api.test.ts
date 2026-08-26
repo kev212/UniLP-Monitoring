@@ -85,6 +85,88 @@ describe("UniswapTradingApi", () => {
     expect(request).toHaveBeenCalledTimes(1);
   });
 
+  it("backs off only the rate-limited pair after the global cooldown expires", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-26T00:00:00Z"));
+    try {
+      const otherOut = "0x0000000000000000000000000000000000000009" as const;
+      const request = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as { tokenOut?: string };
+        if (body.tokenOut?.toLowerCase() === tokenOut.toLowerCase()) return json({ detail: "Rate limit exceeded" }, 429);
+        return json({
+          routing: "CLASSIC",
+          quote: {
+            chainId: 4663,
+            swapper: owner,
+            input: { token: tokenIn, amount: "1000" },
+            output: { token: body.tokenOut, recipient: owner, amount: "1000", minimumAmount: "990" },
+          },
+        });
+      });
+      const api = new UniswapTradingApi("test-key", 100, request);
+      const otherPosition = { ...position, token1: otherOut, quoteToken: otherOut };
+
+      await expect(api.quote(position, tokenIn, 1_000n, tokenOut)).rejects.toThrow("failed (429)");
+      await expect(api.quote(otherPosition, tokenIn, 1_000n, otherOut)).resolves.toBeNull();
+
+      vi.advanceTimersByTime(61_000);
+
+      await expect(api.quote(position, tokenIn, 1_000n, tokenOut)).resolves.toBeNull();
+      await expect(api.quote(otherPosition, tokenIn, 1_000n, otherOut)).resolves.not.toBeNull();
+
+      expect(request).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("coalesces identical in-flight quote requests into one HTTP call", async () => {
+    let calls = 0;
+    const api = new UniswapTradingApi("test-key", 100, async () => {
+      calls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return json({
+        routing: "CLASSIC",
+        quote: {
+          chainId: 4663,
+          swapper: owner,
+          input: { token: tokenIn, amount: "1000" },
+          output: { token: tokenOut, recipient: owner, amount: "1000", minimumAmount: "990" },
+        },
+      });
+    });
+
+    const [left, right] = await Promise.all([
+      api.quote(position, tokenIn, 1_000n, tokenOut),
+      api.quote(position, tokenIn, 1_000n, tokenOut),
+    ]);
+
+    expect(left).not.toBeNull();
+    expect(right).not.toBeNull();
+    expect(calls).toBe(1);
+  });
+
+  it("skips budgeted monitoring quotes when the per-minute budget is exhausted", async () => {
+    const request = vi.fn(async () => json({
+      routing: "CLASSIC",
+      quote: {
+        chainId: 4663,
+        swapper: owner,
+        input: { token: tokenIn, amount: "1000" },
+        output: { token: tokenOut, recipient: owner, amount: "1000", minimumAmount: "990" },
+      },
+    }));
+    const api = new UniswapTradingApi("test-key", 100, request, 2_500, 2);
+
+    await api.quote(position, tokenIn, 1_000n, tokenOut, 100, { budget: true });
+    await api.quote(position, tokenIn, 1_000n, tokenOut, 100, { budget: true });
+    await expect(api.quote(position, tokenIn, 1_000n, tokenOut, 100, { budget: true })).resolves.toBeNull();
+
+    await expect(api.quote(position, tokenIn, 1_000n, tokenOut)).resolves.not.toBeNull();
+
+    expect(request).toHaveBeenCalledTimes(3);
+  });
+
   it("strips permit fields and validates API swap calldata", async () => {
     let request: Record<string, unknown> | undefined;
     const api = new UniswapTradingApi("test-key", 100, async (_url, init) => {
