@@ -243,6 +243,32 @@ describe("trailing TWAP guard timeout", () => {
       trailingExitEstimateAllowed(value: PositionRecord, blockNumber: bigint, estimate: typeof valued): Promise<unknown>;
     }).trailingExitEstimateAllowed(position, 10n, valued)).resolves.toBe(valued.snapshot);
   });
+
+  it("allows a normal trailing exit when the estimate reaches the gate", async () => {
+    const pnl = {
+      trailingExitEstimateGateBps: vi.fn().mockReturnValue(233n),
+      trailingFloorBps: vi.fn().mockReturnValue(259n),
+    };
+    const guardian = new Guardian(config, {} as never, {} as never, {} as never, {} as never, pnl as never, {} as never, {} as never);
+    const valued = { snapshot: { pnlBps: 146n } };
+
+    await expect((guardian as unknown as {
+      trailingExitEstimateAllowed(value: PositionRecord, blockNumber: bigint, estimate: typeof valued): Promise<unknown>;
+    }).trailingExitEstimateAllowed(position, 10n, valued)).resolves.toBe(valued.snapshot);
+  });
+
+  it("defers a normal trailing exit while the estimate remains above the gate", async () => {
+    const pnl = {
+      trailingExitEstimateGateBps: vi.fn().mockReturnValue(233n),
+      trailingFloorBps: vi.fn().mockReturnValue(259n),
+    };
+    const guardian = new Guardian(config, {} as never, {} as never, {} as never, {} as never, pnl as never, {} as never, {} as never);
+    const valued = { snapshot: { pnlBps: 240n } };
+
+    await expect((guardian as unknown as {
+      trailingExitEstimateAllowed(value: PositionRecord, blockNumber: bigint, estimate: typeof valued): Promise<unknown>;
+    }).trailingExitEstimateAllowed(position, 10n, valued)).resolves.toBeNull();
+  });
 });
 
 describe("pending settlement status recovery", () => {
@@ -928,16 +954,16 @@ describe("monitor RPC retries", () => {
     expect(executor.executeRelatedGroup).toHaveBeenCalledWith("manual-retry", "manual");
   });
 
-  it("applies a conservative estimate gate to group trailing exits", async () => {
-    const value = { ...valued, snapshot: { ...valued.snapshot, pnlBps: 450n, pnlQuote: 45_000n } };
+  it("allows group trailing exits when the estimate reaches the conservative gate", async () => {
+    const value = { ...valued, snapshot: { ...valued.snapshot, pnlBps: 146n, pnlQuote: 14_600n } };
     const pnl = {
       valueGroup: vi.fn().mockResolvedValue(value),
       valueGroupLocalExitEstimate: vi.fn().mockResolvedValue({ ...value, twapGuard: { ready: true } }),
       valueGroupExitEstimate: vi.fn().mockResolvedValue({ ...value, twapGuard: { ready: true } }),
       evaluateTrailingStop: vi.fn().mockReturnValue({ action: "trigger" }),
       shouldTriggerGroup: vi.fn().mockReturnValue(null),
-      trailingExitEstimateGateBps: vi.fn().mockReturnValue(400n),
-      trailingFloorBps: vi.fn().mockReturnValue(350n),
+      trailingExitEstimateGateBps: vi.fn().mockReturnValue(233n),
+      trailingFloorBps: vi.fn().mockReturnValue(259n),
     };
     const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
     const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
@@ -966,6 +992,46 @@ describe("monitor RPC retries", () => {
 
     expect(pnl.valueGroupExitEstimate).toHaveBeenCalledWith(trailingGroup, 10n, 200);
     expect(executor.executeRelatedGroup).toHaveBeenCalledWith("trail", "trailing_take_profit");
+  });
+
+  it("defers group trailing exits while the estimate remains above the gate", async () => {
+    const value = { ...valued, snapshot: { ...valued.snapshot, pnlBps: 240n, pnlQuote: 24_000n } };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(value),
+      valueGroupLocalExitEstimate: vi.fn().mockResolvedValue({ ...value, twapGuard: { ready: true } }),
+      valueGroupExitEstimate: vi.fn().mockResolvedValue(value),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "trigger" }),
+      shouldTriggerGroup: vi.fn().mockReturnValue(null),
+      trailingExitEstimateGateBps: vi.fn().mockReturnValue(233n),
+      trailingFloorBps: vi.fn().mockReturnValue(259n),
+    };
+    const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+    const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      { settlementSwapSlippageBps: 200, slTwapGuardMaxWaitMs: 5_000, trailingTwapGuardMaxWaitMs: 5_000 } as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+    const trailingGroup = {
+      ...group("trail-deferred"),
+      metadata: {
+        trailingStop: { peakPnlBps: "409", activatedAtBlock: "1" },
+        trailingTwapWaitStartedAt: Date.now() - 5_001,
+      },
+    };
+
+    await expect(evaluate("robinhood", trailingGroup, 10n)).resolves.toBe(true);
+
+    expect(pnl.valueGroupExitEstimate).toHaveBeenCalledWith(trailingGroup, 10n, 200);
+    expect(executor.executeRelatedGroup).not.toHaveBeenCalled();
   });
 
   it.each(["profit_oor_above", "out_of_range_above"] as const)("revalidates %s against fresh local state", async (trigger) => {

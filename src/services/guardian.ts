@@ -789,8 +789,8 @@ export class Guardian {
       log.warn({ groupId: group.id, estimatePnlBps: estimate.snapshot.pnlBps, trailingFloorBps }, "position group trailing exit forced below hard floor");
       return estimate.snapshot;
     }
-    if (estimate.snapshot.pnlBps >= gateBps) return estimate.snapshot;
-    log.info({ groupId: group.id, estimatePnlBps: estimate.snapshot.pnlBps, gateBps }, "position group trailing exit deferred below conservative estimate gate");
+    if (estimate.snapshot.pnlBps <= gateBps) return estimate.snapshot;
+    log.info({ groupId: group.id, estimatePnlBps: estimate.snapshot.pnlBps, gateBps }, "position group trailing exit deferred above conservative estimate gate");
     return null;
   }
 
@@ -896,13 +896,13 @@ export class Guardian {
       return exitEstimate.snapshot;
     }
 
-    if (exitEstimate.snapshot.pnlBps >= gateBps) return exitEstimate.snapshot;
+    if (exitEstimate.snapshot.pnlBps <= gateBps) return exitEstimate.snapshot;
     log.info({
       positionId: position.id,
       positionKey: position.positionKey,
       estimatePnlBps: exitEstimate.snapshot.pnlBps,
       gateBps,
-    }, "trailing exit deferred below conservative estimate gate");
+    }, "trailing exit deferred above conservative estimate gate");
     return null;
   }
 
