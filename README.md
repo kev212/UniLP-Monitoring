@@ -41,6 +41,9 @@ Mulai dengan `DRY_RUN=true`. Ubah ke `false` hanya setelah cashflow, PnL, dan si
 | `TRAILING_STOP_ACTIVATION_PERCENT` | PnL minimum untuk mengaktifkan trailing stop. |
 | `TRAILING_STOP_DRAWDOWN_PERCENT` | Drawdown dari peak trailing stop. |
 | `TRAILING_EXIT_ESTIMATE_BUFFER_PERCENT` | Buffer estimasi sebelum close trailing; default 10% di bawah trailing floor. |
+| `TRAILING_TWAP_GUARD_MAX_WAIT_MS` | Batas waktu guard trailing sebelum exit dilanjutkan. Default `5000`. |
+| `MAX_TWAP_DEVIATION_BPS` | Deviasi maksimum harga spot dari rolling TWAP. Default `250` (2.5%). |
+| `TWAP_WINDOW_SECONDS` | Durasi rolling TWAP. Default `60` detik. |
 | `PROFIT_OOR_ABOVE_THRESHOLD_PERCENT` | PnL minimum untuk memulai timer profit + OOR above. Default 3%. |
 | `SWAP_GAS_LIMIT_MULTIPLIER_PERCENT` | Multiplier gas limit swap untuk menghindari RPC underestimation. Default 300%. |
 | `OOR_AUTO_CLOSE_ENABLED` | Aktifkan auto-exit saat quote token cukup jauh above range. |

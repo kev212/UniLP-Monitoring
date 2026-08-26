@@ -27,7 +27,7 @@ function environment(overrides: Record<string, string> = {}): NodeJS.ProcessEnv 
     MAX_SWAP_SLIPPAGE_BPS: "100",
     SWAP_GAS_LIMIT_MULTIPLIER_PERCENT: "300",
     MAX_TWAP_DEVIATION_BPS: "250",
-    TWAP_WINDOW_SECONDS: "300",
+    TWAP_WINDOW_SECONDS: "60",
     PNL_INCLUDE_GAS: "false",
     APPROVAL_MODE: "exact",
     DRY_RUN: "true",
@@ -58,8 +58,9 @@ describe("loadConfig", () => {
     expect(config.trailingExitEstimateBufferPercent).toBe(10);
     expect(config.profitOorAboveThresholdPercent).toBe(3);
     expect(config.slTwapGuardMaxWaitMs).toBe(15_000);
-    expect(config.trailingTwapGuardMaxWaitMs).toBe(15_000);
+    expect(config.trailingTwapGuardMaxWaitMs).toBe(5_000);
     expect(config.positionMonitorIntervalMs).toBe(5_000);
+    expect(config.twapWindowSeconds).toBe(60);
     expect(config.discoveryIntervalMs).toBe(30_000);
     expect(config.maxLogBlockRange).toBe(2_000n);
     expect(config.rpcRequestDelayMs).toBe(0);

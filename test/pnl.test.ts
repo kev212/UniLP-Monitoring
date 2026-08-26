@@ -26,7 +26,7 @@ const config: RuntimeConfig = {
   positionMonitorConcurrency: 2,
   maxSwapSlippageBps: 100,
   maxTwapDeviationBps: 250,
-  twapWindowSeconds: 300,
+  twapWindowSeconds: 60,
   pnlIncludeGas: false,
   oorAutoCloseEnabled: false,
   oorAboveMinDistancePercent: 10,
@@ -196,7 +196,7 @@ describe("fresh valuation quotes", () => {
     const database = {
       recordPositionObservation: vi.fn(),
       getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 1_000_000n, realized: 0n }),
-      getPoolObservationAtOrBefore: vi.fn().mockResolvedValue(null),
+      getPoolObservationsForTwap: vi.fn().mockResolvedValue([]),
       recordPoolObservation: vi.fn(),
     };
     const reader = {
@@ -397,7 +397,7 @@ describe("fresh valuation quotes", () => {
     const database = {
       recordPositionObservation: vi.fn(),
       getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 10n ** 18n, realized: 0n }),
-      getPoolObservationAtOrBefore: vi.fn().mockResolvedValue(null),
+      getPoolObservationsForTwap: vi.fn().mockResolvedValue([]),
       recordPoolObservation: vi.fn(),
     };
     const reader = {
@@ -416,6 +416,95 @@ describe("fresh valuation quotes", () => {
 
     expect(tradingApi.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, zeroAddress);
     expect(routes.quoteDirect).not.toHaveBeenCalled();
+  });
+});
+
+describe("rolling TWAP guard", () => {
+  const stable = "0x0000000000000000000000000000000000000001" as Address;
+  const token = "0x0000000000000000000000000000000000000002" as Address;
+
+  function makeValue(observations: Array<{ priceMarker: bigint; observedAt: Date }>, priceMarker: bigint) {
+    const position = {
+      id: "position",
+      chainId: 8453,
+      protocol: "v4",
+      positionKey: "1",
+      owner: "0x0000000000000000000000000000000000000003" as Address,
+      poolAddress: null,
+      token0: stable,
+      token1: token,
+      quoteToken: stable,
+      status: "armed",
+      liquidity: 1n,
+      openedAtBlock: 1n,
+      metadata: {},
+    } as const;
+    const database = {
+      recordPositionObservation: vi.fn(),
+      getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 1_000_000n, realized: 0n }),
+      getPoolObservationsForTwap: vi.fn().mockResolvedValue(observations),
+      recordPoolObservation: vi.fn().mockResolvedValue(undefined),
+    };
+    const reader = {
+      read: vi.fn().mockResolvedValue({
+        protocol: "v4",
+        poolKey: "pool",
+        sourcePool: null,
+        token0: { token: stable, amount: 1_000_000n },
+        token1: { token, amount: 100n },
+        liquidity: 1n,
+        priceMarker,
+        minAmount0: 0n,
+        minAmount1: 0n,
+        unclaimedFees0: 0n,
+        unclaimedFees1: 0n,
+        observedBlock: 1n,
+      }),
+    };
+    const routes = {
+      quoteDirect: vi.fn().mockResolvedValue({ expectedOut: 100n, path: [token, stable] }),
+    };
+    return {
+      pnl: new PnlService(database as never, reader as never, routes as never, config),
+      position,
+      database,
+    };
+  }
+
+  it("uses duration-weighted observations across the 60-second window", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-26T00:01:00.000Z"));
+    try {
+      const { pnl, position, database } = makeValue([
+        { priceMarker: 100n, observedAt: new Date("2026-08-26T00:00:00.000Z") },
+        { priceMarker: 200n, observedAt: new Date("2026-08-26T00:00:30.000Z") },
+      ], 200n);
+
+      const valued = await pnl.value(position, 1n);
+
+      expect(database.getPoolObservationsForTwap).toHaveBeenCalledWith(8453, "v4", "pool", 60);
+      expect(valued.twapGuard).toEqual({ ready: false, deviationBps: 3333n });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts a current marker within the configured deviation", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-26T00:01:00.000Z"));
+    try {
+      const { pnl, position, database } = makeValue([
+        { priceMarker: 100n, observedAt: new Date("2026-08-26T00:00:00.000Z") },
+        { priceMarker: 100n, observedAt: new Date("2026-08-26T00:00:30.000Z") },
+      ], 102n);
+
+      const valued = await pnl.value(position, 1n);
+
+      expect(database.getPoolObservationsForTwap).toHaveBeenCalledWith(8453, "v4", "pool", 60);
+      expect(valued.twapGuard).toEqual({ ready: true, deviationBps: 200n });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -516,7 +605,7 @@ describe("position group valuation fees", () => {
       ]),
       getPositionGroupCashflowTotals: vi.fn().mockResolvedValue({ deposits: 1_000_000n, realized: 0n }),
       addPositionGroupPnlSnapshot: vi.fn().mockResolvedValue(undefined),
-      getPoolObservationAtOrBefore: vi.fn().mockResolvedValue(null),
+      getPoolObservationsForTwap: vi.fn().mockResolvedValue([]),
       recordPoolObservation: vi.fn().mockResolvedValue(undefined),
     };
     const reader = {
@@ -607,7 +696,7 @@ describe("position group valuation fees", () => {
 
     await pnl.valueGroupLocal(group, 10n);
 
-    expect(database.getPoolObservationAtOrBefore).not.toHaveBeenCalled();
+    expect(database.getPoolObservationsForTwap).not.toHaveBeenCalled();
     expect(database.recordPoolObservation).not.toHaveBeenCalled();
     expect(database.addPositionGroupPnlSnapshot).not.toHaveBeenCalled();
   });

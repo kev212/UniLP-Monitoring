@@ -160,7 +160,7 @@ describe("profit + OOR above timer", () => {
 });
 
 describe("trailing TWAP guard timeout", () => {
-  const config = { trailingTwapGuardMaxWaitMs: 15_000 } as RuntimeConfig;
+  const config = { trailingTwapGuardMaxWaitMs: 5_000 } as RuntimeConfig;
   const position = {
     id: "trailing-position",
     chainId: 4663,
@@ -206,7 +206,7 @@ describe("trailing TWAP guard timeout", () => {
     vi.setSystemTime(100_000);
     try {
       const guardian = makeGuardian();
-      await expect(allow(guardian, { ...position, metadata: { trailingTwapWaitStartedAt: 90_001 } })).resolves.toBe(false);
+      await expect(allow(guardian, { ...position, metadata: { trailingTwapWaitStartedAt: 96_001 } })).resolves.toBe(false);
     } finally {
       vi.useRealTimers();
     }
@@ -217,7 +217,7 @@ describe("trailing TWAP guard timeout", () => {
     vi.setSystemTime(100_000);
     try {
       const guardian = makeGuardian();
-      await expect(allow(guardian, { ...position, metadata: { trailingTwapWaitStartedAt: 84_999 } })).resolves.toBe(true);
+      await expect(allow(guardian, { ...position, metadata: { trailingTwapWaitStartedAt: 94_999 } })).resolves.toBe(true);
     } finally {
       vi.useRealTimers();
     }

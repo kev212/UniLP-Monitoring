@@ -24,6 +24,7 @@ import { applySlippage, sqrtRatioAtTick } from "./uniswap-math.js";
 
 const POSITION_READ_TIMEOUT_MS = 15_000;
 const ROUTE_QUOTE_TIMEOUT_MS = 15_000;
+const MIN_TWAP_OBSERVATIONS = 3;
 
 export interface ValuedPosition {
   snapshot: PnlSnapshot;
@@ -377,16 +378,38 @@ export class PnlService {
   }
 
   private async recordAndCheckPrice(position: PositionRecord, poolKey: string, marker: bigint, blockNumber: bigint): Promise<{ ready: boolean; deviationBps?: bigint }> {
-    const previous = await this.database.getPoolObservationAtOrBefore(
+    const observedAt = new Date();
+    const observations = await this.database.getPoolObservationsForTwap(
       position.chainId,
       position.protocol,
       poolKey,
       this.config.twapWindowSeconds,
     );
     await this.database.recordPoolObservation(position.chainId, position.protocol, poolKey, marker, blockNumber);
-    if (!previous || previous.priceMarker === 0n || marker === 0n) return { ready: false };
-    const difference = marker > previous.priceMarker ? marker - previous.priceMarker : previous.priceMarker - marker;
-    const deviationBps = (difference * 10_000n) / previous.priceMarker;
+    const samples = [...observations, { priceMarker: marker, observedAt }]
+      .sort((left, right) => left.observedAt.getTime() - right.observedAt.getTime());
+    const windowStartMs = observedAt.getTime() - this.config.twapWindowSeconds * 1_000;
+    const firstSample = samples[0];
+    const hasFullWindow = firstSample !== undefined && firstSample.observedAt.getTime() <= windowStartMs;
+    if (marker === 0n || samples.length < MIN_TWAP_OBSERVATIONS || !hasFullWindow) return { ready: false };
+
+    let weightedMarker = 0n;
+    let weightedDurationMs = 0n;
+    for (let index = 0; index < samples.length - 1; index += 1) {
+      const sample = samples[index]!;
+      const startMs = Math.max(windowStartMs, sample.observedAt.getTime());
+      const endMs = Math.min(observedAt.getTime(), samples[index + 1]!.observedAt.getTime());
+      if (endMs <= startMs) continue;
+      const durationMs = BigInt(endMs - startMs);
+      weightedMarker += sample.priceMarker * durationMs;
+      weightedDurationMs += durationMs;
+    }
+    if (weightedDurationMs === 0n) return { ready: false };
+
+    const twapMarker = weightedMarker / weightedDurationMs;
+    if (twapMarker === 0n) return { ready: false };
+    const difference = marker > twapMarker ? marker - twapMarker : twapMarker - marker;
+    const deviationBps = (difference * 10_000n) / twapMarker;
     return { ready: deviationBps <= BigInt(this.config.maxTwapDeviationBps), deviationBps };
   }
 

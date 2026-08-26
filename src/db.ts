@@ -2103,16 +2103,36 @@ FROM position_groups g
     );
   }
 
-  async getPoolObservationAtOrBefore(chainId: number, protocol: Protocol, poolKey: string, secondsAgo: number): Promise<{ priceMarker: bigint; blockNumber: bigint } | null> {
-    const result = await this.pool.query<{ price_marker: string; block_number: string }>(
-      `SELECT price_marker, block_number FROM pool_observations
-       WHERE chain_id = $1 AND protocol = $2 AND pool_key = $3 AND observed_at <= NOW() - ($4 * INTERVAL '1 second')
-       ORDER BY observed_at DESC LIMIT 1`,
+  async getPoolObservationsForTwap(chainId: number, protocol: Protocol, poolKey: string, secondsAgo: number): Promise<Array<{ priceMarker: bigint; observedAt: Date }>> {
+    const result = await this.pool.query<{ price_marker: string; observed_at: Date }>(
+      `WITH cutoff AS (
+         SELECT NOW() - ($4 * INTERVAL '1 second') AS observed_at
+       ), baseline AS (
+         SELECT observation.price_marker, observation.observed_at
+         FROM pool_observations AS observation
+         CROSS JOIN cutoff
+         WHERE observation.chain_id = $1
+           AND observation.protocol = $2
+           AND observation.pool_key = $3
+           AND observation.observed_at <= cutoff.observed_at
+         ORDER BY observation.observed_at DESC
+         LIMIT 1
+       ), recent AS (
+         SELECT observation.price_marker, observation.observed_at
+         FROM pool_observations AS observation
+         CROSS JOIN cutoff
+         WHERE observation.chain_id = $1
+           AND observation.protocol = $2
+           AND observation.pool_key = $3
+           AND observation.observed_at > cutoff.observed_at
+       )
+       SELECT price_marker, observed_at FROM baseline
+       UNION ALL
+       SELECT price_marker, observed_at FROM recent
+       ORDER BY observed_at ASC`,
       [chainId, protocol, poolKey, secondsAgo],
     );
-    if (!result.rowCount) return null;
-    const row = result.rows[0]!;
-    return { priceMarker: BigInt(row.price_marker), blockNumber: BigInt(row.block_number) };
+    return result.rows.map((row) => ({ priceMarker: BigInt(row.price_marker), observedAt: row.observed_at }));
   }
 
   async getDashboardMessageId(chatId: string): Promise<number | null> {
