@@ -2290,7 +2290,8 @@ export class Executor {
       log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 NFT state is irrelevant while settlement remains pending");
       return false;
     }
-    const { client, registry } = this.chains.getById(position.chainId);
+    const { registry } = this.chains.getById(position.chainId);
+    const client = this.executionReadClient(position.chainId);
     try {
       const owner = await client.readContract({
         address: registry.contracts.v4.positionManager,
@@ -2319,13 +2320,7 @@ export class Executor {
     } catch (error) {
       const message = errorMessage(error);
       if (!message.includes("NOT_MINTED")) throw error;
-      if (await this.settleExternallyClosedV4(position)) return false;
-      const settled = await this.database.settleUnverifiedZeroLiquidity(position.id, "nft_burned");
-      if (!settled) {
-        log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 NFT is burned but settlement remains pending");
-        return false;
-      }
-      log.info({ positionId: position.id, positionKey: position.positionKey }, "settled burned V4 NFT without a reconstructed receipt");
+      log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 NFT ownership is not confirmed; close deferred for reconciliation");
       return false;
     }
   }
@@ -2334,7 +2329,8 @@ export class Executor {
     if (position.protocol !== "v4") return false;
     if (hasPendingSettlement(position.status, position.metadata)) return false;
     if (await this.database.recoverVerifiedSettlement(position.id)) return true;
-    const { client, registry } = this.chains.getById(position.chainId);
+    const { registry } = this.chains.getById(position.chainId);
+    const client = this.executionReadClient(position.chainId);
     if (await this.autoSettleZeroLiquidityV4(registry.name, position)) return true;
 
     let reason: string | null = null;
@@ -2357,7 +2353,7 @@ export class Executor {
       else if (liquidity === 0n) reason = "externally_closed";
     } catch (error) {
       if (!errorMessage(error).includes("NOT_MINTED")) return false;
-      reason = "nft_burned";
+      log.info({ positionId: position.id, positionKey: position.positionKey }, "V4 NFT burn is not confirmed; settlement remains pending");
     }
     if (!reason) return false;
 
@@ -3381,7 +3377,8 @@ export class Executor {
     const metadata = position.metadata as Record<string, unknown>;
     const salt = metadata.salt as Hex | undefined;
     if (!salt) return false;
-    const { client, registry } = this.chains.getById(position.chainId);
+    const { registry } = this.chains.getById(position.chainId);
+    const client = this.executionReadClient(position.chainId);
     try {
       const withdrawalEvent = await this.findV4WithdrawalEvent(position, salt);
       if (!withdrawalEvent || !withdrawalEvent.transactionHash || !withdrawalEvent.blockNumber) return false;

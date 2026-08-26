@@ -67,7 +67,7 @@ export class DiscoveryService {
     if (!group) throw new Error(`Position group ${typeof groupOrId === "string" ? groupOrId : "unknown"} was not found`);
 
     const { registry } = this.chains.get(name);
-    const client = this.reconciliationClient(name);
+    const client = this.authoritativeClient(name);
     const bins = await this.database.listPositionGroupBins(group.id);
     try {
       if (group.chainId !== registry.chain.id) throw new Error("position group chain does not match the discovery chain");
@@ -87,7 +87,7 @@ export class DiscoveryService {
       }
       return await this.reconcileV4PositionGroupOpen(name, group, plannedBins, transactionHash, resolvedReceipt);
     } catch (error) {
-      await this.markPositionGroupOpenNeedsReview(group, bins, transactionHash, errorMessage(error));
+      if (!isTransientRpcError(error)) await this.markPositionGroupOpenNeedsReview(group, bins, transactionHash, errorMessage(error));
       throw error;
     }
   }
@@ -103,7 +103,7 @@ export class DiscoveryService {
 
   async reconcilePendingPositionGroupOpens(name: ChainName): Promise<void> {
     const { registry } = this.chains.get(name);
-    const client = this.reconciliationClient(name);
+    const client = this.authoritativeClient(name);
     const groups = await this.database.listPositionGroups(registry.chain.id);
     for (const group of groups) {
       if (!shouldRetryPendingGroupOpen(group)) continue;
@@ -131,7 +131,7 @@ export class DiscoveryService {
     receipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>,
   ): Promise<PositionRecord[]> {
     const { registry } = this.chains.get(name);
-    const client = this.reconciliationClient(name);
+    const client = this.authoritativeClient(name);
     const transfers = receipt.logs
       .filter((entry) => entry.address.toLowerCase() === group.positionManager.toLowerCase())
       .map((entry) => decodeErc721Transfer(entry))
@@ -224,7 +224,7 @@ export class DiscoveryService {
     receipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>,
   ): Promise<PositionRecord[]> {
     const { registry } = this.chains.get(name);
-    const client = this.reconciliationClient(name);
+    const client = this.authoritativeClient(name);
     const transfers = receipt.logs
       .filter((entry) => entry.address.toLowerCase() === group.positionManager.toLowerCase())
       .map((entry) => decodeErc721Transfer(entry))
@@ -454,12 +454,21 @@ export class DiscoveryService {
     return typeof this.chains.getForScan === "function" ? this.chains.getForScan(name).client : regular;
   }
 
+  private authoritativeClient(name: ChainName): PublicClient {
+    try {
+      return this.chains.getForExecution(name).client;
+    } catch {
+      // Tests and scan-only chains may not expose an execution client.
+      return this.reconciliationClient(name);
+    }
+  }
+
   private ownerLookupClients(name: ChainName): PublicClient[] {
     const scan = this.reconciliationClient(name);
     try {
       if (typeof this.chains.getForExecution === "function") {
         const execution = this.chains.getForExecution(name).client;
-        if (execution !== scan) return name === "base" ? [scan, execution] : [execution, scan];
+        if (execution !== scan) return [execution, scan];
       }
     } catch {
       // Tests and scan-only chains have no execution client.
@@ -519,7 +528,7 @@ export class DiscoveryService {
     }
     const found: PositionRecord[] = [];
     if (v3.length > 0) found.push(...await this.discoverV3Candidates(name, v3));
-    if (v4.length > 0) found.push(...await this.discoverV4Candidates(name, v4));
+    if (v4.length > 0) found.push(...await this.discoverV4Candidates(name, v4, receipt));
     for (const position of found) {
       if (position.protocol === "v3") await this.hydrateV3OpeningCashflowFromReceipt(name, position, receipt);
     }
@@ -1025,7 +1034,8 @@ export class DiscoveryService {
   }
 
   private async discoverV4FromLiquidityEvents(name: ChainName, fromBlock: bigint, toBlock: bigint): Promise<NftActivity[]> {
-    const { client, registry } = this.chains.get(name);
+    const { registry } = this.chains.get(name);
+    const client = this.authoritativeClient(name);
     const candidates: NftActivity[] = [];
     try {
       const events = await this.getLogsChunked(name, {
@@ -1071,15 +1081,18 @@ export class DiscoveryService {
     return candidates;
   }
 
-  async discoverV4Candidates(name: ChainName, candidates: NftActivity[]): Promise<PositionRecord[]> {
-    const { client, registry } = this.chains.get(name);
+  async discoverV4Candidates(name: ChainName, candidates: NftActivity[], confirmedReceipt?: TransactionReceipt): Promise<PositionRecord[]> {
+    const { registry } = this.chains.get(name);
+    const client = this.authoritativeClient(name);
     const positions: PositionRecord[] = [];
     for (const candidate of candidates) {
       const tokenId = candidate.tokenId;
       try {
         const owner = await this.readMintedNftOwner(name, registry.contracts.v4.positionManager, "v4", tokenId);
         if (owner.toLowerCase() !== this.config.executorAddress.toLowerCase()) continue;
-        const receipt = await client.getTransactionReceipt({ hash: candidate.transactionHash });
+        const receipt = confirmedReceipt?.transactionHash.toLowerCase() === candidate.transactionHash.toLowerCase()
+          ? confirmedReceipt
+          : await client.getTransactionReceipt({ hash: candidate.transactionHash });
         const mintEvent = this.decodeV4MintLog(receipt.logs, registry.contracts.v4.poolManager, tokenId);
         if (!mintEvent) {
           const fallback = await this.upsertV4FromPositionManager(name, tokenId, candidate.blockNumber, candidate.historyTrusted, {
@@ -1136,24 +1149,22 @@ export class DiscoveryService {
       } catch (error) {
         if (isTransientRpcError(error)) throw error;
         const message = error instanceof Error ? error.message : String(error);
-        const burned = message.includes("NOT_MINTED");
-        log[burned ? "info" : "warn"](
-          burned
-            ? { chain: name, tokenId: tokenId.toString() }
-            : { err: error, chain: name, tokenId: tokenId.toString() },
-          burned ? "V4 candidate NFT is burned — requesting settlement review" : "could not resolve V4 candidate; marking needs_review",
-        );
+        log.warn({ err: error, chain: name, tokenId: tokenId.toString() }, "could not resolve V4 candidate; marking needs_review");
         try {
-          if (burned) {
-            const existing = await this.database.findPositionByKey(registry.chain.id, "v4", tokenId.toString());
-            if (existing) {
-              const settled = await this.database.settleUnverifiedZeroLiquidity(existing.id, "nft_burned");
-              log.info(
-                { chain: name, tokenId: tokenId.toString() },
-                settled ? "settled burned V4 NFT without a reconstructed receipt" : "V4 NFT is burned but settlement remains pending",
-              );
-              continue;
+          const existing = await this.database.findPositionByKey(registry.chain.id, "v4", tokenId.toString());
+          if (existing) {
+            if (existing.status !== "settled") {
+              const setStatus = (this.database as Database & {
+                setPositionStatus?: Database["setPositionStatus"];
+              }).setPositionStatus;
+              if (typeof setStatus === "function") {
+                await setStatus.call(this.database, existing.id, "needs_review", {
+                  reason: "v4_read_failed",
+                  error: message,
+                });
+              }
             }
+            continue;
           }
           await this.database.upsertPosition({
             chainId: registry.chain.id, protocol: "v4", positionKey: tokenId.toString(),
@@ -1163,8 +1174,8 @@ export class DiscoveryService {
             metadata: {
               positionManager: registry.contracts.v4.positionManager,
               source: "nft_transfer",
-              reason: burned ? "nft_burned_unverified" : "v4_read_failed",
-              ...(burned ? {} : { error: message }),
+              reason: "v4_read_failed",
+              error: message,
               historyTrusted: candidate.historyTrusted,
             },
           });
@@ -1193,7 +1204,8 @@ export class DiscoveryService {
     historyTrusted: boolean,
     metadata: Record<string, unknown>,
   ): Promise<PositionRecord | null> {
-    const { client, registry } = this.chains.get(name);
+    const { registry } = this.chains.get(name);
+    const client = this.authoritativeClient(name);
     const owner = await client.readContract({
       address: registry.contracts.v4.positionManager,
       abi: v4PositionManagerAbi,

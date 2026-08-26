@@ -305,6 +305,33 @@ describe("Executor pending settlement recovery", () => {
     expect(database.settleUnverifiedZeroLiquidity).toHaveBeenCalledWith("position", "externally_closed");
   });
 
+  it("does not settle a V4 NFT from a single NOT_MINTED response", async () => {
+    const database = {
+      recoverVerifiedSettlement: vi.fn().mockResolvedValue(false),
+      settleUnverifiedZeroLiquidity: vi.fn().mockResolvedValue(true),
+    };
+    const executionClient = {
+      readContract: vi.fn().mockRejectedValue(new Error("execution reverted: NOT_MINTED")),
+    };
+    const chains = {
+      getById: vi.fn(() => ({
+        client: executionClient,
+        registry: { name: "robinhood", contracts: { v4: { positionManager: groupManager } } },
+      })),
+      getForExecution: vi.fn(() => ({ client: executionClient })),
+    };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, { settled: vi.fn() } as never, config);
+    vi.spyOn(executor, "autoSettleZeroLiquidityV4").mockResolvedValue(false);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "99", owner, poolAddress: null,
+      token0: token, token1: usdg, quoteToken: usdg, status: "needs_review", liquidity: 10n, openedAtBlock: 1n,
+      metadata: { reason: "nft_burned_unverified" },
+    } as PositionRecord;
+
+    await expect(executor.settleExternallyClosedV4(position)).resolves.toBe(false);
+    expect(database.settleUnverifiedZeroLiquidity).not.toHaveBeenCalled();
+  });
+
   it("derives net ERC-20 proceeds from confirmed receipt transfers", () => {
     const logs = [
       transferLog(token, sender, owner, 120n),
@@ -650,6 +677,7 @@ describe("Executor pending settlement recovery", () => {
   it("classifies provider rate limits and timeouts as transient RPC errors", () => {
     expect(isTransientRpcError(new Error("HTTP request failed: Status: 429 Too Many Requests"))).toBe(true);
     expect(isTransientRpcError(new Error("The operation was aborted due to timeout"))).toBe(true);
+    expect(isTransientRpcError(new Error("Transaction receipt could not be found yet"))).toBe(true);
     expect(isTransientRpcError({ status: 429, message: "rate limited" })).toBe(true);
     expect(isTransientRpcError({ cause: { code: -32005, message: "resource unavailable" } })).toBe(true);
     expect(isTransientRpcError(new Error("unsupported block number 32436872"))).toBe(true);

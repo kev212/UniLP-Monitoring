@@ -19,7 +19,7 @@ export function isTransientRpcError(error: unknown): boolean {
   }
 
   const message = values.map((value) => String(value.message ?? "")).join(" ");
-  return /\b(?:408|425|429|500|502|503|504|520|521|522|523|524|525|526|527|530)\b|too many requests|rate limit|timed out|timeout|aborted|econnreset|econnrefused|enotfound|network|fetch failed|service unavailable|gateway|origin (?:is )?(?:unreachable|down)|unsupported block number|header not found|block(?:\s+number)?\s+(?:is\s+)?(?:not found|unavailable)|missing trie node/i.test(message);
+  return /\b(?:408|425|429|500|502|503|504|520|521|522|523|524|525|526|527|530)\b|too many requests|rate limit|timed out|timeout|aborted|econnreset|econnrefused|enotfound|network|fetch failed|service unavailable|gateway|origin (?:is )?(?:unreachable|down)|unsupported block number|header not found|block(?:\s+number)?\s+(?:is\s+)?(?:not found|unavailable)|(?:transaction|receipt)[\s\S]{0,100}(?:could not be found|not found|not (?:been )?processed|unavailable|pending)|missing trie node/i.test(message);
 }
 
 export function isRpcRateLimited(error: unknown): boolean {

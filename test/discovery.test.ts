@@ -142,7 +142,7 @@ function groupDatabase(bins: PositionGroupBinRecord[]) {
 }
 
 describe("historical discovery reads", () => {
-  it("records positive V4 mint liquidity from the receipt instead of settling it as zero", async () => {
+  it("reuses the confirmed V4 open receipt when the other RPC provider is behind", async () => {
     const manager = chainRegistry.robinhood.contracts.v4.positionManager;
     const poolManager = chainRegistry.robinhood.contracts.v4.poolManager;
     const tokenId = 910_656n;
@@ -163,7 +163,7 @@ describe("historical discovery reads", () => {
         if (functionName === "poolKeys") return { currency0: token0, currency1: token1, fee: 500, tickSpacing: 10, hooks: zeroAddress };
         throw new Error(`unexpected ${functionName}`);
       }),
-      getTransactionReceipt: vi.fn().mockResolvedValue(receipt),
+      getTransactionReceipt: vi.fn().mockRejectedValue(new Error("Transaction receipt is not available on this provider yet")),
     };
     const discovery = new DiscoveryService(
       { upsertPosition } as never,
@@ -180,7 +180,7 @@ describe("historical discovery reads", () => {
       to: owner,
       tokenId,
       historyTrusted: true,
-    }]);
+    }], receipt);
 
     expect(upsertPosition).toHaveBeenCalledWith(expect.objectContaining({
       positionKey: tokenId.toString(),
@@ -567,9 +567,10 @@ describe("pending Bid-Ask open reconciliation retries", () => {
       }),
     };
     const executionClient = {
+      getTransactionReceipt: client.getTransactionReceipt,
       readContract: vi.fn(async ({ functionName, args }: { functionName: string; args?: readonly unknown[] }) => {
         if (functionName === "ownerOf") return owner;
-        throw new Error(`unexpected execution ${functionName}`);
+        return client.readContract({ functionName, args });
       }),
     };
     const discovery = new DiscoveryService(
