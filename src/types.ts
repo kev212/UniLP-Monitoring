@@ -238,6 +238,34 @@ export interface PositionGroupCashflowTotals {
   realized: bigint;
 }
 
+export type ValuationQuoteProvider = "source_pool" | "uniswap" | "kyberswap";
+
+export function isAggregatorQuote(provider?: ValuationQuoteProvider): boolean {
+  return provider === "uniswap" || provider === "kyberswap";
+}
+
+export interface ExactQuote {
+  quoteToken: Address;
+  depositsQuote: bigint;
+  realizedQuote: bigint;
+  liquidationQuote: bigint;
+  minimumLiquidationQuote: bigint;
+  pnlQuote: bigint;
+  pnlBps: bigint;
+  minimumPnlBps: bigint;
+  provider: ValuationQuoteProvider;
+  blockNumber: bigint;
+  quotedAt: Date;
+}
+
+export interface PositionExactQuote extends ExactQuote {
+  positionId: string;
+}
+
+export interface PositionGroupExactQuote extends ExactQuote {
+  groupId: string;
+}
+
 export interface PositionGroupPnlSnapshot {
   groupId: string;
   quoteToken: Address;
@@ -252,6 +280,9 @@ export interface PositionGroupPnlSnapshot {
   groupGasQuote: bigint;
   rangeCurrentTick: number | null;
   rangeCurrentSqrtPrice: bigint | null;
+  quoteProvider?: ValuationQuoteProvider;
+  minimumPnlBps?: bigint;
+  minimumLiquidationQuote?: bigint;
 }
 
 export interface PositionGroupPnlSnapshotRecord extends PositionGroupPnlSnapshot {
@@ -286,6 +317,9 @@ export interface PnlSnapshot {
   feeQuote: bigint;
   feeNonQuote: { token: Address; amount: bigint; converted: bigint } | null;
   feeQuoteUsdg: bigint;
+  quoteProvider?: ValuationQuoteProvider;
+  minimumPnlBps?: bigint;
+  minimumLiquidationQuote?: bigint;
 }
 
 export interface TransactionPlan {

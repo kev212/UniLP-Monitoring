@@ -6,7 +6,8 @@ import { chainHeading, chainRegistry, parseChainAlias } from "../chains.js";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, CloseHistoryRecord, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionGroupPnlSnapshot, PositionGroupRecord, PositionRangeInfo, PositionRecord, PositionStatus, Protocol, QuoteToken, RiskSettings } from "../types.js";
+import type { ChainName, CloseHistoryRecord, ExactQuote, ExitTrigger, PnlSnapshot, PoolScanSettings, PositionExactQuote, PositionGroupExactQuote, PositionGroupPnlSnapshot, PositionGroupRecord, PositionRangeInfo, PositionRecord, PositionStatus, Protocol, QuoteToken, RiskSettings } from "../types.js";
+import { isAggregatorQuote } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import { TransientCloseError, type Executor } from "./executor.js";
 import { isTransientRpcError } from "../rpc.js";
@@ -58,6 +59,7 @@ interface NamedBidAskOpenerMethod {
 
 const DASHBOARD_PAGE_SIZE = 6;
 const DASHBOARD_VALUE_CONCURRENCY = 3;
+const EXACT_QUOTE_STALE_MS = 90_000;
 const HISTORY_IDLE_TTL_MS = 30_000;
 const CALENDAR_IDLE_TTL_MS = 60_000;
 
@@ -725,7 +727,7 @@ export class Notifier {
         return;
       }
       if (action.type === "select") {
-        await this.showCloseConfirmation(database, chatId, message.message_id, position, action.page);
+        await this.showCloseConfirmation(database, pnl, chatId, message.message_id, position, action.page);
         return;
       }
       if (this.dashboardCloseInFlight.has(position.id)) {
@@ -814,14 +816,20 @@ export class Notifier {
     } else {
       const pagePositions = active.slice(first, first + DASHBOARD_PAGE_SIZE);
       const positionIds = pagePositions.filter((position) => !isGroupParent(position)).map((p) => p.id);
-      const [snapshotMap, observationMap] = await Promise.all([
+      const groupIds = pagePositions.flatMap((position) => {
+        const groupId = isGroupParent(position) ? managedPositionGroupId(position) : null;
+        return groupId ? [groupId] : [];
+      });
+      const [snapshotMap, observationMap, exactMap, groupExactMap] = await Promise.all([
         database.getLatestSnapshots(positionIds),
         database.getLatestObservations(positionIds),
+        database.getLatestExactQuotes(positionIds),
+        database.getLatestGroupExactQuotes(groupIds),
       ]);
       const statusLines = await Promise.all(pagePositions.map((position, index) =>
         isGroupParent(position)
-          ? this.formatGroupStatusLine(position, database, first + index + 1)
-          : this.formatStatusLineFromSnapshot(position, snapshotMap.get(position.id), observationMap.get(position.id), pnl, first + index + 1),
+          ? this.formatGroupStatusLine(position, database, first + index + 1, groupExactMap.get(managedPositionGroupId(position) ?? ""))
+          : this.formatStatusLineFromSnapshot(position, snapshotMap.get(position.id), observationMap.get(position.id), pnl, first + index + 1, exactMap.get(position.id)),
       ));
       lines.push(...statusLines.map((line) => line.trimEnd()));
     }
@@ -914,7 +922,7 @@ export class Notifier {
     await this.editDashboardMessage(chatId, messageId, lines.join("\n"), keyboard);
   }
 
-  private async showCloseConfirmation(database: Database, chatId: string, messageId: number, position: PositionRecord, page: number): Promise<void> {
+  private async showCloseConfirmation(database: Database, pnl: PnlService, chatId: string, messageId: number, position: PositionRecord, page: number): Promise<void> {
     const pair = await this.pairLabel(position);
     const groupId = managedPositionGroupId(position);
     const group = groupId ? await this.positionGroup(database, groupId) : null;
@@ -924,13 +932,43 @@ export class Notifier {
     const target = groupId
       ? `BID-ASK parent ${shortHash(group?.id ?? groupId)}`
       : `${position.protocol.toUpperCase()} #${position.positionKey}`;
-    await this.editDashboardMessage(chatId, messageId, [
+    const lines = [
       "⚠️ CONFIRM CLOSE",
       `${target} ${pair}`,
       groupId
         ? `Semua child NFT ditutup secara atomic${group ? ` (${group.mintableBinCount} bins)` : ""}; satu kegagalan me-revert seluruh batch.`
         : "Aksi ini menghapus liquidity dan memulai settlement ke quote token.",
-    ].join("\n"), keyboard);
+    ];
+    const preview = await this.freshExitPreview(pnl, position, group);
+    if (preview) lines.push(preview);
+    else lines.push("Exit est. unavailable; close will requote on-chain.");
+    await this.editDashboardMessage(chatId, messageId, lines.join("\n"), keyboard);
+  }
+
+  private async freshExitPreview(pnl: PnlService, position: PositionRecord, group: PositionGroupRecord | null): Promise<string | null> {
+    try {
+      const { client } = this.chains.getById(position.chainId);
+      const blockNumber = await client.getBlockNumber();
+      if (group) {
+        const exact = await pnl.valueGroupExactProbe(group, blockNumber, this.config.settlementSwapSlippageBps, { budget: false });
+        if (!isAggregatorQuote(exact.snapshot.quoteProvider)) return null;
+        return this.formatExitPreviewLine(exact.snapshot.pnlBps, exact.snapshot.minimumPnlBps);
+      }
+      const exact = await pnl.valueExactProbe(position, blockNumber, this.config.settlementSwapSlippageBps, { budget: false });
+      if (!isAggregatorQuote(exact.snapshot.quoteProvider)) return null;
+      return this.formatExitPreviewLine(exact.snapshot.pnlBps, exact.snapshot.minimumPnlBps);
+    } catch (error) {
+      log.warn({ err: error, positionId: position.id }, "manual close exact quote preview failed");
+      return null;
+    }
+  }
+
+  private formatExitPreviewLine(pnlBps: bigint, minimumPnlBps?: bigint): string {
+    const expected = `${pnlBps >= 0n ? "+" : ""}${formatBps(pnlBps)}%`;
+    const minimum = minimumPnlBps === undefined ? null : `${minimumPnlBps >= 0n ? "+" : ""}${formatBps(minimumPnlBps)}%`;
+    return minimum
+      ? `🎯 Expected ${expected} | Min ${minimum}`
+      : `🎯 Expected ${expected}`;
   }
 
   private async closeButtonLabel(position: PositionRecord): Promise<string> {
@@ -972,6 +1010,7 @@ export class Notifier {
     observation: { liquidity: bigint; token0Amount: bigint; token1Amount: bigint; blockNumber: bigint; rangeStatus: string | null; rangeTickLower: number | null; rangeTickUpper: number | null; rangeCurrentTick: number | null; rangeSqrtPrice: bigint | null } | undefined,
     pnl: PnlService,
     index: number,
+    exact?: PositionExactQuote,
   ): Promise<string> {
     const t0 = await this.tokenLabel(position.token0, position.chainId);
     const t1 = await this.tokenLabel(position.token1, position.chainId);
@@ -1000,7 +1039,8 @@ export class Notifier {
     const pnlArrow = snapshot.pnlBps > 0n ? "📈" : snapshot.pnlBps < 0n ? "📉" : "➖";
     const trailingPeak = trailingPeakDisplay(position.metadata);
     const feeUsdg = snapshot.feeQuoteUsdg ?? 0n;
-    const headerEmoji = snapshot.pnlBps < 0n ? "🔴" : "🟢";
+    const displayPnl = displayExactQuote(exact)?.pnlBps ?? snapshot.pnlBps;
+    const headerEmoji = displayPnl < 0n ? "🔴" : "🟢";
 
     const rangeInfo = observation?.rangeStatus && observation.rangeTickLower !== null && observation.rangeTickUpper !== null && observation.rangeCurrentTick !== null && observation.rangeSqrtPrice !== null
       ? {
@@ -1014,10 +1054,10 @@ export class Notifier {
     const rangeStr = await this.formatPositionRange(position, rangeInfo);
     const base = `${index}. ${headerEmoji} ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}`;
     const valueLine = `   💰 ${cv} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${pnlArrow} ${pnlSign}${pnlPct}%${trailingPeak}`;
-    return `${base}\n${valueLine}${rangeStr}\n`;
+    return `${base}\n${valueLine}${formatExactQuoteLine(exact)}${rangeStr}\n`;
   }
 
-  private async formatGroupStatusLine(position: PositionRecord, database: Database, index: number): Promise<string> {
+  private async formatGroupStatusLine(position: PositionRecord, database: Database, index: number, exact?: PositionGroupExactQuote): Promise<string> {
     const t0 = await this.tokenLabel(position.token0, position.chainId);
     const t1 = await this.tokenLabel(position.token1, position.chainId);
     const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
@@ -1027,7 +1067,8 @@ export class Notifier {
     const statusLabel = status === "active" ? "" : ` · ${statusDisplay(status as PositionStatus)}`;
     const bins = typeof position.metadata.mintableBinCount === "number" ? position.metadata.mintableBinCount : "?";
     const feeLabel = await this.groupFeeLabel(position, database);
-    const base = `${index}. ${snapshot && snapshot.pnlBps < 0n ? "🔴" : "🟢"} ${pair}${feeLabel} · ${position.protocol.toUpperCase()} · BA${statusLabel}`;
+    const displayPnl = displayExactQuote(exact)?.pnlBps ?? snapshot?.pnlBps;
+    const base = `${index}. ${displayPnl !== undefined && displayPnl < 0n ? "🔴" : "🟢"} ${pair}${feeLabel} · ${position.protocol.toUpperCase()} · BA${statusLabel}`;
     if (!snapshot) return `${base}\n   ⏳ LOADING · ${bins} bins\n`;
     const qtSymbol = this.quoteSymbol(position.quoteToken!);
     const qtDec = await this.decimals(position.quoteToken!, position.chainId);
@@ -1038,7 +1079,7 @@ export class Notifier {
     const trailingPeak = trailingPeakDisplay(position.metadata);
     const valueLine = `   💰 ${value} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${arrow} ${sign}${formatBps(snapshot.pnlBps)}%${trailingPeak}`;
     const rangeLine = await this.formatGroupPositionRange(position, snapshot, bins);
-    return `${base}\n${valueLine}${rangeLine}\n`;
+    return `${base}\n${valueLine}${formatExactQuoteLine(exact)}${rangeLine}\n`;
   }
 
   private async groupFeeLabel(position: PositionRecord, database: Database): Promise<string> {
@@ -2678,6 +2719,25 @@ async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function freshExactQuote<T extends ExactQuote>(quote: T | undefined, now = Date.now()): T | undefined {
+  if (!quote) return undefined;
+  return now - quote.quotedAt.getTime() <= EXACT_QUOTE_STALE_MS ? quote : undefined;
+}
+
+function displayExactQuote<T extends ExactQuote>(quote: T | undefined, now = Date.now()): T | undefined {
+  const fresh = freshExactQuote(quote, now);
+  return fresh && isAggregatorQuote(fresh.provider) ? fresh : undefined;
+}
+
+function formatExactQuoteLine(quote: ExactQuote | undefined): string {
+  const fresh = displayExactQuote(quote);
+  if (!fresh) return "";
+  const expected = `${fresh.pnlBps >= 0n ? "+" : ""}${formatBps(fresh.pnlBps)}%`;
+  if (fresh.minimumPnlBps === undefined) return `\n   🎯 Expected ${expected}`;
+  const minimum = `${fresh.minimumPnlBps >= 0n ? "+" : ""}${formatBps(fresh.minimumPnlBps)}%`;
+  return `\n   🎯 Expected ${expected} | Min ${minimum}`;
 }
 
 function formatBps(value: bigint): string {

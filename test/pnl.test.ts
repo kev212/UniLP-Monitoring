@@ -474,6 +474,153 @@ describe("fresh valuation quotes", () => {
     expect(baseline.snapshot.liquidationQuote).toBe(1_090_000n);
     expect(probe.snapshot.liquidationQuote).toBe(1_100_000n);
   });
+
+  it("prefers a Kyber exact quote over the source-pool mark", async () => {
+    const stable = "0x0000000000000000000000000000000000000001" as Address;
+    const token = "0x0000000000000000000000000000000000000002" as Address;
+    const position = {
+      id: "position",
+      chainId: 4663,
+      protocol: "v4",
+      positionKey: "983856",
+      owner: "0x0000000000000000000000000000000000000003" as Address,
+      poolAddress: null,
+      token0: stable,
+      token1: token,
+      quoteToken: stable,
+      status: "armed",
+      liquidity: 1n,
+      openedAtBlock: 1n,
+      metadata: {},
+    } as const;
+    const database = {
+      recordPositionObservation: vi.fn(),
+      getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 500_000_000n, realized: 0n }),
+      getPoolObservationsForTwap: vi.fn().mockResolvedValue([]),
+      recordPoolObservation: vi.fn(),
+      upsertExactQuote: vi.fn().mockResolvedValue(undefined),
+    };
+    const reader = {
+      read: vi.fn().mockResolvedValue({
+        protocol: "v4", poolKey: "pool", sourcePool: null,
+        token0: { token: stable, amount: 36_388_725n },
+        token1: { token, amount: 10n ** 18n }, liquidity: 1n, priceMarker: 1n,
+        minAmount0: 0n, minAmount1: 0n, unclaimedFees0: 35_070_217n, unclaimedFees1: 0n, observedBlock: 1n,
+      }),
+    };
+    const routes = {
+      quoteSourcePool: vi.fn().mockResolvedValue({ expectedOut: 335_070_217n, path: [token, stable] }),
+      quoteDirect: vi.fn(),
+    };
+    const tradingApi = { quote: vi.fn().mockResolvedValue({ expectedOut: 340_000_000n, minimumOut: 336_600_000n }) };
+    const kyberswap = { quote: vi.fn().mockResolvedValue({ expectedOut: 394_852_923n, minimumOut: 390_904_394n }) };
+    const pnl = new PnlService(database as never, reader as never, routes as never, config, tradingApi as never, kyberswap as never);
+
+    const baseline = await pnl.value(position, 1n);
+    const probe = await pnl.valueExactProbe(position, 1n);
+
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
+    expect(kyberswap.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, stable, 100, { budget: true });
+    expect(baseline.snapshot.pnlBps).toBe(-1_869n);
+    expect(probe.snapshot.pnlBps).toBe(-673n);
+    expect(probe.snapshot.quoteProvider).toBe("kyberswap");
+    expect(database.upsertExactQuote).toHaveBeenCalledWith(expect.objectContaining({
+      provider: "kyberswap",
+      pnlBps: -673n,
+    }));
+  });
+
+  it("prefers an aggregator exact quote over a richer source-pool mark", async () => {
+    const stable = "0x0000000000000000000000000000000000000001" as Address;
+    const token = "0x0000000000000000000000000000000000000002" as Address;
+    const position = {
+      id: "position",
+      chainId: 8453,
+      protocol: "v4",
+      positionKey: "1",
+      owner: "0x0000000000000000000000000000000000000003" as Address,
+      poolAddress: null,
+      token0: stable,
+      token1: token,
+      quoteToken: stable,
+      status: "armed",
+      liquidity: 1n,
+      openedAtBlock: 1n,
+      metadata: {},
+    } as const;
+    const database = {
+      recordPositionObservation: vi.fn(),
+      getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 1_000_000n, realized: 0n }),
+      getPoolObservationsForTwap: vi.fn().mockResolvedValue([]),
+      recordPoolObservation: vi.fn(),
+      upsertExactQuote: vi.fn().mockResolvedValue(undefined),
+    };
+    const reader = {
+      read: vi.fn().mockResolvedValue({
+        protocol: "v4", poolKey: "pool", sourcePool: null,
+        token0: { token: stable, amount: 1_000_000n },
+        token1: { token, amount: 10n ** 18n }, liquidity: 1n, priceMarker: 1n,
+        minAmount0: 0n, minAmount1: 0n, unclaimedFees0: 0n, unclaimedFees1: 0n, observedBlock: 1n,
+      }),
+    };
+    const routes = {
+      quoteSourcePool: vi.fn().mockResolvedValue({ expectedOut: 200_000n, path: [token, stable] }),
+      quoteDirect: vi.fn(),
+    };
+    const tradingApi = { quote: vi.fn().mockResolvedValue({ expectedOut: 90_000n, minimumOut: 88_200n }) };
+    const pnl = new PnlService(database as never, reader as never, routes as never, config, tradingApi as never);
+
+    const probe = await pnl.valueExactProbe(position, 1n);
+
+    expect(probe.snapshot.quoteProvider).toBe("uniswap");
+    expect(probe.snapshot.liquidationQuote).toBe(1_090_000n);
+    expect(database.upsertExactQuote).toHaveBeenCalledWith(expect.objectContaining({ provider: "uniswap" }));
+  });
+
+  it("does not persist a source-pool fallback as an exact quote", async () => {
+    const stable = "0x0000000000000000000000000000000000000001" as Address;
+    const token = "0x0000000000000000000000000000000000000002" as Address;
+    const position = {
+      id: "position",
+      chainId: 8453,
+      protocol: "v4",
+      positionKey: "1",
+      owner: "0x0000000000000000000000000000000000000003" as Address,
+      poolAddress: null,
+      token0: stable,
+      token1: token,
+      quoteToken: stable,
+      status: "armed",
+      liquidity: 1n,
+      openedAtBlock: 1n,
+      metadata: {},
+    } as const;
+    const database = {
+      recordPositionObservation: vi.fn(),
+      getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 1_000_000n, realized: 0n }),
+      getPoolObservationsForTwap: vi.fn().mockResolvedValue([]),
+      recordPoolObservation: vi.fn(),
+      upsertExactQuote: vi.fn().mockResolvedValue(undefined),
+    };
+    const reader = {
+      read: vi.fn().mockResolvedValue({
+        protocol: "v4", poolKey: "pool", sourcePool: null,
+        token0: { token: stable, amount: 1_000_000n },
+        token1: { token, amount: 10n ** 18n }, liquidity: 1n, priceMarker: 1n,
+        minAmount0: 0n, minAmount1: 0n, unclaimedFees0: 0n, unclaimedFees1: 0n, observedBlock: 1n,
+      }),
+    };
+    const routes = {
+      quoteSourcePool: vi.fn().mockResolvedValue({ expectedOut: 90_000n, path: [token, stable] }),
+      quoteDirect: vi.fn(),
+    };
+    const pnl = new PnlService(database as never, reader as never, routes as never, config);
+
+    const probe = await pnl.valueExactProbe(position, 1n);
+
+    expect(probe.snapshot.quoteProvider).toBe("source_pool");
+    expect(database.upsertExactQuote).not.toHaveBeenCalled();
+  });
 });
 
 describe("rolling TWAP guard", () => {
@@ -786,6 +933,24 @@ describe("position group valuation fees", () => {
 
     expect(reader.readGroup).toHaveBeenCalledTimes(2);
     expect(reader.readGroup).toHaveBeenLastCalledWith(group, expect.any(Array), 11n, undefined, "monitoring");
+  });
+
+  it("quotes an aggregated Bid-Ask exact route once per provider", async () => {
+    const { database, routes, reader, group } = setup(token, stable, stable, 500n, 0n, 0n, 0n, [{ symbol: "USDC", address: stable }]);
+    database.upsertGroupExactQuote = vi.fn().mockResolvedValue(undefined);
+    const tradingApi = { quote: vi.fn().mockResolvedValue({ expectedOut: 1_200n, minimumOut: 1_176n }) };
+    const kyberswap = { quote: vi.fn().mockResolvedValue({ expectedOut: 1_400n, minimumOut: 1_372n }) };
+    const pnl = new PnlService(database as never, reader as never, routes as never, { ...config, chains: ["base"], quoteTokens: { base: [{ symbol: "USDC", address: stable }], robinhood: [] } } as unknown as RuntimeConfig, tradingApi as never, kyberswap as never);
+
+    const probe = await pnl.valueGroupExactProbe(group, 10n);
+
+    expect(tradingApi.quote).toHaveBeenCalledTimes(1);
+    expect(kyberswap.quote).toHaveBeenCalledTimes(1);
+    expect(kyberswap.quote).toHaveBeenCalledWith(expect.anything(), token, 1_000n, stable, 100, { budget: true });
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
+    expect(probe.snapshot.quoteProvider).toBe("kyberswap");
+    expect(probe.snapshot.liquidationQuote).toBe(1_400n);
+    expect(database.upsertGroupExactQuote).toHaveBeenCalledWith(expect.objectContaining({ provider: "kyberswap", liquidationQuote: 1_400n }));
   });
 
   it("keeps the prepared group read while an exact route quote retries at the same block", async () => {

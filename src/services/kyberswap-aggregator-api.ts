@@ -4,6 +4,9 @@ import type { PositionRecord, TransactionPlan } from "../types.js";
 
 const API_URL = "https://aggregator-api.kyberswap.com";
 const KYBER_ROUTER = "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5" as Address;
+const QUOTE_RATE_LIMIT_COOLDOWN_MS = 60_000;
+const QUOTE_BUDGET_WINDOW_MS = 60_000;
+const QUOTE_BUDGET_PER_MINUTE = 20;
 const NATIVE_TOKEN = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE" as Address;
 const CHAIN_NAMES: Readonly<Record<number, string>> = { 56: "bsc", 4663: "robinhood", 8453: "base" };
 const kyberRouterAbi = parseAbi(["function swap((address callTarget,address approveTarget,bytes targetData,(address srcToken,address dstToken,address[] srcReceivers,uint256[] srcAmounts,address[] feeReceivers,uint256[] feeAmounts,address dstReceiver,uint256 amount,uint256 minReturnAmount,uint256 flags,bytes permit) desc,bytes clientData) execution) payable returns (uint256)"]);
@@ -26,6 +29,10 @@ export interface KyberSwapQuote {
 }
 
 export class KyberSwapAggregatorApi {
+  private quoteRateLimitedUntil = 0;
+  private readonly inFlight = new Map<string, Promise<KyberSwapQuote | null>>();
+  private readonly budgetedCalls: number[] = [];
+
   constructor(
     private readonly clientId: string,
     private readonly defaultSlippageBps: number,
@@ -33,6 +40,7 @@ export class KyberSwapAggregatorApi {
     private readonly maxRouteAgeMs = 10_000,
     private readonly request: typeof fetch = globalThis.fetch,
     private readonly now: () => number = Date.now,
+    private readonly budgetPerMinute = QUOTE_BUDGET_PER_MINUTE,
   ) {
     if (!clientId.trim()) throw new Error("KyberSwap client ID is required");
     validateSlippage(defaultSlippageBps);
@@ -44,12 +52,40 @@ export class KyberSwapAggregatorApi {
     amountIn: bigint,
     tokenOut: Address,
     slippageBps = this.defaultSlippageBps,
+    opts?: { budget?: boolean },
+  ): Promise<KyberSwapQuote | null> {
+    if (this.now() < this.quoteRateLimitedUntil) return null;
+    const budgeted = opts?.budget === true;
+    if (budgeted && this.budgetExhausted()) return null;
+    const requestKey = `${position.chainId}:${tokenIn.toLowerCase()}:${tokenOut.toLowerCase()}:${amountIn}:${slippageBps}`;
+    const existing = this.inFlight.get(requestKey);
+    if (existing) return existing;
+    const pending = this.quoteUncached(position, tokenIn, amountIn, tokenOut, slippageBps, budgeted)
+      .finally(() => this.inFlight.delete(requestKey));
+    this.inFlight.set(requestKey, pending);
+    return pending;
+  }
+
+  private budgetExhausted(): boolean {
+    const now = this.now();
+    while (this.budgetedCalls.length > 0 && this.budgetedCalls[0]! < now - QUOTE_BUDGET_WINDOW_MS) this.budgetedCalls.shift();
+    return this.budgetedCalls.length >= this.budgetPerMinute;
+  }
+
+  private async quoteUncached(
+    position: PositionRecord,
+    tokenIn: Address,
+    amountIn: bigint,
+    tokenOut: Address,
+    slippageBps: number,
+    budgeted: boolean,
   ): Promise<KyberSwapQuote | null> {
     const chain = CHAIN_NAMES[position.chainId];
     if (!chain) return null;
     if (!isAddress(position.owner) || !isAddress(tokenIn) || !isAddress(tokenOut)) throw new Error("KyberSwap quote contains an invalid address");
     if (amountIn <= 0n || amountIn >= 1n << 256n) throw new Error("KyberSwap quote amount must fit uint256");
     validateSlippage(slippageBps);
+    if (budgeted) this.budgetedCalls.push(this.now());
 
     const apiTokenIn = kyberToken(tokenIn);
     const apiTokenOut = kyberToken(tokenOut);
@@ -67,6 +103,11 @@ export class KyberSwapAggregatorApi {
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     const body = await readJson(response);
+    if (response.status === 429) {
+      this.quoteRateLimitedUntil = this.now() + QUOTE_RATE_LIMIT_COOLDOWN_MS;
+      if (budgeted) return null;
+      throw new Error(`KyberSwap /routes failed (429): ${message(body)}`);
+    }
     if (!response.ok || body.code !== 0) {
       if (body.code === 4008 || body.code === 4010 || body.code === 4011 || body.code === 4221) return null;
       throw new Error(`KyberSwap /routes failed (${response.status}): ${message(body)}`);

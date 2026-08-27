@@ -13,6 +13,7 @@ import type {
   PositionRangeInfo,
   PositionRecord,
   TrailingStopState,
+  ValuationQuoteProvider,
 } from "../types.js";
 import type { KyberSwapAggregatorApi } from "./kyberswap-aggregator-api.js";
 import type { PositionReader, PositionValue } from "./position-reader.js";
@@ -51,6 +52,7 @@ interface ValuationRoute {
   expectedOut: bigint;
   minimumOut: bigint;
   path: Address[];
+  provider: ValuationQuoteProvider;
 }
 
 type GroupQuoteMode = "direct_pool" | "exact_local" | "exact_probe";
@@ -110,8 +112,13 @@ export class PnlService {
     return this.valueWithMode(position, blockNumber, quoteSlippageBps, false, "exact_local", false);
   }
 
-  async valueExactProbe(position: PositionRecord, blockNumber: bigint, quoteSlippageBps = this.config.maxSwapSlippageBps): Promise<ValuedPosition> {
-    return this.valueWithMode(position, blockNumber, quoteSlippageBps, false, "exact_probe", false);
+  async valueExactProbe(
+    position: PositionRecord,
+    blockNumber: bigint,
+    quoteSlippageBps = this.config.maxSwapSlippageBps,
+    opts?: { budget?: boolean },
+  ): Promise<ValuedPosition> {
+    return this.valueWithMode(position, blockNumber, quoteSlippageBps, false, "exact_probe", false, opts?.budget !== false);
   }
 
   async valueExitEstimate(position: PositionRecord, blockNumber: bigint, quoteSlippageBps = this.config.settlementSwapSlippageBps): Promise<ValuedPosition> {
@@ -125,6 +132,7 @@ export class PnlService {
     recordObservations: boolean,
     quoteMode: GroupQuoteMode,
     conservative: boolean,
+    budgeted = true,
   ): Promise<ValuedPosition> {
     if (!position.quoteToken) throw new Error("Position has no eligible quote token");
     const quoteToken = position.quoteToken;
@@ -156,7 +164,7 @@ export class PnlService {
     const nonQuoteFee = quoteIsToken0 ? value.unclaimedFees1 : value.unclaimedFees0;
     const localOnly = quoteMode === "exact_local";
     const totalNonQuote = nonQuote.amount + nonQuoteFee;
-    const route = await this.quoteInContext(context, position, value.observedBlock, nonQuote.token, totalNonQuote, quoteToken, quoteSlippageBps, quoteMode);
+    const route = await this.quoteInContext(context, position, value.observedBlock, nonQuote.token, totalNonQuote, quoteToken, quoteSlippageBps, quoteMode, budgeted);
     if (nonQuote.amount > 0n && !route) throw new Error("No safe direct Uniswap route from LP asset to quote token");
 
     const totalRouteOutput = route ? (conservative ? route.minimumOut : route.expectedOut) : 0n;
@@ -184,21 +192,41 @@ export class PnlService {
       ? await this.recordAndCheckPrice(position, value.poolKey, value.priceMarker, value.observedBlock)
       : { ready: true };
 
-    return {
-      snapshot: {
+    const snapshot: PnlSnapshot = {
+      positionId: position.id,
+      quoteToken: position.quoteToken,
+      depositsQuote: totals.deposits,
+      realizedQuote: totals.realized + feeQuote,
+      liquidationQuote,
+      pnlQuote,
+      pnlBps,
+      blockNumber: value.observedBlock,
+      liquidity: value.liquidity,
+      feeQuote: quoteSideFee,
+      feeNonQuote: nonQuoteFee > 0n ? { token: nonQuote.token, amount: nonQuoteFee, converted: feeNonQuoteConverted } : null,
+      feeQuoteUsdg,
+      quoteProvider: route?.provider,
+      minimumPnlBps: quoteMode === "exact_probe" ? this.exactMinimumPnlBps(totals.deposits, totals.realized, quoteAmount, quoteSideFee, nonQuoteFee, totalNonQuote, route) : undefined,
+      minimumLiquidationQuote: quoteMode === "exact_probe" ? this.exactMinimumLiquidation(quoteAmount, nonQuoteFee, totalNonQuote, route) : undefined,
+    };
+    if (quoteMode === "exact_probe" && !conservative && route?.provider && route.provider !== "source_pool") {
+      await this.persistExactQuote({
         positionId: position.id,
-        quoteToken: position.quoteToken,
+        quoteToken,
         depositsQuote: totals.deposits,
-        realizedQuote: totals.realized + feeQuote,
+        realizedQuote: snapshot.realizedQuote,
         liquidationQuote,
+        minimumLiquidationQuote: snapshot.minimumLiquidationQuote ?? liquidationQuote,
         pnlQuote,
         pnlBps,
+        minimumPnlBps: snapshot.minimumPnlBps ?? pnlBps,
+        provider: route?.provider ?? "source_pool",
         blockNumber: value.observedBlock,
-        liquidity: value.liquidity,
-        feeQuote: quoteSideFee,
-        feeNonQuote: nonQuoteFee > 0n ? { token: nonQuote.token, amount: nonQuoteFee, converted: feeNonQuoteConverted } : null,
-        feeQuoteUsdg,
-      },
+        quotedAt: new Date(),
+      });
+    }
+    return {
+      snapshot,
       liquidation: {
         token0Amount: value.token0.amount,
         token1Amount: value.token1.amount,
@@ -228,8 +256,9 @@ export class PnlService {
     group: PositionGroupRecord,
     blockNumber: bigint,
     quoteSlippageBps = this.config.maxSwapSlippageBps,
+    opts?: { budget?: boolean },
   ): Promise<ValuedPositionGroup> {
-    return this.valueGroupWithMode(group, blockNumber, quoteSlippageBps, false, false, "exact_probe");
+    return this.valueGroupWithMode(group, blockNumber, quoteSlippageBps, false, false, "exact_probe", opts?.budget !== false);
   }
 
   private async valueGroupWithMode(
@@ -239,6 +268,7 @@ export class PnlService {
     recordSnapshot: boolean,
     conservative: boolean,
     quoteMode: GroupQuoteMode,
+    budgeted = true,
   ): Promise<ValuedPositionGroup> {
     const context = await this.groupValuationContext(group, blockNumber);
     const { children, values, token0Amount, token1Amount, token0Fee, token1Fee } = context;
@@ -254,7 +284,7 @@ export class PnlService {
     const quoteFee = quoteIsToken0 ? token0Fee : token1Fee;
     const nonQuoteFee = quoteIsToken0 ? token1Fee : token0Fee;
     const totalNonQuote = nonQuote.amount + nonQuoteFee;
-    const route = await this.quoteInContext(context, context.children[0]!, context.values[0]!.observedBlock, nonQuote.token, totalNonQuote, group.quoteToken, quoteSlippageBps, quoteMode);
+    const route = await this.quoteInContext(context, context.children[0]!, context.values[0]!.observedBlock, nonQuote.token, totalNonQuote, group.quoteToken, quoteSlippageBps, quoteMode, budgeted);
     if (totalNonQuote > 0n && !route) throw new Error("No safe direct Uniswap route from group LP asset to quote token");
 
     const totalRouteOutput = route ? (conservative ? route.minimumOut : route.expectedOut) : 0n;
@@ -294,8 +324,27 @@ export class PnlService {
       groupGasQuote: 0n,
       rangeCurrentTick: range.currentTick,
       rangeCurrentSqrtPrice: range.currentSqrtPrice,
+      quoteProvider: route?.provider,
+      minimumPnlBps: quoteMode === "exact_probe" ? this.exactMinimumPnlBps(deposits, context.realizedQuote, quoteAmount, quoteFee, nonQuoteFee, totalNonQuote, route) : undefined,
+      minimumLiquidationQuote: quoteMode === "exact_probe" ? this.exactMinimumLiquidation(quoteAmount, nonQuoteFee, totalNonQuote, route) : undefined,
     };
     if (recordSnapshot) await this.database.addPositionGroupPnlSnapshot(snapshot);
+    if (quoteMode === "exact_probe" && !conservative && route?.provider && route.provider !== "source_pool") {
+      await this.persistGroupExactQuote({
+        groupId: group.id,
+        quoteToken: group.quoteToken,
+        depositsQuote: deposits,
+        realizedQuote,
+        liquidationQuote,
+        minimumLiquidationQuote: snapshot.minimumLiquidationQuote ?? liquidationQuote,
+        pnlQuote,
+        pnlBps,
+        minimumPnlBps: snapshot.minimumPnlBps ?? pnlBps,
+        provider: route?.provider ?? "source_pool",
+        blockNumber,
+        quotedAt: new Date(),
+      });
+    }
     return {
       snapshot,
       liquidation: {
@@ -421,12 +470,13 @@ export class PnlService {
     tokenOut: Address,
     slippageBps: number,
     mode: GroupQuoteMode,
+    budgeted = true,
   ): Promise<ValuationRoute | null> {
     if (amountIn === 0n || tokenIn.toLowerCase() === tokenOut.toLowerCase()) return Promise.resolve(null);
-    const key = `${mode}:${tokenIn.toLowerCase()}:${amountIn}:${tokenOut.toLowerCase()}:${slippageBps}`;
+    const key = `${mode}:${budgeted}:${tokenIn.toLowerCase()}:${amountIn}:${tokenOut.toLowerCase()}:${slippageBps}`;
     const existing = cache.quotes.get(key);
     if (existing) return existing;
-    const pending = this.quoteUncached(cache, position, blockNumber, tokenIn, amountIn, tokenOut, slippageBps, mode).catch((error) => {
+    const pending = this.quoteUncached(cache, position, blockNumber, tokenIn, amountIn, tokenOut, slippageBps, mode, budgeted).catch((error) => {
       cache.quotes.delete(key);
       throw error;
     });
@@ -443,13 +493,14 @@ export class PnlService {
     tokenOut: Address,
     slippageBps: number,
     mode: GroupQuoteMode,
+    budgeted = true,
   ): Promise<ValuationRoute | null> {
     const isNative = tokenIn.toLowerCase() === zeroAddress || tokenOut.toLowerCase() === zeroAddress;
     const native = async (): Promise<ValuationRoute | null> => {
       if (!this.kyberswapApi) return null;
       try {
         const quote = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
-        if (quote) return { expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, path: [tokenIn, tokenOut] };
+        if (quote) return { expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, path: [tokenIn, tokenOut], provider: "kyberswap" };
       } catch (error) {
         log.warn({ err: error, positionId: position.id, tokenIn, tokenOut }, "KyberSwap native valuation quote failed; native route unavailable");
       }
@@ -459,7 +510,7 @@ export class PnlService {
       const route = (isNative && position.protocol === "v3") || (position.protocol === "v3" && !position.poolAddress)
         ? await withTimeout(this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut, { rpc: "monitoring", blockNumber }), ROUTE_QUOTE_TIMEOUT_MS, "direct route quote")
         : await withTimeout(this.routes.quoteSourcePool(position, tokenIn, amountIn, tokenOut, { rpc: "monitoring", blockNumber }), ROUTE_QUOTE_TIMEOUT_MS, "direct pool quote");
-      const valuation = route ? { expectedOut: route.expectedOut, minimumOut: applySlippage(route.expectedOut, slippageBps), path: route.path } : null;
+      const valuation = route ? { expectedOut: route.expectedOut, minimumOut: applySlippage(route.expectedOut, slippageBps), path: route.path, provider: "source_pool" as const } : null;
       return valuation ?? (isNative ? await native() : null);
     };
     if (mode === "direct_pool") return direct();
@@ -470,19 +521,35 @@ export class PnlService {
         ROUTE_QUOTE_TIMEOUT_MS,
         "exact local route quote",
       );
-      return route ? { expectedOut: route.expectedOut, minimumOut: applySlippage(route.expectedOut, slippageBps), path: route.path } : null;
+      return route ? { expectedOut: route.expectedOut, minimumOut: applySlippage(route.expectedOut, slippageBps), path: route.path, provider: "source_pool" } : null;
     }
 
-    const directQuote = this.quoteInContext(cache, position, blockNumber, tokenIn, amountIn, tokenOut, slippageBps, "direct_pool");
-    if (!this.tradingApi) return directQuote;
-    const apiQuote = this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps, { budget: true })
-      .then((quote) => quote ? { expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, path: [tokenIn, tokenOut] } : null)
+    const sourcePool = this.quoteInContext(cache, position, blockNumber, tokenIn, amountIn, tokenOut, slippageBps, "direct_pool", budgeted)
       .catch((error) => {
-        log.warn({ err: error, positionId: position.id, tokenIn, tokenOut }, "Trading API exact probe failed; using direct pool quote");
+        log.warn({ err: error, positionId: position.id, tokenIn, tokenOut }, "source-pool exact probe failed; using aggregator quotes");
         return null;
       });
-    const candidates = (await Promise.all([directQuote, apiQuote])).filter((quote): quote is ValuationRoute => quote !== null);
-    return candidates.sort((left, right) => left.expectedOut > right.expectedOut ? -1 : left.expectedOut < right.expectedOut ? 1 : 0)[0] ?? null;
+    const uniswap = this.tradingApi
+      ? this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps, { budget: budgeted })
+        .then((quote): ValuationRoute | null => quote ? { expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, path: [tokenIn, tokenOut], provider: "uniswap" } : null)
+        .catch((error) => {
+          log.warn({ err: error, positionId: position.id, tokenIn, tokenOut }, "Trading API exact probe failed; using other quotes");
+          return null;
+        })
+      : Promise.resolve(null);
+    const kyber = this.kyberswapApi
+      ? this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps, { budget: budgeted })
+        .then((quote): ValuationRoute | null => quote ? { expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, path: [tokenIn, tokenOut], provider: "kyberswap" } : null)
+        .catch((error) => {
+          log.warn({ err: error, positionId: position.id, tokenIn, tokenOut }, "KyberSwap exact probe failed; using other quotes");
+          return null;
+        })
+      : Promise.resolve(null);
+    const candidates = (await Promise.all([sourcePool, uniswap, kyber])).filter((quote): quote is ValuationRoute => quote !== null);
+    const aggregators = candidates.filter((quote) => quote.provider === "uniswap" || quote.provider === "kyberswap");
+    const ranked = (aggregators.length > 0 ? aggregators : candidates)
+      .sort((left, right) => left.expectedOut > right.expectedOut ? -1 : left.expectedOut < right.expectedOut ? 1 : 0);
+    return ranked[0] ?? null;
   }
 
   shouldTrigger(snapshot: PnlSnapshot, range: PositionRangeInfo | undefined, quoteIsToken0: boolean): ExitTrigger | null {
@@ -562,7 +629,7 @@ export class PnlService {
           ? await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, undefined, { budget: true })
           : await this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps, { budget: true });
         if (quote) {
-          return { expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, path: [tokenIn, tokenOut] };
+          return { expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, path: [tokenIn, tokenOut], provider: "uniswap" };
         }
       } catch (error) {
         log.warn({ err: error, positionId: position.id, tokenIn, tokenOut }, "Trading API valuation quote failed; using local quote");
@@ -572,7 +639,7 @@ export class PnlService {
     if (this.kyberswapApi && (tokenIn.toLowerCase() === zeroAddress || tokenOut.toLowerCase() === zeroAddress)) {
       try {
         const quote = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
-        if (quote) return { expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, path: [tokenIn, tokenOut] };
+        if (quote) return { expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, path: [tokenIn, tokenOut], provider: "kyberswap" };
       } catch (error) {
         log.warn({ err: error, positionId: position.id, tokenIn, tokenOut }, "KyberSwap native valuation quote failed; native route unavailable");
       }
@@ -585,7 +652,7 @@ export class PnlService {
       "local route quote",
     );
     return route
-      ? { expectedOut: route.expectedOut, minimumOut: applySlippage(route.expectedOut, slippageBps), path: route.path }
+      ? { expectedOut: route.expectedOut, minimumOut: applySlippage(route.expectedOut, slippageBps), path: route.path, provider: "source_pool" }
       : null;
   }
 
@@ -623,6 +690,42 @@ export class PnlService {
     const difference = marker > twapMarker ? marker - twapMarker : twapMarker - marker;
     const deviationBps = (difference * 10_000n) / twapMarker;
     return { ready: deviationBps <= BigInt(this.config.maxTwapDeviationBps), deviationBps };
+  }
+
+  private exactMinimumLiquidation(
+    quoteAmount: bigint,
+    nonQuoteFee: bigint,
+    totalNonQuote: bigint,
+    route: ValuationRoute | null,
+  ): bigint {
+    const minTotal = route?.minimumOut ?? 0n;
+    const minFeeRoute = totalNonQuote > 0n ? (minTotal * nonQuoteFee) / totalNonQuote : 0n;
+    return quoteAmount + (minTotal - minFeeRoute);
+  }
+
+  private exactMinimumPnlBps(
+    deposits: bigint,
+    realized: bigint,
+    quoteAmount: bigint,
+    quoteSideFee: bigint,
+    nonQuoteFee: bigint,
+    totalNonQuote: bigint,
+    route: ValuationRoute | null,
+  ): bigint {
+    const minTotal = route?.minimumOut ?? 0n;
+    const minFeeRoute = totalNonQuote > 0n ? (minTotal * nonQuoteFee) / totalNonQuote : 0n;
+    const minPnl = realized + quoteSideFee + minFeeRoute + quoteAmount + (minTotal - minFeeRoute) - deposits;
+    return (minPnl * 10_000n) / deposits;
+  }
+
+  private async persistExactQuote(quote: import("../types.js").PositionExactQuote): Promise<void> {
+    if (typeof this.database.upsertExactQuote !== "function") return;
+    await this.database.upsertExactQuote(quote);
+  }
+
+  private async persistGroupExactQuote(quote: import("../types.js").PositionGroupExactQuote): Promise<void> {
+    if (typeof this.database.upsertGroupExactQuote !== "function") return;
+    await this.database.upsertGroupExactQuote(quote);
   }
 
   private async toFeeUsd6(

@@ -1,7 +1,8 @@
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, ExitTrigger, PnlSnapshot, PositionGroupPnlSnapshot, PositionGroupRecord, PositionRecord } from "../types.js";
+import type { ChainName, ExitTrigger, PnlSnapshot, PositionGroupPnlSnapshot, PositionGroupRecord, PositionRangeInfo, PositionRecord } from "../types.js";
+import { isAggregatorQuote } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { AlchemyBootstrapper } from "./alchemy-bootstrap.js";
 import type { DiscoveryService } from "./discovery.js";
@@ -16,6 +17,7 @@ const POSITION_EVALUATION_TIMEOUT_MS = 60_000;
 const TRAILING_HARD_FLOOR_DROP_BPS = 200n;
 const NEEDS_REVIEW_RETRY_BACKOFF_MS = 5 * 60_000;
 const EXACT_PROBE_REFRESH_MS = 60_000;
+const EXACT_PROBE_NEAR_REFRESH_MS = 10_000;
 const EXACT_PROBE_GUARD_BPS = 100n;
 
 export class Guardian {
@@ -29,6 +31,8 @@ export class Guardian {
   private readonly groupEvaluations = new Set<string>();
   private readonly groupExactEvaluatedAt = new Map<string, number>();
   private readonly positionExactEvaluatedAt = new Map<string, number>();
+  private readonly groupExactCache = new Map<string, { at: number; snapshot: PositionGroupPnlSnapshot }>();
+  private readonly positionExactCache = new Map<string, { at: number; snapshot: PnlSnapshot; range?: PositionRangeInfo }>();
   private discoveryRunning = false;
 
   constructor(
@@ -247,21 +251,24 @@ export class Guardian {
 
       const quoteIsToken0 = group.quoteToken.toLowerCase() === group.token0.toLowerCase();
       const directStaticTrigger = this.pnl.shouldTriggerGroup(valued.snapshot);
-      let exactStaticTrigger: ExitTrigger | null = null;
       const now = Date.now();
-      const exactDue = now - (this.groupExactEvaluatedAt.get(group.id) ?? 0) >= EXACT_PROBE_REFRESH_MS;
-      if (exactDue || this.pnl.isNearExactThreshold(group.metadata, valued.snapshot, EXACT_PROBE_GUARD_BPS)) {
+      const nearThreshold = typeof this.pnl.isNearExactThreshold === "function"
+        && this.pnl.isNearExactThreshold(group.metadata, valued.snapshot, EXACT_PROBE_GUARD_BPS);
+      const urgent = nearThreshold || directStaticTrigger !== null || trailing.action === "trigger";
+      const cachedExact = this.groupExactCache.get(group.id);
+      const cacheFresh = cachedExact !== undefined && now - cachedExact.at < this.exactCacheTtlMs(urgent);
+      let exactSnapshot = cacheFresh ? cachedExact.snapshot : null;
+      if (!cacheFresh) {
         try {
-          const exact = await this.pnl.valueGroupExactProbe(group, blockNumber);
+          const exact = await this.pnl.valueGroupExactProbe(group, blockNumber, this.exactProbeSlippageBps(), { budget: !urgent });
           this.groupExactEvaluatedAt.set(group.id, now);
-          exactStaticTrigger = this.pnl.shouldTriggerGroup(exact.snapshot);
+          this.groupExactCache.set(group.id, { at: now, snapshot: exact.snapshot });
+          exactSnapshot = exact.snapshot;
         } catch (error) {
-          log.warn({ err: error, groupId: group.id, exactDue }, "position group exact quote refresh deferred");
+          log.warn({ err: error, groupId: group.id, urgent }, "position group exact quote refresh deferred");
         }
       }
-      const staticTrigger = directStaticTrigger === "stop_loss" || exactStaticTrigger === "stop_loss"
-        ? "stop_loss"
-        : directStaticTrigger ?? exactStaticTrigger;
+      const staticTrigger = this.confirmedGroupExactTrigger(exactSnapshot);
       const oorTrigger = await this.updateGroupOorAboveTimer(group, valued.range);
       const profitOorTrigger = await this.updateGroupProfitOorAboveTimer(group, valued.range, valued.snapshot.pnlBps);
       const liveTrigger = staticTrigger
@@ -474,21 +481,26 @@ export class Guardian {
       const quoteIsToken0 = position.quoteToken?.toLowerCase() === position.token0.toLowerCase();
       const quoteRange = quoteRangeState(valued.range, quoteIsToken0);
       const directStaticTrigger = this.pnl.shouldTrigger(valued.snapshot, valued.range, quoteIsToken0);
-      let exactStaticTrigger: ExitTrigger | null = null;
       const now = Date.now();
-      const exactDue = now - (this.positionExactEvaluatedAt.get(position.id) ?? 0) >= EXACT_PROBE_REFRESH_MS;
-      if (exactDue || this.pnl.isNearExactThreshold(position.metadata, valued.snapshot, EXACT_PROBE_GUARD_BPS)) {
+      const nearThreshold = typeof this.pnl.isNearExactThreshold === "function"
+        && this.pnl.isNearExactThreshold(position.metadata, valued.snapshot, EXACT_PROBE_GUARD_BPS);
+      const urgent = nearThreshold || directStaticTrigger !== null || trailing.action === "trigger";
+      const cachedExact = this.positionExactCache.get(position.id);
+      const cacheFresh = cachedExact !== undefined && now - cachedExact.at < this.exactCacheTtlMs(urgent);
+      let exactSnapshot = cacheFresh ? cachedExact.snapshot : null;
+      let exactRange = cacheFresh ? cachedExact.range : undefined;
+      if (!cacheFresh) {
         try {
-          const exact = await this.pnl.valueExactProbe(position, blockNumber);
+          const exact = await this.pnl.valueExactProbe(position, blockNumber, this.exactProbeSlippageBps(), { budget: !urgent });
           this.positionExactEvaluatedAt.set(position.id, now);
-          exactStaticTrigger = this.pnl.shouldTrigger(exact.snapshot, exact.range, quoteIsToken0);
+          this.positionExactCache.set(position.id, { at: now, snapshot: exact.snapshot, range: exact.range });
+          exactSnapshot = exact.snapshot;
+          exactRange = exact.range;
         } catch (error) {
-          log.warn({ err: error, positionId: position.id, exactDue }, "position exact quote refresh deferred");
+          log.warn({ err: error, positionId: position.id, urgent }, "position exact quote refresh deferred");
         }
       }
-      const staticTrigger = directStaticTrigger === "stop_loss" || exactStaticTrigger === "stop_loss"
-        ? "stop_loss"
-        : directStaticTrigger ?? exactStaticTrigger;
+      const staticTrigger = this.confirmedPositionExactTrigger(exactSnapshot, exactRange, quoteIsToken0);
       if (!staticTrigger && (trailing.action === "activate" || trailing.action === "raise_peak")) {
         await this.database.setTrailingStopState(position.id, trailing.state);
         log.info({
@@ -900,6 +912,28 @@ export class Guardian {
 
   private markEvaluated(key: string, blockNumber: bigint): void {
     this.evaluatedAtBlock.set(key, blockNumber);
+  }
+
+  private exactCacheTtlMs(urgent: boolean): number {
+    return urgent ? EXACT_PROBE_NEAR_REFRESH_MS : EXACT_PROBE_REFRESH_MS;
+  }
+
+  private exactProbeSlippageBps(): number {
+    return this.config.settlementSwapSlippageBps ?? 200;
+  }
+
+  private confirmedGroupExactTrigger(snapshot: PositionGroupPnlSnapshot | null): ExitTrigger | null {
+    if (!snapshot || !isAggregatorQuote(snapshot.quoteProvider)) return null;
+    return this.pnl.shouldTriggerGroup(snapshot);
+  }
+
+  private confirmedPositionExactTrigger(
+    snapshot: PnlSnapshot | null,
+    range: PositionRangeInfo | undefined,
+    quoteIsToken0: boolean,
+  ): ExitTrigger | null {
+    if (!snapshot || !isAggregatorQuote(snapshot.quoteProvider)) return null;
+    return this.pnl.shouldTrigger(snapshot, range, quoteIsToken0);
   }
 
   private canAutoExit(name: ChainName): boolean {

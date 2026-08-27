@@ -541,6 +541,63 @@ describe("stop-loss local quote validation", () => {
     await expect(result).rejects.toThrow("RPC rate limited");
     expect(pnl.shouldTriggerGroup).not.toHaveBeenCalled();
   });
+
+  it("does not fire standalone SL when the exact quote is above the threshold", async () => {
+    const baseline = snapshot(-1_869n);
+    const exact = snapshot(-673n);
+    const database = {
+      addPnlSnapshot: vi.fn().mockResolvedValue(undefined),
+      setPositionStatus: vi.fn().mockResolvedValue(undefined),
+    };
+    const notifier = { logPnL: vi.fn().mockResolvedValue(undefined) };
+    const pnl = {
+      value: vi.fn().mockResolvedValue({ snapshot: baseline, range: undefined, twapGuard: { ready: true } }),
+      valueExactProbe: vi.fn().mockResolvedValue({ snapshot: exact, range: undefined, twapGuard: { ready: true } }),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTrigger: vi.fn((item: PnlSnapshot) => item.pnlBps <= -1_000n ? "stop_loss" : null),
+      isNearExactThreshold: vi.fn().mockReturnValue(true),
+    };
+    const executor = { executeRelatedPosition: vi.fn() };
+    const guardian = new Guardian({} as RuntimeConfig, database as never, {} as never, {} as never, {} as never, pnl as never, executor as never, notifier as never);
+    vi.spyOn(guardian as never, "updateOorAboveTimer" as never).mockResolvedValue(null);
+    vi.spyOn(guardian as never, "updateProfitOorAboveTimer" as never).mockResolvedValue(null);
+
+    const result = await (guardian as unknown as {
+      evaluatePosition(name: "robinhood", position: PositionRecord, blockNumber: bigint): Promise<boolean>;
+    }).evaluatePosition("robinhood", position, 10n);
+
+    expect(result).toBe(true);
+    expect(pnl.valueExactProbe).toHaveBeenCalledTimes(1);
+    expect(executor.executeRelatedPosition).not.toHaveBeenCalled();
+  });
+
+  it("does not fire standalone SL from a source-pool fallback quote", async () => {
+    const baseline = snapshot(-3_000n);
+    const exact = { ...snapshot(-3_000n), quoteProvider: "source_pool" as const };
+    const database = {
+      addPnlSnapshot: vi.fn().mockResolvedValue(undefined),
+      setPositionStatus: vi.fn().mockResolvedValue(undefined),
+    };
+    const notifier = { logPnL: vi.fn().mockResolvedValue(undefined) };
+    const pnl = {
+      value: vi.fn().mockResolvedValue({ snapshot: baseline, range: undefined, twapGuard: { ready: true } }),
+      valueExactProbe: vi.fn().mockResolvedValue({ snapshot: exact, range: undefined, twapGuard: { ready: true } }),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTrigger: vi.fn().mockReturnValue("stop_loss"),
+      isNearExactThreshold: vi.fn().mockReturnValue(true),
+    };
+    const executor = { executeRelatedPosition: vi.fn() };
+    const guardian = new Guardian({} as RuntimeConfig, database as never, {} as never, {} as never, {} as never, pnl as never, executor as never, notifier as never);
+    vi.spyOn(guardian as never, "updateOorAboveTimer" as never).mockResolvedValue(null);
+    vi.spyOn(guardian as never, "updateProfitOorAboveTimer" as never).mockResolvedValue(null);
+
+    const result = await (guardian as unknown as {
+      evaluatePosition(name: "robinhood", position: PositionRecord, blockNumber: bigint): Promise<boolean>;
+    }).evaluatePosition("robinhood", position, 10n);
+
+    expect(result).toBe(true);
+    expect(executor.executeRelatedPosition).not.toHaveBeenCalled();
+  });
 });
 
 describe("position monitor timeouts", () => {
@@ -640,6 +697,7 @@ describe("monitor RPC retries", () => {
       pnlBps: 0n,
       blockNumber: 10n,
       groupGasQuote: 0n,
+      quoteProvider: "kyberswap",
     },
     twapGuard: { ready: false },
     range: undefined,
@@ -741,9 +799,11 @@ describe("monitor RPC retries", () => {
     };
     const pnl = {
       valueGroup: vi.fn().mockResolvedValue(value),
+      valueGroupExactProbe: vi.fn().mockResolvedValue(value),
       valueGroupLocal: vi.fn().mockResolvedValue({ ...value, twapGuard: { ready: true } }),
       evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
       shouldTriggerGroup: vi.fn().mockReturnValue("stop_loss"),
+      isNearExactThreshold: vi.fn().mockReturnValue(false),
     };
     const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
     const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
@@ -775,9 +835,11 @@ describe("monitor RPC retries", () => {
     };
     const pnl = {
       valueGroup: vi.fn().mockResolvedValue(value),
+      valueGroupExactProbe: vi.fn().mockResolvedValue(value),
       valueGroupLocal: vi.fn().mockResolvedValue(value),
       evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
       shouldTriggerGroup: vi.fn().mockReturnValue("stop_loss"),
+      isNearExactThreshold: vi.fn().mockReturnValue(false),
     };
     const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(false) };
     const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
@@ -813,9 +875,11 @@ describe("monitor RPC retries", () => {
     };
     const pnl = {
       valueGroup: vi.fn().mockResolvedValue(value),
+      valueGroupExactProbe: vi.fn().mockResolvedValue(value),
       valueGroupLocalExitEstimate: vi.fn().mockResolvedValue({ ...value, twapGuard: { ready: true } }),
       evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
       shouldTriggerGroup: vi.fn().mockReturnValue("take_profit"),
+      isNearExactThreshold: vi.fn().mockReturnValue(false),
     };
     const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
     const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
@@ -855,9 +919,11 @@ describe("monitor RPC retries", () => {
     };
     const pnl = {
       valueGroup: vi.fn().mockResolvedValue(main),
+      valueGroupExactProbe: vi.fn().mockResolvedValue(main),
       valueGroupLocalExitEstimate: vi.fn().mockResolvedValue(local),
       evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
       shouldTriggerGroup: vi.fn((snapshot: PositionGroupPnlSnapshot) => snapshot.pnlBps < 0n ? "stop_loss" : "take_profit"),
+      isNearExactThreshold: vi.fn().mockReturnValue(false),
     };
     const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
     const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
@@ -892,9 +958,11 @@ describe("monitor RPC retries", () => {
     };
     const pnl = {
       valueGroup: vi.fn().mockResolvedValue(main),
+      valueGroupExactProbe: vi.fn().mockResolvedValue(main),
       valueGroupLocalExitEstimate: vi.fn().mockResolvedValue(local),
       evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
       shouldTriggerGroup: vi.fn((snapshot: PositionGroupPnlSnapshot) => snapshot.pnlBps < 0n ? "stop_loss" : "take_profit"),
+      isNearExactThreshold: vi.fn().mockReturnValue(false),
     };
     const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
     const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
@@ -1068,6 +1136,165 @@ describe("monitor RPC retries", () => {
 
     await expect(validate(group(trigger), 10n, trigger, valued.snapshot)).resolves.toEqual(valued.snapshot);
     expect(pnl.valueGroupLocalExitEstimate).toHaveBeenCalled();
+  });
+
+  it("does not fire group SL when the exact quote is above the threshold", async () => {
+    const baseline = {
+      ...valued,
+      twapGuard: { ready: true },
+      snapshot: { ...valued.snapshot, pnlBps: -1_869n, pnlQuote: -186_900n },
+    };
+    const exact = {
+      ...baseline,
+      snapshot: { ...baseline.snapshot, pnlBps: -673n, pnlQuote: -67_300n },
+    };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(baseline),
+      valueGroupExactProbe: vi.fn().mockResolvedValue(exact),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTriggerGroup: vi.fn((snapshot: PositionGroupPnlSnapshot) => snapshot.pnlBps <= -1_000n ? "stop_loss" : null),
+      isNearExactThreshold: vi.fn().mockReturnValue(true),
+    };
+    const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+    const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      {} as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+
+    await expect(evaluate("robinhood", group("exact-sl"), 10n)).resolves.toBe(true);
+
+    expect(pnl.valueGroupExactProbe).toHaveBeenCalledTimes(1);
+    expect(executor.executeRelatedGroup).not.toHaveBeenCalled();
+  });
+
+  it("reuses a fresh exact quote instead of probing every cycle", async () => {
+    const baseline = {
+      ...valued,
+      twapGuard: { ready: true },
+      snapshot: { ...valued.snapshot, pnlBps: -1_869n, pnlQuote: -186_900n },
+    };
+    const exact = {
+      ...baseline,
+      snapshot: { ...baseline.snapshot, pnlBps: -673n, pnlQuote: -67_300n },
+    };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(baseline),
+      valueGroupExactProbe: vi.fn().mockResolvedValue(exact),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTriggerGroup: vi.fn((snapshot: PositionGroupPnlSnapshot) => snapshot.pnlBps <= -1_000n ? "stop_loss" : null),
+      isNearExactThreshold: vi.fn().mockReturnValue(true),
+    };
+    const guardian = new Guardian(
+      {} as RuntimeConfig,
+      { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      { executeRelatedGroup: vi.fn() } as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+    const item = group("exact-cache");
+
+    await evaluate("robinhood", item, 10n);
+    await evaluate("robinhood", item, 11n);
+
+    expect(pnl.valueGroupExactProbe).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes an exact quote after 10s when the local PnL is near a threshold", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-27T00:00:00Z"));
+    try {
+      const baseline = {
+        ...valued,
+        twapGuard: { ready: true },
+        snapshot: { ...valued.snapshot, pnlBps: -1_869n, pnlQuote: -186_900n },
+      };
+      const exact = {
+        ...baseline,
+        snapshot: { ...baseline.snapshot, pnlBps: -673n, pnlQuote: -67_300n, quoteProvider: "kyberswap" as const },
+      };
+      const pnl = {
+        valueGroup: vi.fn().mockResolvedValue(baseline),
+        valueGroupExactProbe: vi.fn().mockResolvedValue(exact),
+        evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+        shouldTriggerGroup: vi.fn().mockReturnValue(null),
+        isNearExactThreshold: vi.fn().mockReturnValue(true),
+      };
+      const guardian = new Guardian(
+        { settlementSwapSlippageBps: 200 } as RuntimeConfig,
+        { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) } as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        pnl as never,
+        { executeRelatedGroup: vi.fn() } as never,
+        {} as never,
+      );
+      const evaluate = (guardian as unknown as {
+        evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+      }).evaluatePositionGroup.bind(guardian);
+      const item = group("exact-near");
+
+      await evaluate("robinhood", item, 10n);
+      vi.advanceTimersByTime(10_001);
+      await evaluate("robinhood", item, 11n);
+
+      expect(pnl.valueGroupExactProbe).toHaveBeenCalledTimes(2);
+      expect(pnl.valueGroupExactProbe).toHaveBeenLastCalledWith(item, 11n, 200, { budget: false });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not treat a source-pool exact quote as TP/SL confirmation", async () => {
+    const baseline = {
+      ...valued,
+      twapGuard: { ready: true },
+      snapshot: { ...valued.snapshot, pnlBps: -3_000n, pnlQuote: -300_000n },
+    };
+    const exact = {
+      ...baseline,
+      snapshot: { ...baseline.snapshot, quoteProvider: "source_pool" as const },
+    };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(baseline),
+      valueGroupExactProbe: vi.fn().mockResolvedValue(exact),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTriggerGroup: vi.fn().mockReturnValue("stop_loss"),
+      isNearExactThreshold: vi.fn().mockReturnValue(true),
+    };
+    const executor = { executeRelatedGroup: vi.fn() };
+    const guardian = new Guardian(
+      {} as RuntimeConfig,
+      { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+
+    await expect(evaluate("robinhood", group("source-pool-sl"), 10n)).resolves.toBe(true);
+    expect(executor.executeRelatedGroup).not.toHaveBeenCalled();
   });
 
   it("keeps only SL and manual group retries sticky", () => {

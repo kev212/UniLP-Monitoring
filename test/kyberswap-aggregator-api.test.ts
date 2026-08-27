@@ -120,4 +120,24 @@ describe("KyberSwapAggregatorApi", () => {
     expect(quote?.chainId).toBe(56);
     expect(String(request.mock.calls[0]![0])).toContain("/bsc/api/v1/routes?");
   });
+
+  it("skips budgeted monitoring quotes when the per-minute budget is exhausted", async () => {
+    const request = vi.fn<typeof fetch>().mockImplementation(async () => json(routeResponse()));
+    const api = new KyberSwapAggregatorApi("client", 200, 2_500, 10_000, request, () => now, 2);
+
+    await api.quote(position, tokenIn, 1_000n, tokenOut, 200, { budget: true });
+    await api.quote(position, tokenIn, 1_000n, tokenOut, 200, { budget: true });
+    await expect(api.quote(position, tokenIn, 1_000n, tokenOut, 200, { budget: true })).resolves.toBeNull();
+    await expect(api.quote(position, tokenIn, 1_000n, tokenOut)).resolves.not.toBeNull();
+    expect(request).toHaveBeenCalledTimes(3);
+  });
+
+  it("cools down budgeted quotes after a 429", async () => {
+    const request = vi.fn<typeof fetch>().mockResolvedValue(json({ code: 4290, message: "rate limited" }, 429));
+    const api = new KyberSwapAggregatorApi("client", 200, 2_500, 10_000, request, () => now);
+
+    await expect(api.quote(position, tokenIn, 1_000n, tokenOut, 200, { budget: true })).resolves.toBeNull();
+    await expect(api.quote(position, tokenIn, 1_000n, tokenOut, 200, { budget: true })).resolves.toBeNull();
+    expect(request).toHaveBeenCalledTimes(1);
+  });
 });

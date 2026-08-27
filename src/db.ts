@@ -7,8 +7,12 @@ import type {
   ChainName,
   PnlCalendarMonth,
   PnlCardDetail,
+  ExactQuote,
   PnlSnapshot,
+  PositionExactQuote,
+  PositionGroupExactQuote,
   PoolScanSettings,
+  ValuationQuoteProvider,
   PositionGroupBinRecord,
   PositionGroupBinSide,
   PositionGroupBinStatus,
@@ -158,6 +162,28 @@ export interface PositionGroupBinPatch {
 export interface PositionGroupChildRecord {
   bin: PositionGroupBinRecord;
   position: PositionRecord | null;
+}
+
+interface ExactQuoteRow {
+  quote_token: string;
+  deposits_quote: string;
+  realized_quote: string;
+  liquidation_quote: string;
+  minimum_liquidation_quote: string;
+  pnl_quote: string;
+  pnl_bps: string;
+  minimum_pnl_bps: string;
+  provider: string;
+  block_number: string;
+  quoted_at: Date | string;
+}
+
+interface PositionExactQuoteRow extends ExactQuoteRow {
+  position_id: string;
+}
+
+interface GroupExactQuoteRow extends ExactQuoteRow {
+  group_id: string;
 }
 
 interface PositionGroupPnlSnapshotRow {
@@ -444,6 +470,34 @@ export class Database {
       );
       CREATE INDEX IF NOT EXISTS pnl_snapshots_position_created_idx ON pnl_snapshots(position_id, created_at DESC);
       ALTER TABLE pnl_snapshots ADD COLUMN IF NOT EXISTS fee_quote_usdg NUMERIC(78, 0) DEFAULT 0;
+      CREATE TABLE IF NOT EXISTS pnl_exact_quotes (
+        position_id UUID PRIMARY KEY REFERENCES positions(id) ON DELETE CASCADE,
+        quote_token TEXT NOT NULL,
+        deposits_quote NUMERIC(78, 0) NOT NULL,
+        realized_quote NUMERIC(78, 0) NOT NULL,
+        liquidation_quote NUMERIC(78, 0) NOT NULL,
+        minimum_liquidation_quote NUMERIC(78, 0) NOT NULL,
+        pnl_quote NUMERIC(78, 0) NOT NULL,
+        pnl_bps NUMERIC(78, 0) NOT NULL,
+        minimum_pnl_bps NUMERIC(78, 0) NOT NULL,
+        provider TEXT NOT NULL,
+        block_number NUMERIC(78, 0) NOT NULL,
+        quoted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS position_group_pnl_exact_quotes (
+        group_id UUID PRIMARY KEY REFERENCES position_groups(id) ON DELETE CASCADE,
+        quote_token TEXT NOT NULL,
+        deposits_quote NUMERIC(78, 0) NOT NULL,
+        realized_quote NUMERIC(78, 0) NOT NULL,
+        liquidation_quote NUMERIC(78, 0) NOT NULL,
+        minimum_liquidation_quote NUMERIC(78, 0) NOT NULL,
+        pnl_quote NUMERIC(78, 0) NOT NULL,
+        pnl_bps NUMERIC(78, 0) NOT NULL,
+        minimum_pnl_bps NUMERIC(78, 0) NOT NULL,
+        provider TEXT NOT NULL,
+        block_number NUMERIC(78, 0) NOT NULL,
+        quoted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
       CREATE TABLE IF NOT EXISTS position_observations (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         position_id UUID NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
@@ -1829,6 +1883,96 @@ FROM position_groups g
     return map;
   }
 
+  async upsertExactQuote(quote: PositionExactQuote): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO pnl_exact_quotes (
+         position_id, quote_token, deposits_quote, realized_quote, liquidation_quote, minimum_liquidation_quote,
+         pnl_quote, pnl_bps, minimum_pnl_bps, provider, block_number, quoted_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+       ON CONFLICT (position_id) DO UPDATE SET
+         quote_token = EXCLUDED.quote_token,
+         deposits_quote = EXCLUDED.deposits_quote,
+         realized_quote = EXCLUDED.realized_quote,
+         liquidation_quote = EXCLUDED.liquidation_quote,
+         minimum_liquidation_quote = EXCLUDED.minimum_liquidation_quote,
+         pnl_quote = EXCLUDED.pnl_quote,
+         pnl_bps = EXCLUDED.pnl_bps,
+         minimum_pnl_bps = EXCLUDED.minimum_pnl_bps,
+         provider = EXCLUDED.provider,
+         block_number = EXCLUDED.block_number,
+         quoted_at = NOW()`,
+      [
+        quote.positionId,
+        quote.quoteToken.toLowerCase(),
+        quote.depositsQuote.toString(),
+        quote.realizedQuote.toString(),
+        quote.liquidationQuote.toString(),
+        quote.minimumLiquidationQuote.toString(),
+        quote.pnlQuote.toString(),
+        quote.pnlBps.toString(),
+        quote.minimumPnlBps.toString(),
+        quote.provider,
+        quote.blockNumber.toString(),
+      ],
+    );
+  }
+
+  async upsertGroupExactQuote(quote: PositionGroupExactQuote): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO position_group_pnl_exact_quotes (
+         group_id, quote_token, deposits_quote, realized_quote, liquidation_quote, minimum_liquidation_quote,
+         pnl_quote, pnl_bps, minimum_pnl_bps, provider, block_number, quoted_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+       ON CONFLICT (group_id) DO UPDATE SET
+         quote_token = EXCLUDED.quote_token,
+         deposits_quote = EXCLUDED.deposits_quote,
+         realized_quote = EXCLUDED.realized_quote,
+         liquidation_quote = EXCLUDED.liquidation_quote,
+         minimum_liquidation_quote = EXCLUDED.minimum_liquidation_quote,
+         pnl_quote = EXCLUDED.pnl_quote,
+         pnl_bps = EXCLUDED.pnl_bps,
+         minimum_pnl_bps = EXCLUDED.minimum_pnl_bps,
+         provider = EXCLUDED.provider,
+         block_number = EXCLUDED.block_number,
+         quoted_at = NOW()`,
+      [
+        quote.groupId,
+        quote.quoteToken.toLowerCase(),
+        quote.depositsQuote.toString(),
+        quote.realizedQuote.toString(),
+        quote.liquidationQuote.toString(),
+        quote.minimumLiquidationQuote.toString(),
+        quote.pnlQuote.toString(),
+        quote.pnlBps.toString(),
+        quote.minimumPnlBps.toString(),
+        quote.provider,
+        quote.blockNumber.toString(),
+      ],
+    );
+  }
+
+  async getLatestExactQuotes(positionIds: string[]): Promise<Map<string, PositionExactQuote>> {
+    if (positionIds.length === 0) return new Map();
+    const result = await this.pool.query<PositionExactQuoteRow>(
+      `SELECT * FROM pnl_exact_quotes WHERE position_id = ANY($1::uuid[])`,
+      [positionIds],
+    );
+    const map = new Map<string, PositionExactQuote>();
+    for (const row of result.rows) map.set(row.position_id, mapPositionExactQuote(row));
+    return map;
+  }
+
+  async getLatestGroupExactQuotes(groupIds: string[]): Promise<Map<string, PositionGroupExactQuote>> {
+    if (groupIds.length === 0) return new Map();
+    const result = await this.pool.query<GroupExactQuoteRow>(
+      `SELECT * FROM position_group_pnl_exact_quotes WHERE group_id = ANY($1::uuid[])`,
+      [groupIds],
+    );
+    const map = new Map<string, PositionGroupExactQuote>();
+    for (const row of result.rows) map.set(row.group_id, mapGroupExactQuote(row));
+    return map;
+  }
+
   async getLatestObservations(positionIds: string[]): Promise<Map<string, {
     liquidity: bigint;
     token0Amount: bigint;
@@ -2719,6 +2863,30 @@ function mapPositionGroupBin(row: PositionGroupBinRow): PositionGroupBinRecord {
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),
   };
+}
+
+function mapExactQuote(row: ExactQuoteRow): ExactQuote {
+  return {
+    quoteToken: row.quote_token as Address,
+    depositsQuote: BigInt(row.deposits_quote),
+    realizedQuote: BigInt(row.realized_quote),
+    liquidationQuote: BigInt(row.liquidation_quote),
+    minimumLiquidationQuote: BigInt(row.minimum_liquidation_quote),
+    pnlQuote: BigInt(row.pnl_quote),
+    pnlBps: BigInt(row.pnl_bps),
+    minimumPnlBps: BigInt(row.minimum_pnl_bps),
+    provider: row.provider as ValuationQuoteProvider,
+    blockNumber: BigInt(row.block_number),
+    quotedAt: new Date(row.quoted_at),
+  };
+}
+
+function mapPositionExactQuote(row: PositionExactQuoteRow): PositionExactQuote {
+  return { ...mapExactQuote(row), positionId: row.position_id };
+}
+
+function mapGroupExactQuote(row: GroupExactQuoteRow): PositionGroupExactQuote {
+  return { ...mapExactQuote(row), groupId: row.group_id };
 }
 
 function mapPositionGroupPnlSnapshot(row: PositionGroupPnlSnapshotRow): PositionGroupPnlSnapshotRecord {
