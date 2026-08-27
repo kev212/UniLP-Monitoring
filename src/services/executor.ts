@@ -98,6 +98,7 @@ export interface SwapRetryState {
   planningFailures: number;
   cycleBroadcastAttempts: number;
   lastProvider?: string;
+  failedProviders?: string[];
   nextAttemptAt?: string;
 }
 
@@ -120,6 +121,13 @@ class RevertedExecutionError extends Error {
   constructor(readonly stage: string, message: string) {
     super(message);
     this.name = "RevertedExecutionError";
+  }
+}
+
+class SettlementRouteError extends Error {
+  constructor(message: string, readonly failedProviders: string[] = []) {
+    super(message);
+    this.name = "SettlementRouteError";
   }
 }
 
@@ -766,7 +774,7 @@ export class Executor {
     );
 
     try {
-      const prepared = await this.prepareBestSettlementSwap(position, pending.token, pending.amount, quoteToken, effectiveSlippageBps, retry.lastProvider);
+      const prepared = await this.prepareBestSettlementSwap(position, pending.token, pending.amount, quoteToken, effectiveSlippageBps, retry.lastProvider, 0, retry.failedProviders);
       if (!prepared) return;
       await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
         swapProvider: prepared.provider,
@@ -803,7 +811,8 @@ export class Executor {
       }
       const message = errorMessage(error);
       const currentProvider = typeof position.metadata.swapProvider === "string" ? position.metadata.swapProvider : retry.lastProvider;
-      const nextRetry = nextSwapRetry(position.metadata, currentProvider, false, this.swapRetryCycleSize());
+      const failedProviders = error instanceof SettlementRouteError ? error.failedProviders : retry.failedProviders;
+      const nextRetry = nextSwapRetry(position.metadata, currentProvider, false, this.swapRetryCycleSize(), Date.now(), failedProviders);
       await this.database.recordExecution(position.id, "swap_to_quote", "failed", undefined, message);
       await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
         reason: null,
@@ -1326,10 +1335,11 @@ export class Executor {
     const synthetic = groupSettlementPosition(group);
     let prepared: PreparedSwap | null;
     try {
-      prepared = await this.prepareGroupSettlementSwap(group, synthetic, pending, effectiveSlippageBps, retry.lastProvider);
+      prepared = await this.prepareGroupSettlementSwap(group, synthetic, pending, effectiveSlippageBps, retry.lastProvider, retry.failedProviders);
     } catch (error) {
       if (error instanceof PendingExecutionError) throw error;
-      await this.deferGroupSettlementSwap(group, hash, pending, trigger, errorMessage(error), retry.lastProvider);
+      const failedProviders = error instanceof SettlementRouteError ? error.failedProviders : retry.failedProviders;
+      await this.deferGroupSettlementSwap(group, hash, pending, trigger, errorMessage(error), failedProviders?.[0] ?? retry.lastProvider, failedProviders);
       return;
     }
     if (!prepared) {
@@ -1506,8 +1516,9 @@ export class Executor {
     trigger: ExitTrigger | undefined,
     reason: string,
     lastProvider?: string,
+    failedProviders?: readonly string[],
   ): Promise<void> {
-    const retry = nextSwapRetry(group.metadata, lastProvider, false, this.swapRetryCycleSize());
+    const retry = nextSwapRetry(group.metadata, lastProvider, false, this.swapRetryCycleSize(), Date.now(), failedProviders);
     await this.setGroupStatus(group.id, "settling", {
       closeTransactionHash: closeHash,
       closeReceiptAccounted: true,
@@ -1541,6 +1552,7 @@ export class Executor {
     pending: { token: Address; amount: bigint },
     slippageBps: number,
     lastFailedProvider?: string,
+    failedProviders: readonly string[] = [],
   ): Promise<PreparedSwap | null> {
     if (dexNameFromMetadata(position.metadata) === "pancake" || dexNameFromMetadata(group.metadata) === "pancake") {
       return this.preparePancakeGroupSettlementSwap(group, position, pending, slippageBps, lastFailedProvider);
@@ -1564,7 +1576,8 @@ export class Executor {
       localBenchmark = nativeBenchmark;
     }
     if (!localBenchmark) throw new Error("No safe local route available to benchmark group settlement swap");
-    const minimumAcceptableOut = applySlippage(localBenchmark.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
+    const floorBps = settlementFloorBps(slippageBps);
+    const minimumAcceptableOut = applySlippage(localBenchmark.expectedOut, floorBps);
     const quoteJobs: Promise<ApiSwapCandidate | null>[] = [];
     if (this.tradingApi) {
       quoteJobs.push(this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
@@ -1579,13 +1592,13 @@ export class Executor {
     const errors: string[] = [];
     const candidates: ApiSwapCandidate[] = [];
     const belowFloor: ApiSwapCandidate[] = [];
-    const allowBelowFloor = position.chainId === chainRegistry.bsc.chain.id;
+    const rejectedProviders: string[] = [];
     for (const result of results) {
       if (result.status === "fulfilled") {
         if (result.value) {
           if (result.value.expectedOut < minimumAcceptableOut) {
-            errors.push(`${result.value.provider}: expected output is below local 2% floor`);
-            if (allowBelowFloor) belowFloor.push(result.value);
+            errors.push(`${result.value.provider}: expected output is below local ${floorBps} bps floor`);
+            belowFloor.push(result.value);
             continue;
           }
           candidates.push(result.value);
@@ -1594,19 +1607,14 @@ export class Executor {
         errors.push(errorMessage(result.reason));
       }
     }
-    candidates.sort((left, right) => {
-      if (lastFailedProvider && left.provider !== right.provider) {
-        if (left.provider === lastFailedProvider) return 1;
-        if (right.provider === lastFailedProvider) return -1;
-      }
-      return left.expectedOut === right.expectedOut ? 0 : left.expectedOut > right.expectedOut ? -1 : 1;
-    });
+    candidates.sort((left, right) => compareSettlementCandidates(left, right, lastFailedProvider, failedProviders));
 
     for (const [candidateIndex, candidate] of candidates.entries()) {
       try {
         const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, minimumAcceptableOut);
         if (!constrained) {
-          errors.push(`${candidate.provider}: calldata minimum output is below local floor`);
+          errors.push(`${candidate.provider}: calldata minimum output is below local ${floorBps} bps floor`);
+          rejectedProviders.push(candidate.provider);
           continue;
         }
         const prepared = await this.prepareGroupApiSwap(group, position, tokenIn, amountIn, tokenOut, slippageBps, constrained, minimumAcceptableOut);
@@ -1616,6 +1624,7 @@ export class Executor {
       } catch (error) {
         if (error instanceof PendingExecutionError) throw error;
         errors.push(`${candidate.provider}: ${errorMessage(error)}`);
+        rejectedProviders.push(candidate.provider);
         log.warn({ groupId: group.id, provider: candidate.provider, error: errorMessage(error), candidateIndex }, "group settlement swap candidate rejected before broadcast");
       }
     }
@@ -1632,25 +1641,30 @@ export class Executor {
       if (error instanceof PendingExecutionError) throw error;
       errors.push(`local: ${errorMessage(error)}`);
     }
-    if (allowBelowFloor) {
-      const fallback = [...belowFloor, ...candidates].sort((left, right) => left.expectedOut === right.expectedOut ? 0 : left.expectedOut > right.expectedOut ? -1 : 1);
-      for (const candidate of fallback) {
-        const floor = applySlippage(candidate.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
-        try {
-          const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, floor);
-          if (!constrained) continue;
-          const prepared = await this.prepareGroupApiSwap(group, position, tokenIn, amountIn, tokenOut, slippageBps, constrained, floor);
-          await this.simulateGroupPlan(group, prepared.plan);
-          log.info({ groupId: group.id, provider: prepared.provider, expectedOut: prepared.expectedOut.toString(), minimumOut: prepared.minimumOut.toString(), slippageBps }, "group settlement swap candidate selected after local route failed");
-          return prepared;
-        } catch (error) {
-          if (error instanceof PendingExecutionError) throw error;
-          errors.push(`${candidate.provider}: ${errorMessage(error)}`);
+    const fallback = [
+      ...belowFloor,
+      ...candidates.filter((candidate) => !belowFloor.some((item) => item.provider === candidate.provider)),
+    ];
+    for (const candidate of fallback) {
+      const floor = applySlippage(candidate.expectedOut, floorBps);
+      try {
+        const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, floor);
+        if (!constrained) {
+          rejectedProviders.push(candidate.provider);
+          continue;
         }
+        const prepared = await this.prepareGroupApiSwap(group, position, tokenIn, amountIn, tokenOut, slippageBps, constrained, floor);
+        await this.simulateGroupPlan(group, prepared.plan);
+        log.info({ groupId: group.id, provider: prepared.provider, expectedOut: prepared.expectedOut.toString(), minimumOut: prepared.minimumOut.toString(), slippageBps }, "group settlement swap candidate selected after local route failed");
+        return prepared;
+      } catch (error) {
+        if (error instanceof PendingExecutionError) throw error;
+        errors.push(`${candidate.provider}: ${errorMessage(error)}`);
+        rejectedProviders.push(candidate.provider);
       }
     }
     const details = errors.filter(Boolean).slice(0, 4).join(" | ");
-    throw new Error(`No executable group settlement route${details ? `: ${details}` : ""}`);
+    throw new SettlementRouteError(`No executable group settlement route${details ? `: ${details}` : ""}`, uniqueProviders(rejectedProviders));
   }
 
   private async prepareGroupApiSwap(
@@ -2397,6 +2411,7 @@ export class Executor {
     slippageBps: number,
     lastFailedProvider?: string,
     approvalRefreshes = 0,
+    failedProviders: readonly string[] = [],
   ): Promise<PreparedSwap | null> {
     if (dexNameFromMetadata(position.metadata) === "pancake") {
       return this.preparePancakeSettlementSwap(position, tokenIn, amountIn, tokenOut, slippageBps, lastFailedProvider, approvalRefreshes);
@@ -2418,7 +2433,8 @@ export class Executor {
       localBenchmark = nativeBenchmark;
     }
     if (!localBenchmark) throw new Error("No safe local route available to benchmark settlement swap");
-    const minimumAcceptableOut = applySlippage(localBenchmark.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
+    const floorBps = settlementFloorBps(slippageBps);
+    const minimumAcceptableOut = applySlippage(localBenchmark.expectedOut, floorBps);
     const quoteJobs: Promise<ApiSwapCandidate | null>[] = [];
     if (this.tradingApi) {
       quoteJobs.push(this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
@@ -2433,15 +2449,15 @@ export class Executor {
     const errors: string[] = [];
     const candidates: ApiSwapCandidate[] = [];
     const belowFloor: ApiSwapCandidate[] = [];
-    const allowBelowFloor = position.chainId === chainRegistry.bsc.chain.id;
+    const rejectedProviders: string[] = [];
     for (const result of results) {
       if (result.status === "fulfilled") {
         if (result.value) {
           if (result.value.expectedOut < minimumAcceptableOut) {
-            const reason = `expected output ${result.value.expectedOut} is below local 2% floor ${minimumAcceptableOut}`;
+            const reason = `expected output ${result.value.expectedOut} is below local ${floorBps} bps floor ${minimumAcceptableOut}`;
             errors.push(`${result.value.provider}: ${reason}`);
             log.warn({ positionKey: position.positionKey, provider: result.value.provider, expectedOut: result.value.expectedOut.toString(), minimumOut: result.value.minimumOut.toString(), localExpectedOut: localBenchmark.expectedOut.toString(), minimumAcceptableOut: minimumAcceptableOut.toString() }, "settlement swap candidate rejected below local minimum floor");
-            if (allowBelowFloor) belowFloor.push(result.value);
+            belowFloor.push(result.value);
             continue;
           }
           candidates.push(result.value);
@@ -2450,26 +2466,21 @@ export class Executor {
         errors.push(errorMessage(result.reason));
       }
     }
-    candidates.sort((left, right) => {
-      if (lastFailedProvider && left.provider !== right.provider) {
-        if (left.provider === lastFailedProvider) return 1;
-        if (right.provider === lastFailedProvider) return -1;
-      }
-      return left.expectedOut === right.expectedOut ? 0 : left.expectedOut > right.expectedOut ? -1 : 1;
-    });
+    candidates.sort((left, right) => compareSettlementCandidates(left, right, lastFailedProvider, failedProviders));
 
     for (const [candidateIndex, candidate] of candidates.entries()) {
       try {
         const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, minimumAcceptableOut);
         if (!constrained) {
-          errors.push(`${candidate.provider}: cannot build calldata with local 2% floor ${minimumAcceptableOut}`);
+          errors.push(`${candidate.provider}: cannot build calldata with local ${floorBps} bps floor ${minimumAcceptableOut}`);
+          rejectedProviders.push(candidate.provider);
           continue;
         }
         const prepared = await this.prepareApiSwap(position, tokenIn, amountIn, tokenOut, slippageBps, constrained, candidateIndex === 0 && approvalRefreshes < 1, minimumAcceptableOut);
         if (!prepared) return null;
         if (prepared === "approval_changed") {
           log.info({ positionKey: position.positionKey, provider: candidate.provider }, "refreshing and re-ranking providers after approval");
-          return this.prepareBestSettlementSwap(position, tokenIn, amountIn, tokenOut, slippageBps, lastFailedProvider, approvalRefreshes + 1);
+          return this.prepareBestSettlementSwap(position, tokenIn, amountIn, tokenOut, slippageBps, lastFailedProvider, approvalRefreshes + 1, failedProviders);
         }
         await this.simulatePlan(position, prepared.plan);
         log.info({
@@ -2485,6 +2496,7 @@ export class Executor {
         if (error instanceof PendingExecutionError) throw error;
         const reason = errorMessage(error);
         errors.push(`${candidate.provider}: ${reason}`);
+        rejectedProviders.push(candidate.provider);
         log.warn({ positionKey: position.positionKey, provider: candidate.provider, error: reason }, "settlement swap candidate rejected before broadcast");
       }
     }
@@ -2498,33 +2510,38 @@ export class Executor {
       if (error instanceof PendingExecutionError) throw error;
       errors.push(`local: ${errorMessage(error)}`);
     }
-    if (allowBelowFloor) {
-      const fallback = [...belowFloor, ...candidates].sort((left, right) => left.expectedOut === right.expectedOut ? 0 : left.expectedOut > right.expectedOut ? -1 : 1);
-      for (const candidate of fallback) {
-        const floor = applySlippage(candidate.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
-        try {
-          const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, floor);
-          if (!constrained) continue;
-          const prepared = await this.prepareApiSwap(position, tokenIn, amountIn, tokenOut, slippageBps, constrained, false, floor);
-          if (!prepared || prepared === "approval_changed") continue;
-          await this.simulatePlan(position, prepared.plan);
-          log.info({
-            positionKey: position.positionKey,
-            provider: prepared.provider,
-            expectedOut: prepared.expectedOut.toString(),
-            minimumOut: prepared.minimumOut.toString(),
-            slippageBps,
-            to: prepared.plan.to,
-          }, "settlement swap candidate selected after local route failed");
-          return prepared;
-        } catch (error) {
-          if (error instanceof PendingExecutionError) throw error;
-          errors.push(`${candidate.provider}: ${errorMessage(error)}`);
+    const fallback = [
+      ...belowFloor,
+      ...candidates.filter((candidate) => !belowFloor.some((item) => item.provider === candidate.provider)),
+    ];
+    for (const candidate of fallback) {
+      const floor = applySlippage(candidate.expectedOut, floorBps);
+      try {
+        const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, floor);
+        if (!constrained) {
+          rejectedProviders.push(candidate.provider);
+          continue;
         }
+        const prepared = await this.prepareApiSwap(position, tokenIn, amountIn, tokenOut, slippageBps, constrained, false, floor);
+        if (!prepared || prepared === "approval_changed") continue;
+        await this.simulatePlan(position, prepared.plan);
+        log.info({
+          positionKey: position.positionKey,
+          provider: prepared.provider,
+          expectedOut: prepared.expectedOut.toString(),
+          minimumOut: prepared.minimumOut.toString(),
+          slippageBps,
+          to: prepared.plan.to,
+        }, "settlement swap candidate selected after local route failed");
+        return prepared;
+      } catch (error) {
+        if (error instanceof PendingExecutionError) throw error;
+        errors.push(`${candidate.provider}: ${errorMessage(error)}`);
+        rejectedProviders.push(candidate.provider);
       }
     }
     const details = errors.filter(Boolean).slice(0, 4).join(" | ");
-    throw new Error(`No executable settlement route${details ? `: ${details}` : ""}`);
+    throw new SettlementRouteError(`No executable settlement route${details ? `: ${details}` : ""}`, uniqueProviders(rejectedProviders));
   }
 
   private async preparePancakeSettlementSwap(
@@ -2555,7 +2572,7 @@ export class Executor {
     }
     for (const candidate of candidates.belowFloor) {
       try {
-        const floor = applySlippage(candidate.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
+        const floor = applySlippage(candidate.expectedOut, settlementFloorBps(slippageBps));
         const prepared = await this.preparePancakeCandidate(position, tokenIn, amountIn, tokenOut, slippageBps, candidate, false, floor);
         if (!prepared || prepared === "approval_changed") continue;
         await this.simulatePlan(position, prepared.plan);
@@ -2592,7 +2609,7 @@ export class Executor {
     }
     for (const candidate of candidates.belowFloor) {
       try {
-        const floor = applySlippage(candidate.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
+        const floor = applySlippage(candidate.expectedOut, settlementFloorBps(slippageBps));
         const prepared = await this.preparePancakeGroupCandidate(group, position, pending.token, pending.amount, group.quoteToken, slippageBps, candidate, floor);
         await this.simulateGroupPlan(group, prepared.plan);
         return prepared;
@@ -2628,7 +2645,7 @@ export class Executor {
     }
     if (quoted.length === 0) throw new Error("No pancake Universal Router or KyberSwap route available");
     const benchmark = quoted.find((item) => item.provider === "pancake") ?? quoted[0]!;
-    const floor = applySlippage(benchmark.expectedOut, API_SETTLEMENT_MINIMUM_FLOOR_BPS);
+    const floor = applySlippage(benchmark.expectedOut, settlementFloorBps(slippageBps));
     const aboveFloor = quoted.filter((item) => item.expectedOut >= floor).sort((left, right) => right.expectedOut === left.expectedOut ? 0 : right.expectedOut > left.expectedOut ? -1 : 1);
     const belowFloor = quoted.filter((item) => item.expectedOut < floor).sort((left, right) => right.expectedOut === left.expectedOut ? 0 : right.expectedOut > left.expectedOut ? -1 : 1);
     return { aboveFloor, belowFloor, floor };
@@ -3808,11 +3825,15 @@ function swapRetryState(metadata: Record<string, unknown>): SwapRetryState {
   const broadcastAttempts = safeAttemptCount(retry.broadcastAttempts);
   const planningFailures = safeAttemptCount(retry.planningFailures);
   const cycleBroadcastAttempts = safeAttemptCount(retry.cycleBroadcastAttempts);
+  const failedProviders = Array.isArray(retry.failedProviders)
+    ? uniqueProviders(retry.failedProviders.filter((provider): provider is string => typeof provider === "string"))
+    : undefined;
   return {
     broadcastAttempts,
     planningFailures,
     cycleBroadcastAttempts,
     ...(typeof retry.lastProvider === "string" ? { lastProvider: retry.lastProvider } : {}),
+    ...(failedProviders && failedProviders.length > 0 ? { failedProviders } : {}),
     ...(typeof retry.nextAttemptAt === "string" ? { nextAttemptAt: retry.nextAttemptAt } : {}),
   };
 }
@@ -3831,17 +3852,42 @@ export function nextSwapRetry(
   broadcastFailed: boolean,
   cycleSize = 2,
   now = Date.now(),
+  failedProviders: readonly string[] = [],
 ): SwapRetryState {
   const previous = swapRetryState(metadata);
   const nextCycleAttempts = broadcastFailed ? previous.cycleBroadcastAttempts + 1 : 0;
   const cycleComplete = !broadcastFailed || nextCycleAttempts >= Math.max(1, cycleSize);
+  const nextFailedProviders = uniqueProviders([...(previous.failedProviders ?? []), ...failedProviders, lastProvider]);
   return {
     broadcastAttempts: previous.broadcastAttempts + (broadcastFailed ? 1 : 0),
     planningFailures: broadcastFailed ? 0 : previous.planningFailures + 1,
     cycleBroadcastAttempts: cycleComplete ? 0 : nextCycleAttempts,
     ...(lastProvider ? { lastProvider } : {}),
+    ...(nextFailedProviders.length > 0 ? { failedProviders: nextFailedProviders } : {}),
     nextAttemptAt: new Date(now + (cycleComplete ? SWAP_RETRY_CYCLE_DELAY_MS : 0)).toISOString(),
   };
+}
+
+export function settlementFloorBps(slippageBps: number): number {
+  return Math.max(API_SETTLEMENT_MINIMUM_FLOOR_BPS, slippageBps);
+}
+
+function compareSettlementCandidates(
+  left: { provider: string; expectedOut: bigint },
+  right: { provider: string; expectedOut: bigint },
+  lastFailedProvider?: string,
+  failedProviders: readonly string[] = [],
+): number {
+  const failed = new Set(failedProviders);
+  if (lastFailedProvider) failed.add(lastFailedProvider);
+  const leftFailed = failed.has(left.provider);
+  const rightFailed = failed.has(right.provider);
+  if (leftFailed !== rightFailed) return leftFailed ? 1 : -1;
+  return left.expectedOut === right.expectedOut ? 0 : left.expectedOut > right.expectedOut ? -1 : 1;
+}
+
+function uniqueProviders(values: Array<string | undefined>): string[] {
+  return [...new Set(values.filter((value): value is string => typeof value === "string" && value.length > 0))];
 }
 
 export function bufferedGasLimit(estimatedGas: bigint, multiplierPercent: number): bigint {

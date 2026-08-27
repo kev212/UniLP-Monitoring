@@ -5,7 +5,7 @@ import { v3PositionManagerAbi, v4PositionManagerAbi } from "../src/abi.js";
 import type { RuntimeConfig } from "../src/config.js";
 import { PANCAKE_PERMIT2 } from "../src/services/pancake-universal-router.js";
 import { isRpcRateLimited } from "../src/rpc.js";
-import { allowsZeroMinimumGroupClose, bufferedGasLimit, Executor, TransientCloseError, effectiveRemoveSlippageBps, effectiveSettlementSlippageBps, groupSettlementPosition, isTransientRpcError, nextExitRetry, nextSwapRetry, permit2AllowanceReady, receiptErc20NetReceived } from "../src/services/executor.js";
+import { allowsZeroMinimumGroupClose, bufferedGasLimit, Executor, TransientCloseError, effectiveRemoveSlippageBps, effectiveSettlementSlippageBps, groupSettlementPosition, isTransientRpcError, nextExitRetry, nextSwapRetry, permit2AllowanceReady, receiptErc20NetReceived, settlementFloorBps } from "../src/services/executor.js";
 import type { PositionGroupBinRecord, PositionGroupRecord, PositionRecord } from "../src/types.js";
 
 const usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as const;
@@ -532,6 +532,8 @@ describe("Executor pending settlement recovery", () => {
 
     expect(effectiveSettlementSlippageBps(200, 500, { broadcastAttempts: 0, planningFailures: 3 })).toBe(500);
     expect(effectiveSettlementSlippageBps(200, 500, { broadcastAttempts: 1, planningFailures: 0 })).toBe(300);
+    expect(settlementFloorBps(200)).toBe(200);
+    expect(settlementFloorBps(500)).toBe(500);
     expect(planning).toMatchObject({ broadcastAttempts: 0, planningFailures: 1, cycleBroadcastAttempts: 0, lastProvider: "uniswap" });
     expect(reverted).toMatchObject({ broadcastAttempts: 1, planningFailures: 0, cycleBroadcastAttempts: 1, lastProvider: "uniswap" });
     expect(Date.parse(planning.nextAttemptAt!)).toBe(now + 3_000);
@@ -950,6 +952,134 @@ describe("Executor pending settlement recovery", () => {
     expect(prepared).toMatchObject({ provider: "uniswap", expectedOut: 100n });
     expect(kyberswapApi.approvalSpender).not.toHaveBeenCalled();
     expect(kyberswapApi.createSwap).not.toHaveBeenCalled();
+  });
+
+  it("keeps a Uniswap quote 2.4% below Kyber when adaptive slippage is 500 bps", async () => {
+    const uniswapTarget = "0x0000000000000000000000000000000000000004" as Address;
+    const kyberTarget = "0x0000000000000000000000000000000000000005" as Address;
+    const client = {
+      readContract: vi.fn().mockResolvedValue(10n ** 30n),
+      call: vi.fn().mockImplementation(({ to }: { to: Address }) => to === kyberTarget
+        ? Promise.reject(new Error("Return amount is not enough"))
+        : Promise.resolve({ data: "0x" })),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const tradingApi = {
+      quote: vi.fn().mockResolvedValue({ routing: "CLASSIC", expectedOut: 222n, minimumOut: 211n, raw: {}, slippageBps: 500 }),
+      approval: vi.fn().mockResolvedValue(null),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: uniswapTarget, data: "0x11", description: "uniswap" }),
+    };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 228n, minimumOut: 216n, router: kyberTarget, slippageBps: 500 }),
+      approvalSpender: vi.fn().mockReturnValue(kyberTarget),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: kyberTarget, data: "0x22", description: "kyber" }),
+    };
+    const routes = { quoteDirect: vi.fn().mockRejectedValue(new Error("V4 quote failed after retries")) };
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, config, tradingApi as never, kyberswapApi as never);
+    const group = {
+      ...groupRecord("v4"),
+      token0: zeroAddress,
+      token1: token,
+      quoteToken: zeroAddress,
+    };
+    const pending = { token, amount: 5n };
+
+    const prepared = await (executor as unknown as {
+      prepareGroupSettlementSwap(
+        value: PositionGroupRecord,
+        position: PositionRecord,
+        swap: { token: Address; amount: bigint },
+        slippage: number,
+      ): Promise<{ provider: string; expectedOut: bigint }>;
+    }).prepareGroupSettlementSwap(group, groupSettlementPosition(group), pending, 500);
+
+    expect(prepared).toMatchObject({ provider: "uniswap", expectedOut: 222n });
+    expect(tradingApi.createSwap).toHaveBeenCalledTimes(1);
+  });
+
+  it("selects Uniswap for BOW/ETH after Kyber simulation reverts even at 200 bps", async () => {
+    const uniswapTarget = "0x0000000000000000000000000000000000000004" as Address;
+    const kyberTarget = "0x0000000000000000000000000000000000000005" as Address;
+    const client = {
+      readContract: vi.fn().mockResolvedValue(10n ** 30n),
+      call: vi.fn().mockImplementation(({ to }: { to: Address }) => to === kyberTarget
+        ? Promise.reject(new Error("Return amount is not enough"))
+        : Promise.resolve({ data: "0x" })),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const tradingApi = {
+      quote: vi.fn().mockResolvedValue({ routing: "CLASSIC", expectedOut: 222n, minimumOut: 217n, raw: {}, slippageBps: 200 }),
+      approval: vi.fn().mockResolvedValue(null),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: uniswapTarget, data: "0x11", description: "uniswap" }),
+    };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 228n, minimumOut: 223n, router: kyberTarget, slippageBps: 200 }),
+      approvalSpender: vi.fn().mockReturnValue(kyberTarget),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: kyberTarget, data: "0x22", description: "kyber" }),
+    };
+    const routes = { quoteDirect: vi.fn().mockRejectedValue(new Error("V4 quote failed after retries")) };
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, config, tradingApi as never, kyberswapApi as never);
+    const group = {
+      ...groupRecord("v4"),
+      token0: zeroAddress,
+      token1: token,
+      quoteToken: zeroAddress,
+    };
+
+    const prepared = await (executor as unknown as {
+      prepareGroupSettlementSwap(
+        value: PositionGroupRecord,
+        position: PositionRecord,
+        swap: { token: Address; amount: bigint },
+        slippage: number,
+      ): Promise<{ provider: string; expectedOut: bigint }>;
+    }).prepareGroupSettlementSwap(group, groupSettlementPosition(group), { token, amount: 5n }, 200);
+
+    expect(prepared).toMatchObject({ provider: "uniswap", expectedOut: 222n });
+    expect(kyberswapApi.createSwap).toHaveBeenCalledTimes(1);
+    expect(tradingApi.createSwap).toHaveBeenCalledTimes(1);
+  });
+
+  it("deprioritizes Kyber on the next group retry after a deterministic simulation failure", async () => {
+    const retry = nextSwapRetry({}, "kyberswap", false, 2, Date.now(), ["kyberswap"]);
+    expect(retry.failedProviders).toEqual(["kyberswap"]);
+    expect(retry.lastProvider).toBe("kyberswap");
+
+    const uniswapTarget = "0x0000000000000000000000000000000000000004" as Address;
+    const kyberTarget = "0x0000000000000000000000000000000000000005" as Address;
+    const client = {
+      readContract: vi.fn().mockResolvedValue(10n ** 30n),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const tradingApi = {
+      quote: vi.fn().mockResolvedValue({ routing: "CLASSIC", expectedOut: 222n, minimumOut: 217n, raw: {}, slippageBps: 200 }),
+      approval: vi.fn().mockResolvedValue(null),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: uniswapTarget, data: "0x11", description: "uniswap" }),
+    };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 228n, minimumOut: 223n, router: kyberTarget, slippageBps: 200 }),
+      approvalSpender: vi.fn().mockReturnValue(kyberTarget),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: kyberTarget, data: "0x22", description: "kyber" }),
+    };
+    const routes = { quoteDirect: vi.fn().mockRejectedValue(new Error("V4 quote failed after retries")) };
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, config, tradingApi as never, kyberswapApi as never);
+    const group = { ...groupRecord("v4"), token0: zeroAddress, token1: token, quoteToken: zeroAddress };
+
+    const prepared = await (executor as unknown as {
+      prepareGroupSettlementSwap(
+        value: PositionGroupRecord,
+        position: PositionRecord,
+        swap: { token: Address; amount: bigint },
+        slippage: number,
+        lastFailed?: string,
+        failed?: string[],
+      ): Promise<{ provider: string }>;
+    }).prepareGroupSettlementSwap(group, groupSettlementPosition(group), { token, amount: 5n }, 500, "kyberswap", ["kyberswap"]);
+
+    expect(prepared.provider).toBe("uniswap");
+    expect(kyberswapApi.createSwap).not.toHaveBeenCalled();
+    expect(client.call).toHaveBeenCalledWith(expect.objectContaining({ to: uniswapTarget }));
   });
 
   it("tightens an API quote so its calldata minimum preserves the local floor", async () => {
