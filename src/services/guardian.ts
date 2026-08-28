@@ -1,7 +1,7 @@
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
-import type { ChainName, ExitTrigger, PnlSnapshot, PositionGroupPnlSnapshot, PositionGroupRecord, PositionRangeInfo, PositionRecord } from "../types.js";
+import type { ChainName, ExitTrigger, PnlSnapshot, PositionGroupPnlSnapshot, PositionGroupRecord, PositionRangeInfo, PositionRecord, TrailingStopSource } from "../types.js";
 import { isAggregatorQuote } from "../types.js";
 import type { ChainClients } from "./chain-client.js";
 import type { AlchemyBootstrapper } from "./alchemy-bootstrap.js";
@@ -241,12 +241,12 @@ export class Guardian {
         feeNonQuote: null,
         feeQuoteUsdg: valued.snapshot.feeQuoteUsdg,
       };
-      const trailing = this.pnl.evaluateTrailingStop(group.metadata, syntheticSnapshot);
-      if (trailing.action === "reset") {
+      const localTrailing = this.pnl.evaluateTrailingStop(group.metadata, syntheticSnapshot, "local");
+      if (localTrailing.action === "reset") {
         await this.database.setPositionGroupStatus(group.id, group.status, { trailingStop: null }, group.status);
-      } else if (trailing.action === "activate" || trailing.action === "raise_peak") {
-        await this.database.setPositionGroupStatus(group.id, group.status, { trailingStop: trailing.state }, group.status);
-        group = { ...group, metadata: { ...group.metadata, trailingStop: trailing.state } };
+      } else if (localTrailing.action === "activate" || localTrailing.action === "raise_peak") {
+        await this.database.setPositionGroupStatus(group.id, group.status, { trailingStop: localTrailing.state }, group.status);
+        group = { ...group, metadata: { ...group.metadata, trailingStop: localTrailing.state } };
       }
 
       const quoteIsToken0 = group.quoteToken.toLowerCase() === group.token0.toLowerCase();
@@ -254,7 +254,7 @@ export class Guardian {
       const now = Date.now();
       const nearThreshold = typeof this.pnl.isNearExactThreshold === "function"
         && this.pnl.isNearExactThreshold(group.metadata, valued.snapshot, EXACT_PROBE_GUARD_BPS);
-      const urgent = nearThreshold || directStaticTrigger !== null || trailing.action === "trigger";
+      const urgent = nearThreshold || directStaticTrigger !== null || localTrailing.action === "trigger" || group.metadata.trailingStopExpected !== undefined;
       const cachedExact = this.groupExactCache.get(group.id);
       const cacheFresh = cachedExact !== undefined && now - cachedExact.at < this.exactCacheTtlMs(urgent);
       let exactSnapshot = cacheFresh ? cachedExact.snapshot : null;
@@ -269,10 +269,25 @@ export class Guardian {
         }
       }
       const staticTrigger = this.confirmedGroupExactTrigger(exactSnapshot);
+      const expectedTrailing = exactSnapshot && isAggregatorQuote(exactSnapshot.quoteProvider)
+        ? this.pnl.evaluateTrailingStop(group.metadata, groupTrailingSnapshot(group.id, exactSnapshot), "expected")
+        : { action: "none" } as const;
+      if (expectedTrailing.action === "reset") {
+        await this.database.setPositionGroupStatus(group.id, group.status, { trailingStopExpected: null }, group.status);
+      } else if (expectedTrailing.action === "activate" || expectedTrailing.action === "raise_peak") {
+        await this.database.setPositionGroupStatus(group.id, group.status, { trailingStopExpected: expectedTrailing.state }, group.status);
+        group = { ...group, metadata: { ...group.metadata, trailingStopExpected: expectedTrailing.state } };
+      }
       const oorTrigger = await this.updateGroupOorAboveTimer(group, valued.range);
       const profitOorTrigger = await this.updateGroupProfitOorAboveTimer(group, valued.range, valued.snapshot.pnlBps);
-      const liveTrigger = staticTrigger
-        ?? (trailing.action === "trigger" ? "trailing_take_profit" : null)
+      const resolvedStaticTrigger = directStaticTrigger === "stop_loss" || staticTrigger === "stop_loss"
+        ? "stop_loss"
+        : directStaticTrigger ?? staticTrigger;
+      const trailingSource: TrailingStopSource | null = localTrailing.action === "trigger"
+        ? "local"
+        : expectedTrailing.action === "trigger" ? "expected" : null;
+      const liveTrigger = resolvedStaticTrigger
+        ?? (trailingSource ? "trailing_take_profit" : null)
         ?? profitOorTrigger
         ?? oorTrigger;
       const pendingRetry = parseExitRetry(group.metadata);
@@ -334,7 +349,7 @@ export class Guardian {
           exitSnapshot = localSnapshot;
         }
       } else if (trigger === "trailing_take_profit") {
-        const trailingSnapshot = await this.groupTrailingExitEstimateAllowed(group, blockNumber);
+        const trailingSnapshot = await this.groupTrailingExitEstimateAllowed(group, blockNumber, trailingSource ?? trailingSourceFromMetadata(group.metadata));
         if (!trailingSnapshot) return true;
         exitSnapshot = trailingSnapshot;
         if (this.pnl.shouldTriggerGroup(exitSnapshot) === "stop_loss") trigger = "stop_loss";
@@ -363,6 +378,7 @@ export class Guardian {
         slTwapWaitStartedAt: null,
         trailingTwapWaitStartedAt: null,
         profitTwapWaitStartedAt: null,
+        ...(trigger === "trailing_take_profit" ? { trailingStopTriggerSource: trailingSource } : {}),
       }, group.status);
       if (stillActive === false) {
         log.info({ groupId: group.id, trigger }, "position group changed status during evaluation; skipping stale exit");
@@ -448,18 +464,18 @@ export class Guardian {
       log.debug({ positionId: position.id, positionKey: position.positionKey, valuationMs: Date.now() - startedAt }, "position valued");
       await this.database.addPnlSnapshot(valued.snapshot);
       await this.notifier.logPnL(position, valued.snapshot);
-      const trailing = this.pnl.evaluateTrailingStop(position.metadata, valued.snapshot);
+      const localTrailing = this.pnl.evaluateTrailingStop(position.metadata, valued.snapshot, "local");
       const oorTrigger = await this.updateOorAboveTimer(position, valued.range);
       const profitOorTrigger = await this.updateProfitOorAboveTimer(position, valued.range, valued.snapshot.pnlBps);
 
       if (position.status === "discovered" || position.status === "syncing") {
-        if (trailing.action === "activate" || trailing.action === "raise_peak") {
-          await this.database.setTrailingStopState(position.id, trailing.state);
+        if (localTrailing.action === "activate" || localTrailing.action === "raise_peak") {
+          await this.database.setTrailingStopState(position.id, localTrailing.state);
           log.info({
             positionId: position.id,
-            peakPnlBps: trailing.state.peakPnlBps,
-            activationBlock: trailing.state.activatedAtBlock,
-            action: trailing.action,
+            peakPnlBps: localTrailing.state.peakPnlBps,
+            activationBlock: localTrailing.state.activatedAtBlock,
+            action: localTrailing.action,
           }, "trailing stop updated");
         }
         const firstArming = position.metadata.armedAtBlock === undefined || position.metadata.armedAtBlock === null;
@@ -473,7 +489,7 @@ export class Guardian {
 
       if (position.metadata.autoExitDisabled === true) return true;
 
-      if (trailing.action === "reset") {
+      if (localTrailing.action === "reset") {
         await this.database.clearTrailingStopState(position.id);
         log.info({ positionId: position.id, pnlBps: valued.snapshot.pnlBps }, "trailing stop reset after negative PnL");
       }
@@ -484,7 +500,7 @@ export class Guardian {
       const now = Date.now();
       const nearThreshold = typeof this.pnl.isNearExactThreshold === "function"
         && this.pnl.isNearExactThreshold(position.metadata, valued.snapshot, EXACT_PROBE_GUARD_BPS);
-      const urgent = nearThreshold || directStaticTrigger !== null || trailing.action === "trigger";
+      const urgent = nearThreshold || directStaticTrigger !== null || localTrailing.action === "trigger" || position.metadata.trailingStopExpected !== undefined;
       const cachedExact = this.positionExactCache.get(position.id);
       const cacheFresh = cachedExact !== undefined && now - cachedExact.at < this.exactCacheTtlMs(urgent);
       let exactSnapshot = cacheFresh ? cachedExact.snapshot : null;
@@ -501,18 +517,36 @@ export class Guardian {
         }
       }
       const staticTrigger = this.confirmedPositionExactTrigger(exactSnapshot, exactRange, quoteIsToken0);
-      if (!staticTrigger && (trailing.action === "activate" || trailing.action === "raise_peak")) {
-        await this.database.setTrailingStopState(position.id, trailing.state);
+      const expectedTrailing = exactSnapshot && isAggregatorQuote(exactSnapshot.quoteProvider)
+        ? this.pnl.evaluateTrailingStop(position.metadata, exactSnapshot, "expected")
+        : { action: "none" } as const;
+      if (localTrailing.action === "activate" || localTrailing.action === "raise_peak") {
+        await this.database.setTrailingStopState(position.id, localTrailing.state);
         log.info({
           positionId: position.id,
-          peakPnlBps: trailing.state.peakPnlBps,
-          activationBlock: trailing.state.activatedAtBlock,
-          action: trailing.action,
+          source: "local",
+          peakPnlBps: localTrailing.state.peakPnlBps,
+          activationBlock: localTrailing.state.activatedAtBlock,
+          action: localTrailing.action,
         }, "trailing stop updated");
       }
+      if (expectedTrailing.action === "reset") {
+        await this.database.setPositionStatus(position.id, position.status, { trailingStopExpected: null });
+      } else if (expectedTrailing.action === "activate" || expectedTrailing.action === "raise_peak") {
+        await this.database.setPositionStatus(position.id, position.status, { trailingStopExpected: expectedTrailing.state });
+        position = { ...position, metadata: { ...position.metadata, trailingStopExpected: expectedTrailing.state } };
+        log.info({ positionId: position.id, source: "expected", peakPnlBps: expectedTrailing.state.peakPnlBps, activationBlock: expectedTrailing.state.activatedAtBlock, action: expectedTrailing.action }, "trailing stop updated");
+      }
 
-      const trigger = staticTrigger
-        ?? (trailing.action === "trigger" ? "trailing_take_profit" : null)
+      const resolvedStaticTrigger = directStaticTrigger === "stop_loss" || staticTrigger === "stop_loss"
+        ? "stop_loss"
+        : directStaticTrigger ?? staticTrigger;
+      const trailingSource: TrailingStopSource | null = localTrailing.action === "trigger"
+        ? "local"
+        : expectedTrailing.action === "trigger" ? "expected" : null;
+
+      const trigger = resolvedStaticTrigger
+        ?? (trailingSource ? "trailing_take_profit" : null)
         ?? profitOorTrigger
         ?? oorTrigger;
       const pendingRetry = !trigger ? parseExitRetry(position.metadata) : null;
@@ -577,7 +611,7 @@ export class Guardian {
       if (!this.canAutoExit(name)) return true;
       if (this.queuedExitPositions.has(position.id)) return true;
       if (effectiveTrigger === "trailing_take_profit") {
-        if (!(await this.trailingExitEstimateAllowed(position, blockNumber))) return true;
+        if (!(await this.trailingExitEstimateAllowed(position, blockNumber, undefined, trailingSource ?? trailingSourceFromMetadata(position.metadata)))) return true;
       }
       let exitSnapshot = valued.snapshot;
       if (effectiveTrigger === "stop_loss") {
@@ -591,8 +625,9 @@ export class Guardian {
           exitSnapshot: {
             pnlBps: exitSnapshot.pnlBps.toString(),
             pnlQuote: exitSnapshot.pnlQuote.toString(),
-            blockNumber: exitSnapshot.blockNumber.toString(),
+          blockNumber: exitSnapshot.blockNumber.toString(),
           },
+          ...(effectiveTrigger === "trailing_take_profit" ? { trailingStopTriggerSource: trailingSource } : {}),
         });
         await this.executeExit(position, effectiveTrigger, exitSnapshot);
         return true;
@@ -778,11 +813,12 @@ export class Guardian {
       const localValuation = await this.pnl.valueGroupLocalExitEstimate(group, blockNumber, this.config.settlementSwapSlippageBps);
       const staticTrigger = this.pnl.shouldTriggerGroup(localValuation.snapshot);
       if (staticTrigger === "stop_loss") return localValuation.snapshot;
-      const localTrigger = trigger === "take_profit"
-        ? staticTrigger
-        : trigger === "profit_oor_above"
-          ? await this.updateGroupProfitOorAboveTimer(group, localValuation.range, localValuation.snapshot.pnlBps)
-          : await this.updateGroupOorAboveTimer(group, localValuation.range);
+      // Take-profit is a local-or-aggregator Expected threshold; a lower
+      // source-pool mark cannot cancel it, but a conservative local SL wins.
+      if (trigger === "take_profit") return apiSnapshot;
+      const localTrigger = trigger === "profit_oor_above"
+        ? await this.updateGroupProfitOorAboveTimer(group, localValuation.range, localValuation.snapshot.pnlBps)
+        : await this.updateGroupOorAboveTimer(group, localValuation.range);
       if (localTrigger !== trigger) {
         log.info({
           groupId: group.id,
@@ -826,8 +862,8 @@ export class Guardian {
     return true;
   }
 
-  private async groupTrailingExitEstimateAllowed(group: PositionGroupRecord, blockNumber: bigint): Promise<PositionGroupPnlSnapshot | null> {
-    const gateBps = this.pnl.trailingExitEstimateGateBps(group.metadata);
+  private async groupTrailingExitEstimateAllowed(group: PositionGroupRecord, blockNumber: bigint, source: TrailingStopSource): Promise<PositionGroupPnlSnapshot | null> {
+    const gateBps = this.pnl.trailingExitEstimateGateBps(group.metadata, source);
     if (gateBps === null) {
       await this.database.setPositionGroupStatus(group.id, "needs_review", {
         reason: "trailing_exit_state_missing",
@@ -836,7 +872,7 @@ export class Guardian {
       return null;
     }
     const estimate = await this.pnl.valueGroupExitEstimate(group, blockNumber, this.config.settlementSwapSlippageBps);
-    const trailingFloorBps = this.pnl.trailingFloorBps(group.metadata);
+    const trailingFloorBps = this.pnl.trailingFloorBps(group.metadata, source);
     if (trailingFloorBps !== null && estimate.snapshot.pnlBps <= trailingFloorBps - TRAILING_HARD_FLOOR_DROP_BPS) {
       log.warn({ groupId: group.id, estimatePnlBps: estimate.snapshot.pnlBps, trailingFloorBps }, "position group trailing exit forced below hard floor");
       return estimate.snapshot;
@@ -888,7 +924,7 @@ export class Guardian {
           triggerSnapshot = latestValuation.snapshot;
           log.warn({ positionId: position.id, positionKey: position.positionKey }, "queued trailing exit upgraded to stop-loss");
         } else {
-          const latestEstimate = await this.trailingExitEstimateAllowed(latestPosition, latestBlock, latestValuation);
+          const latestEstimate = await this.trailingExitEstimateAllowed(latestPosition, latestBlock, undefined, trailingSourceFromMetadata(latestPosition.metadata));
           if (!latestEstimate) return;
           triggerSnapshot = latestEstimate;
         }
@@ -940,8 +976,13 @@ export class Guardian {
     return !this.config.autoExitChains || this.config.autoExitChains.includes(name);
   }
 
-  private async trailingExitEstimateAllowed(position: PositionRecord, blockNumber: bigint, valued?: Awaited<ReturnType<PnlService["value"]>>): Promise<PnlSnapshot | null> {
-    const gateBps = this.pnl.trailingExitEstimateGateBps(position.metadata);
+  private async trailingExitEstimateAllowed(
+    position: PositionRecord,
+    blockNumber: bigint,
+    valued?: Awaited<ReturnType<PnlService["value"]>>,
+    source: TrailingStopSource = trailingSourceFromMetadata(position.metadata),
+  ): Promise<PnlSnapshot | null> {
+    const gateBps = this.pnl.trailingExitEstimateGateBps(position.metadata, source);
     if (gateBps === null) {
       await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
         reason: "trailing_exit_state_missing",
@@ -957,7 +998,7 @@ export class Guardian {
       this.config.settlementSwapSlippageBps,
     );
 
-    const trailingFloorBps = this.pnl.trailingFloorBps(position.metadata);
+    const trailingFloorBps = this.pnl.trailingFloorBps(position.metadata, source);
     if (trailingFloorBps !== null && exitEstimate.snapshot.pnlBps <= trailingFloorBps - TRAILING_HARD_FLOOR_DROP_BPS) {
       log.warn({
         positionId: position.id,
@@ -1163,6 +1204,28 @@ export function shouldResumeGroupExitRetry(trigger: ExitTrigger): boolean {
 
 export function shouldWaitForGroupExitRetry(trigger: ExitTrigger, nextAttemptAt: number | null, now = Date.now()): boolean {
   return trigger !== "stop_loss" && nextAttemptAt !== null && now < nextAttemptAt;
+}
+
+function trailingSourceFromMetadata(metadata: Record<string, unknown>): TrailingStopSource {
+  return metadata.trailingStopTriggerSource === "expected" ? "expected" : "local";
+}
+
+function groupTrailingSnapshot(groupId: string, snapshot: PositionGroupPnlSnapshot): PnlSnapshot {
+  return {
+    positionId: groupId,
+    quoteToken: snapshot.quoteToken,
+    depositsQuote: snapshot.depositsQuote,
+    realizedQuote: snapshot.realizedQuote,
+    liquidationQuote: snapshot.liquidationQuote,
+    pnlQuote: snapshot.pnlQuote,
+    pnlBps: snapshot.pnlBps,
+    blockNumber: snapshot.blockNumber,
+    liquidity: 0n,
+    feeQuote: snapshot.feeQuote,
+    feeNonQuote: null,
+    feeQuoteUsdg: snapshot.feeQuoteUsdg,
+    quoteProvider: snapshot.quoteProvider,
+  };
 }
 
 function validExitTrigger(value: unknown): ExitTrigger | undefined {

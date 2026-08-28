@@ -1297,6 +1297,49 @@ describe("monitor RPC retries", () => {
     expect(executor.executeRelatedGroup).not.toHaveBeenCalled();
   });
 
+  it("activates an independent Expected trailing track when local PnL is below activation", async () => {
+    const baseline = {
+      ...valued,
+      twapGuard: { ready: true },
+      snapshot: { ...valued.snapshot, pnlBps: 100n, pnlQuote: 10_000n },
+    };
+    const exact = {
+      ...baseline,
+      snapshot: { ...baseline.snapshot, pnlBps: 600n, pnlQuote: 60_000n, quoteProvider: "kyberswap" as const },
+    };
+    const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(baseline),
+      valueGroupExactProbe: vi.fn().mockResolvedValue(exact),
+      evaluateTrailingStop: vi.fn((_metadata: unknown, _snapshot: unknown, source: string) => source === "expected"
+        ? { action: "activate", state: { peakPnlBps: 600n, activatedAtBlock: 10n } }
+        : { action: "none" }),
+      shouldTriggerGroup: vi.fn().mockReturnValue(null),
+      isNearExactThreshold: vi.fn().mockReturnValue(false),
+    };
+    const guardian = new Guardian(
+      {} as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      { executeRelatedGroup: vi.fn() } as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+
+    await expect(evaluate("robinhood", group("expected-trail"), 10n)).resolves.toBe(true);
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith(
+      "expected-trail",
+      "active",
+      expect.objectContaining({ trailingStopExpected: { peakPnlBps: 600n, activatedAtBlock: 10n } }),
+      "active",
+    );
+  });
+
   it("keeps only SL and manual group retries sticky", () => {
     expect(shouldResumeGroupExitRetry("stop_loss")).toBe(true);
     expect(shouldResumeGroupExitRetry("manual")).toBe(true);

@@ -140,6 +140,21 @@ describe("trailing stop", () => {
     expect(pnl.trailingFloorBps({ trailingStop: { peakPnlBps: "1000", activatedAtBlock: "10" } })).toBe(850n);
     expect(pnl.trailingFloorBps({})).toBeNull();
   });
+
+  it("keeps Expected trailing state independent from the local track", () => {
+    const metadata = {
+      trailingStop: { peakPnlBps: "500", activatedAtBlock: "10" },
+      trailingStopExpected: { peakPnlBps: "900", activatedAtBlock: "11" },
+    };
+
+    expect(pnl.evaluateTrailingStop(metadata, snapshot(400n), "local")).toEqual({ action: "none" });
+    expect(pnl.evaluateTrailingStop(metadata, snapshot(750n), "expected")).toEqual({
+      action: "trigger",
+      state: { peakPnlBps: 900n, activatedAtBlock: 11n },
+    });
+    expect(pnl.trailingFloorBps(metadata, "local")).toBe(350n);
+    expect(pnl.trailingFloorBps(metadata, "expected")).toBe(750n);
+  });
 });
 
 describe("fresh valuation quotes", () => {

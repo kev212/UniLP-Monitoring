@@ -12,6 +12,7 @@ import type {
   PositionGroupRecord,
   PositionRangeInfo,
   PositionRecord,
+  TrailingStopSource,
   TrailingStopState,
   ValuationQuoteProvider,
 } from "../types.js";
@@ -574,13 +575,16 @@ export class PnlService {
       percentToBps(this.config.takeProfitPercent),
       percentToBps(this.config.profitOorAboveThresholdPercent),
     ];
-    const trailingFloor = this.trailingFloorBps(metadata);
-    if (trailingFloor !== null) thresholds.push(trailingFloor);
+    thresholds.push(percentToBps(this.config.trailingStopActivationPercent));
+    for (const source of ["local", "expected"] as const) {
+      const trailingFloor = this.trailingFloorBps(metadata, source);
+      if (trailingFloor !== null) thresholds.push(trailingFloor);
+    }
     return thresholds.some((threshold) => absolute(snapshot.pnlBps - threshold) <= bufferBps);
   }
 
-  evaluateTrailingStop(metadata: Record<string, unknown>, snapshot: PnlSnapshot): TrailingStopDecision {
-    const state = parseTrailingStopState(metadata);
+  evaluateTrailingStop(metadata: Record<string, unknown>, snapshot: PnlSnapshot, source: TrailingStopSource = "local"): TrailingStopDecision {
+    const state = parseTrailingStopState(metadata, source);
     if (snapshot.pnlBps < 0n) return state ? { action: "reset" } : { action: "none" };
 
     const activationBps = percentToBps(this.config.trailingStopActivationPercent);
@@ -599,8 +603,8 @@ export class PnlService {
     return { action: "none" };
   }
 
-  trailingExitEstimateGateBps(metadata: Record<string, unknown>): bigint | null {
-    const state = parseTrailingStopState(metadata);
+  trailingExitEstimateGateBps(metadata: Record<string, unknown>, source: TrailingStopSource = "local"): bigint | null {
+    const state = parseTrailingStopState(metadata, source);
     if (!state) return null;
     const trailingFloor = state.peakPnlBps - percentToBps(this.config.trailingStopDrawdownPercent);
     if (trailingFloor <= 0n) return 0n;
@@ -608,8 +612,8 @@ export class PnlService {
     return (trailingFloor * (10_000n - bufferBps)) / 10_000n;
   }
 
-  trailingFloorBps(metadata: Record<string, unknown>): bigint | null {
-    const state = parseTrailingStopState(metadata);
+  trailingFloorBps(metadata: Record<string, unknown>, source: TrailingStopSource = "local"): bigint | null {
+    const state = parseTrailingStopState(metadata, source);
     if (!state) return null;
     return state.peakPnlBps - percentToBps(this.config.trailingStopDrawdownPercent);
   }
@@ -792,8 +796,8 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation:
   }
 }
 
-function parseTrailingStopState(metadata: Record<string, unknown>): TrailingStopState | null {
-  const raw = metadata.trailingStop;
+function parseTrailingStopState(metadata: Record<string, unknown>, source: TrailingStopSource): TrailingStopState | null {
+  const raw = metadata[source === "expected" ? "trailingStopExpected" : "trailingStop"];
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const state = raw as Record<string, unknown>;
   if (typeof state.peakPnlBps !== "string" || typeof state.activatedAtBlock !== "string") return null;

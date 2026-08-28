@@ -80,6 +80,8 @@ export interface TrailingStopState {
   activatedAtBlock: bigint;
 }
 
+export type TrailingStopSource = "local" | "expected";
+
 export interface QuoteToken {
   address: Address;
   symbol: string;
