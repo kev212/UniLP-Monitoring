@@ -651,6 +651,11 @@ export class Notifier {
           await this.replyTemp(ctx, "Bid-Ask Ladder sedang dimatikan.");
           return;
         }
+        const chain = soleEnabledChain(this.config.chains);
+        if (chain) {
+          await this.beginBidAskPoolInput(ctx, database, pnl, chatId, message.message_id, action.page, chain);
+          return;
+        }
         await this.editDashboardMessage(chatId, message.message_id, "🟣 Bid-Ask Ladder\nPilih chain:", this.chainPickerKeyboard(
           (chain) => `lp:open_ladder_chain:${chain}:${action.page}`,
           dashboardAction("open", action.page),
@@ -666,12 +671,15 @@ export class Notifier {
           await this.replyTemp(ctx, "Chain tidak aktif.");
           return;
         }
-        this.pendingInput.set(chatId, { kind: "bid_ask_pool", chain: action.chain, dashboardMessageId: message.message_id });
-        await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
-        await this.replyTemp(ctx, `🟣 Bid-Ask Ladder (${chainRegistry[action.chain].displayName})\nKirim pool address (V3 contract) atau V4 pool ID.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
+        await this.beginBidAskPoolInput(ctx, database, pnl, chatId, message.message_id, action.page, action.chain);
         return;
       }
       if (action.type === "open_mode") {
+        const chain = soleEnabledChain(this.config.chains);
+        if (chain) {
+          await this.beginOpenPoolInput(ctx, database, pnl, chatId, message.message_id, action.page, chain, action.mode);
+          return;
+        }
         await this.editDashboardMessage(chatId, message.message_id, `🟢 Open Position (${action.mode === "dual" ? "Dual-side" : "Single-side"})\nPilih chain:`, this.chainPickerKeyboard(
           (chain) => `lp:open_chain:${chain}:${action.mode}:${action.page}`,
           dashboardAction("open", action.page),
@@ -683,9 +691,7 @@ export class Notifier {
           await this.replyTemp(ctx, "Chain tidak aktif.");
           return;
         }
-        this.pendingInput.set(chatId, { kind: "open_pool", chain: action.chain, mode: action.mode, dashboardMessageId: message.message_id });
-        await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
-        await this.replyTemp(ctx, `🟢 Open Position (${action.mode === "dual" ? "Dual-side" : "Single-side"} · ${chainRegistry[action.chain].displayName})\nKirim pool address (V3 contract) atau V4 pool ID.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
+        await this.beginOpenPoolInput(ctx, database, pnl, chatId, message.message_id, action.page, action.chain, action.mode);
         return;
       }
       if (action.type === "open_confirm") {
@@ -1246,6 +1252,35 @@ export class Notifier {
     this.pendingInput.set(chatId, { kind: "scan_token", chain });
     await this.refreshDashboardMessage(database, pnl, chatId, messageId, page);
     await this.replyTemp(ctx, `Kirim address token ${chainRegistry[chain].displayName} untuk di-scan.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
+  }
+
+  private async beginOpenPoolInput(
+    ctx: Context,
+    database: Database,
+    pnl: PnlService,
+    chatId: string,
+    messageId: number,
+    page: number,
+    chain: ChainName,
+    mode: "single" | "dual",
+  ): Promise<void> {
+    this.pendingInput.set(chatId, { kind: "open_pool", chain, mode, dashboardMessageId: messageId });
+    await this.refreshDashboardMessage(database, pnl, chatId, messageId, page);
+    await this.replyTemp(ctx, `🟢 Open Position (${mode === "dual" ? "Dual-side" : "Single-side"} · ${chainRegistry[chain].displayName})\nKirim pool address (V3 contract) atau V4 pool ID.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
+  }
+
+  private async beginBidAskPoolInput(
+    ctx: Context,
+    database: Database,
+    pnl: PnlService,
+    chatId: string,
+    messageId: number,
+    page: number,
+    chain: BidAskLadderChain,
+  ): Promise<void> {
+    this.pendingInput.set(chatId, { kind: "bid_ask_pool", chain, dashboardMessageId: messageId });
+    await this.refreshDashboardMessage(database, pnl, chatId, messageId, page);
+    await this.replyTemp(ctx, `🟣 Bid-Ask Ladder (${chainRegistry[chain].displayName})\nKirim pool address (V3 contract) atau V4 pool ID.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
   }
 
   private async executeScanV2(scanner: PoolScanner, token: Address, chain: ChainName, range: number, chatId: string): Promise<void> {

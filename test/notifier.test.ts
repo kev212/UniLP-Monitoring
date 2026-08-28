@@ -53,6 +53,7 @@ describe("Telegram dashboard callbacks", () => {
 
   it("identifies the sole enabled chain for direct scan actions", () => {
     expect(soleEnabledChain(["robinhood"])).toBe("robinhood");
+    expect(soleEnabledChain(["bsc"])).toBe("bsc");
     expect(soleEnabledChain(["base", "robinhood"])).toBeUndefined();
     expect(soleEnabledChain([])).toBeUndefined();
   });
