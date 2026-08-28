@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { PositionOpener } from "../src/services/position-opener.js";
-import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isDashboardVisibleGroup, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanPoolsInput, parseScanV2Input, positionRangeBins, positionRangeLine, trailingPeakDisplay } from "../src/services/notifier.js";
+import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isDashboardVisibleGroup, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanPoolsInput, parseScanV2Input, positionRangeBins, positionRangeLine, soleEnabledChain, trailingPeakDisplay } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("parses chain-aware token scan input", () => {
@@ -49,6 +49,12 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseDashboardAction("lp:refresh:2")).toEqual({ type: "refresh", page: 2 });
     expect(parseDashboardAction("lp:close:0")).toEqual({ type: "close", page: 0 });
     expect(parseDashboardAction("lp:status:4")).toEqual({ type: "status", page: 4 });
+  });
+
+  it("identifies the sole enabled chain for direct scan actions", () => {
+    expect(soleEnabledChain(["robinhood"])).toBe("robinhood");
+    expect(soleEnabledChain(["base", "robinhood"])).toBeUndefined();
+    expect(soleEnabledChain([])).toBeUndefined();
   });
 
   it("parses open mode callbacks", () => {

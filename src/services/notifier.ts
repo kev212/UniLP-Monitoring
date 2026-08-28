@@ -517,6 +517,11 @@ export class Notifier {
         return;
       }
       if (action.type === "scan") {
+        const chain = soleEnabledChain(this.config.chains);
+        if (chain) {
+          await this.beginTokenScanInput(ctx, database, pnl, chatId, message.message_id, action.page, chain);
+          return;
+        }
         await this.editDashboardMessage(chatId, message.message_id, "🔍 Scan token\nPilih chain:", this.chainPickerKeyboard(
           (chain) => `lp:scan_chain:${chain}:${action.page}`,
           dashboardAction("status", action.page),
@@ -528,12 +533,15 @@ export class Notifier {
           await this.replyTemp(ctx, "Chain tidak aktif.");
           return;
         }
-        this.pendingInput.set(chatId, { kind: "scan_token", chain: action.chain });
-        await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
-        await this.replyTemp(ctx, `Kirim address token ${chainRegistry[action.chain].displayName} untuk di-scan.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
+        await this.beginTokenScanInput(ctx, database, pnl, chatId, message.message_id, action.page, action.chain);
         return;
       }
       if (action.type === "scan_pools") {
+        const chain = soleEnabledChain(this.config.chains);
+        if (chain) {
+          await this.handleScanPools(ctx as ChatContext, database, scanner, chain);
+          return;
+        }
         await this.editDashboardMessage(chatId, message.message_id, "🏆 Scan pools\nPilih chain:", this.chainPickerKeyboard(
           (chain) => `lp:scan_pools_chain:${chain}:${action.page}`,
           dashboardAction("status", action.page),
@@ -1224,6 +1232,20 @@ export class Notifier {
     this.scanV2Running = true;
     await this.replyTemp(ctx, `🔬 Menghitung concentrated yield ${parsed.range}% untuk ${shortAddress(parsed.token)} di ${parsed.chain}...`, undefined, 180_000);
     void this.executeScanV2(scanner, parsed.token, parsed.chain, parsed.range, chatId).catch((error) => log.error({ error: errorMessage(error), token: parsed.token, chain: parsed.chain }, "scanv2 background job failed"));
+  }
+
+  private async beginTokenScanInput(
+    ctx: Context,
+    database: Database,
+    pnl: PnlService,
+    chatId: string,
+    messageId: number,
+    page: number,
+    chain: ChainName,
+  ): Promise<void> {
+    this.pendingInput.set(chatId, { kind: "scan_token", chain });
+    await this.refreshDashboardMessage(database, pnl, chatId, messageId, page);
+    await this.replyTemp(ctx, `Kirim address token ${chainRegistry[chain].displayName} untuk di-scan.`, { reply_markup: { force_reply: true, input_field_placeholder: "0x..." } as any });
   }
 
   private async executeScanV2(scanner: PoolScanner, token: Address, chain: ChainName, range: number, chatId: string): Promise<void> {
@@ -2767,6 +2789,10 @@ function shortAddress(address: Address): string {
 
 function shortHash(hash: string): string {
   return `${hash.slice(0, 10)}...${hash.slice(-8)}`;
+}
+
+export function soleEnabledChain(chains: readonly ChainName[]): ChainName | undefined {
+  return chains.length === 1 ? chains[0] : undefined;
 }
 
 export function chainButtonLabel(chain: ChainName): string {
