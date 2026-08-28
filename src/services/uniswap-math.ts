@@ -41,6 +41,20 @@ export function quoteValueAtSqrtPrice(amount0: bigint, amount1: bigint, quoteIsT
     : amount1 + (amount0 * square) / Q192;
 }
 
+export function quoteValueAtPriceMarker(amount0: bigint, amount1: bigint, quoteIsToken0: boolean, priceMarker: bigint): bigint {
+  if (priceMarker <= 0n) return quoteIsToken0 ? amount0 : amount1;
+  return quoteIsToken0
+    ? amount0 + ((amount1 << 96n) / priceMarker)
+    : amount1 + ((amount0 * priceMarker) >> 96n);
+}
+
+export function quoteValueAtReserves(amount0: bigint, amount1: bigint, quoteIsToken0: boolean, reserve0: bigint, reserve1: bigint): bigint {
+  if (reserve0 <= 0n || reserve1 <= 0n) return quoteIsToken0 ? amount0 : amount1;
+  return quoteIsToken0
+    ? amount0 + (amount1 * reserve0) / reserve1
+    : amount1 + (amount0 * reserve1) / reserve0;
+}
+
 export function sqrtRatioAtTick(tick: number): bigint {
   if (!Number.isInteger(tick) || tick < -MAX_TICK || tick > MAX_TICK) {
     throw new Error(`Tick ${tick} is outside the supported range`);

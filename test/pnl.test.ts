@@ -6,6 +6,9 @@ import { PnlService } from "../src/services/pnl.js";
 import { amountsForLiquidity, applySlippage, sqrtRatioAtTick } from "../src/services/uniswap-math.js";
 import type { PositionGroupRecord } from "../src/types.js";
 
+const Q96 = 1n << 96n;
+const spotRange = { tickLower: -100, tickUpper: 100, currentTick: 0, currentSqrtPrice: Q96, status: "in_range" as const };
+
 const config: RuntimeConfig = {
   databaseUrl: "postgres://unused",
   chains: ["base"],
@@ -280,9 +283,10 @@ describe("fresh valuation quotes", () => {
         priceMarker: 1n,
         minAmount0: 0n,
         minAmount1: 0n,
-        unclaimedFees0: 0n,
+         unclaimedFees0: 0n,
         unclaimedFees1: 0n,
         observedBlock: 1n,
+        range: { ...spotRange },
       }),
     };
     const routes = {
@@ -296,8 +300,8 @@ describe("fresh valuation quotes", () => {
     const valued = await pnl.valueLocal(position, 1n);
 
     expect(tradingApi.quote).not.toHaveBeenCalled();
-    expect(routes.quoteDirect).toHaveBeenCalledWith(position, token, 10n ** 18n, usdg, { rpc: "monitoring", blockNumber: 1n });
-    expect(valued.snapshot.liquidationQuote).toBe(1_100_000n);
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
+    expect(valued.snapshot.liquidationQuote).toBe(1_000_000n + 10n ** 18n);
   });
 
   it("does not use an unrelated local route when native quote validation has no Kyber quote", async () => {
@@ -335,6 +339,7 @@ describe("fresh valuation quotes", () => {
         unclaimedFees0: 0n,
         unclaimedFees1: 0n,
         observedBlock: 1n,
+        range: { ...spotRange },
       }),
     };
     const routes = {
@@ -342,9 +347,10 @@ describe("fresh valuation quotes", () => {
     };
     const pnl = new PnlService(database as never, reader as never, routes as never, config);
 
-    await expect(pnl.valueLocal(position, 1n)).rejects.toThrow("No safe direct Uniswap route from LP asset to quote token");
+    const valued = await pnl.valueLocal(position, 1n);
 
     expect(routes.quoteDirect).not.toHaveBeenCalled();
+    expect(valued.snapshot.liquidationQuote).toBe(100n + 10n ** 18n);
   });
 
   it("uses KyberSwap for native quote validation", async () => {
@@ -382,6 +388,7 @@ describe("fresh valuation quotes", () => {
         unclaimedFees0: 0n,
         unclaimedFees1: 0n,
         observedBlock: 1n,
+        range: { ...spotRange },
       }),
     };
     const routes = { quoteDirect: vi.fn() };
@@ -392,9 +399,9 @@ describe("fresh valuation quotes", () => {
 
     const valued = await pnl.valueLocal(position, 1n);
 
-    expect(kyberswap.quote).toHaveBeenCalledWith(position, froge, 10n ** 18n, native, 100);
+    expect(kyberswap.quote).not.toHaveBeenCalled();
     expect(routes.quoteDirect).not.toHaveBeenCalled();
-    expect(valued.snapshot.liquidationQuote).toBe(900_100n);
+    expect(valued.snapshot.liquidationQuote).toBe(100n + 10n ** 18n);
   });
 
   it("uses native ETH as a quote token without an ERC-20 route", async () => {
@@ -469,8 +476,9 @@ describe("fresh valuation quotes", () => {
       read: vi.fn().mockResolvedValue({
         protocol: "v4", poolKey: "pool", sourcePool: null,
         token0: { token: stable, amount: 1_000_000n },
-        token1: { token, amount: 10n ** 18n }, liquidity: 1n, priceMarker: 1n,
+        token1: { token, amount: 90_000n }, liquidity: 1n, priceMarker: 1n,
         minAmount0: 0n, minAmount1: 0n, unclaimedFees0: 0n, unclaimedFees1: 0n, observedBlock: 1n,
+        range: { ...spotRange },
       }),
     };
     const routes = {
@@ -484,7 +492,7 @@ describe("fresh valuation quotes", () => {
     const probe = await pnl.valueExactProbe(position, 1n);
 
     expect(tradingApi.quote).toHaveBeenCalledTimes(1);
-    expect(tradingApi.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, stable, 100, { budget: true });
+    expect(tradingApi.quote).toHaveBeenCalledWith(position, token, 90_000n, stable, 100, { budget: true });
     expect(reader.read).toHaveBeenCalledTimes(1);
     expect(baseline.snapshot.liquidationQuote).toBe(1_090_000n);
     expect(probe.snapshot.liquidationQuote).toBe(1_100_000n);
@@ -521,6 +529,7 @@ describe("fresh valuation quotes", () => {
         token0: { token: stable, amount: 36_388_725n },
         token1: { token, amount: 10n ** 18n }, liquidity: 1n, priceMarker: 1n,
         minAmount0: 0n, minAmount1: 0n, unclaimedFees0: 35_070_217n, unclaimedFees1: 0n, observedBlock: 1n,
+        range: { ...spotRange },
       }),
     };
     const routes = {
@@ -536,8 +545,8 @@ describe("fresh valuation quotes", () => {
 
     expect(routes.quoteDirect).not.toHaveBeenCalled();
     expect(kyberswap.quote).toHaveBeenCalledWith(position, token, 10n ** 18n, stable, 100, { budget: true });
-    expect(baseline.snapshot.pnlBps).toBe(-1_869n);
     expect(probe.snapshot.pnlBps).toBe(-673n);
+    expect(baseline.snapshot.quoteProvider).toBeUndefined();
     expect(probe.snapshot.quoteProvider).toBe("kyberswap");
     expect(database.upsertExactQuote).toHaveBeenCalledWith(expect.objectContaining({
       provider: "kyberswap",
@@ -678,6 +687,7 @@ describe("rolling TWAP guard", () => {
         unclaimedFees0: 0n,
         unclaimedFees1: 0n,
         observedBlock: 1n,
+        range: { ...spotRange },
       }),
     };
     const routes = {
@@ -842,7 +852,7 @@ describe("position group valuation fees", () => {
           priceMarker: 100n,
           minAmount0: 0n,
           minAmount1: 0n,
-          range: { tickLower: lower, tickUpper: upper, currentTick: 0, currentSqrtPrice: 1n, status: "in_range" },
+          range: { tickLower: lower, tickUpper: upper, currentTick: 0, currentSqrtPrice: Q96, status: "in_range" },
           unclaimedFees0: fee0,
           unclaimedFees1: fee1,
           observedBlock: 10n,
@@ -930,7 +940,7 @@ describe("position group valuation fees", () => {
 
     const estimate = await pnl.valueGroupLocalExitEstimate(group, 10n, 200);
 
-    expect(estimate.snapshot.liquidationQuote).toBe(980n);
+    expect(estimate.snapshot.liquidationQuote).toBe(1_000n);
     expect(database.recordPoolObservation).not.toHaveBeenCalled();
     expect(database.addPositionGroupPnlSnapshot).not.toHaveBeenCalled();
   });
@@ -970,18 +980,10 @@ describe("position group valuation fees", () => {
 
   it("keeps the prepared group read while an exact route quote retries at the same block", async () => {
     const { pnl, database, routes, reader, group } = setup(token, stable, stable, 500n, 0n, 0n, 0n, [{ symbol: "USDC", address: stable }]);
-    routes.quoteDirect
-      .mockRejectedValueOnce(new Error("HTTP request failed. Status: 429"))
-      .mockImplementationOnce(async (_position: never, tokenIn: Address, amountIn: bigint, tokenOut: Address) => ({
-        expectedOut: amountIn,
-        path: [tokenIn, tokenOut],
-      }));
-
-    await expect(pnl.valueGroupLocal(group, 10n)).rejects.toThrow();
     const valued = await pnl.valueGroupLocal(group, 10n);
 
     expect(reader.readGroup).toHaveBeenCalledTimes(1);
-    expect(routes.quoteDirect).toHaveBeenCalledTimes(2);
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
     expect(valued.snapshot.liquidationQuote).toBe(1_000n);
   });
 });

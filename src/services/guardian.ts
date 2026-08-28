@@ -756,7 +756,7 @@ export class Guardian {
           apiPnlBps: apiSnapshot.pnlBps,
           localPnlBps: localValuation.snapshot.pnlBps,
           localLiquidationQuote: localValuation.snapshot.liquidationQuote,
-        }, "SL cancelled by local quote validation");
+        }, "SL cancelled by spot mark");
         return null;
       }
       return localValuation.snapshot;
@@ -781,7 +781,7 @@ export class Guardian {
           apiPnlBps: apiSnapshot.pnlBps,
           localPnlBps: localValuation.snapshot.pnlBps,
           localLiquidationQuote: localValuation.snapshot.liquidationQuote,
-        }, "position group SL cancelled by local quote validation");
+        }, "position group SL cancelled by spot mark");
         return null;
       }
       return localValuation.snapshot;

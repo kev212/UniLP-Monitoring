@@ -62,6 +62,7 @@ const envSchema = z.object({
   MAX_SWAP_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(100),
   SETTLEMENT_SWAP_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(200),
   SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(500),
+  SETTLEMENT_MAX_IMPACT_BPS: z.coerce.number().int().min(1).max(5_000).default(1_500),
   SWAP_GAS_LIMIT_MULTIPLIER_PERCENT: z.coerce.number().int().min(100).max(500).default(300),
   REMOVE_LIQUIDITY_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(200),
   REMOVE_LIQUIDITY_MAX_SLIPPAGE_BPS: z.coerce.number().int().min(1).max(2_000).default(500),
@@ -139,6 +140,7 @@ export interface RuntimeConfig {
   maxSwapSlippageBps: number;
   settlementSwapSlippageBps: number;
   settlementSwapMaxSlippageBps: number;
+  settlementMaxImpactBps: number;
   swapGasLimitMultiplierPercent: number;
   removeLiquiditySlippageBps: number;
   removeLiquidityMaxSlippageBps: number;
@@ -377,6 +379,7 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     maxSwapSlippageBps: env.MAX_SWAP_SLIPPAGE_BPS,
     settlementSwapSlippageBps: env.SETTLEMENT_SWAP_SLIPPAGE_BPS,
     settlementSwapMaxSlippageBps: env.SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS,
+    settlementMaxImpactBps: env.SETTLEMENT_MAX_IMPACT_BPS,
     swapGasLimitMultiplierPercent: env.SWAP_GAS_LIMIT_MULTIPLIER_PERCENT,
     removeLiquiditySlippageBps: env.REMOVE_LIQUIDITY_SLIPPAGE_BPS,
     removeLiquidityMaxSlippageBps: env.REMOVE_LIQUIDITY_MAX_SLIPPAGE_BPS,

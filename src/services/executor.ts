@@ -27,6 +27,7 @@ import {
   wethAbi,
   v2RouterAbi,
   v3FactoryAbi,
+  v2PairAbi,
   v3PoolAbi,
   v3CollectEvent,
   v3DecreaseLiquidityEvent,
@@ -62,7 +63,7 @@ import { hasPendingSettlement } from "./pending-settlement.js";
 import { buildSwapPlan } from "./swap-builder.js";
 import { buildV3BidAskClosePlan, buildV4BidAskClosePlan, type V4PoolKey } from "./bid-ask-batch.js";
 import { receiptTokenTransfers } from "./discovery.js";
-import { applySlippage, isUsableSqrtPrice, quoteValueAtSqrtPrice, sqrtRatioAtTick } from "./uniswap-math.js";
+import { applySlippage, isUsableSqrtPrice, quoteValueAtReserves, quoteValueAtSqrtPrice, sqrtRatioAtTick } from "./uniswap-math.js";
 import { isUsdStableSymbol, normalizeToUsd6 } from "./token-meta.js";
 import { dexNameFromMetadata, v3ContractsFor } from "./v3-deployment.js";
 
@@ -104,7 +105,6 @@ export interface SwapRetryState {
 
 const SWAP_RETRY_CYCLE_DELAY_MS = 3_000;
 const PENDING_RECEIPT_REVIEW_MS = 5 * 60_000;
-const API_SETTLEMENT_MINIMUM_FLOOR_BPS = 200;
 const MAX_UINT256 = (1n << 256n) - 1n;
 const MAX_UINT160 = (1n << 160n) - 1n;
 const PERMIT2_MAX_EXPIRATION_SECONDS = 2_592_000;
@@ -1559,46 +1559,25 @@ export class Executor {
     }
     const { token: tokenIn, amount: amountIn } = pending;
     const tokenOut = group.quoteToken;
-    const isNativeSettlement = tokenIn.toLowerCase() === zeroAddress || tokenOut.toLowerCase() === zeroAddress;
-    let nativeBenchmark: KyberSwapQuote | null = null;
-    if (isNativeSettlement) {
-      if (!this.kyberswapApi) throw new Error("KyberSwap is required to benchmark native group settlement swap");
-      nativeBenchmark = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
-      if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark native group settlement swap");
-    }
-    let localBenchmark = isNativeSettlement
-      ? nativeBenchmark
-      : await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
-    if (!localBenchmark && !isNativeSettlement) {
-      if (!this.kyberswapApi) throw new Error("KyberSwap is required to benchmark group settlement swap");
-      nativeBenchmark = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
-      if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark group settlement swap");
-      localBenchmark = nativeBenchmark;
-    }
-    if (!localBenchmark) throw new Error("No safe local route available to benchmark group settlement swap");
-    const floorBps = settlementFloorBps(slippageBps);
-    const minimumAcceptableOut = applySlippage(localBenchmark.expectedOut, floorBps);
+    const minimumAcceptableOut = await this.settlementMinimumOut(position, tokenIn, amountIn, tokenOut);
     const quoteJobs: Promise<ApiSwapCandidate | null>[] = [];
     if (this.tradingApi) {
       quoteJobs.push(this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
         .then((quote) => quote ? { provider: "uniswap" as const, expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote } : null));
     }
     if (this.kyberswapApi) {
-      const quote = nativeBenchmark ?? this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
-      quoteJobs.push(Promise.resolve(quote)
+      quoteJobs.push(this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
         .then((quote) => quote ? { provider: "kyberswap" as const, expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote } : null));
     }
     const results = await Promise.allSettled(quoteJobs);
     const errors: string[] = [];
     const candidates: ApiSwapCandidate[] = [];
-    const belowFloor: ApiSwapCandidate[] = [];
     const rejectedProviders: string[] = [];
     for (const result of results) {
       if (result.status === "fulfilled") {
         if (result.value) {
           if (result.value.expectedOut < minimumAcceptableOut) {
-            errors.push(`${result.value.provider}: expected output is below local ${floorBps} bps floor`);
-            belowFloor.push(result.value);
+            errors.push(`${result.value.provider}: expected output is below spot-mark floor ${minimumAcceptableOut}`);
             continue;
           }
           candidates.push(result.value);
@@ -1613,7 +1592,7 @@ export class Executor {
       try {
         const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, minimumAcceptableOut);
         if (!constrained) {
-          errors.push(`${candidate.provider}: calldata minimum output is below local ${floorBps} bps floor`);
+          errors.push(`${candidate.provider}: calldata minimum output is below spot-mark floor ${minimumAcceptableOut}`);
           rejectedProviders.push(candidate.provider);
           continue;
         }
@@ -1632,6 +1611,7 @@ export class Executor {
     try {
       const route = await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
       if (!route) throw new Error("No safe local route remains for group settlement swap");
+      if (route.expectedOut < minimumAcceptableOut) throw new Error(`local expected output is below spot-mark floor ${minimumAcceptableOut}`);
       const minimumOut = applySlippage(route.expectedOut, slippageBps);
       await this.ensureGroupSettlementApproval(group, position, route.protocol, route.router, tokenIn, amountIn);
       const plan = buildSwapPlan(group.chainId, group.owner, { ...route, minimumOut }, BigInt(Math.floor(Date.now() / 1_000) + 300));
@@ -1640,28 +1620,6 @@ export class Executor {
     } catch (error) {
       if (error instanceof PendingExecutionError) throw error;
       errors.push(`local: ${errorMessage(error)}`);
-    }
-    const fallback = [
-      ...belowFloor,
-      ...candidates.filter((candidate) => !belowFloor.some((item) => item.provider === candidate.provider)),
-    ];
-    for (const candidate of fallback) {
-      const floor = applySlippage(candidate.expectedOut, floorBps);
-      try {
-        const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, floor);
-        if (!constrained) {
-          rejectedProviders.push(candidate.provider);
-          continue;
-        }
-        const prepared = await this.prepareGroupApiSwap(group, position, tokenIn, amountIn, tokenOut, slippageBps, constrained, floor);
-        await this.simulateGroupPlan(group, prepared.plan);
-        log.info({ groupId: group.id, provider: prepared.provider, expectedOut: prepared.expectedOut.toString(), minimumOut: prepared.minimumOut.toString(), slippageBps }, "group settlement swap candidate selected after local route failed");
-        return prepared;
-      } catch (error) {
-        if (error instanceof PendingExecutionError) throw error;
-        errors.push(`${candidate.provider}: ${errorMessage(error)}`);
-        rejectedProviders.push(candidate.provider);
-      }
     }
     const details = errors.filter(Boolean).slice(0, 4).join(" | ");
     throw new SettlementRouteError(`No executable group settlement route${details ? `: ${details}` : ""}`, uniqueProviders(rejectedProviders));
@@ -2416,48 +2374,27 @@ export class Executor {
     if (dexNameFromMetadata(position.metadata) === "pancake") {
       return this.preparePancakeSettlementSwap(position, tokenIn, amountIn, tokenOut, slippageBps, lastFailedProvider, approvalRefreshes);
     }
-    const isNativeSettlement = tokenIn.toLowerCase() === zeroAddress || tokenOut.toLowerCase() === zeroAddress;
-    let nativeBenchmark: KyberSwapQuote | null = null;
-    if (isNativeSettlement) {
-      if (!this.kyberswapApi) throw new Error("KyberSwap is required to benchmark native settlement swap");
-      nativeBenchmark = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
-      if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark native settlement swap");
-    }
-    let localBenchmark = isNativeSettlement
-      ? nativeBenchmark
-      : await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
-    if (!localBenchmark && !isNativeSettlement) {
-      if (!this.kyberswapApi) throw new Error("KyberSwap is required to benchmark settlement swap");
-      nativeBenchmark = await this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
-      if (!nativeBenchmark) throw new Error("No safe KyberSwap route available to benchmark settlement swap");
-      localBenchmark = nativeBenchmark;
-    }
-    if (!localBenchmark) throw new Error("No safe local route available to benchmark settlement swap");
-    const floorBps = settlementFloorBps(slippageBps);
-    const minimumAcceptableOut = applySlippage(localBenchmark.expectedOut, floorBps);
+    const minimumAcceptableOut = await this.settlementMinimumOut(position, tokenIn, amountIn, tokenOut);
     const quoteJobs: Promise<ApiSwapCandidate | null>[] = [];
     if (this.tradingApi) {
       quoteJobs.push(this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
         .then((quote) => quote ? { provider: "uniswap" as const, expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote } : null));
     }
     if (this.kyberswapApi) {
-      const quote = nativeBenchmark ?? this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps);
-      quoteJobs.push(Promise.resolve(quote)
+      quoteJobs.push(this.kyberswapApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
         .then((quote) => quote ? { provider: "kyberswap" as const, expectedOut: quote.expectedOut, minimumOut: quote.minimumOut, quote } : null));
     }
     const results = await Promise.allSettled(quoteJobs);
     const errors: string[] = [];
     const candidates: ApiSwapCandidate[] = [];
-    const belowFloor: ApiSwapCandidate[] = [];
     const rejectedProviders: string[] = [];
     for (const result of results) {
       if (result.status === "fulfilled") {
         if (result.value) {
           if (result.value.expectedOut < minimumAcceptableOut) {
-            const reason = `expected output ${result.value.expectedOut} is below local ${floorBps} bps floor ${minimumAcceptableOut}`;
+            const reason = `expected output ${result.value.expectedOut} is below spot-mark floor ${minimumAcceptableOut}`;
             errors.push(`${result.value.provider}: ${reason}`);
-            log.warn({ positionKey: position.positionKey, provider: result.value.provider, expectedOut: result.value.expectedOut.toString(), minimumOut: result.value.minimumOut.toString(), localExpectedOut: localBenchmark.expectedOut.toString(), minimumAcceptableOut: minimumAcceptableOut.toString() }, "settlement swap candidate rejected below local minimum floor");
-            belowFloor.push(result.value);
+            log.warn({ positionKey: position.positionKey, provider: result.value.provider, expectedOut: result.value.expectedOut.toString(), minimumOut: result.value.minimumOut.toString(), minimumAcceptableOut: minimumAcceptableOut.toString() }, "settlement swap candidate rejected below spot-mark floor");
             continue;
           }
           candidates.push(result.value);
@@ -2472,7 +2409,7 @@ export class Executor {
       try {
         const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, minimumAcceptableOut);
         if (!constrained) {
-          errors.push(`${candidate.provider}: cannot build calldata with local ${floorBps} bps floor ${minimumAcceptableOut}`);
+          errors.push(`${candidate.provider}: cannot build calldata with spot-mark floor ${minimumAcceptableOut}`);
           rejectedProviders.push(candidate.provider);
           continue;
         }
@@ -2504,41 +2441,12 @@ export class Executor {
     try {
       const local = await this.prepareLocalSwap(position, tokenIn, amountIn, tokenOut, slippageBps);
       if (!local) return null;
+      if (local.expectedOut < minimumAcceptableOut) throw new Error(`local expected output is below spot-mark floor ${minimumAcceptableOut}`);
       await this.simulatePlan(position, local.plan);
       return local;
     } catch (error) {
       if (error instanceof PendingExecutionError) throw error;
       errors.push(`local: ${errorMessage(error)}`);
-    }
-    const fallback = [
-      ...belowFloor,
-      ...candidates.filter((candidate) => !belowFloor.some((item) => item.provider === candidate.provider)),
-    ];
-    for (const candidate of fallback) {
-      const floor = applySlippage(candidate.expectedOut, floorBps);
-      try {
-        const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, floor);
-        if (!constrained) {
-          rejectedProviders.push(candidate.provider);
-          continue;
-        }
-        const prepared = await this.prepareApiSwap(position, tokenIn, amountIn, tokenOut, slippageBps, constrained, false, floor);
-        if (!prepared || prepared === "approval_changed") continue;
-        await this.simulatePlan(position, prepared.plan);
-        log.info({
-          positionKey: position.positionKey,
-          provider: prepared.provider,
-          expectedOut: prepared.expectedOut.toString(),
-          minimumOut: prepared.minimumOut.toString(),
-          slippageBps,
-          to: prepared.plan.to,
-        }, "settlement swap candidate selected after local route failed");
-        return prepared;
-      } catch (error) {
-        if (error instanceof PendingExecutionError) throw error;
-        errors.push(`${candidate.provider}: ${errorMessage(error)}`);
-        rejectedProviders.push(candidate.provider);
-      }
     }
     const details = errors.filter(Boolean).slice(0, 4).join(" | ");
     throw new SettlementRouteError(`No executable settlement route${details ? `: ${details}` : ""}`, uniqueProviders(rejectedProviders));
@@ -2570,21 +2478,8 @@ export class Executor {
         errors.push(`${candidate.provider}: ${errorMessage(error)}`);
       }
     }
-    for (const candidate of candidates.belowFloor) {
-      try {
-        const floor = applySlippage(candidate.expectedOut, settlementFloorBps(slippageBps));
-        const prepared = await this.preparePancakeCandidate(position, tokenIn, amountIn, tokenOut, slippageBps, candidate, false, floor);
-        if (!prepared || prepared === "approval_changed") continue;
-        await this.simulatePlan(position, prepared.plan);
-        log.info({ positionKey: position.positionKey, provider: prepared.provider, expectedOut: prepared.expectedOut.toString() }, "pancake settlement swap selected after better routes failed");
-        return prepared;
-      } catch (error) {
-        if (error instanceof PendingExecutionError) throw error;
-        errors.push(`${candidate.provider}: ${errorMessage(error)}`);
-      }
-    }
     const details = errors.filter(Boolean).slice(0, 4).join(" | ");
-    throw new Error(`No executable pancake settlement route${details ? `: ${details}` : ""}`);
+    throw new SettlementRouteError(`No executable pancake settlement route${details ? `: ${details}` : ""}`);
   }
 
   private async preparePancakeGroupSettlementSwap(
@@ -2607,19 +2502,8 @@ export class Executor {
         errors.push(`${candidate.provider}: ${errorMessage(error)}`);
       }
     }
-    for (const candidate of candidates.belowFloor) {
-      try {
-        const floor = applySlippage(candidate.expectedOut, settlementFloorBps(slippageBps));
-        const prepared = await this.preparePancakeGroupCandidate(group, position, pending.token, pending.amount, group.quoteToken, slippageBps, candidate, floor);
-        await this.simulateGroupPlan(group, prepared.plan);
-        return prepared;
-      } catch (error) {
-        if (error instanceof PendingExecutionError) throw error;
-        errors.push(`${candidate.provider}: ${errorMessage(error)}`);
-      }
-    }
     const details = errors.filter(Boolean).slice(0, 4).join(" | ");
-    throw new Error(`No executable pancake group settlement route${details ? `: ${details}` : ""}`);
+    throw new SettlementRouteError(`No executable pancake group settlement route${details ? `: ${details}` : ""}`);
   }
 
   private async pancakeSettlementCandidates(
@@ -2643,9 +2527,8 @@ export class Executor {
     for (const result of results) {
       if (result.status === "fulfilled" && result.value) quoted.push(result.value);
     }
-    if (quoted.length === 0) throw new Error("No pancake Universal Router or KyberSwap route available");
-    const benchmark = quoted.find((item) => item.provider === "pancake") ?? quoted[0]!;
-    const floor = applySlippage(benchmark.expectedOut, settlementFloorBps(slippageBps));
+    if (quoted.length === 0) throw new SettlementRouteError("No pancake Universal Router or KyberSwap route available");
+    const floor = await this.settlementMinimumOut(position, tokenIn, amountIn, tokenOut);
     const aboveFloor = quoted.filter((item) => item.expectedOut >= floor).sort((left, right) => right.expectedOut === left.expectedOut ? 0 : right.expectedOut > left.expectedOut ? -1 : 1);
     const belowFloor = quoted.filter((item) => item.expectedOut < floor).sort((left, right) => right.expectedOut === left.expectedOut ? 0 : right.expectedOut > left.expectedOut ? -1 : 1);
     return { aboveFloor, belowFloor, floor };
@@ -3582,6 +3465,63 @@ export class Executor {
     return amounts;
   }
 
+  private async settlementMinimumOut(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address): Promise<bigint> {
+    const mark = await this.settlementSpotMarkQuote(position, tokenIn, amountIn, tokenOut);
+    if (mark <= 0n) throw new SettlementRouteError("Spot mark is unavailable");
+    return applySlippage(mark, this.config.settlementMaxImpactBps ?? 1_500);
+  }
+
+  private async settlementSpotMarkQuote(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address): Promise<bigint> {
+    if (amountIn <= 0n) return 0n;
+    const quoteIsToken0 = tokenOut.toLowerCase() === position.token0.toLowerCase();
+    const tokenInIsToken0 = tokenIn.toLowerCase() === position.token0.toLowerCase();
+    const amount0 = tokenInIsToken0 ? amountIn : 0n;
+    const amount1 = tokenInIsToken0 ? 0n : amountIn;
+    const { client, registry } = this.chains.getById(position.chainId);
+    const metadata = position.metadata as Record<string, unknown>;
+    if (position.protocol === "v4") {
+      const currency0 = (metadata.currency0 as Address | undefined) ?? position.token0;
+      const currency1 = (metadata.currency1 as Address | undefined) ?? position.token1;
+      const fee = (metadata.fee as number | undefined) ?? 3_000;
+      const tickSpacing = (metadata.tickSpacing as number | undefined) ?? 60;
+      const hooks = (metadata.hooks as Address | undefined) ?? zeroAddress;
+      if (currency0 && currency1) {
+        const poolId = keccak256(encodeAbiParameters(
+          [{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }],
+          [currency0, currency1, fee, tickSpacing, hooks],
+        ));
+        const slot0 = await client.readContract({
+          address: registry.contracts.v4.stateView,
+          abi: v4StateViewAbi,
+          functionName: "getSlot0",
+          args: [poolId],
+        });
+        const sqrtPriceX96 = sqrtPriceFromSlot0(slot0);
+        if (!isUsableSqrtPrice(sqrtPriceX96)) throw new SettlementRouteError("Spot mark is unavailable");
+        return quoteValueAtSqrtPrice(amount0, amount1, quoteIsToken0, sqrtPriceX96);
+      }
+    }
+    if (position.poolAddress && (position.protocol === "v3" || dexNameFromMetadata(position.metadata) === "pancake")) {
+      const slot0 = await client.readContract({
+        address: position.poolAddress,
+        abi: v3PoolAbi,
+        functionName: "slot0",
+      });
+      const sqrtPriceX96 = sqrtPriceFromSlot0(slot0);
+      if (!isUsableSqrtPrice(sqrtPriceX96)) throw new SettlementRouteError("Spot mark is unavailable");
+      return quoteValueAtSqrtPrice(amount0, amount1, quoteIsToken0, sqrtPriceX96);
+    }
+    if (position.poolAddress && position.protocol === "v2") {
+      const reserves = await client.readContract({
+        address: position.poolAddress,
+        abi: v2PairAbi,
+        functionName: "getReserves",
+      }) as readonly [bigint, bigint, ...unknown[]];
+      return quoteValueAtReserves(amount0, amount1, quoteIsToken0, reserves[0], reserves[1]);
+    }
+    throw new SettlementRouteError("Spot mark is unavailable");
+  }
+
   private async quoteV4AmountsAtBlock(position: PositionRecord, amount0: bigint, amount1: bigint, blockNumber: bigint): Promise<bigint> {
     if (!position.quoteToken) return 0n;
     const { client, registry } = this.chains.getById(position.chainId);
@@ -3868,8 +3808,10 @@ export function nextSwapRetry(
   };
 }
 
-export function settlementFloorBps(slippageBps: number): number {
-  return Math.max(API_SETTLEMENT_MINIMUM_FLOOR_BPS, slippageBps);
+function sqrtPriceFromSlot0(slot0: unknown): bigint {
+  if (typeof slot0 === "bigint") return slot0;
+  if (Array.isArray(slot0) && typeof slot0[0] === "bigint") return slot0[0];
+  return 0n;
 }
 
 function compareSettlementCandidates(

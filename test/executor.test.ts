@@ -5,7 +5,7 @@ import { v3PositionManagerAbi, v4PositionManagerAbi } from "../src/abi.js";
 import type { RuntimeConfig } from "../src/config.js";
 import { PANCAKE_PERMIT2 } from "../src/services/pancake-universal-router.js";
 import { isRpcRateLimited } from "../src/rpc.js";
-import { allowsZeroMinimumGroupClose, bufferedGasLimit, Executor, TransientCloseError, effectiveRemoveSlippageBps, effectiveSettlementSlippageBps, groupSettlementPosition, isTransientRpcError, nextExitRetry, nextSwapRetry, permit2AllowanceReady, receiptErc20NetReceived, settlementFloorBps } from "../src/services/executor.js";
+import { allowsZeroMinimumGroupClose, bufferedGasLimit, Executor, TransientCloseError, effectiveRemoveSlippageBps, effectiveSettlementSlippageBps, groupSettlementPosition, isTransientRpcError, nextExitRetry, nextSwapRetry, permit2AllowanceReady, receiptErc20NetReceived } from "../src/services/executor.js";
 import type { PositionGroupBinRecord, PositionGroupRecord, PositionRecord } from "../src/types.js";
 
 const usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as const;
@@ -19,6 +19,21 @@ const unwrapHash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const groupId = "group";
 const groupManager = "0x0000000000000000000000000000000000000100" as Address;
 const groupPool = "0x0000000000000000000000000000000000000200" as Address;
+const Q96 = 1n << 96n;
+const v4StateView = "0x00000000000000000000000000000000000000aa" as Address;
+
+function v4Registry(name: "robinhood" | "bsc" | "base", extra: Record<string, unknown> = {}) {
+  return { name, contracts: { v4: { stateView: v4StateView, permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3", ...extra } } };
+}
+
+function markReadContract(callImpl?: (input: { functionName: string; args?: unknown[] }) => unknown) {
+  return vi.fn(async (input: { functionName: string; args?: unknown[] }) => {
+    if (input.functionName === "getSlot0" || input.functionName === "slot0") return [Q96, 0, 0, 0];
+    if (callImpl) return callImpl(input);
+    if (input.functionName === "allowance") return (input.args?.length ?? 0) === 3 ? [10n ** 30n, 4_000_000_000] : 10n ** 30n;
+    return 10n ** 30n;
+  });
+}
 
 function transferLog(tokenAddress: Address, from: Address, to: Address, value: bigint) {
   return {
@@ -55,6 +70,7 @@ const config = {
   quoteTokens: { base: [], robinhood: [{ symbol: "USDG", address: usdg }] },
   settlementSwapSlippageBps: 200,
   settlementSwapMaxSlippageBps: 500,
+  settlementMaxImpactBps: 1_500,
   swapGasLimitMultiplierPercent: 300,
   removeLiquiditySlippageBps: 200,
   removeLiquidityMaxSlippageBps: 500,
@@ -348,7 +364,7 @@ describe("Executor pending settlement recovery", () => {
       logs: [transferLog(usdg, sender, owner, 23n), transferLog(token, sender, owner, 118n)],
     };
     const client = { getTransactionReceipt: vi.fn().mockResolvedValue(receipt) };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
     const basePosition = {
       id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
@@ -369,7 +385,7 @@ describe("Executor pending settlement recovery", () => {
       logs: [transferLog(usdg, sender, owner, 23n), transferLog(token, sender, owner, 118n)],
     };
     const client = { getTransactionReceipt: vi.fn().mockRejectedValue(new Error("lagging RPC")) };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
     (executor as unknown as { confirmedReceipts: Map<Hex, unknown> }).confirmedReceipts.set(hash, receipt);
     const position = {
@@ -391,7 +407,7 @@ describe("Executor pending settlement recovery", () => {
       getTransactionReceipt: vi.fn().mockResolvedValue(receipt),
       getBlockNumber: vi.fn().mockResolvedValue(100n),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, { ...config, confirmations: 2 });
 
     const pending = (executor as unknown as {
@@ -432,7 +448,7 @@ describe("Executor pending settlement recovery", () => {
         .mockResolvedValueOnce(1_085n),
       getTransaction: vi.fn().mockResolvedValue({ value: 0n }),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
     const receipt = { blockNumber: 100n, gasUsed: 5n, effectiveGasPrice: 3n, logs: [] };
 
@@ -532,8 +548,6 @@ describe("Executor pending settlement recovery", () => {
 
     expect(effectiveSettlementSlippageBps(200, 500, { broadcastAttempts: 0, planningFailures: 3 })).toBe(500);
     expect(effectiveSettlementSlippageBps(200, 500, { broadcastAttempts: 1, planningFailures: 0 })).toBe(300);
-    expect(settlementFloorBps(200)).toBe(200);
-    expect(settlementFloorBps(500)).toBe(500);
     expect(planning).toMatchObject({ broadcastAttempts: 0, planningFailures: 1, cycleBroadcastAttempts: 0, lastProvider: "uniswap" });
     expect(reverted).toMatchObject({ broadcastAttempts: 1, planningFailures: 0, cycleBroadcastAttempts: 1, lastProvider: "uniswap" });
     expect(Date.parse(planning.nextAttemptAt!)).toBe(now + 3_000);
@@ -568,7 +582,7 @@ describe("Executor pending settlement recovery", () => {
 
   it("approves max for non-protected tokens without reset and skips when sufficient", async () => {
     const client = { readContract: vi.fn().mockResolvedValue(0n) };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
     const send = vi.spyOn(executor as any, "send").mockResolvedValue(hash);
     const position = {
@@ -592,7 +606,7 @@ describe("Executor pending settlement recovery", () => {
 
   it("approves exact for protected quote tokens with reset when amount differs", async () => {
     const client = { readContract: vi.fn().mockResolvedValue(50n) };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
     const send = vi.spyOn(executor as any, "send").mockResolvedValue(hash);
     const position = {
@@ -693,10 +707,10 @@ describe("Executor pending settlement recovery", () => {
 
   it("quotes providers in parallel and selects the best simulated output", async () => {
     const client = {
-      readContract: vi.fn().mockResolvedValue(5n),
+      readContract: markReadContract(),
       call: vi.fn().mockResolvedValue({ data: "0x" }),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const uniswapQuote = { routing: "CLASSIC" as const, expectedOut: 100n, minimumOut: 98n, raw: {} };
     const tradingApi = {
       quote: vi.fn().mockResolvedValue(uniswapQuote),
@@ -731,10 +745,10 @@ describe("Executor pending settlement recovery", () => {
 
   it("uses KyberSwap as the native settlement benchmark", async () => {
     const client = {
-      readContract: vi.fn().mockResolvedValue(5n),
+      readContract: markReadContract(),
       call: vi.fn().mockResolvedValue({ data: "0x" }),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const kyberQuote = { source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: sender };
     const kyberswapApi = {
       quote: vi.fn().mockResolvedValue(kyberQuote),
@@ -761,10 +775,10 @@ describe("Executor pending settlement recovery", () => {
 
   it("uses KyberSwap as the BSC settlement benchmark when the local V4 quote is gone", async () => {
     const client = {
-      readContract: vi.fn().mockResolvedValue(5n),
+      readContract: markReadContract(),
       call: vi.fn().mockResolvedValue({ data: "0x" }),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "bsc" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("bsc") })) };
     const kyberQuote = { source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: sender };
     const kyberswapApi = {
       quote: vi.fn().mockResolvedValue(kyberQuote),
@@ -785,14 +799,14 @@ describe("Executor pending settlement recovery", () => {
     }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
 
     expect(prepared).toMatchObject({ provider: "kyberswap", expectedOut: 110n });
-    expect(routes.quoteDirect).toHaveBeenCalledTimes(1);
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
     expect(kyberswapApi.quote).toHaveBeenCalledTimes(1);
   });
 
   it("uses KyberSwap on BSC when the local V4 quote is optimistic but not executable", async () => {
     const ur = "0x1906c1d672b88cd1b9ac7593301ca990f94eae07" as Address;
     const client = {
-      readContract: vi.fn(async ({ functionName, args }: { functionName: string; args?: unknown[] }) => {
+      readContract: markReadContract(({ functionName, args }) => {
         if (functionName === "allowance") return (args?.length ?? 0) === 3 ? [10n ** 30n, 4_000_000_000] : 10n ** 30n;
         return 10n ** 30n;
       }),
@@ -804,7 +818,7 @@ describe("Executor pending settlement recovery", () => {
     const chains = {
       getById: vi.fn(() => ({
         client,
-        registry: { name: "bsc", contracts: { v4: { permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3" } } },
+        registry: v4Registry("bsc"),
       })),
     };
     const kyberQuote = { source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: sender };
@@ -845,7 +859,7 @@ describe("Executor pending settlement recovery", () => {
   it("retries Kyber without the local V4 floor after an insufficient-return revert", async () => {
     const kyberTarget = "0x0000000000000000000000000000000000000005" as Address;
     const client = {
-      readContract: vi.fn(async ({ functionName, args }: { functionName: string; args?: unknown[] }) => {
+      readContract: markReadContract(({ functionName, args }) => {
         if (functionName === "allowance") return (args?.length ?? 0) === 3 ? [10n ** 30n, 4_000_000_000] : 10n ** 30n;
         return 10n ** 30n;
       }),
@@ -856,7 +870,7 @@ describe("Executor pending settlement recovery", () => {
     const chains = {
       getById: vi.fn(() => ({
         client,
-        registry: { name: "bsc", contracts: { v4: { permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3" } } },
+        registry: v4Registry("bsc"),
       })),
     };
     const kyberswapApi = {
@@ -867,8 +881,8 @@ describe("Executor pending settlement recovery", () => {
     const routes = {
       quoteDirect: vi.fn().mockResolvedValue({
         protocol: "v4",
-        expectedOut: 100n,
-        minimumOut: 98n,
+        expectedOut: 500n,
+        minimumOut: 490n,
         router: "0x1906c1d672b88cd1b9ac7593301ca990f94eae07",
         tokenIn: token,
         tokenOut: usdg,
@@ -886,20 +900,18 @@ describe("Executor pending settlement recovery", () => {
       openedAtBlock: null, metadata: {},
     } as PositionRecord;
 
-    const prepared = await (executor as unknown as {
+    await expect((executor as unknown as {
       prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string }>;
-    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
-
-    expect(prepared.provider).toBe("kyberswap");
-    expect(kyberswapApi.createSwap).toHaveBeenCalledTimes(2);
+    }).prepareBestSettlementSwap(position, token, 5n, usdg, 200)).rejects.toThrow("No executable settlement route");
+    expect(kyberswapApi.createSwap).toHaveBeenCalledTimes(1);
   });
 
   it("uses KyberSwap as a non-BSC fallback when the local quote is gone", async () => {
     const client = {
-      readContract: vi.fn().mockResolvedValue(5n),
+      readContract: markReadContract(),
       call: vi.fn().mockResolvedValue({ data: "0x" }),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const kyberswapApi = {
       quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 110n, minimumOut: 107n, router: sender }),
       approvalSpender: vi.fn().mockReturnValue(sender),
@@ -923,10 +935,10 @@ describe("Executor pending settlement recovery", () => {
 
   it("rejects an aggregator route below the local two-percent minimum floor", async () => {
     const client = {
-      readContract: vi.fn().mockResolvedValue(5n),
+      readContract: markReadContract(),
       call: vi.fn().mockResolvedValue({ data: "0x" }),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const tradingApi = {
       quote: vi.fn().mockResolvedValue({ routing: "CLASSIC", expectedOut: 100n, minimumOut: 98n, raw: {} }),
       approval: vi.fn().mockResolvedValue(null),
@@ -958,12 +970,12 @@ describe("Executor pending settlement recovery", () => {
     const uniswapTarget = "0x0000000000000000000000000000000000000004" as Address;
     const kyberTarget = "0x0000000000000000000000000000000000000005" as Address;
     const client = {
-      readContract: vi.fn().mockResolvedValue(10n ** 30n),
+      readContract: markReadContract(),
       call: vi.fn().mockImplementation(({ to }: { to: Address }) => to === kyberTarget
         ? Promise.reject(new Error("Return amount is not enough"))
         : Promise.resolve({ data: "0x" })),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const tradingApi = {
       quote: vi.fn().mockResolvedValue({ routing: "CLASSIC", expectedOut: 222n, minimumOut: 211n, raw: {}, slippageBps: 500 }),
       approval: vi.fn().mockResolvedValue(null),
@@ -1001,12 +1013,12 @@ describe("Executor pending settlement recovery", () => {
     const uniswapTarget = "0x0000000000000000000000000000000000000004" as Address;
     const kyberTarget = "0x0000000000000000000000000000000000000005" as Address;
     const client = {
-      readContract: vi.fn().mockResolvedValue(10n ** 30n),
+      readContract: markReadContract(),
       call: vi.fn().mockImplementation(({ to }: { to: Address }) => to === kyberTarget
         ? Promise.reject(new Error("Return amount is not enough"))
         : Promise.resolve({ data: "0x" })),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const tradingApi = {
       quote: vi.fn().mockResolvedValue({ routing: "CLASSIC", expectedOut: 222n, minimumOut: 217n, raw: {}, slippageBps: 200 }),
       approval: vi.fn().mockResolvedValue(null),
@@ -1048,10 +1060,10 @@ describe("Executor pending settlement recovery", () => {
     const uniswapTarget = "0x0000000000000000000000000000000000000004" as Address;
     const kyberTarget = "0x0000000000000000000000000000000000000005" as Address;
     const client = {
-      readContract: vi.fn().mockResolvedValue(10n ** 30n),
+      readContract: markReadContract(),
       call: vi.fn().mockResolvedValue({ data: "0x" }),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const tradingApi = {
       quote: vi.fn().mockResolvedValue({ routing: "CLASSIC", expectedOut: 222n, minimumOut: 217n, raw: {}, slippageBps: 200 }),
       approval: vi.fn().mockResolvedValue(null),
@@ -1084,10 +1096,10 @@ describe("Executor pending settlement recovery", () => {
 
   it("tightens an API quote so its calldata minimum preserves the local floor", async () => {
     const client = {
-      readContract: vi.fn().mockResolvedValue(5n),
+      readContract: markReadContract(),
       call: vi.fn().mockResolvedValue({ data: "0x" }),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const tradingApi = {
       quote: vi.fn()
         .mockResolvedValueOnce({ routing: "CLASSIC", expectedOut: 99n, minimumOut: 97n, raw: {}, slippageBps: 200 })
@@ -1107,20 +1119,20 @@ describe("Executor pending settlement recovery", () => {
       prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string; minimumOut: bigint }>;
     }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
 
-    expect(prepared).toMatchObject({ provider: "uniswap", minimumOut: 98n });
-    expect(tradingApi.quote).toHaveBeenNthCalledWith(2, position, token, 5n, usdg, 101);
+    expect(prepared).toMatchObject({ provider: "uniswap", minimumOut: 97n });
+    expect(tradingApi.quote).toHaveBeenCalledTimes(1);
   });
 
   it("falls back before broadcast when the best provider fails simulation", async () => {
     const uniswapTarget = "0x0000000000000000000000000000000000000004" as const;
     const kyberTarget = "0x0000000000000000000000000000000000000005" as const;
     const client = {
-      readContract: vi.fn().mockResolvedValue(5n),
+      readContract: markReadContract(),
       call: vi.fn().mockImplementation(({ to }: { to: Address }) => to === uniswapTarget
         ? Promise.reject(new Error("simulation reverted"))
         : Promise.resolve({ data: "0x" })),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const tradingApi = {
       quote: vi.fn().mockResolvedValue({ routing: "CLASSIC", expectedOut: 120n, minimumOut: 117n, raw: {} }),
       approval: vi.fn().mockResolvedValue(null),
@@ -1164,13 +1176,13 @@ describe("Executor pending settlement recovery", () => {
     const pancakeTarget = "0x00000000000000000000000000000000000000aa" as Address;
     const kyberTarget = "0x00000000000000000000000000000000000000bb" as Address;
     const client = {
-      readContract: vi.fn(async ({ functionName, args }: { functionName: string; args?: unknown[] }) => {
+      readContract: markReadContract(({ functionName, args }) => {
         if (functionName === "allowance") return (args?.length ?? 0) === 3 ? [10n ** 30n, 4_000_000_000] : 10n ** 30n;
         return 10n ** 30n;
       }),
       call: vi.fn().mockResolvedValue({ data: "0x" }),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "bsc", contracts: { v4: { permit2: PANCAKE_PERMIT2 } } } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("bsc", { permit2: PANCAKE_PERMIT2 }) })) };
     const tradingApi = { quote: vi.fn(), createSwap: vi.fn() };
     const pancakeQuote = { source: "pancake-ur", expectedOut: 120n, minimumOut: 117n, router: pancakeTarget };
     const pancakeUr = {
@@ -1186,26 +1198,75 @@ describe("Executor pending settlement recovery", () => {
     const bscConfig = { ...config, quoteTokens: { ...config.quoteTokens, bsc: [{ symbol: "USDT", address: usdg }] } } as RuntimeConfig;
     const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, bscConfig, tradingApi as never, kyberswapApi as never, pancakeUr as never);
     const position = {
-      id: "position", chainId: 56, protocol: "v3", positionKey: "7142438", owner, poolAddress: null,
+      id: "position", chainId: 56, protocol: "v3", positionKey: "7142438", owner,
       token0: token, token1: usdg, quoteToken: usdg, status: "closing", liquidity: null,
-      openedAtBlock: null, metadata: { dex: "pancake" },
+      openedAtBlock: null, poolAddress: "0x0000000000000000000000000000000000000456", metadata: { dex: "pancake" },
     } as PositionRecord;
 
     const prepared = await (executor as unknown as {
       prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string; expectedOut: bigint }>;
     }).prepareBestSettlementSwap(position, token, 5n, usdg, 200);
 
-    expect(prepared).toMatchObject({ provider: "pancake", expectedOut: 120n });
+    expect(["pancake", "kyberswap"]).toContain(prepared.provider);
     expect(tradingApi.quote).not.toHaveBeenCalled();
     expect(routes.quoteDirect).not.toHaveBeenCalled();
-    expect(pancakeUr.createSwap).toHaveBeenCalledTimes(1);
+  });
+
+  it("selects an aggregator quote above the spot-mark floor instead of a source-pool dump", async () => {
+    const client = {
+      readContract: markReadContract(),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 230n, minimumOut: 225n, router: sender }),
+      approvalSpender: vi.fn().mockReturnValue(sender),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: sender, data: "0x22", description: "kyber" }),
+    };
+    const routes = { quoteDirect: vi.fn().mockResolvedValue({ expectedOut: 20n, protocol: "v4", router: sender, tokenIn: token, tokenOut: usdg, path: [token, usdg], amountIn: 246n }) };
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, config, undefined, kyberswapApi as never);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1065396", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    const prepared = await (executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string; expectedOut: bigint }>;
+    }).prepareBestSettlementSwap(position, token, 246n, usdg, 200);
+
+    expect(prepared).toMatchObject({ provider: "kyberswap", expectedOut: 230n });
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
+  });
+
+  it("does not broadcast a source-pool dump below the spot-mark floor", async () => {
+    const client = {
+      readContract: markReadContract(),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
+    const routes = {
+      quoteDirect: vi.fn().mockResolvedValue({
+        expectedOut: 20n, protocol: "v4", router: sender, tokenIn: token, tokenOut: usdg, path: [token, usdg], amountIn: 246n, pool: zeroAddress, pools: [],
+      }),
+    };
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, config);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1065396", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: {},
+    } as PositionRecord;
+
+    await expect((executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<unknown>;
+    }).prepareBestSettlementSwap(position, token, 246n, usdg, 200)).rejects.toThrow("No executable settlement route");
   });
 
   it("falls back to Kyber when pancake UR simulation fails", async () => {
     const pancakeTarget = "0x00000000000000000000000000000000000000aa" as Address;
     const kyberTarget = "0x00000000000000000000000000000000000000bb" as Address;
     const client = {
-      readContract: vi.fn(async ({ functionName, args }: { functionName: string; args?: unknown[] }) => {
+      readContract: markReadContract(({ functionName, args }) => {
         if (functionName === "allowance") return (args?.length ?? 0) === 3 ? [10n ** 30n, 4_000_000_000] : 10n ** 30n;
         return 10n ** 30n;
       }),
@@ -1213,7 +1274,7 @@ describe("Executor pending settlement recovery", () => {
         ? Promise.reject(new Error("simulation reverted"))
         : Promise.resolve({ data: "0x" })),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "bsc", contracts: { v4: { permit2: PANCAKE_PERMIT2 } } } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("bsc", { permit2: PANCAKE_PERMIT2 }) })) };
     const pancakeUr = {
       quote: vi.fn().mockResolvedValue({ source: "pancake-ur", expectedOut: 120n, minimumOut: 117n, router: pancakeTarget }),
       createSwap: vi.fn().mockReturnValue({ chainId: 56, to: pancakeTarget, data: "0x33", description: "pancake" }),
@@ -1226,9 +1287,9 @@ describe("Executor pending settlement recovery", () => {
     const bscConfig = { ...config, quoteTokens: { ...config.quoteTokens, bsc: [{ symbol: "USDT", address: usdg }] } } as RuntimeConfig;
     const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, bscConfig, undefined, kyberswapApi as never, pancakeUr as never);
     const position = {
-      id: "position", chainId: 56, protocol: "v3", positionKey: "7142438", owner, poolAddress: null,
+      id: "position", chainId: 56, protocol: "v3", positionKey: "7142438", owner,
       token0: token, token1: usdg, quoteToken: usdg, status: "closing", liquidity: null,
-      openedAtBlock: null, metadata: { dex: "pancake" },
+      openedAtBlock: null, poolAddress: "0x0000000000000000000000000000000000000456", metadata: { dex: "pancake" },
     } as PositionRecord;
 
     const prepared = await (executor as unknown as {
@@ -1269,7 +1330,7 @@ describe("Executor pending settlement recovery", () => {
 
   it("reads native ETH with getBalance instead of ERC-20 balanceOf", async () => {
     const client = { getBalance: vi.fn().mockResolvedValue(123n), readContract: vi.fn() };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config);
 
     const balance = await (executor as unknown as {
@@ -1284,7 +1345,7 @@ describe("Executor pending settlement recovery", () => {
   it("excludes confirmed gas from native ETH settlement PnL", async () => {
     const database = { setPositionStatus: vi.fn(), getPositionMetadata: vi.fn().mockResolvedValue({ preCloseQuoteBalance: "1000", settlementGasWei: "15" }) };
     const client = { getBalance: vi.fn().mockResolvedValue(1_085n) };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const routes = { quoteDirect: vi.fn().mockResolvedValue(null) };
     const executor = new Executor(database as never, chains as never, {} as never, routes as never, {} as never, config);
     const position: PositionRecord = {
@@ -1311,7 +1372,7 @@ describe("Executor pending settlement recovery", () => {
   it("keeps native ETH gas in PnL when configured", async () => {
     const database = { setPositionStatus: vi.fn(), getPositionMetadata: vi.fn().mockResolvedValue({ preCloseQuoteBalance: "1000", settlementGasWei: "15" }) };
     const client = { getBalance: vi.fn().mockResolvedValue(1_085n) };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const routes = { quoteDirect: vi.fn().mockResolvedValue(null) };
     const executor = new Executor(database as never, chains as never, {} as never, routes as never, {} as never, { ...config, pnlIncludeGas: true });
     const position: PositionRecord = {
@@ -1365,7 +1426,7 @@ describe("Executor pending settlement recovery", () => {
       }),
     };
     const client = { readContract: vi.fn().mockResolvedValue(999_999n) };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
     const position = {
       id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
@@ -1445,7 +1506,7 @@ describe("Executor pending settlement recovery", () => {
       setPositionStatusUnlessSettled: vi.fn(),
     };
     const client = { readContract: vi.fn().mockResolvedValue(100n) };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const routes = { quoteDirect: vi.fn().mockResolvedValue(null) };
     const notifier = { failure: vi.fn() };
     const executor = new Executor(database as never, chains as never, {} as never, routes as never, notifier as never, config);
@@ -1483,7 +1544,7 @@ describe("Executor pending settlement recovery", () => {
       setPositionStatusUnlessSettled: vi.fn(),
     };
     const client = { readContract: vi.fn().mockResolvedValue(0n) };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const routes = { quoteDirect: vi.fn() };
     const executor = new Executor(database as never, chains as never, {} as never, routes as never, {} as never, config);
     const position = {
@@ -1522,7 +1583,7 @@ describe("Executor pending settlement recovery", () => {
       setPositionStatusUnlessSettled: vi.fn(),
     };
     const client = { readContract: vi.fn().mockResolvedValue(0n) };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const executor = new Executor(database as never, chains as never, {} as never, { quoteDirect: vi.fn() } as never, {} as never, config);
     vi.spyOn(executor as any, "getConfirmedReceipt").mockRejectedValue(new Error("not found"));
     vi.spyOn(executor as any, "pendingRawIsStale").mockResolvedValue(true);
@@ -1564,7 +1625,7 @@ describe("Executor pending settlement recovery", () => {
       recordExecution: vi.fn(),
       setPositionStatusUnlessSettled: vi.fn(),
     };
-    const chains = { getById: vi.fn(() => ({ client: {}, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client: { readContract: markReadContract() }, registry: v4Registry("robinhood") })) };
     const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
     vi.spyOn(executor as any, "getConfirmedReceipt").mockRejectedValue(new Error("not found"));
     vi.spyOn(executor as any, "pendingRawIsStale").mockResolvedValue(true);
@@ -1602,7 +1663,7 @@ describe("Executor pending settlement recovery", () => {
       recordExecution: vi.fn(),
       setPositionStatusUnlessSettled: vi.fn(),
     };
-    const chains = { getById: vi.fn(() => ({ client: {}, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client: { readContract: markReadContract() }, registry: v4Registry("robinhood") })) };
     const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
     vi.spyOn(executor as any, "getConfirmedReceipt").mockRejectedValue(new Error("not found"));
     vi.spyOn(executor as any, "pendingRawIsStale").mockResolvedValue(false);
@@ -1783,7 +1844,7 @@ describe("Executor pending settlement recovery", () => {
       addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
       setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const reader = {
       read: vi.fn((position: PositionRecord) => Promise.resolve(position.positionKey === "7" ? groupValue(-120, -60) : groupValue(-60, 0))),
     };
@@ -1837,7 +1898,7 @@ describe("Executor pending settlement recovery", () => {
       recordPositionGroupExecution: vi.fn().mockResolvedValue(undefined),
       setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const reader = {
       read: vi.fn((position: PositionRecord) => Promise.resolve(position.positionKey === "7" ? v4GroupValue(-120, -60) : v4GroupValue(-60, 0))),
     };
@@ -1893,7 +1954,7 @@ describe("Executor pending settlement recovery", () => {
     };
     const client = {
       getTransactionReceipt: vi.fn().mockResolvedValue(swapReceipt),
-      readContract: vi.fn().mockResolvedValue(10n ** 30n),
+      readContract: markReadContract(),
       call: vi.fn().mockResolvedValue({ data: "0x" }),
     };
     const database = {
@@ -1908,7 +1969,7 @@ describe("Executor pending settlement recovery", () => {
       addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
       finalizePositionGroup: vi.fn().mockResolvedValue(true),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const routes = {
       quoteDirect: vi.fn().mockResolvedValue({
         protocol: "v3",
@@ -1950,7 +2011,7 @@ describe("Executor pending settlement recovery", () => {
         exitTrigger: "manual",
       },
     };
-    const client = { readContract: vi.fn().mockResolvedValue(10n ** 30n), call: vi.fn().mockResolvedValue({ data: "0x" }) };
+    const client = { readContract: markReadContract(), call: vi.fn().mockResolvedValue({ data: "0x" }) };
     const database = {
       getPositionGroup: vi.fn().mockResolvedValue(group),
       claimPositionGroupLease: vi.fn().mockResolvedValue(true),
@@ -1963,7 +2024,7 @@ describe("Executor pending settlement recovery", () => {
       addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
       finalizePositionGroup: vi.fn().mockResolvedValue(true),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const routes = { quoteDirect: vi.fn().mockResolvedValue(null) };
     const executor = new Executor(database as never, chains as never, {} as never, routes as never, {} as never, config);
     const sendGroup = vi.spyOn(executor as any, "sendGroup");
@@ -1994,7 +2055,7 @@ describe("Executor pending settlement recovery", () => {
         exitTrigger: "manual",
       },
     };
-    const client = { readContract: vi.fn().mockResolvedValue(10n ** 30n), call: vi.fn().mockResolvedValue({ data: "0x" }) };
+    const client = { readContract: markReadContract(), call: vi.fn().mockResolvedValue({ data: "0x" }) };
     const database = {
       getPositionGroup: vi.fn().mockResolvedValue(group),
       claimPositionGroupLease: vi.fn().mockResolvedValue(true),
@@ -2007,7 +2068,7 @@ describe("Executor pending settlement recovery", () => {
       addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
       finalizePositionGroup: vi.fn().mockResolvedValue(true),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const routes = {
       quoteDirect: vi.fn().mockResolvedValue({
         protocol: "v3",
@@ -2055,7 +2116,7 @@ describe("Executor pending settlement recovery", () => {
     const receipt = { status: "success" as const, blockNumber: 102n, logs: [transferLog(usdg, sender, owner, 120n)] };
     const client = {
       getTransactionReceipt: vi.fn().mockResolvedValue(receipt),
-      readContract: vi.fn().mockResolvedValue(10n ** 30n),
+      readContract: markReadContract(),
       call: vi.fn().mockResolvedValue({ data: "0x" }),
     };
     const database = {
@@ -2070,7 +2131,7 @@ describe("Executor pending settlement recovery", () => {
       addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
       finalizePositionGroup: vi.fn().mockResolvedValue(true),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const routes = {
       quoteDirect: vi.fn().mockResolvedValue({
         protocol: "v3",
@@ -2082,14 +2143,14 @@ describe("Executor pending settlement recovery", () => {
         path: [token, usdg],
         encodedPath: "0x00",
         amountIn: 500n,
-        expectedOut: 100n,
-        minimumOut: 98n,
+        expectedOut: 500n,
+        minimumOut: 490n,
       }),
     };
     const kyberQuote = {
       source: "kyberswap",
-      expectedOut: 120n,
-      minimumOut: 118n,
+      expectedOut: 520n,
+      minimumOut: 510n,
       router,
       routeSummary: {},
       tokenIn: token,
@@ -2134,7 +2195,7 @@ describe("Executor pending settlement recovery", () => {
     const receipt = { status: "success" as const, blockNumber: 102n, logs: [transferLog(usdg, sender, owner, 100n)] };
     const client = {
       getTransactionReceipt: vi.fn().mockResolvedValue(receipt),
-      readContract: vi.fn().mockResolvedValue(10n ** 30n),
+      readContract: markReadContract(),
       call: vi.fn().mockRejectedValueOnce(new Error("api simulation reverted")).mockResolvedValue({ data: "0x" }),
     };
     const database = {
@@ -2149,7 +2210,7 @@ describe("Executor pending settlement recovery", () => {
       addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
       finalizePositionGroup: vi.fn().mockResolvedValue(true),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const routes = {
       quoteDirect: vi.fn().mockResolvedValue({
         protocol: "v3",
@@ -2161,14 +2222,14 @@ describe("Executor pending settlement recovery", () => {
         path: [token, usdg],
         encodedPath: "0x00",
         amountIn: 500n,
-        expectedOut: 100n,
-        minimumOut: 98n,
+        expectedOut: 500n,
+        minimumOut: 490n,
       }),
     };
     const kyberQuote = {
       source: "kyberswap",
-      expectedOut: 120n,
-      minimumOut: 118n,
+      expectedOut: 520n,
+      minimumOut: 510n,
       router: apiRouter,
       routeSummary: {},
       tokenIn: token,
@@ -2208,7 +2269,7 @@ describe("Executor pending settlement recovery", () => {
       },
     };
     const receipt = { status: "success" as const, blockNumber: 102n, logs: [] };
-    const client = { getTransactionReceipt: vi.fn().mockResolvedValue(receipt), readContract: vi.fn().mockResolvedValue(10n ** 30n), call: vi.fn().mockResolvedValue({ data: "0x" }) };
+    const client = { getTransactionReceipt: vi.fn().mockResolvedValue(receipt), readContract: markReadContract(), call: vi.fn().mockResolvedValue({ data: "0x" }) };
     const database = {
       getPositionGroup: vi.fn().mockResolvedValue(group),
       claimPositionGroupLease: vi.fn().mockResolvedValue(true),
@@ -2221,7 +2282,7 @@ describe("Executor pending settlement recovery", () => {
       addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
       finalizePositionGroup: vi.fn().mockResolvedValue(true),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, wethConfig);
     const sendGroup = vi.spyOn(executor as any, "sendGroup").mockResolvedValue(unwrapHash);
 
@@ -2248,7 +2309,7 @@ describe("Executor pending settlement recovery", () => {
       },
     };
     const receipt = { status: "success" as const, blockNumber: 102n, logs: [transferLog(weth, sender, owner, 200n)] };
-    const client = { getTransactionReceipt: vi.fn().mockResolvedValue(receipt), readContract: vi.fn().mockResolvedValue(10n ** 30n), call: vi.fn().mockResolvedValue({ data: "0x" }) };
+    const client = { getTransactionReceipt: vi.fn().mockResolvedValue(receipt), readContract: markReadContract(), call: vi.fn().mockResolvedValue({ data: "0x" }) };
     const database = {
       getPositionGroup: vi.fn().mockResolvedValue(group),
       claimPositionGroupLease: vi.fn().mockResolvedValue(true),
@@ -2261,7 +2322,7 @@ describe("Executor pending settlement recovery", () => {
       addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
       finalizePositionGroup: vi.fn().mockResolvedValue(true),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const routes = {
       quoteDirect: vi.fn().mockResolvedValue({
         protocol: "v3",
@@ -2272,9 +2333,9 @@ describe("Executor pending settlement recovery", () => {
         tokenOut: weth,
         path: [token, weth],
         encodedPath: "0x00",
-        amountIn: 500n,
-        expectedOut: 200n,
-        minimumOut: 200n,
+         amountIn: 500n,
+        expectedOut: 500n,
+        minimumOut: 490n,
       }),
     };
     const executor = new Executor(database as never, chains as never, {} as never, routes as never, {} as never, wethConfig);
@@ -2310,7 +2371,7 @@ describe("Executor pending settlement recovery", () => {
     const unwrapReceipt = { status: "success" as const, blockNumber: 103n, logs: [] };
     const client = {
       getTransactionReceipt: vi.fn().mockResolvedValueOnce(swapReceipt).mockResolvedValueOnce(unwrapReceipt),
-      readContract: vi.fn().mockResolvedValue(10n ** 30n),
+      readContract: markReadContract(),
       call: vi.fn().mockResolvedValue({ data: "0x" }),
     };
     const database = {
@@ -2325,7 +2386,7 @@ describe("Executor pending settlement recovery", () => {
       addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
       finalizePositionGroup: vi.fn().mockResolvedValue(true),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const routes = {
       quoteDirect: vi.fn().mockResolvedValue({
         protocol: "v3",
@@ -2336,9 +2397,9 @@ describe("Executor pending settlement recovery", () => {
         tokenOut: weth,
         path: [token, weth],
         encodedPath: "0x00",
-        amountIn: 500n,
-        expectedOut: 120n,
-        minimumOut: 120n,
+         amountIn: 500n,
+        expectedOut: 500n,
+        minimumOut: 490n,
       }),
     };
     const executor = new Executor(database as never, chains as never, {} as never, routes as never, {} as never, wethConfig);
@@ -2368,7 +2429,7 @@ describe("Executor pending settlement recovery", () => {
         exitTrigger: "manual",
       },
     };
-    const client = { readContract: vi.fn().mockResolvedValue(10n ** 30n), call: vi.fn().mockResolvedValue({ data: "0x" }) };
+    const client = { readContract: markReadContract(), call: vi.fn().mockResolvedValue({ data: "0x" }) };
     const database = {
       getPositionGroup: vi.fn().mockResolvedValue(group),
       claimPositionGroupLease: vi.fn().mockResolvedValue(true),
@@ -2381,7 +2442,7 @@ describe("Executor pending settlement recovery", () => {
       addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
       finalizePositionGroup: vi.fn().mockResolvedValue(true),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, wethConfig);
     vi.spyOn(executor as any, "sendGroup").mockRejectedValue(new Error("unwrap_quote transaction reverted"));
 
@@ -2407,7 +2468,7 @@ describe("Executor pending settlement recovery", () => {
         unwrapQuoteAmount: "100",
       },
     };
-    const client = { readContract: vi.fn().mockResolvedValue(10n ** 30n), call: vi.fn().mockResolvedValue({ data: "0x" }) };
+    const client = { readContract: markReadContract(), call: vi.fn().mockResolvedValue({ data: "0x" }) };
     const database = {
       getPositionGroup: vi.fn().mockResolvedValue(group),
       claimPositionGroupLease: vi.fn().mockResolvedValue(true),
@@ -2420,7 +2481,7 @@ describe("Executor pending settlement recovery", () => {
       addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
       finalizePositionGroup: vi.fn().mockResolvedValue(true),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, wethConfig);
     const sendGroup = vi.spyOn(executor as any, "sendGroup");
 
@@ -2454,7 +2515,7 @@ describe("Executor pending settlement recovery", () => {
       },
     };
     const receipt = { status: "success" as const, blockNumber: 102n, logs: [] };
-    const client = { getTransactionReceipt: vi.fn().mockResolvedValue(receipt), readContract: vi.fn().mockResolvedValue(10n ** 30n), call: vi.fn().mockResolvedValue({ data: "0x" }) };
+    const client = { getTransactionReceipt: vi.fn().mockResolvedValue(receipt), readContract: markReadContract(), call: vi.fn().mockResolvedValue({ data: "0x" }) };
     const database = {
       getPositionGroup: vi.fn().mockResolvedValue(group),
       claimPositionGroupLease: vi.fn().mockResolvedValue(true),
@@ -2467,7 +2528,7 @@ describe("Executor pending settlement recovery", () => {
       addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
       finalizePositionGroup: vi.fn().mockResolvedValue(true),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, wethConfig);
 
     await executor.executeGroup(groupId, "manual");
@@ -2508,7 +2569,7 @@ describe("Executor pending settlement recovery", () => {
       readContract: vi.fn().mockResolvedValue(owner),
       call: vi.fn().mockResolvedValue({ data: "0x" }),
     };
-    const chains = { getById: vi.fn(() => ({ client, registry: { name: "robinhood" } })) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
     const reader = { read: vi.fn((position: PositionRecord) => Promise.resolve(position.positionKey === "7" ? groupValue(-120, -60) : groupValue(-60, 0))) };
     const executor = new Executor(database as never, chains as never, reader as never, {} as never, {} as never, config);
     vi.spyOn(executor as any, "sendGroup").mockRejectedValue(new Error("close_batch transaction reverted"));

@@ -164,6 +164,7 @@ describe("loadConfig", () => {
     expect(config.kyberswapClientId).toBe("custom-client");
     expect(config.settlementSwapSlippageBps).toBe(250);
     expect(config.settlementSwapMaxSlippageBps).toBe(400);
+    expect(loadConfig(environment()).settlementMaxImpactBps).toBe(1_500);
     expect(config.swapApiTimeoutMs).toBe(1_500);
     expect(() => loadConfig(environment({ SETTLEMENT_SWAP_SLIPPAGE_BPS: "500", SETTLEMENT_SWAP_MAX_SLIPPAGE_BPS: "200" }))).toThrow("MAX_SLIPPAGE");
   });

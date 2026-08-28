@@ -22,7 +22,7 @@ import type { RoutePlanner } from "./route-planner.js";
 import type { UniswapTradingApi } from "./uniswap-trading-api.js";
 import { quoteRangeState } from "./quote-range.js";
 import { normalizeToUsd6 } from "./token-meta.js";
-import { applySlippage, sqrtRatioAtTick } from "./uniswap-math.js";
+import { applySlippage, isUsableSqrtPrice, quoteValueAtPriceMarker, quoteValueAtSqrtPrice, sqrtRatioAtTick } from "./uniswap-math.js";
 
 const POSITION_READ_TIMEOUT_MS = 15_000;
 const ROUTE_QUOTE_TIMEOUT_MS = 15_000;
@@ -165,19 +165,16 @@ export class PnlService {
     const nonQuoteFee = quoteIsToken0 ? value.unclaimedFees1 : value.unclaimedFees0;
     const localOnly = quoteMode === "exact_local";
     const totalNonQuote = nonQuote.amount + nonQuoteFee;
-    const route = await this.quoteInContext(context, position, value.observedBlock, nonQuote.token, totalNonQuote, quoteToken, quoteSlippageBps, quoteMode, budgeted);
-    if (nonQuote.amount > 0n && !route) throw new Error("No safe direct Uniswap route from LP asset to quote token");
+    const useMark = quoteMode === "direct_pool" || quoteMode === "exact_local";
+    const route = useMark
+      ? null
+      : await this.quoteInContext(context, position, value.observedBlock, nonQuote.token, totalNonQuote, quoteToken, quoteSlippageBps, quoteMode, budgeted);
+    if (!useMark && nonQuote.amount > 0n && !route) throw new Error("No safe direct Uniswap route from LP asset to quote token");
 
-    const totalRouteOutput = route ? (conservative ? route.minimumOut : route.expectedOut) : 0n;
-    const feeRouteOutput = totalNonQuote > 0n ? (totalRouteOutput * nonQuoteFee) / totalNonQuote : 0n;
-    const routeOutput = totalRouteOutput - feeRouteOutput;
-    const liquidationQuote = quoteAmount + routeOutput;
-    let feeQuote = quoteSideFee;
-    let feeNonQuoteConverted = 0n;
-    if (nonQuoteFee > 0n) {
-      feeNonQuoteConverted = feeRouteOutput;
-      feeQuote += feeNonQuoteConverted;
-    }
+    const marked = useMark
+      ? allocateSpotMark(spotMarkTotal(value, quoteIsToken0), quoteAmount, quoteSideFee, nonQuote.amount, nonQuoteFee)
+      : allocateRouteOutput(route ? (conservative ? route.minimumOut : route.expectedOut) : 0n, quoteAmount, quoteSideFee, nonQuote.amount, nonQuoteFee);
+    const { liquidationQuote, feeQuote, feeNonQuoteConverted, routeOutput } = marked;
     const totals = context.totals;
     if (totals.deposits === 0n) throw new Error("Position cost basis has not been reconstructed");
 
@@ -206,7 +203,7 @@ export class PnlService {
       feeQuote: quoteSideFee,
       feeNonQuote: nonQuoteFee > 0n ? { token: nonQuote.token, amount: nonQuoteFee, converted: feeNonQuoteConverted } : null,
       feeQuoteUsdg,
-      quoteProvider: route?.provider,
+      quoteProvider: useMark ? undefined : route?.provider,
       minimumPnlBps: quoteMode === "exact_probe" ? this.exactMinimumPnlBps(totals.deposits, totals.realized, quoteAmount, quoteSideFee, nonQuoteFee, totalNonQuote, route) : undefined,
       minimumLiquidationQuote: quoteMode === "exact_probe" ? this.exactMinimumLiquidation(quoteAmount, nonQuoteFee, totalNonQuote, route) : undefined,
     };
@@ -285,14 +282,16 @@ export class PnlService {
     const quoteFee = quoteIsToken0 ? token0Fee : token1Fee;
     const nonQuoteFee = quoteIsToken0 ? token1Fee : token0Fee;
     const totalNonQuote = nonQuote.amount + nonQuoteFee;
-    const route = await this.quoteInContext(context, context.children[0]!, context.values[0]!.observedBlock, nonQuote.token, totalNonQuote, group.quoteToken, quoteSlippageBps, quoteMode, budgeted);
-    if (totalNonQuote > 0n && !route) throw new Error("No safe direct Uniswap route from group LP asset to quote token");
+    const useMark = quoteMode === "direct_pool" || quoteMode === "exact_local";
+    const route = useMark
+      ? null
+      : await this.quoteInContext(context, context.children[0]!, context.values[0]!.observedBlock, nonQuote.token, totalNonQuote, group.quoteToken, quoteSlippageBps, quoteMode, budgeted);
+    if (!useMark && totalNonQuote > 0n && !route) throw new Error("No safe direct Uniswap route from group LP asset to quote token");
 
-    const totalRouteOutput = route ? (conservative ? route.minimumOut : route.expectedOut) : 0n;
-    const feeRouteOutput = totalNonQuote > 0n ? (totalRouteOutput * nonQuoteFee) / totalNonQuote : 0n;
-    const routeOutput = totalRouteOutput - feeRouteOutput;
-    const liquidationQuote = quoteAmount + routeOutput;
-    const feeQuote = quoteFee + feeRouteOutput;
+    const marked = useMark
+      ? allocateSpotMark(groupSpotMarkTotal(values, token0Amount, token1Amount, token0Fee, token1Fee, quoteIsToken0), quoteAmount, quoteFee, nonQuote.amount, nonQuoteFee)
+      : allocateRouteOutput(route ? (conservative ? route.minimumOut : route.expectedOut) : 0n, quoteAmount, quoteFee, nonQuote.amount, nonQuoteFee);
+    const { liquidationQuote, feeQuote, feeNonQuoteConverted: feeRouteOutput, routeOutput } = marked;
     const feeQuoteUsdg = await this.toFeeUsd6(
       group.chainId,
       group.quoteToken,
@@ -325,7 +324,7 @@ export class PnlService {
       groupGasQuote: 0n,
       rangeCurrentTick: range.currentTick,
       rangeCurrentSqrtPrice: range.currentSqrtPrice,
-      quoteProvider: route?.provider,
+      quoteProvider: useMark ? undefined : route?.provider,
       minimumPnlBps: quoteMode === "exact_probe" ? this.exactMinimumPnlBps(deposits, context.realizedQuote, quoteAmount, quoteFee, nonQuoteFee, totalNonQuote, route) : undefined,
       minimumLiquidationQuote: quoteMode === "exact_probe" ? this.exactMinimumLiquidation(quoteAmount, nonQuoteFee, totalNonQuote, route) : undefined,
     };
@@ -808,6 +807,68 @@ function parseTrailingStopState(metadata: Record<string, unknown>, source: Trail
   } catch {
     return null;
   }
+}
+
+function spotMarkTotal(value: PositionValue, quoteIsToken0: boolean): bigint {
+  const amount0 = value.token0.amount + value.unclaimedFees0;
+  const amount1 = value.token1.amount + value.unclaimedFees1;
+  if (value.range && isUsableSqrtPrice(value.range.currentSqrtPrice, value.range.currentTick)) {
+    return quoteValueAtSqrtPrice(amount0, amount1, quoteIsToken0, value.range.currentSqrtPrice);
+  }
+  if (value.protocol === "v2") return quoteValueAtPriceMarker(amount0, amount1, quoteIsToken0, value.priceMarker);
+  throw new Error("Spot mark is unavailable");
+}
+
+function groupSpotMarkTotal(
+  values: readonly PositionValue[],
+  token0Amount: bigint,
+  token1Amount: bigint,
+  token0Fee: bigint,
+  token1Fee: bigint,
+  quoteIsToken0: boolean,
+): bigint {
+  const amount0 = token0Amount + token0Fee;
+  const amount1 = token1Amount + token1Fee;
+  const source = values.find((value) => value.range);
+  if (source?.range && isUsableSqrtPrice(source.range.currentSqrtPrice, source.range.currentTick)) {
+    return quoteValueAtSqrtPrice(amount0, amount1, quoteIsToken0, source.range.currentSqrtPrice);
+  }
+  if (values[0]?.protocol === "v2") return quoteValueAtPriceMarker(amount0, amount1, quoteIsToken0, values[0].priceMarker);
+  throw new Error("Spot mark is unavailable");
+}
+
+function allocateSpotMark(
+  markedTotal: bigint,
+  quoteAmount: bigint,
+  quoteSideFee: bigint,
+  nonQuoteAmount: bigint,
+  nonQuoteFee: bigint,
+): { liquidationQuote: bigint; feeQuote: bigint; feeNonQuoteConverted: bigint; routeOutput: bigint } {
+  return allocateRouteOutput(
+    markedTotal > quoteAmount + quoteSideFee ? markedTotal - quoteAmount - quoteSideFee : 0n,
+    quoteAmount,
+    quoteSideFee,
+    nonQuoteAmount,
+    nonQuoteFee,
+  );
+}
+
+function allocateRouteOutput(
+  totalRouteOutput: bigint,
+  quoteAmount: bigint,
+  quoteSideFee: bigint,
+  nonQuoteAmount: bigint,
+  nonQuoteFee: bigint,
+): { liquidationQuote: bigint; feeQuote: bigint; feeNonQuoteConverted: bigint; routeOutput: bigint } {
+  const totalNonQuote = nonQuoteAmount + nonQuoteFee;
+  const feeNonQuoteConverted = totalNonQuote > 0n ? (totalRouteOutput * nonQuoteFee) / totalNonQuote : 0n;
+  const routeOutput = totalRouteOutput - feeNonQuoteConverted;
+  return {
+    liquidationQuote: quoteAmount + routeOutput,
+    feeQuote: quoteSideFee + feeNonQuoteConverted,
+    feeNonQuoteConverted,
+    routeOutput,
+  };
 }
 
 export function isQuoteToken(token: Address, allowlist: readonly { address: Address }[]): boolean {
