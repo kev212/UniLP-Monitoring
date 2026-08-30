@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, isMarketScanPair, isOfficialRobinhoodStock, limitQualifiedPoolsPerToken, marketScanDexIds, MIN_VOLUME_6H_USD, PoolScanner, poolPair, rankPools, resolveBscStockToken, STOCK_MIN_VOLUME_24H_USD, stockUniswapVolume24h, stockVolumeOptions, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
+import { effectiveMarketCap, estimatedHourlyYieldPercent, estimatedYieldPercent, hasMinimumScanVolume6h, isMarketScanPair, isOfficialRobinhoodStock, isStockScanPair, limitQualifiedPoolsPerToken, marketScanDexIds, MIN_VOLUME_6H_USD, PoolScanner, poolPair, rankPools, resolveBscStockToken, STOCK_MIN_VOLUME_24H_USD, stockUniswapVolume24h, stockVolumeOptions, uniswapPoolUrl, type ScoredPool } from "../src/services/pool-scanner.js";
 import { calibrateOhlcvPrices, normalizeOhlcvPrices, overlapFraction, snapRange } from "../src/services/concentrated-yield.js";
 
 describe("pool scoring formula", () => {
@@ -249,15 +249,27 @@ describe("stock volume prefilter", () => {
     })).toBe(false);
   });
 
-  it("sums Uniswap v3/v4 24h volume against USDG/WETH/ETH/SPY only", () => {
+  it("sums Uniswap v3/v4 24h volume against USDG/WETH/ETH only", () => {
     const volume = stockUniswapVolume24h(nvda, [
       { chainId: "robinhood", dexId: "uniswap", pairAddress: "0x1", labels: ["v3"], baseToken: { address: nvda, symbol: "NVDA" }, quoteToken: { address: usdg, symbol: "USDG" }, volume: { h24: 80_000 } },
       { chainId: "robinhood", dexId: "uniswap", pairAddress: "0x2", labels: ["v4"], baseToken: { address: nvda, symbol: "NVDA" }, quoteToken: { address: "0x0000000000000000000000000000000000000000", symbol: "ETH" }, volume: { h24: 30_000 } },
       { chainId: "robinhood", dexId: "uniswap", pairAddress: "0x3", labels: ["v4"], baseToken: { address: nvda, symbol: "NVDA" }, quoteToken: { address: pack, symbol: "PACK" }, volume: { h24: 200_000 } },
       { chainId: "robinhood", dexId: "ramses", pairAddress: "0x4", labels: ["v3"], baseToken: { address: nvda, symbol: "NVDA" }, quoteToken: { address: usdg, symbol: "USDG" }, volume: { h24: 50_000 } },
+      { chainId: "robinhood", dexId: "uniswap", pairAddress: "0x5", labels: ["v3"], baseToken: { address: nvda, symbol: "NVDA" }, quoteToken: { address: "0x117cc2133c37b721f49de2a7a74833232b3b4c0c", symbol: "SPY" }, volume: { h24: 200_000 } },
     ]);
     expect(volume).toBe(110_000);
     expect(volume).toBeGreaterThanOrEqual(STOCK_MIN_VOLUME_24H_USD);
+  });
+
+  it("accepts only USDG, WETH, or native ETH stock pairs on Robinhood", () => {
+    const stock = { address: nvda, symbol: "NVDA" };
+    const allowed = { chainId: "robinhood", dexId: "uniswap", pairAddress: "0x1", labels: ["v3"], baseToken: stock, quoteToken: { address: usdg, symbol: "USDG" } };
+    const spy = { ...allowed, pairAddress: "0x2", quoteToken: { address: "0x117cc2133c37b721f49de2a7a74833232b3b4c0c", symbol: "SPY" } };
+    const otherStock = { ...allowed, pairAddress: "0x3", quoteToken: { address: pack, symbol: "PACK" } };
+
+    expect(isStockScanPair(allowed, "robinhood")).toBe(true);
+    expect(isStockScanPair(spy, "robinhood")).toBe(false);
+    expect(isStockScanPair(otherStock, "robinhood")).toBe(false);
   });
 
   it("resolves the liquid BSC *B token and ignores cheap clones", () => {

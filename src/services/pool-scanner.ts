@@ -29,8 +29,7 @@ const STOCK_VERIFY_CONCURRENCY = 3;
 const STOCK_VOLUME_BATCH = 25;
 const STOCK_LIST_MAX_PAGES = 8;
 const BLOCKSCOUT_TOKENS = "https://robinhoodchain.blockscout.com/api/v2/tokens";
-const SPY = "0x117cc2133c37b721f49de2a7a74833232b3b4c0c";
-const STOCK_VOLUME_QUOTES = new Set<string>([USDG, WETH, zeroAddress, SPY]);
+const STOCK_VOLUME_QUOTES = new Set<string>([USDG, WETH, zeroAddress]);
 const BSC_USDT = "0x55d398326f99059ff775485246999027b3197955";
 const BSC_USDC = "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d";
 const BSC_WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
@@ -1277,7 +1276,8 @@ export function isStockScanPair(pair: DexScreenerPair, chain: ChainName): boolea
   const options = stockVolumeOptions(chain);
   if (pair.chainId && pair.chainId !== options.chainId) return false;
   if (!options.dexIds.includes(pair.dexId)) return false;
-  return stockPairProtocol(pair) !== null;
+  if (stockPairProtocol(pair) === null) return false;
+  return options.quotes.has(pair.baseToken.address.toLowerCase()) || options.quotes.has(pair.quoteToken.address.toLowerCase());
 }
 
 export function resolveBscStockToken(symbol: string, pairs: readonly DexScreenerPair[]): { address: Address; symbol: string } | null {
