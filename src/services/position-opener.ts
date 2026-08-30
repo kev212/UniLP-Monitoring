@@ -169,6 +169,7 @@ type BidAskDatabase = Pick<
   | "recordPositionGroupExecution"
   | "withExecutionLock"
   | "hasPendingRawTransaction"
+  | "nextPositionGroupExecutionNonce"
 >;
 
 export type BidAskOpenReconciler = (
@@ -1259,14 +1260,16 @@ export class PositionOpener {
       }
 
       const wallet = this.walletClient(chain);
-      const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account!, to, data, value });
+      const pendingNonce = await client.getTransactionCount({ address: this.account!.address, blockTag: "pending" });
+      const nonce = await this.database!.nextPositionGroupExecutionNonce(chainId, pendingNonce);
+      const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account!, to, data, value, nonce });
       const serializedTransaction = await wallet.signTransaction(preparedRequest);
       const hash = keccak256(serializedTransaction);
-      const nonce = preparedRequest.nonce === undefined ? undefined : BigInt(preparedRequest.nonce);
+      const transactionNonce = preparedRequest.nonce === undefined ? undefined : BigInt(preparedRequest.nonce);
       let broadcastAccepted = false;
       let confirmedReceipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>> | undefined;
 
-      await this.database!.recordPositionGroupExecution(groupId, "open_batch", "submitted", hash, serializedTransaction, nonce, undefined, {
+      await this.database!.recordPositionGroupExecution(groupId, "open_batch", "submitted", hash, serializedTransaction, transactionNonce, undefined, {
         description: "atomic_bid_ask_open",
       });
       const linked = await this.database!.setPositionGroupOpenTransaction(groupId, hash, "opening");

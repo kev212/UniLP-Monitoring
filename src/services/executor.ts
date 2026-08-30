@@ -160,6 +160,7 @@ interface GroupDatabaseExtensions {
     trigger: string,
     finalPnlUsd?: bigint | null,
   ) => Promise<boolean>;
+  nextPositionGroupExecutionNonce?: (chainId: number, onchainPendingNonce: number) => Promise<number>;
   getLatestPositionGroupExecutionHash?: (groupId: string, stage: PositionGroupExecutionStage, status?: "confirmed" | "submitted") => Promise<string | null>;
 }
 
@@ -1172,11 +1173,21 @@ export class Executor {
       return true;
     }
 
-    await this.setGroupStatus(group.id, "needs_review", {
-      pendingRawTransaction: null,
-      settlementRetryDisabled: true,
-      reason,
-    });
+    if (pending.stage === "close_batch") {
+      await this.setGroupStatus(group.id, "active", {
+        closeTransactionHash: null,
+        closeReceiptAccounted: null,
+        settlementPhase: null,
+        pendingRawTransaction: null,
+        settlementRetryDisabled: null,
+        exitRetry: nextExitRetry(group.metadata, this.groupExitTrigger(group)),
+        reason,
+      });
+      log.warn({ groupId: group.id, stage: pending.stage, hash: pending.hash, pendingNonce: pending.nonce, currentNonce }, "cleared stale group close transaction for retry");
+      return true;
+    }
+
+    await this.setGroupStatus(group.id, "needs_review", { pendingRawTransaction: null, settlementRetryDisabled: true, reason });
     log.error({ groupId: group.id, stage: pending.stage, hash: pending.hash, pendingNonce: pending.nonce, currentNonce }, "group transaction nonce was consumed without a receipt");
     return true;
   }
@@ -1849,11 +1860,14 @@ export class Executor {
     const renew = this.groupDatabase().renewPositionGroupLease;
     if (renew && !(await renew.call(this.database, group.id, leaseToken))) throw new Error("Position group lease ownership was lost before broadcast");
       const wallet = createWalletClient({ account: this.account, chain: registry.chain, transport: this.executionChain(registry.name).transport });
-    const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account, to: plan.to, data: plan.data, value: plan.value ?? 0n });
+    const pendingNonce = await client.getTransactionCount({ address: this.account.address, blockTag: "pending" });
+    const nextNonce = this.groupDatabase().nextPositionGroupExecutionNonce;
+    const nonce = nextNonce ? await nextNonce.call(this.database, plan.chainId, pendingNonce) : pendingNonce;
+    const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account, to: plan.to, data: plan.data, value: plan.value ?? 0n, nonce });
     const serializedTransaction = await wallet.signTransaction(preparedRequest);
     const hash = keccak256(serializedTransaction);
-    const nonce = preparedRequest.nonce === undefined ? undefined : BigInt(preparedRequest.nonce);
-    await this.database.recordPositionGroupExecution(group.id, stage, "submitted", hash, serializedTransaction, nonce);
+    const transactionNonce = preparedRequest.nonce === undefined ? undefined : BigInt(preparedRequest.nonce);
+    await this.database.recordPositionGroupExecution(group.id, stage, "submitted", hash, serializedTransaction, transactionNonce);
 
     let receipt: TransactionReceipt;
     try {

@@ -2180,6 +2180,29 @@ FROM position_groups g
     return result.rowCount === 1;
   }
 
+  async nextPositionGroupExecutionNonce(chainId: number, onchainPendingNonce: number): Promise<number> {
+    const result = await this.pool.query<{ highest_nonce: string | null }>(
+      `SELECT MAX(attempt.nonce)::text AS highest_nonce
+       FROM position_group_execution_attempts attempt
+       JOIN position_groups group_record ON group_record.id = attempt.group_id
+       WHERE group_record.chain_id = $1
+         AND attempt.nonce IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1
+           FROM position_group_execution_attempts terminal
+           WHERE terminal.group_id = attempt.group_id
+             AND terminal.stage = attempt.stage
+             AND terminal.transaction_hash IS NOT DISTINCT FROM attempt.transaction_hash
+             AND terminal.status IN ('failed', 'confirmed')
+         )`,
+      [chainId],
+    );
+    const highest = result.rows[0]?.highest_nonce;
+    return highest === null || highest === undefined
+      ? onchainPendingNonce
+      : Math.max(onchainPendingNonce, Number(highest) + 1);
+  }
+
   async recordSignedExecution(positionId: string, stage: string, transactionHash: string, serializedTransaction: string, leaseToken: string): Promise<void> {
     await this.transaction(async (client) => {
       const updated = await client.query(

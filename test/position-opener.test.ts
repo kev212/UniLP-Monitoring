@@ -268,6 +268,7 @@ describe("Bid-Ask NVDA opening", () => {
   it("cancels a Bid-Ask group when its confirmed open receipt reverted", async () => {
     const database = {
       hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      nextPositionGroupExecutionNonce: vi.fn().mockResolvedValue(7),
       recordPositionGroupExecution: vi.fn().mockResolvedValue(undefined),
       setPositionGroupOpenTransaction: vi.fn().mockResolvedValue(true),
       setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
@@ -275,6 +276,7 @@ describe("Bid-Ask NVDA opening", () => {
     };
     const client = {
       call: vi.fn().mockResolvedValue(undefined),
+      getTransactionCount: vi.fn().mockResolvedValue(7),
       waitForTransactionReceipt: vi.fn().mockResolvedValue({ status: "reverted" }),
     };
     const chains = {
@@ -306,6 +308,7 @@ describe("Bid-Ask NVDA opening", () => {
   it("returns pending reconciliation after the batch broadcast is accepted but confirmation RPC fails", async () => {
     const database = {
       hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      nextPositionGroupExecutionNonce: vi.fn().mockResolvedValue(7),
       recordPositionGroupExecution: vi.fn(),
       setPositionGroupOpenTransaction: vi.fn().mockResolvedValue(true),
       setPositionGroupStatus: vi.fn(),
@@ -313,6 +316,7 @@ describe("Bid-Ask NVDA opening", () => {
     };
     const client = {
       call: vi.fn().mockResolvedValue(undefined),
+      getTransactionCount: vi.fn().mockResolvedValue(7),
       waitForTransactionReceipt: vi.fn().mockRejectedValue(new Error("Missing or invalid parameters")),
     };
     const chains = {
