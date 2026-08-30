@@ -2539,6 +2539,64 @@ describe("Executor pending settlement recovery", () => {
     expect(database.finalizePositionGroup).toHaveBeenCalledWith(groupId, hash, 0n, 200n, 20000n, "manual", null);
   });
 
+  it("clears a stale pending group approval after its nonce is consumed", async () => {
+    const pendingRaw = stringToHex("pending-approval");
+    const pendingHash = keccak256(pendingRaw);
+    const group = {
+      ...groupRecord(),
+      status: "settling",
+      closeTransactionHash: hash,
+      pendingRawTransaction: {
+        stage: "approve_quote",
+        hash: pendingHash,
+        serializedTransaction: pendingRaw,
+        nonce: "12",
+        submittedAt: new Date().toISOString(),
+      },
+      metadata: {
+        closeTransactionHash: hash,
+        closeReceiptAccounted: true,
+        settlementPhase: "pending_swap",
+        pendingSwap: { token, amount: "500" },
+      },
+    };
+    const client = {
+      getTransactionReceipt: vi.fn().mockRejectedValue(new Error("not found")),
+      getTransactionCount: vi.fn().mockResolvedValue(13n),
+      readContract: markReadContract(),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const database = {
+      getPositionGroup: vi.fn().mockResolvedValue(group),
+      claimPositionGroupLease: vi.fn().mockResolvedValue(true),
+      releasePositionGroupLease: vi.fn().mockResolvedValue(undefined),
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      withExecutionLock: vi.fn(async (_chainId: number, _address: Address, work: () => Promise<unknown>) => work()),
+      recordPositionGroupExecution: vi.fn().mockResolvedValue(undefined),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(undefined),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
+    const rebroadcast = vi.spyOn(executor as any, "rebroadcastGroupPendingTransaction");
+
+    await executor.executeGroup(groupId, "manual");
+
+    expect(database.recordPositionGroupExecution).toHaveBeenCalledWith(
+      groupId,
+      "approve_quote",
+      "failed",
+      pendingHash,
+      undefined,
+      undefined,
+      expect.stringContaining("nonce 12 was consumed"),
+    );
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith(groupId, "settling", expect.objectContaining({
+      pendingRawTransaction: null,
+      settlementPhase: "pending_swap",
+    }));
+    expect(rebroadcast).not.toHaveBeenCalled();
+  });
+
   it("converts WETH and native ETH Bid-Ask PnL using the settlement quote rate", async () => {
     const routes = { quoteDirect: vi.fn().mockResolvedValue({ expectedOut: 3_000_000_000n }) };
     const chains = { getById: vi.fn(() => ({ registry: { name: "robinhood" } })) };

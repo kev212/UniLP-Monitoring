@@ -78,6 +78,7 @@ interface PendingRawTransaction {
   stage: string;
   hash: Hex;
   serializedTransaction: Hex;
+  nonce?: bigint;
   submittedAt?: string;
 }
 
@@ -1102,6 +1103,7 @@ export class Executor {
     try {
       receipt = await this.getConfirmedReceipt(group.chainId, pending.hash);
     } catch {
+      if (await this.clearStalePendingGroupTransaction(group, pending)) return true;
       await this.rebroadcastGroupPendingTransaction(group, pending);
       return true;
     }
@@ -1143,6 +1145,39 @@ export class Executor {
     } else if (pending.stage === "unwrap_quote") {
       await this.reconcileGroupUnwrap(group, pending.hash, trigger);
     }
+    return true;
+  }
+
+  private async clearStalePendingGroupTransaction(group: PositionGroupRecord, pending: PendingRawTransaction): Promise<boolean> {
+    if (pending.nonce === undefined) return false;
+    let currentNonce: number;
+    try {
+      const { client } = this.chains.getById(group.chainId);
+      currentNonce = await client.getTransactionCount({ address: group.owner, blockTag: "latest" });
+    } catch {
+      return false;
+    }
+    if (BigInt(currentNonce) <= pending.nonce) return false;
+
+    const reason = `${pending.stage} transaction nonce ${pending.nonce} was consumed without a receipt: ${pending.hash}`;
+    await this.recordGroupExecutionFailure(group.id, pending.stage, reason, pending.hash);
+    if (pending.stage === "approve_quote" || pending.stage === "permit2_approve") {
+      await this.setGroupStatus(group.id, "settling", {
+        closeReceiptAccounted: true,
+        settlementPhase: "pending_swap",
+        pendingRawTransaction: null,
+        lastExecutionError: reason,
+      });
+      log.warn({ groupId: group.id, stage: pending.stage, hash: pending.hash, pendingNonce: pending.nonce, currentNonce }, "cleared stale group approval transaction");
+      return true;
+    }
+
+    await this.setGroupStatus(group.id, "needs_review", {
+      pendingRawTransaction: null,
+      settlementRetryDisabled: true,
+      reason,
+    });
+    log.error({ groupId: group.id, stage: pending.stage, hash: pending.hash, pendingNonce: pending.nonce, currentNonce }, "group transaction nonce was consumed without a receipt");
     return true;
   }
 
@@ -3754,8 +3789,9 @@ function parsePendingRawTransaction(value: unknown): PendingRawTransaction | nul
   if (typeof raw.stage !== "string" || !raw.stage || typeof raw.hash !== "string" || !isHex(raw.hash) || raw.hash.length !== 66) return null;
   if (typeof raw.serializedTransaction !== "string" || !isHex(raw.serializedTransaction) || raw.serializedTransaction === "0x") return null;
   if (keccak256(raw.serializedTransaction as Hex) !== raw.hash.toLowerCase()) return null;
+  const nonce = typeof raw.nonce === "string" && /^\d+$/.test(raw.nonce) ? BigInt(raw.nonce) : undefined;
   const submittedAt = typeof raw.submittedAt === "string" && Number.isFinite(Date.parse(raw.submittedAt)) ? raw.submittedAt : undefined;
-  return { stage: raw.stage, hash: raw.hash as Hex, serializedTransaction: raw.serializedTransaction as Hex, ...(submittedAt ? { submittedAt } : {}) };
+  return { stage: raw.stage, hash: raw.hash as Hex, serializedTransaction: raw.serializedTransaction as Hex, ...(nonce !== undefined ? { nonce } : {}), ...(submittedAt ? { submittedAt } : {}) };
 }
 
 function swapRetryState(metadata: Record<string, unknown>): SwapRetryState {
