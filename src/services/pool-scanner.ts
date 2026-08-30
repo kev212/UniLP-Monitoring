@@ -23,7 +23,6 @@ const USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168" as Address;
 const WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73" as Address;
 export const MIN_VOLUME_6H_USD = 100;
 export const STOCK_MIN_VOLUME_24H_USD = 100_000;
-const STOCK_MIN_YIELD_1H_PERCENT = 0.1;
 const STOCK_MAX_RESULTS = 10;
 const STOCK_VERIFY_CONCURRENCY = 3;
 const STOCK_VOLUME_BATCH = 25;
@@ -835,7 +834,11 @@ export class PoolScanner {
     }
   }
 
-  async scanStocks(onProgress?: (stage: string) => void, chain: ChainName = "robinhood"): Promise<PoolMarketScan> {
+  async scanStocks(
+    onProgress?: (stage: string) => void,
+    chain: ChainName = "robinhood",
+    minYieldHourlyPercent = 0.1,
+  ): Promise<PoolMarketScan> {
     const dexLabel = chain === "bsc" ? "Pancake/Uniswap V3" : "Uniswap V3/V4";
     onProgress?.(chain === "bsc" ? "Memuat token *B (stock/ETF/komoditas) di BSC..." : "Memuat daftar resmi Robinhood Token...");
     let universe: { address: Address; symbol: string }[] = chain === "bsc" ? [...BSC_STOCK_SEEDS] : [...ROBINHOOD_STOCK_TOKENS];
@@ -864,7 +867,7 @@ export class PoolScanner {
     onProgress?.("Memverifikasi pool on-chain dan menghitung yield...");
     const pools = enriched
       .flatMap((result) => result ?? [])
-      .filter((pool) => pool.estimatedPoolYield1hPercent > STOCK_MIN_YIELD_1H_PERCENT)
+      .filter((pool) => pool.estimatedPoolYield1hPercent > minYieldHourlyPercent)
       .sort((a, b) => b.estimatedPoolYield1hPercent - a.estimatedPoolYield1hPercent || b.tvlUsd - a.tvlUsd)
       .slice(0, STOCK_MAX_RESULTS);
     return {

@@ -93,6 +93,7 @@ export interface PoolScanSettings {
   minTotalActiveTvlUsd: number;
   minPoolAgeSeconds: number;
   minYieldHourlyPercent: number;
+  minStockYieldHourlyPercent: number;
   maxResults: number;
   allowedQuotes: string[];
 }

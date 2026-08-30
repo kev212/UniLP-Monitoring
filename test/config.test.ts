@@ -87,6 +87,7 @@ describe("loadConfig", () => {
       minTotalActiveTvlUsd: 70_000,
       minPoolAgeSeconds: 3_600,
       minYieldHourlyPercent: 1,
+      minStockYieldHourlyPercent: 0.1,
       maxResults: 10,
       allowedQuotes: ["USDG", "WETH", "ETH"],
     });

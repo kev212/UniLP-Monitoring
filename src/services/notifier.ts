@@ -96,7 +96,7 @@ type DashboardAction =
   | { type: "open_cancel"; page: number }
   | { type: "select" | "confirm"; page: number; chainId: number; protocol: Protocol; positionKey: string };
 
-type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "max_results";
+type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "stock_yield" | "max_results";
 type RiskSettingKey = "stop_loss" | "take_profit" | "trailing_activation" | "trailing_drawdown";
 type PendingInput =
   | { kind: "scan_token"; chain: ChainName }
@@ -212,7 +212,7 @@ export class Notifier {
     });
     this.bot.command("scan_stocks", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
-      await this.handleScanStocks(ctx, scanner);
+      await this.handleScanStocks(ctx, database, scanner);
     });
     this.bot.command("investigate", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
@@ -1425,7 +1425,7 @@ export class Notifier {
     }
   }
 
-  private async handleScanStocks(ctx: Context, scanner: PoolScanner): Promise<void> {
+  private async handleScanStocks(ctx: Context, database: Database, scanner: PoolScanner): Promise<void> {
     const chatId = ctx.chat?.id.toString();
     if (!chatId || !this.authorized(chatId, ctx.from?.id.toString())) return;
     if (this.stockScanRunning) {
@@ -1434,6 +1434,7 @@ export class Notifier {
     }
     const raw = (ctx.message?.text ?? "").trim().split(/\s+/).slice(1);
     const chain = parseChainAlias(raw[0] ?? "") === "bsc" ? "bsc" : "robinhood";
+    const settings = await this.poolScanSettings(database, chatId);
     this.stockScanRunning = true;
     const progress = await ctx.reply(
       chain === "bsc"
@@ -1442,19 +1443,25 @@ export class Notifier {
     );
     const messageId = progress.message_id;
     void this.queueTemp(chatId, messageId, 120_000);
-    void this.executeStockScan(scanner, chatId, messageId, chain).catch((error) =>
+    void this.executeStockScan(scanner, chatId, messageId, chain, settings.minStockYieldHourlyPercent).catch((error) =>
       log.error({ error: errorMessage(error) }, "stock scan background job failed"),
     );
   }
 
-  private async executeStockScan(scanner: PoolScanner, chatId: string, messageId: number, chain: ChainName = "robinhood"): Promise<void> {
+  private async executeStockScan(
+    scanner: PoolScanner,
+    chatId: string,
+    messageId: number,
+    chain: ChainName = "robinhood",
+    minYieldHourlyPercent = 0.1,
+  ): Promise<void> {
     let stage = "Memuat data tokenized stocks...";
     const startedAt = Date.now();
     const heartbeat = setInterval(() => {
       void this.refreshStockScanProgress(chatId, messageId, `${stage}\nElapsed: ${Math.floor((Date.now() - startedAt) / 1_000)}s`);
     }, 20_000);
     try {
-      const scan = await scanner.scanStocks((nextStage) => { stage = nextStage; }, chain);
+      const scan = await scanner.scanStocks((nextStage) => { stage = nextStage; }, chain, minYieldHourlyPercent);
       const text = formatStockScan(scan);
       if (!this.bot) return;
       try {
@@ -1977,9 +1984,11 @@ export class Notifier {
       .row()
       .text("Min total TVL", "lp:cfg:total_tvl")
       .row()
-      .text("Min usia", "lp:cfg:age")
-      .text("Min yield/h", "lp:cfg:yield")
-      .row()
+        .text("Min usia", "lp:cfg:age")
+        .text("Min yield/h", "lp:cfg:yield")
+        .row()
+        .text("Min stock yield/h", "lp:cfg:stock_yield")
+        .row()
       .text("Top N", "lp:cfg:max_results")
       .row();
     keyboard.row().text("Reset ENV", dashboardAction("config_reset", 0)).text("← Back", dashboardAction("status", 0));
@@ -1990,6 +1999,7 @@ export class Notifier {
       `Min total active TVL V3/V4: $${fmtUsd(settings.minTotalActiveTvlUsd)}`,
       `Min usia pool tertua: ${fmtDuration(settings.minPoolAgeSeconds)}`,
       `Min gross yield/h: ${fmtPercent(settings.minYieldHourlyPercent)}`,
+      `Min stock yield/h: ${fmtPercent(settings.minStockYieldHourlyPercent)}`,
       `Top results: ${settings.maxResults}`,
       "Quote mengikuti allowlist chain saat scan.",
     ];
@@ -2500,7 +2510,7 @@ function isProtocol(value: string | undefined): value is Protocol {
 }
 
 function isPoolSettingKey(value: string | undefined): value is PoolSettingKey {
-  return value === "market_cap" || value === "pool_tvl" || value === "total_tvl" || value === "age" || value === "yield" || value === "max_results";
+  return value === "market_cap" || value === "pool_tvl" || value === "total_tvl" || value === "age" || value === "yield" || value === "stock_yield" || value === "max_results";
 }
 
 function isRiskSettingKey(value: string | undefined): value is RiskSettingKey {
@@ -3180,6 +3190,7 @@ function parsePoolScanInput(key: PoolSettingKey, value: string): Partial<PoolSca
   if (key === "pool_tvl") return { minPoolTvlUsd: number };
   if (key === "total_tvl") return { minTotalActiveTvlUsd: number };
   if (key === "yield") return { minYieldHourlyPercent: number };
+  if (key === "stock_yield") return { minStockYieldHourlyPercent: number };
   if (!Number.isInteger(number) || number < 1 || number > 20) throw new Error("Top N harus integer 1 sampai 20");
   return { maxResults: number };
 }
@@ -3190,6 +3201,7 @@ function configInputPrompt(key: PoolSettingKey): string {
   if (key === "total_tvl") return "Kirim Min total active TVL V3/V4, contoh: 70000.";
   if (key === "age") return "Kirim Min usia pool tertua, contoh: 30m, 1h, atau 2d.";
   if (key === "yield") return "Kirim Min gross yield per jam, contoh: 1 atau 1%.";
+  if (key === "stock_yield") return "Kirim Min stock yield per jam, contoh: 0.1 atau 0.1%.";
   return "Kirim jumlah hasil top, dari 1 sampai 20.";
 }
 
