@@ -234,7 +234,7 @@ export class PoolScanner {
     private readonly geckoMinRequestIntervalMs = GECKO_MIN_REQUEST_INTERVAL_MS,
   ) {}
 
-  async scan(tokenAddress: Address, chain: ChainName = "robinhood"): Promise<PoolScan> {
+  async scan(tokenAddress: Address, chain: ChainName = "robinhood", minPoolTvlUsd = 300): Promise<PoolScan> {
     const startedAt = Date.now();
     const normalized = tokenAddress.toLowerCase();
 
@@ -247,7 +247,7 @@ export class PoolScanner {
     const dexTvlMap = await this.buildDexScreenerTvlMap(normalized, chain);
     const scored = (await mapWithConcurrency(pools, TOKEN_SCAN_VERIFY_CONCURRENCY, (raw) =>
       this.toScoredPool(raw, normalized, true, chain, dexTvlMap, "execution"),
-    )).filter((pool): pool is ScoredPool => pool !== null);
+    )).filter((pool): pool is ScoredPool => pool !== null && pool.tvlUsd >= minPoolTvlUsd);
     const result = rankPools(scored);
     log.info({ token: normalized, rawPools: pools.length, scoredPools: scored.length, active: result.active.length, watchlist: result.watchlist.length, durationMs: Date.now() - startedAt }, "token pool scan completed");
     return result;

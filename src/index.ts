@@ -51,6 +51,7 @@ async function main(): Promise<void> {
     database,
     (chain, groupId, transactionHash, receipt) => discovery.reconcileKnownGroupOpen(chain, groupId, transactionHash, receipt),
     (chain, receipt) => discovery.ingestOpenReceipt(chain, receipt),
+    kyberswapApi,
   );
   const gemScanner = new GemScanner(chains, database, scanner, config.quoteTokens.robinhood);
   const portfolio = new PortfolioService(config, chains, database);

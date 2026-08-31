@@ -124,6 +124,7 @@ export class Notifier {
   private readonly dashboardCloseInFlight = new Set<string>();
   private readonly pendingInput = new Map<string, PendingInput>();
   private readonly pendingBgUpload = new Set<string>();
+  private openExecutionQueue: Promise<void> = Promise.resolve();
   private readonly riskDefaults: RiskSettings;
   private poolScanRunning = false;
   private tokenScanRunning = false;
@@ -704,26 +705,10 @@ export class Notifier {
         this.openConfirmations.delete(action.requestId);
         await this.dismissOpenReview(ctx, chatId, message.message_id);
         await this.replyTemp(ctx, "⏳ Membuka posisi...");
-        try {
-          if (!this.positionOpener) throw new Error("Position opener is not configured");
-          if (confirmation.kind === "bid_ask") {
-            const result = await this.executeBidAskLadder(confirmation.preview);
-            const hashLabel = result.hash ? `\ntx: ${shortHash(result.hash)}` : "";
-            if (result.pendingReconciliation) {
-              await this.replyTemp(ctx, `🟡 BID-ASK TX TERKIRIM\n${formatBidAskLadderTarget(confirmation.preview, confirmation.request)}\nRekonsiliasi posisi sedang diproses otomatis. Jangan open ulang.${hashLabel}`);
-            } else {
-              await this.replyTemp(ctx, `🟢 BID-ASK LADDER OPENED\n${formatBidAskLadderTarget(confirmation.preview, confirmation.request)}\nAtomic: one transaction for all mintable bins${hashLabel}`);
-            }
-            return;
-          }
-          const result = await this.positionOpener.executeOpen(confirmation.preview);
-          const hashLabel = result.hash ? `\ntx: ${result.hash.slice(0, 18)}...` : "";
-          const swapLabel = result.swapHash ? `\nswap: ${result.swapHash.slice(0, 18)}...` : "";
-          const depositFormatted = (Number(confirmation.preview.depositAmount) / 10 ** (confirmation.preview.quoteTokenSymbol === "USDG" ? 6 : 18)).toFixed(2);
-          await this.replyTemp(ctx, `🟢 LP OPENED\n${confirmation.preview.protocol.toUpperCase()} ${confirmation.preview.pair} | ${confirmation.preview.feeLabel}\nRange: ${confirmation.preview.lowerPrice} → ${confirmation.preview.upperPrice}\nDeposit: ${depositFormatted} ${confirmation.preview.quoteTokenSymbol}${swapLabel}${hashLabel}`);
-        } catch (error) {
-          await this.replyTemp(ctx, `❌ Open position gagal: ${errorMessage(error).slice(0, 200)}`);
-        }
+        const execution = this.openExecutionQueue.then(() => this.executeOpenConfirmation(ctx, confirmation));
+        this.openExecutionQueue = execution.catch((error) => {
+          log.error({ error: errorMessage(error) }, "background open confirmation failed");
+        });
         return;
       }
       if (action.type === "open_cancel") {
@@ -760,6 +745,29 @@ export class Notifier {
       } catch (editError) {
         log.warn({ error: errorMessage(editError) }, "could not render dashboard error state");
       }
+    }
+  }
+
+  private async executeOpenConfirmation(ctx: Context, confirmation: OpenConfirmation): Promise<void> {
+    try {
+      if (!this.positionOpener) throw new Error("Position opener is not configured");
+      if (confirmation.kind === "bid_ask") {
+        const result = await this.executeBidAskLadder(confirmation.preview);
+        const hashLabel = result.hash ? `\ntx: ${shortHash(result.hash)}` : "";
+        if (result.pendingReconciliation) {
+          await this.replyTemp(ctx, `🟡 BID-ASK TX TERKIRIM\n${formatBidAskLadderTarget(confirmation.preview, confirmation.request)}\nRekonsiliasi posisi sedang diproses otomatis. Jangan open ulang.${hashLabel}`);
+        } else {
+          await this.replyTemp(ctx, `🟢 BID-ASK LADDER OPENED\n${formatBidAskLadderTarget(confirmation.preview, confirmation.request)}\nAtomic: one transaction for all mintable bins${hashLabel}`);
+        }
+        return;
+      }
+      const result = await this.positionOpener.executeOpen(confirmation.preview);
+      const hashLabel = result.hash ? `\ntx: ${result.hash.slice(0, 18)}...` : "";
+      const swapLabel = result.swapHash ? `\nswap: ${result.swapHash.slice(0, 18)}...` : "";
+      const depositFormatted = (Number(confirmation.preview.depositAmount) / 10 ** (confirmation.preview.quoteTokenSymbol === "USDG" ? 6 : 18)).toFixed(2);
+      await this.replyTemp(ctx, `🟢 LP OPENED\n${confirmation.preview.protocol.toUpperCase()} ${confirmation.preview.pair} | ${confirmation.preview.feeLabel}\nRange: ${confirmation.preview.lowerPrice} → ${confirmation.preview.upperPrice}\nDeposit: ${depositFormatted} ${confirmation.preview.quoteTokenSymbol}${swapLabel}${hashLabel}`);
+    } catch (error) {
+      await this.replyTemp(ctx, `❌ Open position gagal: ${errorMessage(error).slice(0, 200)}`);
     }
   }
 
@@ -1332,9 +1340,9 @@ export class Notifier {
 
   private async executeTokenScan(scanner: PoolScanner, token: Address, chain: ChainName, chatId: string): Promise<void> {
     try {
-      const scan = await scanner.scan(token, chain);
+      const scan = await scanner.scan(token, chain, this.config.tokenScanMinPoolTvlUsd);
       if (scan.active.length === 0 && scan.watchlist.length === 0) {
-        await this.sendTemp([`Tidak ditemukan pool Uniswap V3/V4 dengan TVL > $0 dan Vol 6h >= $100 untuk token ini.`], chatId, 120_000);
+        await this.sendTemp([`Tidak ditemukan pool Uniswap V3/V4 dengan TVL >= $${fmtUsd(this.config.tokenScanMinPoolTvlUsd)} dan Vol 6h >= $100 untuk token ini.`], chatId, 120_000);
         return;
       }
 
@@ -1837,6 +1845,11 @@ export class Notifier {
       lines.push(`Drop: -${rangePercent}%`);
       lines.push(`Deposit: ${depositFormatted} ${preview.quoteTokenSymbol}`);
       lines.push(`Quote side: single-side ${preview.quoteTokenSymbol}`);
+    }
+    if (preview.spotMark !== undefined && preview.executableOut !== undefined) {
+      const quoteDec = preview.quoteTokenDecimals;
+      lines.push(`Pool mark: ${(Number(preview.spotMark) / 10 ** quoteDec).toFixed(4)} ${preview.quoteTokenSymbol}`);
+      lines.push(`Executable: ${(Number(preview.executableOut) / 10 ** quoteDec).toFixed(4)} ${preview.quoteTokenSymbol}`);
     }
 
     lines.push("", `${this.config.dryRun ? "⚠️ DRY_RUN — simulasi tanpa broadcast" : "Konfirmasi untuk eksekusi."}`);

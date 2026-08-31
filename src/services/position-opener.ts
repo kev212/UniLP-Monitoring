@@ -25,7 +25,8 @@ import type { ChainClients } from "./chain-client.js";
 import type { RoutePlanner } from "./route-planner.js";
 import { buildSwapPlan } from "./swap-builder.js";
 import { UNISWAP_API_ROUTER, type UniswapTradingApi } from "./uniswap-trading-api.js";
-import { applySlippage, nearestSingleSidedTicks, sqrtRatioAtTick, tickToCeilSpacing, tickToFloorSpacing, ticksForDropPercent, ticksForRisePercent } from "./uniswap-math.js";
+import { KyberSwapAggregatorApi } from "./kyberswap-aggregator-api.js";
+import { applySlippage, baseAmountFromQuote, depositWouldCrossSingleSideRange, nearestSingleSidedTicks, quoteValueFromBase, sqrtRatioAtTick, tickToCeilSpacing, tickToFloorSpacing, ticksForDropPercent, ticksForRisePercent } from "./uniswap-math.js";
 import { dexNameFromMetadata, v3ContractsFor, v3Deployments, type DexName } from "./v3-deployment.js";
 import { isDynamicFee } from "./v4-pool.js";
 
@@ -79,6 +80,8 @@ export interface OpenPositionPreview {
   upperPrice: string;
   currentPrice: string;
   dropPercent: number;
+  spotMark?: bigint;
+  executableOut?: bigint;
   mode: OpenMode;
   baseToken?: Address;
   baseTokenSymbol?: string;
@@ -221,6 +224,7 @@ export class PositionOpener {
     private readonly database?: BidAskDatabase,
     private readonly reconcileBidAskOpen?: BidAskOpenReconciler,
     private readonly ingestOpenReceipt?: (chain: ChainName, receipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>) => Promise<unknown>,
+    private readonly kyberswapApi?: KyberSwapAggregatorApi,
   ) {
     this.account = config.executorPrivateKey ? privateKeyToAccount(config.executorPrivateKey) : undefined;
   }
@@ -289,6 +293,25 @@ export class PositionOpener {
     const baseSymbol = quoteIsToken0 ? token1Symbol : token0Symbol;
     const plan = this.makeBidAskPlan(state, chain, quoteIsToken0, token0Decimals, token1Decimals, outer, depositAmount, requestedBinCount);
     assertMintUtilization(quoteIsToken0 ? plan.totalAmount0 : plan.totalAmount1, depositAmount);
+    if (depositWouldCrossSingleSideRange(state.currentTick, state.sqrtPriceX96, state.poolLiquidity, outer.lowerTick, outer.upperTick, quoteIsToken0, depositAmount, state.tickSpacing)) {
+      throw new Error("Deposit is large enough to walk the pool through the requested range");
+    }
+    await this.assertExecutableOpenPrice({
+      chain,
+      protocol,
+      pool: normalized,
+      token0: state.token0,
+      token1: state.token1,
+      fee: state.fee,
+      tickSpacing: state.tickSpacing,
+      hooks: state.hooks,
+      dex: state.dex ?? "uniswap",
+      quoteToken: quoteToken.address,
+      quoteIsToken0,
+      quoteDecimals: quoteIsToken0 ? token0Decimals : token1Decimals,
+      sqrtPriceX96: state.sqrtPriceX96,
+      depositAmount,
+    });
     const deadline = this.bidAskDeadline();
     const batchPlan = this.buildBidAskBatch(state, chain, plan, quoteIsToken0, quoteToken, deadline);
     const planHash = hashBidAskPlan(plan);
@@ -486,9 +509,16 @@ export class PositionOpener {
       this.assertSingleSideSpend(position, quoteIsToken0, depositAmount);
       const lockedQuote = BigInt((quoteIsToken0 ? position.mintAmounts.amount0 : position.mintAmounts.amount1).toString());
       assertMintUtilization(lockedQuote, depositAmount);
+      if (depositWouldCrossSingleSideRange(currentTick, sqrtPriceX96, poolLiquidity, tickLower, tickUpper, quoteIsToken0, depositAmount, tickSpacing)) {
+        throw new Error("Deposit is large enough to walk the pool through the requested range");
+      }
     } else {
       this.assertDualSidePosition(position, quoteIsToken0);
     }
+    const exitCheck = await this.assertExecutableOpenPrice({
+      chain, protocol, pool, token0, token1, fee, tickSpacing, hooks, dex,
+      quoteToken: quoteToken.address, quoteIsToken0, quoteDecimals, sqrtPriceX96, depositAmount,
+    });
 
     const sqrtLower = sqrtRatioAtTick(tickLower);
     const sqrtUpper = sqrtRatioAtTick(tickUpper);
@@ -511,6 +541,7 @@ export class PositionOpener {
       quoteTokenDecimals: quoteDecimals, currentTick, tickSpacing, tickLower, tickUpper, sqrtPriceX96, poolLiquidity, hooks,
       ...(currentLpFee !== undefined ? { currentLpFee } : {}), liquidity, depositAmount,
       lowerPrice, upperPrice, currentPrice, dropPercent: rangePercent, mode,
+      spotMark: exitCheck.spotMark, executableOut: exitCheck.executableOut,
     };
 
     if (mode === "dual") {
@@ -1634,6 +1665,66 @@ export class PositionOpener {
       || expected.hooks.toLowerCase() !== actual.hooks.toLowerCase()) {
       throw new Error("Pool configuration changed after confirmation; open was cancelled");
     }
+  }
+
+  private async assertExecutableOpenPrice(input: {
+    chain: ChainName;
+    protocol: "v3" | "v4";
+    pool: Hex;
+    token0: Address;
+    token1: Address;
+    fee: number;
+    tickSpacing: number;
+    hooks: Address;
+    dex: DexName;
+    quoteToken: Address;
+    quoteIsToken0: boolean;
+    quoteDecimals: number;
+    sqrtPriceX96: bigint;
+    depositAmount: bigint;
+  }): Promise<{ spotMark: bigint; executableOut: bigint }> {
+    const quoteCap = 50n * (10n ** BigInt(input.quoteDecimals));
+    const probeQuote = input.depositAmount < quoteCap ? input.depositAmount : quoteCap;
+    const probeBase = baseAmountFromQuote(input.sqrtPriceX96, probeQuote, input.quoteIsToken0);
+    const spotMark = quoteValueFromBase(input.sqrtPriceX96, probeBase, input.quoteIsToken0);
+    if (probeBase <= 0n || spotMark <= 0n) throw new Error("Cannot verify executable exit price");
+    const baseToken = input.quoteIsToken0 ? input.token1 : input.token0;
+    const position: PositionRecord = {
+      id: `open:${input.pool}`,
+      chainId: this.chains.getForScan(input.chain).registry.chain.id,
+      protocol: input.protocol,
+      positionKey: input.pool,
+      owner: this.config.executorAddress,
+      poolAddress: input.protocol === "v3" ? input.pool as Address : null,
+      token0: input.token0,
+      token1: input.token1,
+      quoteToken: input.quoteToken,
+      status: "discovered",
+      liquidity: null,
+      openedAtBlock: null,
+      metadata: {
+        dex: input.dex,
+        currency0: input.token0,
+        currency1: input.token1,
+        fee: input.fee,
+        tickSpacing: input.tickSpacing,
+        hooks: input.hooks,
+      },
+    };
+    const quotes = await Promise.all([
+      this.tradingApi?.quote(position, baseToken, probeBase, input.quoteToken).catch(() => null) ?? Promise.resolve(null),
+      this.kyberswapApi?.quote(position, baseToken, probeBase, input.quoteToken).catch(() => null) ?? Promise.resolve(null),
+    ]);
+    const executableOut = quotes.reduce<bigint | null>((best, quote) => {
+      if (!quote || quote.expectedOut <= 0n) return best;
+      return best === null || quote.expectedOut > best ? quote.expectedOut : best;
+    }, null);
+    if (executableOut === null) throw new Error("Cannot verify executable exit price");
+    const minBps = BigInt(this.config.openMinExecutableBps ?? 5_000);
+    if (executableOut * 10_000n < spotMark * minBps) {
+      throw new Error("Pool price is not executable");
+    }
+    return { spotMark, executableOut };
   }
 
   private assertSingleSideSpend(position: V3Position | V4Position, quoteIsToken0: boolean, depositAmount: bigint): void {

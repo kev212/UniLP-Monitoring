@@ -391,6 +391,30 @@ describe("token scan RPC", () => {
     await scanner.scan("0x0000000000000000000000000000000000000001");
     expect(verify).toHaveBeenCalledWith("v3", "0x0000000000000000000000000000000000000002", "0x0000000000000000000000000000000000000001", "robinhood", "execution");
 
+    const belowFloor = rankPools([{
+      protocol: "v3",
+      dex: "uniswap",
+      pair: "TOKEN/USDG",
+      quoteToken: "0x0000000000000000000000000000000000000003",
+      uniswapUrl: "https://app.uniswap.org",
+      activeLiquidity: true,
+      feeTier: 3_000,
+      feeRate: 0.003,
+      tvlUsd: 299,
+      volume1hUsd: 100,
+      volume6hUsd: 200,
+      estimatedPoolFees1hUsd: 1,
+      estimatedPoolYield1hPercent: 1,
+      estimatedPoolFees6hUsd: 2,
+      estimatedPoolYieldHourlyPercent: 1,
+      score: 1,
+      safetyFactor: 1,
+      dynamicFee: false,
+      stale: false,
+      warnings: [],
+    }].filter((pool) => pool.tvlUsd >= 300));
+    expect(belowFloor.active).toHaveLength(0);
+
     verify.mockRestore();
     await scanner.verifyPool("v3", "0x0000000000000000000000000000000000000002", "0x0000000000000000000000000000000000000001", "robinhood");
     expect(getForScan).toHaveBeenCalled();

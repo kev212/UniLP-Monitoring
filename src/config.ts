@@ -78,6 +78,8 @@ const envSchema = z.object({
   DRY_RUN: z.string().default("true"),
   POOL_SCAN_MIN_MARKET_CAP_USD: z.coerce.number().nonnegative().default(500_000),
   POOL_SCAN_MIN_POOL_TVL_USD: z.coerce.number().nonnegative().default(10_000),
+  TOKEN_SCAN_MIN_POOL_TVL_USD: z.coerce.number().nonnegative().default(300),
+  OPEN_MIN_EXECUTABLE_BPS: z.coerce.number().int().min(1).max(10_000).default(5_000),
   POOL_SCAN_MIN_TOTAL_ACTIVE_TVL_USD: z.coerce.number().nonnegative().default(70_000),
   POOL_SCAN_MIN_POOL_AGE_SECONDS: z.coerce.number().int().nonnegative().default(3_600),
   POOL_SCAN_MIN_YIELD_HOURLY_PERCENT: z.coerce.number().nonnegative().default(1),
@@ -155,6 +157,8 @@ export interface RuntimeConfig {
   oorAboveProfitDurationMs: number;
   dryRun: boolean;
   poolScanDefaults: PoolScanSettings;
+  tokenScanMinPoolTvlUsd: number;
+  openMinExecutableBps: number;
   poolScanCandidatePages: number;
   scanV2Enabled: boolean;
   uniswapApiKey?: string;
@@ -403,6 +407,8 @@ export function loadConfig(environment = process.env): RuntimeConfig {
       maxResults: env.POOL_SCAN_MAX_RESULTS,
       allowedQuotes: parseSymbols(env.POOL_SCAN_ALLOWED_QUOTES, "POOL_SCAN_ALLOWED_QUOTES"),
     },
+    tokenScanMinPoolTvlUsd: env.TOKEN_SCAN_MIN_POOL_TVL_USD,
+    openMinExecutableBps: env.OPEN_MIN_EXECUTABLE_BPS,
     poolScanCandidatePages: env.POOL_SCAN_CANDIDATE_PAGES,
     scanV2Enabled: parseBoolean(env.SCANV2_ENABLED, "SCANV2_ENABLED"),
     uniswapApiKey: env.UNISWAP_API_KEY,

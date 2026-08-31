@@ -1,9 +1,43 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import type { RuntimeConfig } from "../src/config.js";
 import type { PositionOpener } from "../src/services/position-opener.js";
-import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isDashboardVisibleGroup, isExpiredCallbackError, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanPoolsInput, parseScanV2Input, positionRangeBins, positionRangeLine, soleEnabledChain, trailingPeakDisplay } from "../src/services/notifier.js";
+import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isDashboardVisibleGroup, isExpiredCallbackError, Notifier, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanPoolsInput, parseScanV2Input, positionRangeBins, positionRangeLine, soleEnabledChain, trailingPeakDisplay } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
+  it("does not block Telegram updates while a confirmed open is pending", async () => {
+    const notifier = new Notifier({
+      telegram: { token: "123:test", chatId: "1", userId: "1" },
+    } as RuntimeConfig, {} as never, {
+      queueMessageDeletion: vi.fn().mockResolvedValue(undefined),
+    } as never);
+    const executeOpen = vi.fn().mockReturnValue(new Promise(() => {}));
+    notifier.setPositionOpener({ executeOpen } as unknown as PositionOpener);
+    (notifier as unknown as { openConfirmations: Map<string, unknown> }).openConfirmations.set("request", {
+      kind: "normal",
+      preview: {},
+    });
+    const ctx = {
+      update: { update_id: 1 },
+      from: { id: 1 },
+      chat: { id: 1 },
+      callbackQuery: {
+        data: "lp:open_confirm:request",
+        message: { message_id: 10, chat: { id: 1 } },
+      },
+      answerCallbackQuery: vi.fn().mockResolvedValue(undefined),
+      api: { deleteMessage: vi.fn().mockResolvedValue(undefined) },
+      reply: vi.fn().mockResolvedValue({ message_id: 11 }),
+    };
+
+    await expect((notifier as unknown as {
+      handleDashboardCallback(ctx: unknown, database: unknown, pnl: unknown, executor: unknown, scanner: unknown): Promise<void>;
+    }).handleDashboardCallback(ctx, {}, {}, {}, {})).resolves.toBeUndefined();
+
+    expect(executeOpen).toHaveBeenCalledOnce();
+    expect(ctx.reply).toHaveBeenCalledWith("⏳ Membuka posisi...", undefined);
+  });
+
   it("parses chain-aware token scan input", () => {
     const token = "0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913";
     expect(parseScanInput(`base ${token}`)).toEqual({ chain: "base", token });

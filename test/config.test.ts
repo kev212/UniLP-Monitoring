@@ -81,6 +81,8 @@ describe("loadConfig", () => {
     expect(config.removeLiquiditySlippageBps).toBe(200);
     expect(config.removeLiquidityMaxSlippageBps).toBe(500);
     expect(config.swapApiTimeoutMs).toBe(2_500);
+    expect(config.tokenScanMinPoolTvlUsd).toBe(300);
+    expect(config.openMinExecutableBps).toBe(5_000);
     expect(config.poolScanDefaults).toEqual({
       minMarketCapUsd: 500_000,
       minPoolTvlUsd: 10_000,

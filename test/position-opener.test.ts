@@ -6,7 +6,7 @@ import { encodeAbiParameters, keccak256, zeroAddress, type Address, type Hex } f
 
 import { chainRegistry } from "../src/chains.js";
 import { assertMintUtilization, assertSafeOpenMarket, bidAskDirectionForQuote, openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken, wrappedNativeShortfall } from "../src/services/position-opener.js";
-import { nearestSingleSidedTicks, ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
+import { baseAmountFromQuote, depositWouldCrossSingleSideRange, nearestSingleSidedTicks, quoteValueFromBase, ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
 
 const chainId = 4663;
 const token0 = new Token(chainId, "0x0000000000000000000000000000000000000001", 6, "USDG");
@@ -59,9 +59,13 @@ function poolOpener(
     bidAskLadderEnabled: true,
     bidAskLadderProtocols: ["v3", "v4"],
     bidAskLadderMaxBins: 10,
+    openMinExecutableBps: 5_000,
+  };
+  const tradingApi = {
+    quote: vi.fn(async () => ({ expectedOut: 1n << 128n, minimumOut: 1n << 128n })),
   };
   return {
-    opener: new PositionOpener(config as never, chains as never),
+    opener: new PositionOpener(config as never, chains as never, undefined, tradingApi as never),
     pool: protocol === "v3" ? v3PoolAddress as Hex : poolId,
     client,
     chains,
@@ -74,6 +78,19 @@ describe("open safety guards", () => {
     expect(() => assertSafeOpenMarket(-881161, 1n)).toThrow("extreme tick");
     expect(() => assertSafeOpenMarket(880_000, 1n)).toThrow("extreme tick");
     expect(() => assertSafeOpenMarket(0, 1n)).not.toThrow();
+  });
+
+  it("rejects a deposit that can walk a thin pool through the single-side range", () => {
+    const sqrtPrice = 1n << 96n;
+    expect(depositWouldCrossSingleSideRange(0, sqrtPrice, 1n, 200, 5_000, true, 10n ** 18n, 200)).toBe(true);
+    expect(depositWouldCrossSingleSideRange(0, sqrtPrice, 10n ** 30n, 200, 5_000, true, 3n * 10n ** 18n, 200)).toBe(false);
+    expect(depositWouldCrossSingleSideRange(0, sqrtPrice, 10n ** 30n, -5_000, 0, false, 3n * 10n ** 18n, 200)).toBe(false);
+  });
+
+  it("values base inventory from the pool sqrt price", () => {
+    const sqrtPrice = 1n << 96n;
+    expect(quoteValueFromBase(sqrtPrice, 10n ** 18n, true)).toBe(10n ** 18n);
+    expect(baseAmountFromQuote(sqrtPrice, 10n ** 18n, false)).toBe(10n ** 18n);
   });
 
   it("rejects mints that lock less than 90% of the deposit", () => {
@@ -94,6 +111,26 @@ describe("open safety guards", () => {
     });
 
     await expect(opener.prepareBidAskOpen(pool, "robinhood", 30, 3n * 10n ** 18n, { symbol: "NVDA", address: nvdaAddress }, 3)).rejects.toThrow("extreme tick");
+  });
+
+  it("rejects an open when the executable quote is far below the pool mark", async () => {
+    const { opener, pool } = poolOpener("v4");
+    (opener as { tradingApi?: { quote: ReturnType<typeof vi.fn> } }).tradingApi = {
+      quote: vi.fn().mockResolvedValue({ expectedOut: 1n, minimumOut: 1n }),
+    };
+
+    await expect(opener.prepareOpen(pool, "robinhood", 30, 3n * 10n ** 18n, { symbol: "NVDA", address: nvdaAddress }))
+      .rejects.toThrow("not executable");
+  });
+
+  it("rejects an open when no aggregator quote is available", async () => {
+    const { opener, pool } = poolOpener("v4");
+    (opener as { tradingApi?: { quote: ReturnType<typeof vi.fn> } }).tradingApi = {
+      quote: vi.fn().mockResolvedValue(null),
+    };
+
+    await expect(opener.prepareOpen(pool, "robinhood", 30, 3n * 10n ** 18n, { symbol: "NVDA", address: nvdaAddress }))
+      .rejects.toThrow("Cannot verify executable exit price");
   });
 });
 
