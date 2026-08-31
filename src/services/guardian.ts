@@ -495,7 +495,6 @@ export class Guardian {
       }
 
       const quoteIsToken0 = position.quoteToken?.toLowerCase() === position.token0.toLowerCase();
-      const quoteRange = quoteRangeState(valued.range, quoteIsToken0);
       const directStaticTrigger = this.pnl.shouldTrigger(valued.snapshot, valued.range, quoteIsToken0);
       const now = Date.now();
       const nearThreshold = typeof this.pnl.isNearExactThreshold === "function"
@@ -554,16 +553,20 @@ export class Guardian {
       const effectiveTrigger: ExitTrigger | null = trigger ?? retryTrigger;
       if (!effectiveTrigger) {
         const staleDynamicRetry = pendingRetry && !shouldResumeExitRetry(pendingRetry.reason);
-        if (position.metadata.slTwapWaitStartedAt !== undefined || position.metadata.trailingTwapWaitStartedAt !== undefined || staleDynamicRetry) {
+        if (position.metadata.slTwapWaitStartedAt !== undefined
+          || position.metadata.trailingTwapWaitStartedAt !== undefined
+          || position.metadata.profitTwapWaitStartedAt !== undefined
+          || staleDynamicRetry) {
           await this.database.setPositionStatus(position.id, position.status, {
             slTwapWaitStartedAt: null,
             trailingTwapWaitStartedAt: null,
+            profitTwapWaitStartedAt: null,
             ...(staleDynamicRetry ? { exitRetry: null } : {}),
           });
         }
         return true;
       }
-      if (!valued.twapGuard.ready) {
+      if (!valued.twapGuard.ready && effectiveTrigger !== "manual") {
         if (effectiveTrigger === "stop_loss") {
           const slWaitStartedAt = typeof position.metadata.slTwapWaitStartedAt === "number"
             ? position.metadata.slTwapWaitStartedAt : null;
@@ -592,15 +595,7 @@ export class Guardian {
         } else if (effectiveTrigger === "trailing_take_profit") {
           if (!(await this.allowTrailingAfterTwapWait(position, valued.twapGuard.deviationBps))) return true;
         } else {
-          log.warn({
-            positionId: position.id,
-            trigger: effectiveTrigger,
-            rawRangeStatus: valued.range?.status,
-            quoteRangeStatus: quoteRange?.status,
-            quoteIsToken0,
-            deviationBps: valued.twapGuard.deviationBps,
-          }, "threshold reached but price guard is not ready");
-          return true;
+          if (!(await this.allowProfitAfterTwapWait(position, effectiveTrigger, valued.twapGuard.deviationBps))) return true;
         }
       }
       const nextAttemptAt = retryAt(position.metadata);
@@ -622,6 +617,8 @@ export class Guardian {
       try {
         await this.database.setPositionStatus(position.id, position.status, {
           slTwapWaitStartedAt: null,
+          trailingTwapWaitStartedAt: null,
+          profitTwapWaitStartedAt: null,
           exitSnapshot: {
             pnlBps: exitSnapshot.pnlBps.toString(),
             pnlQuote: exitSnapshot.pnlQuote.toString(),
@@ -905,6 +902,32 @@ export class Guardian {
     }
 
     log.warn({ positionId: position.id, positionKey: position.positionKey, elapsed, maxWaitMs, deviationBps }, "trailing executing after TWAP guard max wait override");
+    return true;
+  }
+
+  private async allowProfitAfterTwapWait(position: PositionRecord, trigger: ExitTrigger, deviationBps?: bigint): Promise<boolean> {
+    const maxWaitMs = this.config.trailingTwapGuardMaxWaitMs;
+    if (maxWaitMs === 0) {
+      log.warn({ positionId: position.id, positionKey: position.positionKey, trigger, deviationBps }, "profit exit executing without TWAP guard wait");
+      return true;
+    }
+
+    const startedAt = typeof position.metadata.profitTwapWaitStartedAt === "number"
+      ? position.metadata.profitTwapWaitStartedAt
+      : null;
+    if (startedAt === null) {
+      await this.database.setPositionStatus(position.id, position.status, { profitTwapWaitStartedAt: Date.now() });
+      log.warn({ positionId: position.id, positionKey: position.positionKey, trigger, deviationBps }, "profit threshold reached but TWAP not ready; starting guard wait");
+      return false;
+    }
+
+    const elapsed = Math.max(0, Date.now() - startedAt);
+    if (elapsed < maxWaitMs) {
+      log.info({ positionId: position.id, positionKey: position.positionKey, trigger, elapsed, maxWaitMs, deviationBps }, "profit exit waiting for TWAP guard to stabilize");
+      return false;
+    }
+
+    log.warn({ positionId: position.id, positionKey: position.positionKey, trigger, elapsed, maxWaitMs, deviationBps }, "profit exit executing after TWAP guard max wait override");
     return true;
   }
 

@@ -188,6 +188,12 @@ describe("trailing TWAP guard timeout", () => {
     }).allowTrailingAfterTwapWait(value, 900n);
   }
 
+  async function allowProfit(guardian: Guardian, value: PositionRecord, trigger: "take_profit" | "profit_oor_above" | "out_of_range_above"): Promise<boolean> {
+    return (guardian as unknown as {
+      allowProfitAfterTwapWait(position: PositionRecord, trigger: typeof trigger, deviationBps?: bigint): Promise<boolean>;
+    }).allowProfitAfterTwapWait(value, trigger, 900n);
+  }
+
   it("starts a bounded wait when the trailing guard is not ready", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(100_000);
@@ -228,6 +234,20 @@ describe("trailing TWAP guard timeout", () => {
     await expect(allow(guardian, position)).resolves.toBe(true);
     const database = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
     expect(database.setPositionStatus).not.toHaveBeenCalled();
+  });
+
+  it.each(["take_profit", "profit_oor_above", "out_of_range_above"] as const)("bounds standalone %s TWAP waits", async (trigger) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    try {
+      const guardian = makeGuardian();
+      await expect(allowProfit(guardian, position, trigger)).resolves.toBe(false);
+      const database = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
+      expect(database.setPositionStatus).toHaveBeenCalledWith("trailing-position", "armed", { profitTwapWaitStartedAt: 100_000 });
+      await expect(allowProfit(guardian, { ...position, metadata: { profitTwapWaitStartedAt: 94_999 } }, trigger)).resolves.toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps the hard-floor override below the conservative estimate gate", async () => {
@@ -597,6 +617,109 @@ describe("stop-loss local quote validation", () => {
 
     expect(result).toBe(true);
     expect(executor.executeRelatedPosition).not.toHaveBeenCalled();
+  });
+
+  it("persists Expected trailing state and executes standalone TP after the TWAP timeout", async () => {
+    const baseline = snapshot(4_629n);
+    const exact = { ...snapshot(4_610n), quoteProvider: "kyberswap" as const };
+    const timedOutPosition = {
+      ...position,
+      metadata: { profitTwapWaitStartedAt: Date.now() - 5_001 },
+    };
+    const database = {
+      addPnlSnapshot: vi.fn().mockResolvedValue(undefined),
+      setPositionStatus: vi.fn().mockResolvedValue(undefined),
+    };
+    const notifier = {
+      logPnL: vi.fn().mockResolvedValue(undefined),
+      trigger: vi.fn().mockResolvedValue(undefined),
+    };
+    const pnl = {
+      value: vi.fn().mockResolvedValue({ snapshot: baseline, range: undefined, twapGuard: { ready: false, deviationBps: 900n } }),
+      valueExactProbe: vi.fn().mockResolvedValue({ snapshot: exact, range: undefined, twapGuard: { ready: false, deviationBps: 900n } }),
+      evaluateTrailingStop: vi.fn((_metadata: unknown, _snapshot: unknown, source: string) => source === "expected"
+        ? { action: "activate", state: { peakPnlBps: 4_610n, activatedAtBlock: 10n } }
+        : { action: "trigger", state: { peakPnlBps: 4_813n, activatedAtBlock: 9n } }),
+      shouldTrigger: vi.fn().mockReturnValue("take_profit"),
+      isNearExactThreshold: vi.fn().mockReturnValue(true),
+    };
+    const executor = { executeRelatedPosition: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      { autoExitChains: ["robinhood"], trailingTwapGuardMaxWaitMs: 5_000 } as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      notifier as never,
+    );
+    vi.spyOn(guardian as never, "updateOorAboveTimer" as never).mockResolvedValue(null);
+    vi.spyOn(guardian as never, "updateProfitOorAboveTimer" as never).mockResolvedValue(null);
+
+    await expect((guardian as unknown as {
+      evaluatePosition(name: "robinhood", value: PositionRecord, blockNumber: bigint): Promise<boolean>;
+    }).evaluatePosition("robinhood", timedOutPosition, 10n)).resolves.toBe(true);
+
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "armed", {
+      trailingStopExpected: { peakPnlBps: 4_610n, activatedAtBlock: 10n },
+    });
+    expect(executor.executeRelatedPosition).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "position" }),
+      "take_profit",
+    );
+  });
+
+  it("does not block a standalone manual retry on the TWAP guard", async () => {
+    const baseline = snapshot(100n);
+    const manualPosition = {
+      ...position,
+      metadata: {
+        exitRetry: { reason: "manual", nextAttemptAt: new Date(Date.now() - 1_000).toISOString() },
+      },
+    };
+    const database = {
+      addPnlSnapshot: vi.fn().mockResolvedValue(undefined),
+      setPositionStatus: vi.fn().mockResolvedValue(undefined),
+    };
+    const notifier = {
+      logPnL: vi.fn().mockResolvedValue(undefined),
+      trigger: vi.fn().mockResolvedValue(undefined),
+    };
+    const pnl = {
+      value: vi.fn().mockResolvedValue({ snapshot: baseline, range: undefined, twapGuard: { ready: false, deviationBps: 900n } }),
+      valueExactProbe: vi.fn().mockResolvedValue({ snapshot: baseline, range: undefined, twapGuard: { ready: false, deviationBps: 900n } }),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTrigger: vi.fn().mockReturnValue(null),
+      isNearExactThreshold: vi.fn().mockReturnValue(false),
+    };
+    const executor = { executeRelatedPosition: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      { autoExitChains: ["robinhood"], trailingTwapGuardMaxWaitMs: 5_000 } as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      notifier as never,
+    );
+    vi.spyOn(guardian as never, "updateOorAboveTimer" as never).mockResolvedValue(null);
+    vi.spyOn(guardian as never, "updateProfitOorAboveTimer" as never).mockResolvedValue(null);
+
+    await expect((guardian as unknown as {
+      evaluatePosition(name: "robinhood", value: PositionRecord, blockNumber: bigint): Promise<boolean>;
+    }).evaluatePosition("robinhood", manualPosition, 10n)).resolves.toBe(true);
+
+    expect(database.setPositionStatus).not.toHaveBeenCalledWith(
+      "position",
+      "armed",
+      expect.objectContaining({ profitTwapWaitStartedAt: expect.any(Number) }),
+    );
+    expect(executor.executeRelatedPosition).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "position" }),
+      "manual",
+    );
   });
 });
 

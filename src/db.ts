@@ -1604,7 +1604,7 @@ FROM position_groups g
   async setPositionStatus(positionId: string, status: PositionStatus, metadata?: Record<string, unknown>): Promise<void> {
     await this.pool.query(
       "UPDATE positions SET status = $2, metadata = metadata || $3::jsonb, updated_at = NOW() WHERE id = $1",
-      [positionId, status, JSON.stringify(metadata ?? {})],
+      [positionId, status, stringifyJson(metadata ?? {})],
     );
   }
 
@@ -1614,7 +1614,7 @@ FROM position_groups g
        SET status = $2, metadata = metadata || $3::jsonb, updated_at = NOW()
        WHERE id = $1 AND status <> 'settled'
        RETURNING id`,
-      [positionId, status, JSON.stringify(metadata ?? {})],
+      [positionId, status, stringifyJson(metadata ?? {})],
     );
     return result.rowCount === 1;
   }

@@ -300,6 +300,22 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[0]![0]).toContain("status <> 'settled'");
   });
 
+  it("serializes bigint values in standalone position metadata", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ id: "position" }] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    const metadata = {
+      trailingStopExpected: { peakPnlBps: 4_610n, activatedAtBlock: 50_847_048n },
+    };
+    await expect(database.setPositionStatus("position", "armed", metadata)).resolves.toBeUndefined();
+    await expect(database.setPositionStatusUnlessSettled("position", "closing", metadata)).resolves.toBe(true);
+
+    const serialized = '{"trailingStopExpected":{"peakPnlBps":"4610","activatedAtBlock":"50847048"}}';
+    expect(query.mock.calls[0]![1]).toEqual(["position", "armed", serialized]);
+    expect(query.mock.calls[1]![1]).toEqual(["position", "closing", serialized]);
+  });
+
   it("renews a settlement lease only while the worker still owns it", async () => {
     const database = new Database("postgres://unused");
     const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ id: "position" }] });
