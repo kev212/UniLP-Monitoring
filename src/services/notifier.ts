@@ -3027,15 +3027,19 @@ function pnlEmoji(pnlBps: bigint): string {
 }
 
 export function trailingPeakDisplay(metadata: Record<string, unknown>): string {
-  const raw = metadata.trailingStop;
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return "";
-  const peak = (raw as Record<string, unknown>).peakPnlBps;
-  if (typeof peak !== "string") return "";
-  try {
-    return ` | 🎯 Peak ${formatBps(BigInt(peak))}%`;
-  } catch {
-    return "";
-  }
+  const peaks = [metadata.trailingStop, metadata.trailingStopExpected].flatMap((raw) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+    const peak = (raw as Record<string, unknown>).peakPnlBps;
+    if (typeof peak !== "string") return [];
+    try {
+      return [BigInt(peak)];
+    } catch {
+      return [];
+    }
+  });
+  if (peaks.length === 0) return "";
+  const peak = peaks.reduce((highest, current) => current > highest ? current : highest);
+  return ` | 🎯 Peak ${formatBps(peak)}%`;
 }
 
 function reviewReasonDisplay(metadata: Record<string, unknown>): string {

@@ -364,5 +364,17 @@ describe("dashboard group visibility", () => {
   it("formats Bid-Ask trailing peak from group metadata", () => {
     expect(trailingPeakDisplay({})).toBe("");
     expect(trailingPeakDisplay({ trailingStop: { peakPnlBps: "687" } })).toBe(" | 🎯 Peak 6.87%");
+    expect(trailingPeakDisplay({
+      trailingStop: { peakPnlBps: "610" },
+      trailingStopExpected: { peakPnlBps: "670" },
+    })).toBe(" | 🎯 Peak 6.70%");
+    expect(trailingPeakDisplay({
+      trailingStop: { peakPnlBps: "720" },
+      trailingStopExpected: { peakPnlBps: "679" },
+    })).toBe(" | 🎯 Peak 7.20%");
+    expect(trailingPeakDisplay({
+      trailingStop: { peakPnlBps: "invalid" },
+      trailingStopExpected: { peakPnlBps: "670" },
+    })).toBe(" | 🎯 Peak 6.70%");
   });
 });
