@@ -523,6 +523,29 @@ export class Executor {
     let group = await this.database.getPositionGroup(groupId);
     if (!group) throw new Error(`Position group ${groupId} was not found`);
     if (group.status === "settled" || group.status === "cancelled") return;
+    const pendingSwap = group.metadata.pendingSwap !== null
+      && typeof group.metadata.pendingSwap === "object"
+      && !Array.isArray(group.metadata.pendingSwap);
+    const pendingStage = group.pendingRawTransaction !== null
+      && typeof group.pendingRawTransaction.stage === "string"
+      ? group.pendingRawTransaction.stage
+      : null;
+    const pendingCloseExecution = group.pendingRawTransaction !== null && pendingStage !== "open_batch";
+    const exitRetry = group.metadata.exitRetry !== null
+      && typeof group.metadata.exitRetry === "object"
+      && !Array.isArray(group.metadata.exitRetry);
+    const hasRecoveryState = group.status === "closing"
+      || group.status === "settling"
+      || pendingCloseExecution
+      || typeof group.closeTransactionHash === "string"
+      || typeof group.metadata.closeTransactionHash === "string"
+      || pendingSwap
+      || exitRetry
+      || typeof group.metadata.exitTrigger === "string";
+    if (trigger === undefined && group.status === "active" && !hasRecoveryState) {
+      log.info({ groupId }, "ignoring stale triggerless group recovery after open completed");
+      return;
+    }
     trigger = this.groupExitTrigger(group, trigger);
 
     let groupFailureRecorded = false;

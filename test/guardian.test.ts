@@ -1550,6 +1550,37 @@ describe("monitor RPC retries", () => {
     expect(executor.executeGroup).not.toHaveBeenCalled();
   });
 
+  it("does not treat a pending Bid-Ask open batch as close recovery", async () => {
+    const opening = {
+      ...group("pending-open"),
+      status: "active" as const,
+      pendingRawTransaction: {
+        stage: "open_batch",
+        hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        serializedTransaction: "0x1234",
+      },
+    };
+    const database = {
+      listPendingSwapPositions: vi.fn().mockResolvedValue([]),
+      listPositionGroups: vi.fn().mockResolvedValue([opening]),
+    };
+    const executor = { executeGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      {} as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      executor as never,
+      {} as never,
+    );
+
+    await (guardian as unknown as { resumeClosingPositions(): Promise<void> }).resumeClosingPositions();
+
+    expect(executor.executeGroup).not.toHaveBeenCalled();
+  });
+
   it("contains a failed dynamic recovery reset without stopping recovery", async () => {
     const closing = {
       ...group("restart-db-error"),

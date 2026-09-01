@@ -1876,6 +1876,29 @@ describe("Executor pending settlement recovery", () => {
     expect(closeReceiptAmounts).not.toHaveBeenCalled();
   });
 
+  it("ignores a stale triggerless recovery after an open becomes active", async () => {
+    const group = {
+      ...groupRecord(),
+      pendingRawTransaction: {
+        stage: "open_batch",
+        hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        serializedTransaction: "0x1234",
+      },
+      metadata: { exitRetry: null, exitTrigger: null, pendingSwap: null },
+    } as PositionGroupRecord;
+    const database = {
+      getPositionGroup: vi.fn().mockResolvedValue(group),
+      claimPositionGroupLease: vi.fn().mockResolvedValue(true),
+      releasePositionGroupLease: vi.fn().mockResolvedValue(undefined),
+      listPositionGroupBins: vi.fn(),
+    };
+    const executor = new Executor(database as never, {} as never, {} as never, {} as never, {} as never, config);
+
+    await expect(executor.executeGroup(group.id)).resolves.toBeUndefined();
+
+    expect(database.listPositionGroupBins).not.toHaveBeenCalled();
+  });
+
   it("falls back to zero minimums for a reverting V4 Bid-Ask close simulation", async () => {
     const group = groupRecord("v4");
     const children = [v4GroupChild("child-7", 7n), v4GroupChild("child-8", 8n)];

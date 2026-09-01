@@ -704,7 +704,12 @@ export class Guardian {
       const recoveryTrigger = groupRetry && shouldResumeGroupExitRetry(groupRetry.reason)
         ? groupRetry.reason
         : storedTrigger ?? groupRetry?.reason;
-      const hasDurableExecution = group.pendingRawTransaction !== null
+      const pendingStage = group.pendingRawTransaction !== null
+        && typeof group.pendingRawTransaction.stage === "string"
+        ? group.pendingRawTransaction.stage
+        : null;
+      const pendingCloseExecution = group.pendingRawTransaction !== null && pendingStage !== "open_batch";
+      const hasDurableExecution = pendingCloseExecution
         || typeof closeHash === "string"
         || pendingSwap;
       if (group.status === "closing"
@@ -727,7 +732,7 @@ export class Guardian {
         && group.status !== "cancelled"
         && (group.status === "closing"
           || group.status === "settling"
-          || group.pendingRawTransaction !== null
+          || pendingCloseExecution
           || typeof closeHash === "string"
           || pendingSwap
           || retryDue);
