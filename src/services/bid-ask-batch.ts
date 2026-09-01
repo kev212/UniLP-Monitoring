@@ -30,8 +30,9 @@ const v4MintParameters = [
   { name: "hookData", type: "bytes" },
 ] as const;
 
-const v4BurnParameters = [
+const v4DecreaseParameters = [
   { name: "tokenId", type: "uint256" },
+  { name: "liquidity", type: "uint256" },
   { name: "amount0Min", type: "uint128" },
   { name: "amount1Min", type: "uint128" },
   { name: "hookData", type: "bytes" },
@@ -112,6 +113,7 @@ export interface V4MintBatchPlanOptions extends BidAskBatchPlanOptions {
 
 export interface V4CloseBatchItem {
   tokenId: bigint;
+  liquidity: bigint;
   amount0Min: bigint;
   amount1Min: bigint;
   hookData?: Hex;
@@ -182,7 +184,6 @@ export function buildV3BidAskClosePlan(options: V3CloseBatchPlanOptions): Transa
           amount1Max: position.amount1Max ?? MAX_UINT128,
         }],
       }),
-      encodeFunctionData({ abi: v3PositionManagerAbi, functionName: "burn", args: [position.tokenId] }),
     );
   }
 
@@ -237,15 +238,16 @@ export function buildV4BidAskOpenPlan(options: V4MintBatchPlanOptions): Transact
 export function buildV4BidAskClosePlan(options: V4CloseBatchPlanOptions): TransactionPlan {
   requireItems(options.positions, "V4 positions");
 
-  const params = options.positions.map((position) => encodeAbiParameters(v4BurnParameters, [
+  const params = options.positions.map((position) => encodeAbiParameters(v4DecreaseParameters, [
     position.tokenId,
+    position.liquidity,
     position.amount0Min,
     position.amount1Min,
     position.hookData ?? EMPTY_BYTES,
   ]));
   params.push(encodeAbiParameters(v4TakePairParameters, [options.poolKey.currency0, options.poolKey.currency1, options.recipient]));
 
-  const actions = actionBytes(...Array(options.positions.length).fill(0x03), 0x11);
+  const actions = actionBytes(...Array(options.positions.length).fill(0x01), 0x11);
   return makePlan(
     options,
     encodeFunctionData({

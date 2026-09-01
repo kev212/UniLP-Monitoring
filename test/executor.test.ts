@@ -60,6 +60,43 @@ function nftBurnLog(tokenAddress: Address, from: Address, tokenId: bigint) {
   };
 }
 
+function v3DecreaseLog(tokenAddress: Address, tokenId: bigint, liquidity = 1n) {
+  return {
+    address: tokenAddress,
+    topics: [
+      keccak256(stringToHex("DecreaseLiquidity(uint256,uint128,uint256,uint256)")),
+      pad(toHex(tokenId), { size: 32 }),
+    ] as Hex[],
+    data: encodeAbiParameters([{ type: "uint128" }, { type: "uint256" }, { type: "uint256" }], [liquidity, 1n, 1n]),
+  };
+}
+
+function v3CollectLog(tokenAddress: Address, tokenId: bigint, recipient: Address) {
+  return {
+    address: tokenAddress,
+    topics: [
+      keccak256(stringToHex("Collect(uint256,address,uint256,uint256)")),
+      pad(toHex(tokenId), { size: 32 }),
+    ] as Hex[],
+    data: encodeAbiParameters([{ type: "address" }, { type: "uint256" }, { type: "uint256" }], [recipient, 1n, 1n]),
+  };
+}
+
+function v4ModifyLiquidityLog(poolManager: Address, positionManager: Address, tokenId: bigint, liquidityDelta = -1n) {
+  return {
+    address: poolManager,
+    topics: [
+      keccak256(stringToHex("ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)")),
+      pad(toHex(1n), { size: 32 }),
+      pad(positionManager, { size: 32 }),
+    ] as Hex[],
+    data: encodeAbiParameters(
+      [{ type: "int24" }, { type: "int24" }, { type: "int256" }, { type: "bytes32" }],
+      [-120, -60, liquidityDelta, pad(toHex(tokenId), { size: 32 })],
+    ),
+  };
+}
+
 const config = {
   executorAddress: owner,
   executorPrivateKey: undefined,
@@ -251,6 +288,29 @@ function v4GroupValue(lower: number, upper: number, liquidity = 10n) {
 }
 
 describe("Executor pending settlement recovery", () => {
+  it("retains an empty V3 NFT after an atomic normal close", () => {
+    const executor = new Executor(
+      {} as never,
+      { getById: vi.fn(() => ({ registry: { name: "robinhood", contracts: { v3: { positionManager: groupManager } } } })) } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      config,
+    );
+    const position = {
+      id: "position", chainId: 4663, protocol: "v3", positionKey: "123", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "armed", liquidity: 10n, openedAtBlock: 1n, metadata: {},
+    } as PositionRecord;
+    const plan = (executor as any).closePlan(position, groupValue(-100, 100));
+    const decoded = decodeFunctionData({ abi: v3PositionManagerAbi, data: plan.data });
+
+    expect(decoded.args[0]).toHaveLength(2);
+    expect(decoded.args[0].map((call) => call.slice(0, 10))).toEqual([
+      toFunctionSelector("decreaseLiquidity((uint256,uint128,uint256,uint256,uint256))"),
+      toFunctionSelector("collect((uint256,address,uint128,uint128))"),
+    ]);
+  });
+
   it("encodes stored remove-liquidity hook data for a hooked V4 close", () => {
     const executor = new Executor({} as never, { getById: vi.fn(() => ({ registry: { contracts: { v4: { positionManager: groupManager } } } })) } as never, {} as never, {} as never, {} as never, config);
     const hookData = "0x1234" as Hex;
@@ -261,12 +321,15 @@ describe("Executor pending settlement recovery", () => {
     } as PositionRecord;
     const plan = (executor as any).closePlan(position, v4GroupValue(-100, 100));
     const decoded = decodeFunctionData({ abi: v4PositionManagerAbi, data: plan.data });
-    const [, inputs] = decodeAbiParameters([{ type: "bytes" }, { type: "bytes[]" }], decoded.args[0]);
-    const [, , , encodedHookData] = decodeAbiParameters(
-      [{ type: "uint256" }, { type: "uint128" }, { type: "uint128" }, { type: "bytes" }],
+    const [actions, inputs] = decodeAbiParameters([{ type: "bytes" }, { type: "bytes[]" }], decoded.args[0]);
+    const [tokenId, liquidity, , , encodedHookData] = decodeAbiParameters(
+      [{ type: "uint256" }, { type: "uint256" }, { type: "uint128" }, { type: "uint128" }, { type: "bytes" }],
       inputs[0]!,
     );
 
+    expect(actions).toBe("0x0111");
+    expect(tokenId).toBe(123n);
+    expect(liquidity).toBe(10n);
     expect(encodedHookData).toBe(hookData);
   });
 
@@ -1819,7 +1882,9 @@ describe("Executor pending settlement recovery", () => {
     const bins = [groupBin(0, 7n, "child-7", -120, -60), groupBin(1, 8n, "child-8", -60, 0)];
     const client = {
       getBlockNumber: vi.fn().mockResolvedValue(100n),
-      readContract: vi.fn().mockResolvedValue(owner),
+      readContract: vi.fn(async ({ functionName }: { functionName: string }) => functionName === "positions"
+        ? [0n, zeroAddress, usdg, token, 500, -120, -60, 0n, 0n, 0n, 0n, 0n]
+        : owner),
       call: vi.fn().mockResolvedValue({ data: "0x" }),
     };
     const receipt = {
@@ -1828,8 +1893,10 @@ describe("Executor pending settlement recovery", () => {
       logs: [
         transferLog(usdg, sender, owner, 23n),
         transferLog(token, sender, owner, 118n),
-        nftBurnLog(groupManager, owner, 7n),
-        nftBurnLog(groupManager, owner, 8n),
+        v3DecreaseLog(groupManager, 7n, 10n),
+        v3CollectLog(groupManager, 7n, owner),
+        v3DecreaseLog(groupManager, 8n, 10n),
+        v3CollectLog(groupManager, 8n, owner),
       ],
     };
     const database = {
@@ -1861,7 +1928,7 @@ describe("Executor pending settlement recovery", () => {
     const plan = sendGroup.mock.calls[0]![2] as { data: Hex };
     const outer = decodeFunctionData({ abi: v3PositionManagerAbi, data: plan.data });
     expect(plan.data.slice(0, 10)).toBe(toFunctionSelector("multicall(bytes[])") as string);
-    expect(outer.args[0]).toHaveLength(6);
+    expect(outer.args[0]).toHaveLength(4);
     expect(database.addPositionGroupCashflow).toHaveBeenCalledTimes(1);
     expect(database.addPositionGroupCashflow).toHaveBeenCalledWith(
       groupId,
@@ -1874,6 +1941,53 @@ describe("Executor pending settlement recovery", () => {
       expect.objectContaining({ source: "atomic_group_close", childCount: 2 }),
     );
     expect(closeReceiptAmounts).not.toHaveBeenCalled();
+  });
+
+  it("accepts retained zero-liquidity V4 NFTs after an atomic group close", async () => {
+    const poolManager = "0x0000000000000000000000000000000000000300" as Address;
+    const group = groupRecord("v4");
+    const bins = [groupBin(0, 7n, "child-7", -120, -60), groupBin(1, 8n, "child-8", -60, 0)];
+    const client = {
+      readContract: vi.fn(async ({ functionName }: { functionName: string }) => functionName === "getPositionLiquidity" ? 0n : owner),
+    };
+    const database = { listPositionGroupBins: vi.fn().mockResolvedValue(bins) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood", { poolManager }) })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
+    const receipt = {
+      status: "success" as const,
+      blockNumber: 101n,
+      logs: [
+        v4ModifyLiquidityLog(poolManager, groupManager, 7n, -10n),
+        v4ModifyLiquidityLog(poolManager, groupManager, 8n, -20n),
+      ],
+    };
+
+    await expect((executor as any).assertGroupCloseReceipt(group, receipt)).resolves.toBeUndefined();
+    expect(client.readContract).toHaveBeenCalledTimes(4);
+  });
+
+  it("accepts legacy V3 close receipts that burned the exact NFT set", async () => {
+    const group = groupRecord();
+    const bins = [groupBin(0, 7n, "child-7", -120, -60), groupBin(1, 8n, "child-8", -60, 0)];
+    const client = { readContract: vi.fn() };
+    const database = { listPositionGroupBins: vi.fn().mockResolvedValue(bins) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
+    const receipt = {
+      status: "success" as const,
+      blockNumber: 101n,
+      logs: [
+        v3DecreaseLog(groupManager, 7n),
+        v3CollectLog(groupManager, 7n, owner),
+        nftBurnLog(groupManager, owner, 7n),
+        v3DecreaseLog(groupManager, 8n),
+        v3CollectLog(groupManager, 8n, owner),
+        nftBurnLog(groupManager, owner, 8n),
+      ],
+    };
+
+    await expect((executor as any).assertGroupCloseReceipt(group, receipt)).resolves.toBeUndefined();
+    expect(client.readContract).not.toHaveBeenCalled();
   });
 
   it("ignores a stale triggerless recovery after an open becomes active", async () => {
@@ -1935,10 +2049,11 @@ describe("Executor pending settlement recovery", () => {
     const plan = sendGroup.mock.calls[0]![2] as { data: Hex };
     const outer = decodeFunctionData({ abi: v4PositionManagerAbi, data: plan.data });
     const [actions, params] = decodeAbiParameters([{ type: "bytes" }, { type: "bytes[]" }], outer.args[0]);
-    expect(actions).toBe("0x030311");
-    const burnTypes = [{ type: "uint256" }, { type: "uint128" }, { type: "uint128" }, { type: "bytes" }] as const;
+    expect(actions).toBe("0x010111");
+    const decreaseTypes = [{ type: "uint256" }, { type: "uint256" }, { type: "uint128" }, { type: "uint128" }, { type: "bytes" }] as const;
     for (const param of params.slice(0, 2)) {
-      const [, amount0Min, amount1Min] = decodeAbiParameters(burnTypes, param);
+      const [, liquidity, amount0Min, amount1Min] = decodeAbiParameters(decreaseTypes, param);
+      expect(liquidity).toBe(10n);
       expect(amount0Min).toBe(0n);
       expect(amount1Min).toBe(0n);
     }

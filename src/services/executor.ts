@@ -1111,6 +1111,7 @@ export class Executor {
       value: 0n,
       positions: children.map(({ bin, value, position }) => ({
         tokenId: bin.tokenId!,
+        liquidity: value.liquidity,
         amount0Min: zeroMinimums ? 0n : value.minAmount0,
         amount1Min: zeroMinimums ? 0n : value.minAmount1,
         ...(typeof position.metadata.hookData === "string" && isHex(position.metadata.hookData) ? { hookData: position.metadata.hookData } : {}),
@@ -1338,8 +1339,12 @@ export class Executor {
     const bins = await this.database.listPositionGroupBins(group.id);
     const expected = bins
       .filter((bin) => bin.status === "minted" && bin.tokenId !== null)
-      .map((bin) => bin.tokenId!.toString());
+      .map((bin) => bin.tokenId!);
     if (expected.length === 0) throw new GroupIntegrityError("Position group close receipt has no expected active token IDs");
+    const expectedIds = new Set(expected.map((tokenId) => tokenId.toString()));
+    const isExactSet = (actual: readonly bigint[]): boolean => actual.length === expected.length
+      && new Set(actual.map((tokenId) => tokenId.toString())).size === expected.length
+      && actual.every((tokenId) => expectedIds.has(tokenId.toString()));
     const burns = receipt.logs
       .filter((entry) => entry.address.toLowerCase() === group.positionManager.toLowerCase())
       .map((entry) => {
@@ -1353,12 +1358,53 @@ export class Executor {
       })
       .filter((value): value is { from: Address; to: Address; tokenId: bigint } => value !== null)
       .filter((value) => value.from.toLowerCase() === group.owner.toLowerCase() && value.to.toLowerCase() === zeroAddress.toLowerCase())
-      .map((value) => value.tokenId.toString());
-    if (burns.length !== expected.length || new Set(burns).size !== expected.length || burns.some((tokenId) => !expected.includes(tokenId))) {
-      throw new GroupIntegrityError("group close receipt does not burn the exact expected NFT set");
+      .map((value) => value.tokenId);
+    const legacyBurnClose = isExactSet(burns);
+    if (burns.length > 0 && !legacyBurnClose) {
+      throw new GroupIntegrityError("group close receipt contains a partial or unexpected NFT burn set");
     }
-    if (group.protocol !== "v4") return;
-    const { registry } = this.chains.getById(group.chainId);
+    const { client, registry } = this.chains.getById(group.chainId);
+    if (group.protocol === "v3") {
+      const decreases = receipt.logs
+        .filter((entry) => entry.address.toLowerCase() === group.positionManager.toLowerCase())
+        .map((entry) => {
+          try {
+            const decoded = decodeEventLog({ abi: [v3DecreaseLiquidityEvent], data: entry.data, topics: entry.topics as [Hex, ...Hex[]] });
+            const args = decoded.args as { tokenId?: bigint; liquidity?: bigint };
+            return args.tokenId !== undefined && args.liquidity !== undefined && args.liquidity > 0n ? args.tokenId : null;
+          } catch {
+            return null;
+          }
+        })
+        .filter((tokenId): tokenId is bigint => tokenId !== null);
+      if (!isExactSet(decreases)) throw new GroupIntegrityError("V3 group close receipt does not decrease the exact expected NFT set");
+      const collects = receipt.logs
+        .filter((entry) => entry.address.toLowerCase() === group.positionManager.toLowerCase())
+        .map((entry) => {
+          try {
+            const decoded = decodeEventLog({ abi: [v3CollectEvent], data: entry.data, topics: entry.topics as [Hex, ...Hex[]] });
+            const args = decoded.args as { tokenId?: bigint; recipient?: Address };
+            return args.tokenId !== undefined && args.recipient?.toLowerCase() === group.owner.toLowerCase() ? args.tokenId : null;
+          } catch {
+            return null;
+          }
+        })
+        .filter((tokenId): tokenId is bigint => tokenId !== null);
+      if (!isExactSet(collects)) throw new GroupIntegrityError("V3 group close receipt does not collect the exact expected NFT set to the group owner");
+      if (legacyBurnClose) return;
+      await Promise.all(expected.map(async (tokenId) => {
+        const [owner, details] = await Promise.all([
+          client.readContract({ address: group.positionManager, abi: v3PositionManagerAbi, functionName: "ownerOf", args: [tokenId], blockNumber: receipt.blockNumber }),
+          client.readContract({ address: group.positionManager, abi: v3PositionManagerAbi, functionName: "positions", args: [tokenId], blockNumber: receipt.blockNumber }),
+        ]);
+        const position = details as readonly [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint];
+        if (owner.toLowerCase() !== group.owner.toLowerCase()) throw new GroupIntegrityError(`V3 retained NFT ${tokenId} is not owned by the group owner`);
+        if (position[7] !== 0n || position[10] !== 0n || position[11] !== 0n) {
+          throw new GroupIntegrityError(`V3 retained NFT ${tokenId} is not economically empty`);
+        }
+      }));
+      return;
+    }
     const modifications = receipt.logs
       .filter((entry) => entry.address.toLowerCase() === registry.contracts.v4.poolManager.toLowerCase())
       .map((entry) => {
@@ -1375,9 +1421,18 @@ export class Executor {
     if (modifications.length !== expected.length) throw new GroupIntegrityError("V4 group close receipt does not contain one negative liquidity event per child");
     const salts = new Set(modifications.map((modification) => modification.salt.toLowerCase()));
     for (const tokenId of expected) {
-      const salt = pad(toHex(BigInt(tokenId)), { size: 32 }).toLowerCase();
+      const salt = pad(toHex(tokenId), { size: 32 }).toLowerCase();
       if (!salts.has(salt)) throw new GroupIntegrityError(`V4 group close receipt is missing token-ID salt ${tokenId}`);
     }
+    if (legacyBurnClose) return;
+    await Promise.all(expected.map(async (tokenId) => {
+      const [owner, liquidity] = await Promise.all([
+        client.readContract({ address: group.positionManager, abi: v4PositionManagerAbi, functionName: "ownerOf", args: [tokenId], blockNumber: receipt.blockNumber }),
+        client.readContract({ address: group.positionManager, abi: v4PositionManagerAbi, functionName: "getPositionLiquidity", args: [tokenId], blockNumber: receipt.blockNumber }),
+      ]);
+      if (owner.toLowerCase() !== group.owner.toLowerCase()) throw new GroupIntegrityError(`V4 retained NFT ${tokenId} is not owned by the group owner`);
+      if (liquidity !== 0n) throw new GroupIntegrityError(`V4 retained NFT ${tokenId} still has liquidity`);
+    }));
   }
 
   private async resumeGroupSettlement(group: PositionGroupRecord, hash: Hex, trigger?: ExitTrigger): Promise<void> {
@@ -2850,11 +2905,10 @@ export class Executor {
         functionName: "collect",
         args: [{ tokenId, recipient: position.owner, amount0Max: (1n << 128n) - 1n, amount1Max: (1n << 128n) - 1n }],
       });
-      const burn = encodeFunctionData({ abi: v3PositionManagerAbi, functionName: "burn", args: [tokenId] });
       return {
         chainId: position.chainId,
         to: v3ContractsFor(registry, dexNameFromMetadata(position.metadata)).positionManager,
-        data: encodeFunctionData({ abi: v3PositionManagerAbi, functionName: "multicall", args: [[decrease, collect, burn]] }),
+        data: encodeFunctionData({ abi: v3PositionManagerAbi, functionName: "multicall", args: [[decrease, collect]] }),
         description: "remove V3 liquidity and collect fees",
       };
     }
@@ -2864,20 +2918,20 @@ export class Executor {
       : typeof position.metadata.hookData === "string" && isHex(position.metadata.hookData)
         ? position.metadata.hookData
         : "0x";
-    const burnParams = encodeAbiParameters(
-      [{ type: "uint256" }, { type: "uint128" }, { type: "uint128" }, { type: "bytes" }],
-      [BigInt(position.positionKey), value.minAmount0, value.minAmount1, removeHookData],
+    const decreaseParams = encodeAbiParameters(
+      [{ type: "uint256" }, { type: "uint256" }, { type: "uint128" }, { type: "uint128" }, { type: "bytes" }],
+      [BigInt(position.positionKey), value.liquidity, value.minAmount0, value.minAmount1, removeHookData],
     );
     const takePairParams = encodeAbiParameters(
       [{ type: "address" }, { type: "address" }, { type: "address" }],
       [value.v4PoolKey.currency0, value.v4PoolKey.currency1, position.owner],
     );
-    const unlockData = encodeAbiParameters([{ type: "bytes" }, { type: "bytes[]" }], ["0x0311", [burnParams, takePairParams]]);
+    const unlockData = encodeAbiParameters([{ type: "bytes" }, { type: "bytes[]" }], ["0x0111", [decreaseParams, takePairParams]]);
     return {
       chainId: position.chainId,
       to: registry.contracts.v4.positionManager,
       data: encodeFunctionData({ abi: v4PositionManagerAbi, functionName: "modifyLiquidities", args: [unlockData, deadline] }),
-      description: "burn V4 position and take pair",
+      description: "remove V4 liquidity and take pair",
     };
   }
 

@@ -90,7 +90,7 @@ describe("pure Bid-Ask batch calldata", () => {
     expect(decodeFunctionData({ abi: v3RefundAbi, data: calls[2]! }).functionName).toBe("refundETH");
   });
 
-  it("encodes decrease, collect, and burn for every V3 child", () => {
+  it("encodes decrease and collect without burning V3 children", () => {
     const plan = buildV3BidAskClosePlan({
       chainId: 8453,
       positionManager: manager,
@@ -105,14 +105,12 @@ describe("pure Bid-Ask batch calldata", () => {
 
     const outer = decodeFunctionData({ abi: v3PositionManagerAbi, data: plan.data });
     const calls = outer.args[0];
-    expect(calls).toHaveLength(6);
+    expect(calls).toHaveLength(4);
     expect(selectors(calls)).toEqual([
       toFunctionSelector("decreaseLiquidity((uint256,uint128,uint256,uint256,uint256))"),
       toFunctionSelector("collect((uint256,address,uint128,uint128))"),
-      toFunctionSelector("burn(uint256)"),
       toFunctionSelector("decreaseLiquidity((uint256,uint128,uint256,uint256,uint256))"),
       toFunctionSelector("collect((uint256,address,uint128,uint128))"),
-      toFunctionSelector("burn(uint256)"),
     ]);
   });
 
@@ -135,7 +133,7 @@ describe("pure Bid-Ask batch calldata", () => {
     expect(params).toHaveLength(4);
   });
 
-  it("encodes repeated V4 burns followed by one take-pair", () => {
+  it("encodes repeated V4 decreases followed by one take-pair", () => {
     const plan = buildV4BidAskClosePlan({
       chainId: 8453,
       positionManager: manager,
@@ -144,14 +142,16 @@ describe("pure Bid-Ask batch calldata", () => {
       deadline: 1234n,
       value: 0n,
       positions: [
-        { tokenId: 7n, amount0Min: 1n, amount1Min: 2n },
-        { tokenId: 8n, amount0Min: 3n, amount1Min: 4n },
-        { tokenId: 9n, amount0Min: 5n, amount1Min: 6n },
+        { tokenId: 7n, liquidity: 10n, amount0Min: 1n, amount1Min: 2n },
+        { tokenId: 8n, liquidity: 20n, amount0Min: 3n, amount1Min: 4n },
+        { tokenId: 9n, liquidity: 30n, amount0Min: 5n, amount1Min: 6n },
       ],
     });
 
     const { actions, params } = decodeUnlockData(plan.data);
-    expect(actions).toBe("0x03030311");
+    expect(actions).toBe("0x01010111");
     expect(params).toHaveLength(4);
+    const decreaseTypes = [{ type: "uint256" }, { type: "uint256" }, { type: "uint128" }, { type: "uint128" }, { type: "bytes" }] as const;
+    expect(params.slice(0, 3).map((param) => decodeAbiParameters(decreaseTypes, param)[1])).toEqual([10n, 20n, 30n]);
   });
 });
