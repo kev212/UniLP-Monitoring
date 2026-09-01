@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { RuntimeConfig } from "../src/config.js";
 import type { PositionOpener } from "../src/services/position-opener.js";
-import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isDashboardVisibleGroup, isExpiredCallbackError, Notifier, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanPoolsInput, parseScanV2Input, positionRangeBins, positionRangeLine, soleEnabledChain, trailingPeakDisplay } from "../src/services/notifier.js";
+import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isDashboardVisibleGroup, isExpiredCallbackError, Notifier, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanPoolsInput, parseScanV2Input, positionRangeBins, positionRangeLine, soleEnabledChain, trailingDisabledDisplay, trailingPeakDisplay, trailingTogglePatch } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {
   it("does not block Telegram updates while a confirmed open is pending", async () => {
@@ -249,6 +249,14 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseDashboardAction("lp:calendar:2026-07")).toEqual({ type: "calendar", year: 2026, month: 7 });
     expect(parseDashboardAction("lp:calnav:2026-06")).toEqual({ type: "calendar_page", year: 2026, month: 6 });
     expect(parseDashboardAction("lp:histpg:2")).toEqual({ type: "history_page", page: 2 });
+    expect(parseDashboardAction("lp:trailpg:1")).toEqual({ type: "trail_page", page: 1 });
+    expect(parseDashboardAction("lp:trail:0:4663:v4:49339")).toEqual({
+      type: "trail",
+      page: 0,
+      chainId: 4663,
+      protocol: "v4",
+      positionKey: "49339",
+    });
     expect(parseDashboardAction("lp:calendar:2026-13")).toBeNull();
   });
 
@@ -376,5 +384,29 @@ describe("dashboard group visibility", () => {
       trailingStop: { peakPnlBps: "invalid" },
       trailingStopExpected: { peakPnlBps: "670" },
     })).toBe(" | 🎯 Peak 6.70%");
+    expect(trailingPeakDisplay({
+      trailingDisabled: true,
+      trailingStop: { peakPnlBps: "720" },
+      trailingStopExpected: { peakPnlBps: "679" },
+    })).toBe("");
+    expect(trailingDisabledDisplay({ trailingDisabled: true })).toBe(" | Trail OFF");
+    expect(trailingDisabledDisplay({})).toBe("");
+  });
+
+  it("clears trailing peaks when disabling and starts fresh when enabling", () => {
+    expect(trailingTogglePatch({
+      trailingStop: { peakPnlBps: "720" },
+      trailingStopExpected: { peakPnlBps: "679" },
+      exitRetry: { reason: "trailing_take_profit", attempts: 1 },
+      exitTrigger: "trailing_take_profit",
+    }, true)).toEqual({
+      trailingDisabled: true,
+      trailingStop: null,
+      trailingStopExpected: null,
+      trailingTwapWaitStartedAt: null,
+      exitRetry: null,
+      exitTrigger: null,
+    });
+    expect(trailingTogglePatch({ trailingDisabled: true }, false)).toEqual({ trailingDisabled: false });
   });
 });

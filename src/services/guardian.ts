@@ -241,7 +241,10 @@ export class Guardian {
         feeNonQuote: null,
         feeQuoteUsdg: valued.snapshot.feeQuoteUsdg,
       };
-      const localTrailing = this.pnl.evaluateTrailingStop(group.metadata, syntheticSnapshot, "local");
+      const trailingEnabled = group.metadata.trailingDisabled !== true;
+      const localTrailing = trailingEnabled
+        ? this.pnl.evaluateTrailingStop(group.metadata, syntheticSnapshot, "local")
+        : { action: "none" } as const;
       if (localTrailing.action === "reset") {
         await this.database.setPositionGroupStatus(group.id, group.status, { trailingStop: null }, group.status);
       } else if (localTrailing.action === "activate" || localTrailing.action === "raise_peak") {
@@ -269,7 +272,7 @@ export class Guardian {
         }
       }
       const staticTrigger = this.confirmedGroupExactTrigger(exactSnapshot);
-      const expectedTrailing = exactSnapshot && isAggregatorQuote(exactSnapshot.quoteProvider)
+      const expectedTrailing = trailingEnabled && exactSnapshot && isAggregatorQuote(exactSnapshot.quoteProvider)
         ? this.pnl.evaluateTrailingStop(group.metadata, groupTrailingSnapshot(group.id, exactSnapshot), "expected")
         : { action: "none" } as const;
       if (expectedTrailing.action === "reset") {
@@ -291,7 +294,11 @@ export class Guardian {
         ?? profitOorTrigger
         ?? oorTrigger;
       const pendingRetry = parseExitRetry(group.metadata);
-      const retryTrigger = pendingRetry && shouldResumeGroupExitRetry(pendingRetry.reason) ? pendingRetry.reason : null;
+      const retryTrigger = pendingRetry
+        && shouldResumeGroupExitRetry(pendingRetry.reason)
+        && !(pendingRetry.reason === "trailing_take_profit" && !trailingEnabled)
+        ? pendingRetry.reason
+        : null;
       let trigger: ExitTrigger | null = liveTrigger === "stop_loss"
         ? liveTrigger
         : retryTrigger ?? liveTrigger;
@@ -464,7 +471,10 @@ export class Guardian {
       log.debug({ positionId: position.id, positionKey: position.positionKey, valuationMs: Date.now() - startedAt }, "position valued");
       await this.database.addPnlSnapshot(valued.snapshot);
       await this.notifier.logPnL(position, valued.snapshot);
-      const localTrailing = this.pnl.evaluateTrailingStop(position.metadata, valued.snapshot, "local");
+      const trailingEnabled = position.metadata.trailingDisabled !== true;
+      const localTrailing = trailingEnabled
+        ? this.pnl.evaluateTrailingStop(position.metadata, valued.snapshot, "local")
+        : { action: "none" } as const;
       const oorTrigger = await this.updateOorAboveTimer(position, valued.range);
       const profitOorTrigger = await this.updateProfitOorAboveTimer(position, valued.range, valued.snapshot.pnlBps);
 
@@ -516,7 +526,7 @@ export class Guardian {
         }
       }
       const staticTrigger = this.confirmedPositionExactTrigger(exactSnapshot, exactRange, quoteIsToken0);
-      const expectedTrailing = exactSnapshot && isAggregatorQuote(exactSnapshot.quoteProvider)
+      const expectedTrailing = trailingEnabled && exactSnapshot && isAggregatorQuote(exactSnapshot.quoteProvider)
         ? this.pnl.evaluateTrailingStop(position.metadata, exactSnapshot, "expected")
         : { action: "none" } as const;
       if (localTrailing.action === "activate" || localTrailing.action === "raise_peak") {
@@ -549,7 +559,11 @@ export class Guardian {
         ?? profitOorTrigger
         ?? oorTrigger;
       const pendingRetry = !trigger ? parseExitRetry(position.metadata) : null;
-      const retryTrigger = pendingRetry && shouldResumeExitRetry(pendingRetry.reason) ? pendingRetry.reason : null;
+      const retryTrigger = pendingRetry
+        && shouldResumeExitRetry(pendingRetry.reason)
+        && !(pendingRetry.reason === "trailing_take_profit" && !trailingEnabled)
+        ? pendingRetry.reason
+        : null;
       const effectiveTrigger: ExitTrigger | null = trigger ?? retryTrigger;
       if (!effectiveTrigger) {
         const staleDynamicRetry = pendingRetry && !shouldResumeExitRetry(pendingRetry.reason);

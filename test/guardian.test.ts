@@ -1187,6 +1187,40 @@ describe("monitor RPC retries", () => {
     expect(executor.executeRelatedGroup).toHaveBeenCalledWith("trail", "trailing_take_profit");
   });
 
+  it("does not trail-close a group when trailing is disabled", async () => {
+    const value = { ...valued, snapshot: { ...valued.snapshot, pnlBps: 900n, pnlQuote: 90_000n } };
+    const pnl = {
+      valueGroup: vi.fn().mockResolvedValue(value),
+      valueGroupExactProbe: vi.fn().mockResolvedValue(value),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "trigger" }),
+      shouldTriggerGroup: vi.fn().mockReturnValue(null),
+      isNearExactThreshold: vi.fn().mockReturnValue(false),
+    };
+    const database = { setPositionGroupStatus: vi.fn().mockResolvedValue(undefined) };
+    const executor = { executeRelatedGroup: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      { slTwapGuardMaxWaitMs: 5_000, trailingTwapGuardMaxWaitMs: 5_000 } as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      {} as never,
+    );
+    const evaluate = (guardian as unknown as {
+      evaluatePositionGroup(name: "robinhood", value: PositionGroupRecord, block: bigint): Promise<boolean>;
+    }).evaluatePositionGroup.bind(guardian);
+
+    await expect(evaluate("robinhood", {
+      ...group("trail-off"),
+      metadata: { trailingDisabled: true, trailingStop: { peakPnlBps: "900", activatedAtBlock: "1" } },
+    }, 10n)).resolves.toBe(true);
+
+    expect(pnl.evaluateTrailingStop).not.toHaveBeenCalled();
+    expect(executor.executeRelatedGroup).not.toHaveBeenCalled();
+  });
+
   it("defers group trailing exits while the estimate remains above the gate", async () => {
     const value = { ...valued, snapshot: { ...valued.snapshot, pnlBps: 240n, pnlQuote: 24_000n } };
     const pnl = {

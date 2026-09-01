@@ -94,7 +94,9 @@ type DashboardAction =
   | { type: "open_pool_input"; page: number }
   | { type: "open_confirm"; requestId: string }
   | { type: "open_cancel"; page: number }
-  | { type: "select" | "confirm"; page: number; chainId: number; protocol: Protocol; positionKey: string };
+  | { type: "select" | "confirm"; page: number; chainId: number; protocol: Protocol; positionKey: string }
+  | { type: "trail"; page: number; chainId: number; protocol: Protocol; positionKey: string }
+  | { type: "trail_page"; page: number };
 
 type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "stock_yield" | "max_results";
 type RiskSettingKey = "stop_loss" | "take_profit" | "trailing_activation" | "trailing_drawdown";
@@ -183,6 +185,7 @@ export class Notifier {
       { command: "gem", description: "💎 Hidden gem radar — yield gacor V3/V4" },
       { command: "history", description: "Tampilkan riwayat posisi close >= ±$0.50 PnL" },
       { command: "calendar", description: "Tampilkan kalender realized PnL UTC" },
+      { command: "trail", description: "On/off trailing stop per posisi — /trail" },
     ]).catch((error) => {
       log.warn({ err: error }, "Telegram command registration failed; bot will continue without updated commands");
     });
@@ -234,6 +237,10 @@ export class Notifier {
     this.bot.command("calendar", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleCalendarCommand(ctx, database);
+    });
+    this.bot.command("trail", async (ctx: ChatContext) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
+      await this.handleTrail(ctx, database);
     });
     this.bot.callbackQuery(/^lp:/, async (ctx) => {
       await this.handleDashboardCallback(ctx, database, pnl, executor, scanner);
@@ -716,6 +723,14 @@ export class Notifier {
         await this.replyTemp(ctx, "❌ Open position dibatalkan.");
         return;
       }
+      if (action.type === "trail_page") {
+        await this.showTrailMenu(database, chatId, message.message_id, action.page);
+        return;
+      }
+      if (action.type === "trail") {
+        await this.toggleTrailing(database, chatId, message.message_id, action);
+        return;
+      }
       if (action.type !== "select" && action.type !== "confirm") {
         await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
         return;
@@ -1000,7 +1015,7 @@ export class Notifier {
     return label.length <= 64 ? label : `${label.slice(0, 61)}...`;
   }
 
-  private async findDashboardPosition(database: Database, action: Extract<DashboardAction, { type: "select" | "confirm" }>): Promise<PositionRecord | null> {
+  private async findDashboardPosition(database: Database, action: Extract<DashboardAction, { type: "select" | "confirm" | "trail" }>): Promise<PositionRecord | null> {
     if (!this.config.chains.some((chain) => this.chains.get(chain).registry.chain.id === action.chainId)) return null;
     const position = await database.findPositionByKey(action.chainId, action.protocol, action.positionKey);
     if (position) return position;
@@ -1075,7 +1090,7 @@ export class Notifier {
       : undefined;
     const rangeStr = await this.formatPositionRange(position, rangeInfo);
     const base = `${index}. ${headerEmoji} ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}`;
-    const valueLine = `   💰 ${cv} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${pnlArrow} ${pnlSign}${pnlPct}%${trailingPeak}`;
+    const valueLine = `   💰 ${cv} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${pnlArrow} ${pnlSign}${pnlPct}%${trailingPeak}${trailingDisabledDisplay(position.metadata)}`;
     return `${base}\n${valueLine}${formatExactQuoteLine(exact)}${rangeStr}\n`;
   }
 
@@ -1099,7 +1114,7 @@ export class Notifier {
     const sign = snapshot.pnlBps >= 0n ? "+" : "";
     const arrow = snapshot.pnlBps > 0n ? "📈" : snapshot.pnlBps < 0n ? "📉" : "➖";
     const trailingPeak = trailingPeakDisplay(position.metadata);
-    const valueLine = `   💰 ${value} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${arrow} ${sign}${formatBps(snapshot.pnlBps)}%${trailingPeak}`;
+    const valueLine = `   💰 ${value} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${arrow} ${sign}${formatBps(snapshot.pnlBps)}%${trailingPeak}${trailingDisabledDisplay(position.metadata)}`;
     const rangeLine = await this.formatGroupPositionRange(position, snapshot, bins);
     return `${base}\n${valueLine}${formatExactQuoteLine(exact)}${rangeLine}\n`;
   }
@@ -1167,7 +1182,7 @@ export class Notifier {
       const headerEmoji = valued.snapshot.pnlBps < 0n ? "🔴" : "🟢";
       const rangeStr = await this.formatPositionRange(position, valued.range);
       const base = `${index}. ${headerEmoji} ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}`;
-      const valueLine = `   💰 ${cv} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${pnlArrow} ${pnlSign}${pnlPct}%${trailingPeak}`;
+      const valueLine = `   💰 ${cv} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${pnlArrow} ${pnlSign}${pnlPct}%${trailingPeak}${trailingDisabledDisplay(position.metadata)}`;
       return `${base}\n${valueLine}${rangeStr}\n`;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2213,6 +2228,75 @@ export class Notifier {
     }
   }
 
+  private async handleTrail(ctx: ChatContext, database: Database): Promise<void> {
+    const chatId = ctx.chat.id.toString();
+    if (!this.authorized(chatId, ctx.from?.id.toString())) return;
+    const view = await this.renderTrailMenu(database, 0);
+    await ctx.reply(view.text, { reply_markup: view.keyboard });
+  }
+
+  private async showTrailMenu(database: Database, chatId: string, messageId: number, requestedPage: number, notice?: string): Promise<void> {
+    const view = await this.renderTrailMenu(database, requestedPage, notice);
+    await this.editDashboardMessage(chatId, messageId, view.text, view.keyboard);
+  }
+
+  private async renderTrailMenu(database: Database, requestedPage: number, notice?: string): Promise<{ text: string; keyboard: InlineKeyboard; page: number }> {
+    const { active } = await this.activePositions(database, false);
+    const pageCount = Math.max(1, Math.ceil(active.length / DASHBOARD_PAGE_SIZE));
+    const page = clampDashboardPage(requestedPage, pageCount);
+    const first = page * DASHBOARD_PAGE_SIZE;
+    const keyboard = new InlineKeyboard();
+    const lines = ["🎯 TRAILING STOP", "Pilih posisi untuk on/off."];
+    if (notice) lines.push("", notice);
+
+    if (active.length === 0) {
+      lines.push("", "Tidak ada posisi aktif.");
+    } else {
+      for (const [offset, position] of active.slice(first, first + DASHBOARD_PAGE_SIZE).entries()) {
+        keyboard.text(await this.trailButtonLabel(position, first + offset + 1), trailPositionAction(page, position)).row();
+      }
+      if (pageCount > 1) {
+        if (page > 0) keyboard.text("← Prev", trailPageAction(page - 1));
+        if (page < pageCount - 1) keyboard.text("Next →", trailPageAction(page + 1));
+        keyboard.row();
+      }
+    }
+    return { text: lines.join("\n"), keyboard, page };
+  }
+
+  private async toggleTrailing(database: Database, chatId: string, messageId: number, action: Extract<DashboardAction, { type: "trail" }>): Promise<void> {
+    const position = await this.findDashboardPosition(database, action);
+    if (!position) {
+      await this.showTrailMenu(database, chatId, messageId, action.page, "Posisi tidak ditemukan.");
+      return;
+    }
+    const disabled = position.metadata.trailingDisabled !== true;
+    const patch = trailingTogglePatch(position.metadata, disabled);
+    const groupId = isGroupParent(position) ? managedPositionGroupId(position) : null;
+    if (groupId) {
+      const group = await database.getPositionGroup(groupId);
+      if (!group || group.status === "settled" || group.status === "cancelled") {
+        await this.showTrailMenu(database, chatId, messageId, action.page, "Group sudah tidak aktif.");
+        return;
+      }
+      await database.setPositionGroupStatus(group.id, group.status, patch, group.status);
+    } else {
+      await database.setPositionStatus(position.id, position.status, patch);
+    }
+    const pair = await this.pairLabel(position);
+    await this.showTrailMenu(database, chatId, messageId, action.page, disabled ? `${pair} trailing OFF` : `${pair} trailing ON`);
+  }
+
+  private async trailButtonLabel(position: PositionRecord, index: number): Promise<string> {
+    const pair = await this.pairLabel(position);
+    const groupId = isGroupParent(position) ? managedPositionGroupId(position) : null;
+    const state = position.metadata.trailingDisabled === true ? "OFF" : "ON";
+    const label = groupId
+      ? `#${index} ${pair} · ${position.protocol.toUpperCase()} · BA · ${state}`
+      : `#${index} ${pair} · ${position.protocol.toUpperCase()} · ${state}`;
+    return label.length <= 64 ? label : `${label.slice(0, 61)}...`;
+  }
+
   private async handleClose(ctx: ChatContext, database: Database, executor: Executor): Promise<void> {
     const chatId = ctx.chat.id.toString();
     if (!this.authorized(chatId, ctx.from?.id.toString())) return;
@@ -2409,6 +2493,14 @@ function dashboardPositionAction(type: "select" | "confirm", page: number, posit
   return `lp:${type}:${page}:${position.chainId}:${position.protocol}:${position.positionKey}`;
 }
 
+function trailPositionAction(page: number, position: PositionRecord): string {
+  return `lp:trail:${page}:${position.chainId}:${position.protocol}:${position.positionKey}`;
+}
+
+function trailPageAction(page: number): string {
+  return `lp:trailpg:${page}`;
+}
+
 export function parseDashboardAction(data: string | undefined): DashboardAction | null {
   if (!data) return null;
   const parts = data.split(":");
@@ -2429,6 +2521,18 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
   if (parts.length === 3 && parts[0] === "lp" && parts[1] === "histpg") {
     const page = parseDashboardPage(parts[2]);
     return page === null ? null : { type: "history_page", page };
+  }
+  if (parts.length === 3 && parts[0] === "lp" && parts[1] === "trailpg") {
+    const page = parseDashboardPage(parts[2]);
+    return page === null ? null : { type: "trail_page", page };
+  }
+  if (parts.length === 6 && parts[0] === "lp" && parts[1] === "trail") {
+    const page = parseDashboardPage(parts[2]);
+    const chainId = Number(parts[3]);
+    const protocol = parts[4];
+    const positionKey = parts[5];
+    if (page === null || !Number.isSafeInteger(chainId) || chainId <= 0 || !isProtocol(protocol) || !positionKey) return null;
+    return { type: "trail", page, chainId, protocol, positionKey };
   }
   if (parts.length === 3 && parts[0] === "lp" && parts[1] === "openmode" && (parts[2] === "single" || parts[2] === "dual")) {
     return { type: "open_mode", mode: parts[2], page: 0 };
@@ -3027,6 +3131,7 @@ function pnlEmoji(pnlBps: bigint): string {
 }
 
 export function trailingPeakDisplay(metadata: Record<string, unknown>): string {
+  if (metadata.trailingDisabled === true) return "";
   const peaks = [metadata.trailingStop, metadata.trailingStopExpected].flatMap((raw) => {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
     const peak = (raw as Record<string, unknown>).peakPnlBps;
@@ -3040,6 +3145,27 @@ export function trailingPeakDisplay(metadata: Record<string, unknown>): string {
   if (peaks.length === 0) return "";
   const peak = peaks.reduce((highest, current) => current > highest ? current : highest);
   return ` | 🎯 Peak ${formatBps(peak)}%`;
+}
+
+export function trailingDisabledDisplay(metadata: Record<string, unknown>): string {
+  return metadata.trailingDisabled === true ? " | Trail OFF" : "";
+}
+
+export function trailingTogglePatch(metadata: Record<string, unknown>, disabled: boolean): Record<string, unknown> {
+  if (!disabled) return { trailingDisabled: false };
+  const retry = metadata.exitRetry;
+  const retryReason = retry && typeof retry === "object" && !Array.isArray(retry) && typeof (retry as { reason?: unknown }).reason === "string"
+    ? (retry as { reason: string }).reason
+    : null;
+  return {
+    trailingDisabled: true,
+    trailingStop: null,
+    trailingStopExpected: null,
+    trailingTwapWaitStartedAt: null,
+    ...(retryReason === "trailing_take_profit" || metadata.exitTrigger === "trailing_take_profit"
+      ? { exitRetry: null, exitTrigger: null }
+      : {}),
+  };
 }
 
 function reviewReasonDisplay(metadata: Record<string, unknown>): string {

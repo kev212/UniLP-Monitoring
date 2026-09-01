@@ -574,15 +574,18 @@ export class PnlService {
       percentToBps(this.config.takeProfitPercent),
       percentToBps(this.config.profitOorAboveThresholdPercent),
     ];
-    thresholds.push(percentToBps(this.config.trailingStopActivationPercent));
-    for (const source of ["local", "expected"] as const) {
-      const trailingFloor = this.trailingFloorBps(metadata, source);
-      if (trailingFloor !== null) thresholds.push(trailingFloor);
+    if (!isTrailingDisabled(metadata)) {
+      thresholds.push(percentToBps(this.config.trailingStopActivationPercent));
+      for (const source of ["local", "expected"] as const) {
+        const trailingFloor = this.trailingFloorBps(metadata, source);
+        if (trailingFloor !== null) thresholds.push(trailingFloor);
+      }
     }
     return thresholds.some((threshold) => absolute(snapshot.pnlBps - threshold) <= bufferBps);
   }
 
   evaluateTrailingStop(metadata: Record<string, unknown>, snapshot: PnlSnapshot, source: TrailingStopSource = "local"): TrailingStopDecision {
+    if (isTrailingDisabled(metadata)) return { action: "none" };
     const state = parseTrailingStopState(metadata, source);
     if (snapshot.pnlBps < 0n) return state ? { action: "reset" } : { action: "none" };
 
@@ -603,6 +606,7 @@ export class PnlService {
   }
 
   trailingExitEstimateGateBps(metadata: Record<string, unknown>, source: TrailingStopSource = "local"): bigint | null {
+    if (isTrailingDisabled(metadata)) return null;
     const state = parseTrailingStopState(metadata, source);
     if (!state) return null;
     const trailingFloor = state.peakPnlBps - percentToBps(this.config.trailingStopDrawdownPercent);
@@ -612,6 +616,7 @@ export class PnlService {
   }
 
   trailingFloorBps(metadata: Record<string, unknown>, source: TrailingStopSource = "local"): bigint | null {
+    if (isTrailingDisabled(metadata)) return null;
     const state = parseTrailingStopState(metadata, source);
     if (!state) return null;
     return state.peakPnlBps - percentToBps(this.config.trailingStopDrawdownPercent);
@@ -873,4 +878,8 @@ function allocateRouteOutput(
 
 export function isQuoteToken(token: Address, allowlist: readonly { address: Address }[]): boolean {
   return allowlist.some((allowed) => allowed.address.toLowerCase() === token.toLowerCase());
+}
+
+export function isTrailingDisabled(metadata: Record<string, unknown>): boolean {
+  return metadata.trailingDisabled === true;
 }
