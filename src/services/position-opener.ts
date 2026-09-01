@@ -1291,7 +1291,6 @@ export class PositionOpener {
       const serializedTransaction = await wallet.signTransaction(preparedRequest);
       const hash = keccak256(serializedTransaction);
       const transactionNonce = preparedRequest.nonce === undefined ? undefined : BigInt(preparedRequest.nonce);
-      let broadcastAccepted = false;
       let confirmedReceipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>> | undefined;
 
       await this.database!.recordPositionGroupExecution(groupId, "open_batch", "submitted", hash, serializedTransaction, transactionNonce, undefined, {
@@ -1303,7 +1302,6 @@ export class PositionOpener {
       try {
         const broadcastHash = await wallet.sendRawTransaction({ serializedTransaction });
         if (broadcastHash.toLowerCase() !== hash.toLowerCase()) throw new Error("Bid-Ask open broadcast returned an unexpected transaction hash");
-        broadcastAccepted = true;
         confirmedReceipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
         if (confirmedReceipt.status !== "success") {
           await this.database!.recordPositionGroupExecution(groupId, "open_batch", "failed", hash, undefined, undefined, "transaction reverted");
@@ -1319,11 +1317,10 @@ export class PositionOpener {
         return { hash, receipt: confirmedReceipt };
       } catch (error) {
         if (error instanceof Error && error.message.includes("reverted")) throw error;
-        if (broadcastAccepted) {
-          log.warn({ err: error, chain, groupId, transactionHash: hash }, "Bid-Ask open broadcast accepted; confirmation deferred to reconciliation");
-          return { hash, ...(confirmedReceipt ? { receipt: confirmedReceipt } : {}), pendingReconciliation: true };
-        }
-        throw new Error(`open_batch transaction ${hash} is pending reconciliation: ${error instanceof Error ? error.message : String(error)}`);
+        // The signed transaction is persisted before broadcast. A provider error can occur
+        // after accepting it, so reconciliation must own recovery instead of cancelling open.
+        log.warn({ err: error, chain, groupId, transactionHash: hash }, "Bid-Ask open confirmation deferred to reconciliation");
+        return { hash, ...(confirmedReceipt ? { receipt: confirmedReceipt } : {}), pendingReconciliation: true };
       }
     };
 

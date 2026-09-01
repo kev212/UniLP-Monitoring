@@ -393,6 +393,44 @@ describe("Bid-Ask NVDA opening", () => {
     );
   });
 
+  it("returns pending reconciliation when the broadcast RPC errors after durable signing", async () => {
+    const database = {
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      nextPositionGroupExecutionNonce: vi.fn().mockResolvedValue(7),
+      recordPositionGroupExecution: vi.fn(),
+      setPositionGroupOpenTransaction: vi.fn().mockResolvedValue(true),
+      setPositionGroupStatus: vi.fn(),
+      withExecutionLock: vi.fn(async (_chainId: number, _owner: Address, work: () => Promise<unknown>) => work()),
+    };
+    const client = {
+      call: vi.fn().mockResolvedValue(undefined),
+      getTransactionCount: vi.fn().mockResolvedValue(7),
+      waitForTransactionReceipt: vi.fn(),
+    };
+    const chains = {
+      getForScan: vi.fn(() => ({ registry: chainRegistry.robinhood, client })),
+      getForExecution: vi.fn(() => ({ registry: chainRegistry.robinhood, client, transport: {} })),
+    };
+    const opener = new PositionOpener({ executorAddress: owner, confirmations: 2, dryRun: false } as never, chains as never, undefined, undefined, database as never);
+    const signed = "0x1234" as Hex;
+    const expectedHash = keccak256(signed);
+    (opener as any).account = {};
+    (opener as any).executionClient = vi.fn().mockReturnValue(client);
+    (opener as any).walletClient = vi.fn().mockReturnValue({
+      prepareTransactionRequest: vi.fn().mockResolvedValue({ nonce: 7n }),
+      signTransaction: vi.fn().mockResolvedValue(signed),
+      sendRawTransaction: vi.fn().mockRejectedValue(new Error("Missing or invalid parameters")),
+    });
+
+    await expect((opener as any).broadcastBidAsk("robinhood", "group", v3PoolAddress, "0x1234", 0n)).resolves.toEqual({
+      hash: expectedHash,
+      pendingReconciliation: true,
+    });
+    expect(database.setPositionGroupOpenTransaction).toHaveBeenCalledWith("group", expectedHash, "opening");
+    expect(database.setPositionGroupStatus).not.toHaveBeenCalled();
+    expect(client.waitForTransactionReceipt).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["v3", false],
     ["v3", true],
