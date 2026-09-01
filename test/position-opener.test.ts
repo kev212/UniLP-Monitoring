@@ -6,7 +6,7 @@ import { encodeAbiParameters, keccak256, zeroAddress, type Address, type Hex } f
 
 import { chainRegistry } from "../src/chains.js";
 import { assertMintUtilization, assertSafeOpenMarket, bidAskDirectionForQuote, openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken, wrappedNativeShortfall } from "../src/services/position-opener.js";
-import { baseAmountFromQuote, depositWouldCrossSingleSideRange, nearestSingleSidedTicks, quoteValueFromBase, ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
+import { baseAmountFromQuote, nearestSingleSidedTicks, quoteValueFromBase, ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
 
 const chainId = 4663;
 const token0 = new Token(chainId, "0x0000000000000000000000000000000000000001", 6, "USDG");
@@ -26,6 +26,7 @@ function poolOpener(
   quoteTokens = [{ symbol: "NVDA", address: nvdaAddress }],
   fee = 10_000,
   currentLpFee = fee,
+  poolLiquidity = 10n ** 30n,
 ) {
   const poolKey = { currency0: tokenA, currency1: tokenB, fee, tickSpacing: 200, hooks };
   const poolId = keccak256(encodeAbiParameters(
@@ -38,7 +39,7 @@ function poolOpener(
       if (functionName === "token1") return tokenB;
       if (functionName === "fee") return fee;
       if (functionName === "tickSpacing") return 200;
-      if (functionName === "liquidity" || functionName === "getLiquidity") return 10n ** 30n;
+      if (functionName === "liquidity" || functionName === "getLiquidity") return poolLiquidity;
       if (functionName === "slot0") return [1n << 96n, 0, 0, 0, 0, 0, true];
       if (functionName === "getSlot0") return [1n << 96n, 0, 0, currentLpFee];
       if (functionName === "getPool") return v3PoolAddress;
@@ -74,17 +75,10 @@ function poolOpener(
 
 describe("open safety guards", () => {
   it("rejects empty pools and extreme ticks", () => {
-    expect(() => assertSafeOpenMarket(0, 0n)).toThrow("no active liquidity");
+    expect(() => assertSafeOpenMarket(0, 0n)).toThrow("no liquidity active at the current tick");
     expect(() => assertSafeOpenMarket(-881161, 1n)).toThrow("extreme tick");
     expect(() => assertSafeOpenMarket(880_000, 1n)).toThrow("extreme tick");
     expect(() => assertSafeOpenMarket(0, 1n)).not.toThrow();
-  });
-
-  it("rejects a deposit that can walk a thin pool through the single-side range", () => {
-    const sqrtPrice = 1n << 96n;
-    expect(depositWouldCrossSingleSideRange(0, sqrtPrice, 1n, 200, 5_000, true, 10n ** 18n, 200)).toBe(true);
-    expect(depositWouldCrossSingleSideRange(0, sqrtPrice, 10n ** 30n, 200, 5_000, true, 3n * 10n ** 18n, 200)).toBe(false);
-    expect(depositWouldCrossSingleSideRange(0, sqrtPrice, 10n ** 30n, -5_000, 0, false, 3n * 10n ** 18n, 200)).toBe(false);
   });
 
   it("values base inventory from the pool sqrt price", () => {
@@ -131,6 +125,25 @@ describe("open safety guards", () => {
 
     await expect(opener.prepareOpen(pool, "robinhood", 30, 3n * 10n ** 18n, { symbol: "NVDA", address: nvdaAddress }))
       .rejects.toThrow("Cannot verify executable exit price");
+  });
+
+  it("does not model mint-only deposits as swaps through thin active liquidity", async () => {
+    const { opener, pool } = poolOpener(
+      "v4",
+      packAddress,
+      nvdaAddress,
+      zeroAddress,
+      [{ symbol: "NVDA", address: nvdaAddress }],
+      10_000,
+      10_000,
+      1n,
+    );
+    const quote = { symbol: "NVDA", address: nvdaAddress };
+
+    await expect(opener.prepareOpen(pool, "robinhood", 30, 3n * 10n ** 18n, quote))
+      .resolves.toMatchObject({ mode: "single" });
+    await expect(opener.prepareBidAskOpen(pool, "robinhood", 30, 3n * 10n ** 18n, quote, 3))
+      .resolves.toMatchObject({ protocol: "v4" });
   });
 });
 

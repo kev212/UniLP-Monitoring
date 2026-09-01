@@ -26,7 +26,7 @@ import type { RoutePlanner } from "./route-planner.js";
 import { buildSwapPlan } from "./swap-builder.js";
 import { UNISWAP_API_ROUTER, type UniswapTradingApi } from "./uniswap-trading-api.js";
 import { KyberSwapAggregatorApi } from "./kyberswap-aggregator-api.js";
-import { applySlippage, baseAmountFromQuote, depositWouldCrossSingleSideRange, nearestSingleSidedTicks, quoteValueFromBase, sqrtRatioAtTick, tickToCeilSpacing, tickToFloorSpacing, ticksForDropPercent, ticksForRisePercent } from "./uniswap-math.js";
+import { applySlippage, baseAmountFromQuote, nearestSingleSidedTicks, quoteValueFromBase, sqrtRatioAtTick, tickToCeilSpacing, tickToFloorSpacing, ticksForDropPercent, ticksForRisePercent } from "./uniswap-math.js";
 import { dexNameFromMetadata, v3ContractsFor, v3Deployments, type DexName } from "./v3-deployment.js";
 import { isDynamicFee } from "./v4-pool.js";
 
@@ -293,9 +293,6 @@ export class PositionOpener {
     const baseSymbol = quoteIsToken0 ? token1Symbol : token0Symbol;
     const plan = this.makeBidAskPlan(state, chain, quoteIsToken0, token0Decimals, token1Decimals, outer, depositAmount, requestedBinCount);
     assertMintUtilization(quoteIsToken0 ? plan.totalAmount0 : plan.totalAmount1, depositAmount);
-    if (depositWouldCrossSingleSideRange(state.currentTick, state.sqrtPriceX96, state.poolLiquidity, outer.lowerTick, outer.upperTick, quoteIsToken0, depositAmount, state.tickSpacing)) {
-      throw new Error("Deposit is large enough to walk the pool through the requested range");
-    }
     await this.assertExecutableOpenPrice({
       chain,
       protocol,
@@ -509,9 +506,6 @@ export class PositionOpener {
       this.assertSingleSideSpend(position, quoteIsToken0, depositAmount);
       const lockedQuote = BigInt((quoteIsToken0 ? position.mintAmounts.amount0 : position.mintAmounts.amount1).toString());
       assertMintUtilization(lockedQuote, depositAmount);
-      if (depositWouldCrossSingleSideRange(currentTick, sqrtPriceX96, poolLiquidity, tickLower, tickUpper, quoteIsToken0, depositAmount, tickSpacing)) {
-        throw new Error("Deposit is large enough to walk the pool through the requested range");
-      }
     } else {
       this.assertDualSidePosition(position, quoteIsToken0);
     }
@@ -2044,7 +2038,7 @@ export class PositionOpener {
 }
 
 export function assertSafeOpenMarket(currentTick: number, poolLiquidity: bigint): void {
-  if (poolLiquidity <= 0n) throw new Error("Pool has no active liquidity");
+  if (poolLiquidity <= 0n) throw new Error("Pool has no liquidity active at the current tick; displayed TVL may be entirely out of range");
   if (!Number.isInteger(currentTick)) throw new Error("Pool price is unusable (invalid tick)");
   if (Math.abs(currentTick) > EXTREME_TICK_ABS) throw new Error("Pool price is unusable (extreme tick)");
   if (currentTick <= -UNISWAP_MAX_TICK + EXTREME_TICK_EDGE || currentTick >= UNISWAP_MAX_TICK - EXTREME_TICK_EDGE) {

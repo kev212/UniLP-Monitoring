@@ -99,34 +99,6 @@ export function baseAmountFromQuote(sqrtPriceX96: bigint, quoteAmount: bigint, q
   return quoteIsToken0 ? (quoteAmount * priceX192) >> 192n : (quoteAmount << 192n) / priceX192;
 }
 
-export function depositWouldCrossSingleSideRange(
-  currentTick: number,
-  currentSqrtPrice: bigint,
-  poolLiquidity: bigint,
-  tickLower: number,
-  tickUpper: number,
-  quoteIsToken0: boolean,
-  depositAmount: bigint,
-  tickSpacing = 1,
-): boolean {
-  if (poolLiquidity <= 0n || depositAmount <= 0n || currentSqrtPrice <= 0n) return true;
-  const spacing = tickSpacing > 0 ? tickSpacing : 1;
-  if (quoteIsToken0) {
-    if (currentTick >= tickLower) return true;
-    const amount1 = baseAmountFromQuote(currentSqrtPrice, depositAmount, true);
-    if (amount1 <= 0n) return true;
-    const nextSqrt = currentSqrtPrice + (amount1 << 96n) / poolLiquidity;
-    return nextSqrt >= sqrtRatioAtTick(tickLower);
-  }
-  if (currentTick < tickUpper) return true;
-  const amount0 = baseAmountFromQuote(currentSqrtPrice, depositAmount, false);
-  if (amount0 <= 0n) return true;
-  const denominator = poolLiquidity * Q96 + amount0 * currentSqrtPrice;
-  if (denominator <= 0n) return true;
-  const nextSqrt = (poolLiquidity * currentSqrtPrice * Q96) / denominator;
-  return nextSqrt <= sqrtRatioAtTick(tickUpper - spacing);
-}
-
 function amount0Delta(sqrtA: bigint, sqrtB: bigint, liquidity: bigint): bigint {
   const numerator = (liquidity << 96n) * (sqrtB - sqrtA);
   return (numerator / sqrtB) / sqrtA;
