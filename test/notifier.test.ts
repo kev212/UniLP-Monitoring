@@ -33,9 +33,38 @@ describe("Telegram dashboard callbacks", () => {
     await expect((notifier as unknown as {
       handleDashboardCallback(ctx: unknown, database: unknown, pnl: unknown, executor: unknown, scanner: unknown): Promise<void>;
     }).handleDashboardCallback(ctx, {}, {}, {}, {})).resolves.toBeUndefined();
+    await new Promise((resolve) => setImmediate(resolve));
 
+    expect(ctx.answerCallbackQuery).toHaveBeenCalledOnce();
     expect(executeOpen).toHaveBeenCalledOnce();
     expect(ctx.reply).toHaveBeenCalledWith("⏳ Membuka posisi...", undefined);
+  });
+
+  it("cleans up completed dashboard callback state", async () => {
+    const notifier = new Notifier({
+      telegram: { token: "123:test", chatId: "1", userId: "1" },
+    } as RuntimeConfig, {} as never, {
+      queueMessageDeletion: vi.fn().mockResolvedValue(undefined),
+    } as never);
+    const refreshDashboardMessage = vi.fn().mockResolvedValue(undefined);
+    (notifier as unknown as { refreshDashboardMessage: typeof refreshDashboardMessage }).refreshDashboardMessage = refreshDashboardMessage;
+    const ctx = {
+      update: { update_id: 1 },
+      from: { id: 1 },
+      callbackQuery: {
+        data: "lp:refresh:0",
+        message: { message_id: 10, chat: { id: 1 } },
+      },
+      answerCallbackQuery: vi.fn().mockResolvedValue(undefined),
+    };
+
+    await (notifier as unknown as {
+      handleDashboardCallback(ctx: unknown, database: unknown, pnl: unknown, executor: unknown, scanner: unknown): Promise<void>;
+    }).handleDashboardCallback(ctx, {}, {}, {}, {});
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(refreshDashboardMessage).toHaveBeenCalledOnce();
+    expect((notifier as unknown as { dashboardRenderGeneration: Map<string, number> }).dashboardRenderGeneration).toEqual(new Map());
   });
 
   it("parses chain-aware token scan input", () => {

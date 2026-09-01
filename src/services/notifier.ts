@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import { Bot, Context, InlineKeyboard, InputFile, type CommandContext } from "grammy";
 import { isAddress, parseUnits, zeroAddress, type Address } from "viem";
 import sharp from "sharp";
@@ -126,6 +128,13 @@ export class Notifier {
   private readonly dashboardCloseInFlight = new Set<string>();
   private readonly pendingInput = new Map<string, PendingInput>();
   private readonly pendingBgUpload = new Set<string>();
+  private readonly dashboardRenderContext = new AsyncLocalStorage<{ key: string; generation: number }>();
+  private readonly dashboardRenderGeneration = new Map<string, number>();
+  private readonly dashboardMutationQueues = new Map<string, Promise<void>>();
+  private readonly tokenMetadata = new Map<string, { symbol: string; decimals: number }>();
+  private readonly tokenMetadataInflight = new Map<string, Promise<{ symbol: string; decimals: number } | null>>();
+  private readonly tokenMetadataFailures = new Map<string, number>();
+  private deletionPassRunning = false;
   private openExecutionQueue: Promise<void> = Promise.resolve();
   private readonly riskDefaults: RiskSettings;
   private poolScanRunning = false;
@@ -149,7 +158,7 @@ export class Notifier {
     this.database = database;
     this.riskDefaults = this.riskSettings();
     if (!config.telegram) return;
-    this.bot = new Bot(config.telegram.token);
+    this.bot = new Bot(config.telegram.token, { client: { timeoutSeconds: 20 } });
     this.bot.catch((error) => {
       log.error({ updateId: error.ctx.update.update_id }, "Telegram update failed");
     });
@@ -396,8 +405,7 @@ export class Notifier {
       this.startDeletionWorker();
       void this.runDeletionPass().catch(() => {});
     }
-    log.info("Telegram bot polling started");
-    await this.bot.start();
+    await this.bot.start({ timeout: 10, onStart: () => log.info("Telegram bot polling started") });
   }
 
   async stopBot(): Promise<void> {
@@ -414,6 +422,9 @@ export class Notifier {
 
   private async runDeletionPass(): Promise<void> {
     if (!this.bot || !this.database) return;
+    if (this.deletionPassRunning) return;
+    this.deletionPassRunning = true;
+    try {
     const items = await this.database.fetchDueDeletions();
     for (const item of items) {
       try {
@@ -429,6 +440,9 @@ export class Notifier {
         }
       }
       await this.database.removeDeletion(item.id);
+    }
+    } finally {
+      this.deletionPassRunning = false;
     }
   }
 
@@ -515,6 +529,10 @@ export class Notifier {
     }
 
     if (!await this.acknowledgeDashboardCallback(ctx, action.type === "refresh" ? "Memperbarui..." : undefined)) return;
+    const renderKey = `${chatId}:${message.message_id}`;
+    const generation = (this.dashboardRenderGeneration.get(renderKey) ?? 0) + 1;
+    this.dashboardRenderGeneration.set(renderKey, generation);
+    const work = () => this.dashboardRenderContext.run({ key: renderKey, generation }, async () => {
     try {
       if (action.type === "refresh" || action.type === "status") {
         await this.refreshDashboardMessage(database, pnl, chatId, message.message_id, action.page);
@@ -741,7 +759,7 @@ export class Notifier {
         return;
       }
       if (action.type === "select") {
-        await this.showCloseConfirmation(database, pnl, chatId, message.message_id, position, action.page);
+        await this.showCloseConfirmation(database, chatId, message.message_id, position, action.page);
         return;
       }
       if (this.dashboardCloseInFlight.has(position.id)) {
@@ -760,7 +778,30 @@ export class Notifier {
       } catch (editError) {
         log.warn({ error: errorMessage(editError) }, "could not render dashboard error state");
       }
+    } finally {
+      if (this.dashboardRenderGeneration.get(renderKey) === generation) {
+        this.dashboardRenderGeneration.delete(renderKey);
+      }
     }
+    });
+    if (action.type === "trail") {
+      void this.enqueueDashboardMutation(renderKey, work);
+    } else {
+      void work();
+    }
+  }
+
+  private enqueueDashboardMutation(key: string, work: () => Promise<void>): Promise<void> {
+    const previous = this.dashboardMutationQueues.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(work);
+    const settled = next.catch(() => {});
+    this.dashboardMutationQueues.set(key, settled);
+    void settled.finally(() => {
+      if (this.dashboardMutationQueues.get(key) === settled) {
+        this.dashboardMutationQueues.delete(key);
+      }
+    });
+    return next;
   }
 
   private async executeOpenConfirmation(ctx: Context, confirmation: OpenConfirmation): Promise<void> {
@@ -946,8 +987,10 @@ export class Notifier {
     if (closable.length === 0) {
       lines.push("\nTidak ada posisi yang dapat ditutup.");
     } else {
-      for (const position of closable.slice(first, first + DASHBOARD_PAGE_SIZE)) {
-        keyboard.text(await this.closeButtonLabel(position), dashboardPositionAction("select", page, position)).row();
+      const pagePositions = closable.slice(first, first + DASHBOARD_PAGE_SIZE);
+      const labels = await Promise.all(pagePositions.map((position) => this.closeButtonLabel(position)));
+      for (const [index, position] of pagePositions.entries()) {
+        keyboard.text(labels[index]!, dashboardPositionAction("select", page, position)).row();
       }
       if (pageCount > 1) {
         if (page > 0) keyboard.text("← Prev", dashboardAction("close", page - 1));
@@ -959,7 +1002,7 @@ export class Notifier {
     await this.editDashboardMessage(chatId, messageId, lines.join("\n"), keyboard);
   }
 
-  private async showCloseConfirmation(database: Database, pnl: PnlService, chatId: string, messageId: number, position: PositionRecord, page: number): Promise<void> {
+  private async showCloseConfirmation(database: Database, chatId: string, messageId: number, position: PositionRecord, page: number): Promise<void> {
     const pair = await this.pairLabel(position);
     const groupId = managedPositionGroupId(position);
     const group = groupId ? await this.positionGroup(database, groupId) : null;
@@ -976,36 +1019,8 @@ export class Notifier {
         ? `Semua child NFT ditutup secara atomic${group ? ` (${group.mintableBinCount} bins)` : ""}; satu kegagalan me-revert seluruh batch.`
         : "Aksi ini menghapus liquidity dan memulai settlement ke quote token.",
     ];
-    const preview = await this.freshExitPreview(pnl, position, group);
-    if (preview) lines.push(preview);
-    else lines.push("Exit est. unavailable; close will requote on-chain.");
+    lines.push("Exit akan requote on-chain sebelum transaksi dikirim.");
     await this.editDashboardMessage(chatId, messageId, lines.join("\n"), keyboard);
-  }
-
-  private async freshExitPreview(pnl: PnlService, position: PositionRecord, group: PositionGroupRecord | null): Promise<string | null> {
-    try {
-      const { client } = this.chains.getById(position.chainId);
-      const blockNumber = await client.getBlockNumber();
-      if (group) {
-        const exact = await pnl.valueGroupExactProbe(group, blockNumber, this.config.settlementSwapSlippageBps, { budget: false });
-        if (!isAggregatorQuote(exact.snapshot.quoteProvider)) return null;
-        return this.formatExitPreviewLine(exact.snapshot.pnlBps, exact.snapshot.minimumPnlBps);
-      }
-      const exact = await pnl.valueExactProbe(position, blockNumber, this.config.settlementSwapSlippageBps, { budget: false });
-      if (!isAggregatorQuote(exact.snapshot.quoteProvider)) return null;
-      return this.formatExitPreviewLine(exact.snapshot.pnlBps, exact.snapshot.minimumPnlBps);
-    } catch (error) {
-      log.warn({ err: error, positionId: position.id }, "manual close exact quote preview failed");
-      return null;
-    }
-  }
-
-  private formatExitPreviewLine(pnlBps: bigint, minimumPnlBps?: bigint): string {
-    const expected = `${pnlBps >= 0n ? "+" : ""}${formatBps(pnlBps)}%`;
-    const minimum = minimumPnlBps === undefined ? null : `${minimumPnlBps >= 0n ? "+" : ""}${formatBps(minimumPnlBps)}%`;
-    return minimum
-      ? `🎯 Expected ${expected} | Min ${minimum}`
-      : `🎯 Expected ${expected}`;
   }
 
   private async closeButtonLabel(position: PositionRecord): Promise<string> {
@@ -1032,6 +1047,8 @@ export class Notifier {
 
   private async editDashboardMessage(chatId: string, messageId: number, text: string, replyMarkup?: InlineKeyboard): Promise<void> {
     if (!this.bot) return;
+    const render = this.dashboardRenderContext.getStore();
+    if (render && this.dashboardRenderGeneration.get(render.key) !== render.generation) return;
     try {
       await this.bot.api.editMessageText(chatId, messageId, text, replyMarkup ? { reply_markup: replyMarkup } : { reply_markup: undefined });
     } catch (error) {
@@ -1049,8 +1066,10 @@ export class Notifier {
     index: number,
     exact?: PositionExactQuote,
   ): Promise<string> {
-    const t0 = await this.tokenLabel(position.token0, position.chainId);
-    const t1 = await this.tokenLabel(position.token1, position.chainId);
+    const [t0, t1] = await Promise.all([
+      this.tokenLabel(position.token0, position.chainId),
+      this.tokenLabel(position.token1, position.chainId),
+    ]);
     const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
     const reviewReason = position.status === "needs_review" ? ` · ${reviewReasonDisplay(position.metadata)}` : "";
     const autoExitDisabled = position.metadata.autoExitDisabled === true ? " · ⚠️ AUTO EXIT DISABLED" : "";
@@ -1063,9 +1082,7 @@ export class Notifier {
     }
     if (!snapshot || !position.quoteToken) {
       if (!position.quoteToken) return `${index}. ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}\n`;
-      const blockNumber = observation?.blockNumber;
-      if (!blockNumber) return `${index}. ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled} · ⏳ LOADING\n`;
-      return this.formatStatusLine(position, pnl, blockNumber, index);
+      return `${index}. ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled} · ⏳ LOADING\n`;
     }
 
     const qtSymbol = this.quoteSymbol(position.quoteToken);
@@ -1095,8 +1112,10 @@ export class Notifier {
   }
 
   private async formatGroupStatusLine(position: PositionRecord, database: Database, index: number, exact?: PositionGroupExactQuote): Promise<string> {
-    const t0 = await this.tokenLabel(position.token0, position.chainId);
-    const t1 = await this.tokenLabel(position.token1, position.chainId);
+    const [t0, t1] = await Promise.all([
+      this.tokenLabel(position.token0, position.chainId),
+      this.tokenLabel(position.token1, position.chainId),
+    ]);
     const pair = position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
     const groupId = position.metadata.positionGroupId as string;
     const snapshot = await database.getLatestPositionGroupPnlSnapshot(groupId);
@@ -2252,8 +2271,10 @@ export class Notifier {
     if (active.length === 0) {
       lines.push("", "Tidak ada posisi aktif.");
     } else {
-      for (const [offset, position] of active.slice(first, first + DASHBOARD_PAGE_SIZE).entries()) {
-        keyboard.text(await this.trailButtonLabel(position, first + offset + 1), trailPositionAction(page, position)).row();
+      const pagePositions = active.slice(first, first + DASHBOARD_PAGE_SIZE);
+      const labels = await Promise.all(pagePositions.map((position, offset) => this.trailButtonLabel(position, first + offset + 1)));
+      for (const [index, position] of pagePositions.entries()) {
+        keyboard.text(labels[index]!, trailPositionAction(page, position)).row();
       }
       if (pageCount > 1) {
         if (page > 0) keyboard.text("← Prev", trailPageAction(page - 1));
@@ -2385,8 +2406,10 @@ export class Notifier {
   }
 
   private async pairLabel(position: PositionRecord): Promise<string> {
-    const t0 = await this.tokenLabel(position.token0, position.chainId);
-    const t1 = await this.tokenLabel(position.token1, position.chainId);
+    const [t0, t1] = await Promise.all([
+      this.tokenLabel(position.token0, position.chainId),
+      this.tokenLabel(position.token1, position.chainId),
+    ]);
     return position.quoteToken?.toLowerCase() === position.token0.toLowerCase() ? `${t1}/${t0}` : `${t0}/${t1}`;
   }
 
@@ -2397,19 +2420,7 @@ export class Notifier {
     }
     const qt = this.config.quoteTokens.robinhood.concat(this.config.quoteTokens.base, this.config.quoteTokens.bsc).find(q => q.address.toLowerCase() === address.toLowerCase());
     if (qt) return qt.symbol;
-    const cached = this.chains.getCachedToken(address);
-    if (cached) return cached.symbol;
-    try {
-      const { client } = chainId === undefined ? this.chains.get("robinhood") : this.chains.getById(chainId);
-      const [symbol, decimals] = await Promise.all([
-        client.readContract({ address, abi: [{ name: "symbol", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] }], functionName: "symbol" }),
-        client.readContract({ address, abi: [{ name: "decimals", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "uint8" }] }], functionName: "decimals" }),
-      ]);
-      this.chains.cacheToken(address, { decimals, symbol });
-      return symbol;
-    } catch {
-      return shortAddress(address);
-    }
+    return (await this.tokenMetadataFor(address, chainId))?.symbol ?? shortAddress(address);
   }
 
   private quoteSymbol(address: Address | null): string {
@@ -2423,15 +2434,46 @@ export class Notifier {
 
   private async decimals(address: Address | null, chainId?: number): Promise<number> {
     if (!address) return 18;
-    const cached = this.chains.getCachedToken(address);
-    if (cached) return cached.decimals;
-    try {
-      const { client } = chainId === undefined ? this.chains.get("robinhood") : this.chains.getById(chainId);
-      const d = await client.readContract({ address, abi: [{ name: "decimals", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "uint8" }] }], functionName: "decimals" });
-      return d;
-    } catch {
-      return 18;
-    }
+    if (address.toLowerCase() === zeroAddress) return 18;
+    return (await this.tokenMetadataFor(address, chainId))?.decimals ?? 18;
+  }
+
+  private async tokenMetadataFor(address: Address, chainId?: number): Promise<{ symbol: string; decimals: number } | null> {
+    const resolvedChainId = chainId ?? chainRegistry.robinhood.chain.id;
+    const key = `${resolvedChainId}:${address.toLowerCase()}`;
+    const cached = this.tokenMetadata.get(key);
+    if (cached) return cached;
+    const failedAt = this.tokenMetadataFailures.get(key);
+    if (failedAt !== undefined && Date.now() - failedAt < 30_000) return null;
+    const inflight = this.tokenMetadataInflight.get(key);
+    if (inflight) return inflight;
+
+    const request = (async () => {
+      try {
+        const chainCached = this.chains.getCachedToken(address);
+        if (chainCached) {
+          const meta = { symbol: chainCached.symbol, decimals: chainCached.decimals };
+          this.tokenMetadata.set(key, meta);
+          return meta;
+        }
+        const { client } = chainId === undefined ? this.chains.get("robinhood") : this.chains.getById(chainId);
+        const [symbol, decimals] = await Promise.all([
+          client.readContract({ address, abi: [{ name: "symbol", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] }], functionName: "symbol" }),
+          client.readContract({ address, abi: [{ name: "decimals", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "uint8" }] }], functionName: "decimals" }),
+        ]);
+        const meta = { symbol, decimals };
+        this.tokenMetadata.set(key, meta);
+        this.chains.cacheToken(address, meta);
+        return meta;
+      } catch {
+        this.tokenMetadataFailures.set(key, Date.now());
+        return null;
+      } finally {
+        this.tokenMetadataInflight.delete(key);
+      }
+    })();
+    this.tokenMetadataInflight.set(key, request);
+    return request;
   }
 
   private async formatLiquidity(position: PositionRecord, liquidity: bigint): Promise<string> {

@@ -99,9 +99,10 @@ async function main(): Promise<void> {
   process.once("SIGINT", () => void shutdown("SIGINT"));
   process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
+  botRunning = true;
   await Promise.all([
     guardian.runForever(),
-    notifier.startBot().then(() => { botRunning = true; }),
+    notifier.startBot(),
   ]);
 }
 
