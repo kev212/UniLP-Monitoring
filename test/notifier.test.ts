@@ -67,6 +67,34 @@ describe("Telegram dashboard callbacks", () => {
     expect((notifier as unknown as { dashboardRenderGeneration: Map<string, number> }).dashboardRenderGeneration).toEqual(new Map());
   });
 
+  it("deletes the /trail menu after 10 seconds", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-02T12:00:00.000Z"));
+    try {
+      const queueMessageDeletion = vi.fn().mockResolvedValue(undefined);
+      const notifier = new Notifier({
+        telegram: { token: "123:test", chatId: "1", userId: "1" },
+      } as RuntimeConfig, {} as never, { queueMessageDeletion } as never);
+      (notifier as unknown as { renderTrailMenu: () => Promise<{ text: string; keyboard: unknown }> }).renderTrailMenu = vi.fn().mockResolvedValue({
+        text: "trailing menu",
+        keyboard: {},
+      });
+      const ctx = {
+        chat: { id: 1 },
+        from: { id: 1 },
+        reply: vi.fn().mockResolvedValue({ message_id: 42 }),
+      };
+
+      await (notifier as unknown as {
+        handleTrail(ctx: unknown, database: unknown): Promise<void>;
+      }).handleTrail(ctx, {});
+
+      expect(queueMessageDeletion).toHaveBeenCalledWith("1", 42, new Date("2026-09-02T12:00:10.000Z"));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("parses chain-aware token scan input", () => {
     const token = "0x833589fCD6EDB6E08f4c7C32D4f71b54bdA02913";
     expect(parseScanInput(`base ${token}`)).toEqual({ chain: "base", token });

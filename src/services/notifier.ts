@@ -2251,7 +2251,8 @@ export class Notifier {
     const chatId = ctx.chat.id.toString();
     if (!this.authorized(chatId, ctx.from?.id.toString())) return;
     const view = await this.renderTrailMenu(database, 0);
-    await ctx.reply(view.text, { reply_markup: view.keyboard });
+    const sent = await ctx.reply(view.text, { reply_markup: view.keyboard });
+    await this.queueTemp(chatId, sent.message_id);
   }
 
   private async showTrailMenu(database: Database, chatId: string, messageId: number, requestedPage: number, notice?: string): Promise<void> {
