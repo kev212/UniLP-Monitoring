@@ -569,6 +569,21 @@ describe("Executor pending settlement recovery", () => {
     expect(notifier.settled).toHaveBeenCalled();
   });
 
+  it("does not auto-settle a V4 close that still needs receipt reconciliation", async () => {
+    const database = { setPositionStatus: vi.fn() };
+    const executor = new Executor(database as never, {} as never, {} as never, {} as never, { settled: vi.fn() } as never, config);
+    const findV4WithdrawalEvent = vi.spyOn(executor as any, "findV4WithdrawalEvent");
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1429590", owner, poolAddress: null,
+      token0: zeroAddress, token1: token, quoteToken: zeroAddress, status: "needs_review", liquidity: 0n,
+      openedAtBlock: 1n, metadata: { salt: hash, settlementPhase: "removing_liquidity" },
+    } as PositionRecord;
+
+    await expect(executor.autoSettleZeroLiquidityV4("robinhood", position)).resolves.toBe(false);
+    expect(findV4WithdrawalEvent).not.toHaveBeenCalled();
+    expect(database.setPositionStatus).not.toHaveBeenCalled();
+  });
+
   it("does not auto-settle a V4 burn when no token outflows can be reconstructed", async () => {
     const database = { addCashflow: vi.fn(), setPositionStatus: vi.fn() };
     const receipt = { status: "success", blockNumber: 100n, logs: [] };

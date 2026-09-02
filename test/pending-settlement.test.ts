@@ -16,4 +16,15 @@ describe("hasPendingSwap", () => {
     expect(hasPendingSettlement("closing", { pendingSwap: null })).toBe(true);
     expect(hasPendingSettlement("armed", { pendingSwap: null })).toBe(false);
   });
+
+  it.each(["removing_liquidity", "pending_swap", "accounting", "unwrapping_quote"])(
+    "keeps needs-review positions in the %s settlement phase recoverable",
+    (settlementPhase) => {
+      expect(hasPendingSettlement("needs_review", { settlementPhase })).toBe(true);
+    },
+  );
+
+  it("does not reopen a settled position with stale settlement metadata", () => {
+    expect(hasPendingSettlement("settled", { settlementPhase: "removing_liquidity" })).toBe(false);
+  });
 });

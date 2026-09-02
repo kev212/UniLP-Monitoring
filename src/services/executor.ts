@@ -3400,6 +3400,7 @@ export class Executor {
 
   async autoSettleZeroLiquidityV4(name: string, position: PositionRecord): Promise<boolean> {
     if (position.protocol !== "v4" || !position.quoteToken) return false;
+    if (hasPendingSettlement(position.status, position.metadata)) return false;
     const metadata = position.metadata as Record<string, unknown>;
     const salt = metadata.salt as Hex | undefined;
     if (!salt) return false;
