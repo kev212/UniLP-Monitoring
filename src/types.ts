@@ -103,6 +103,7 @@ export interface RiskSettings {
   takeProfitPercent: number;
   trailingStopActivationPercent: number;
   trailingStopDrawdownPercent: number;
+  bidAskLadderV4MaxOpenGasUsd?: number;
 }
 
 export function isRiskSettings(value: unknown): value is RiskSettings {
@@ -112,10 +113,13 @@ export function isRiskSettings(value: unknown): value is RiskSettings {
   const takeProfit = settings.takeProfitPercent;
   const activation = settings.trailingStopActivationPercent;
   const drawdown = settings.trailingStopDrawdownPercent;
+  const maxOpenGasUsd = settings.bidAskLadderV4MaxOpenGasUsd;
   return typeof stopLoss === "number" && Number.isFinite(stopLoss) && stopLoss < 0 && stopLoss >= -100
     && typeof takeProfit === "number" && Number.isFinite(takeProfit) && takeProfit > 0 && takeProfit <= 1_000
     && typeof activation === "number" && Number.isFinite(activation) && activation > 0 && activation <= 1_000
-    && typeof drawdown === "number" && Number.isFinite(drawdown) && drawdown > 0 && drawdown <= 1_000;
+    && typeof drawdown === "number" && Number.isFinite(drawdown) && drawdown > 0 && drawdown <= 1_000
+    // Existing risk overrides did not include this setting.
+    && (maxOpenGasUsd === undefined || (typeof maxOpenGasUsd === "number" && Number.isFinite(maxOpenGasUsd) && maxOpenGasUsd > 0 && maxOpenGasUsd <= 100));
 }
 
 export interface PositionRecord {

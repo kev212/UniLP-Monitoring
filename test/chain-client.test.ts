@@ -3,11 +3,32 @@ import { createPublicClient } from "viem";
 
 import { chainRegistry } from "../src/chains.js";
 import type { RuntimeConfig } from "../src/config.js";
-import { ChainClients, createRpcTransport, ROBINHOOD_EXECUTION_CONCURRENCY, ROBINHOOD_READ_CONCURRENCY } from "../src/services/chain-client.js";
+import { AsyncLimiter, ChainClients, createRpcTransport, ROBINHOOD_EXECUTION_CONCURRENCY, ROBINHOOD_READ_CONCURRENCY } from "../src/services/chain-client.js";
 
 describe("RPC failover transport", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("serves a normal waiter during sustained priority traffic", async () => {
+    const limiter = new AsyncLimiter(1);
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const first = limiter.run(() => new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    }));
+    const normal = limiter.run(async () => {
+      order.push("normal");
+    });
+    const priority = Array.from({ length: 8 }, (_, index) => limiter.run(async () => {
+      order.push(`priority-${index}`);
+    }, true));
+
+    await Promise.resolve();
+    releaseFirst();
+    await Promise.all([first, normal, ...priority]);
+
+    expect(order.indexOf("normal")).toBe(4);
   });
 
   it("moves to the fallback immediately when the primary returns HTTP 429", async () => {

@@ -291,6 +291,7 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseDashboardAction("lp:risk:0")).toEqual({ type: "risk", page: 0 });
     expect(parseDashboardAction("lp:riskcfg:stop_loss")).toEqual({ type: "risk_edit", key: "stop_loss" });
     expect(parseDashboardAction("lp:riskcfg:trailing_drawdown")).toEqual({ type: "risk_edit", key: "trailing_drawdown" });
+    expect(parseDashboardAction("lp:riskcfg:v4_open_gas_usd")).toEqual({ type: "risk_edit", key: "v4_open_gas_usd" });
   });
 
   it("validates global risk-setting values", () => {
@@ -298,8 +299,11 @@ describe("Telegram dashboard callbacks", () => {
     expect(parseRiskSettingInput("take_profit", "20")).toEqual({ takeProfitPercent: 20 });
     expect(parseRiskSettingInput("trailing_activation", "5")).toEqual({ trailingStopActivationPercent: 5 });
     expect(parseRiskSettingInput("trailing_drawdown", "1.5")).toEqual({ trailingStopDrawdownPercent: 1.5 });
+    expect(parseRiskSettingInput("v4_open_gas_usd", "$2.00")).toEqual({ bidAskLadderV4MaxOpenGasUsd: 2 });
     expect(() => parseRiskSettingInput("stop_loss", "0")).toThrow();
     expect(() => parseRiskSettingInput("take_profit", "-1")).toThrow();
+    expect(() => parseRiskSettingInput("v4_open_gas_usd", "0")).toThrow();
+    expect(() => parseRiskSettingInput("v4_open_gas_usd", "101")).toThrow();
   });
 
   it("parses UTC calendar callbacks", () => {

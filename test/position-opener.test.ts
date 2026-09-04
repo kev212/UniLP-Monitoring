@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { encodeAbiParameters, keccak256, zeroAddress, type Address, type Hex } from "viem";
 
 import { chainRegistry } from "../src/chains.js";
-import { assertMintUtilization, assertSafeOpenMarket, bidAskDirectionForQuote, openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken, wrappedNativeShortfall } from "../src/services/position-opener.js";
+import { assertBidAskV4OpenGasCost, assertMintUtilization, assertSafeOpenMarket, bidAskDirectionForQuote, bidAskV4OpenGasBudgetWei, openPoolQuoteAddress, PositionOpener, selectOpenQuoteToken, wrappedNativeShortfall } from "../src/services/position-opener.js";
 import { baseAmountFromQuote, nearestSingleSidedTicks, quoteValueFromBase, ticksForDropPercent, ticksForRisePercent } from "../src/services/uniswap-math.js";
 
 const chainId = 4663;
@@ -344,7 +344,7 @@ describe("Bid-Ask NVDA opening", () => {
       sendRawTransaction: vi.fn().mockResolvedValue(expectedHash),
     });
 
-    await expect((opener as any).broadcastBidAsk("robinhood", "group", v3PoolAddress, "0x1234", 0n))
+    await expect((opener as any).broadcastBidAsk("robinhood", "v3", "group", v3PoolAddress, "0x1234", 0n, 100_000n))
       .rejects.toThrow(`Bid-Ask open transaction reverted: ${expectedHash}`);
 
     expect(database.setPositionGroupStatus).toHaveBeenCalledWith("group", "cancelled", {
@@ -384,7 +384,7 @@ describe("Bid-Ask NVDA opening", () => {
       sendRawTransaction: vi.fn().mockResolvedValue(expectedHash),
     });
 
-    await expect((opener as any).broadcastBidAsk("robinhood", "group", v3PoolAddress, "0x1234", 0n)).resolves.toEqual({
+    await expect((opener as any).broadcastBidAsk("robinhood", "v3", "group", v3PoolAddress, "0x1234", 0n, 100_000n)).resolves.toEqual({
       hash: expectedHash,
       pendingReconciliation: true,
     });
@@ -422,13 +422,52 @@ describe("Bid-Ask NVDA opening", () => {
       sendRawTransaction: vi.fn().mockRejectedValue(new Error("Missing or invalid parameters")),
     });
 
-    await expect((opener as any).broadcastBidAsk("robinhood", "group", v3PoolAddress, "0x1234", 0n)).resolves.toEqual({
+    await expect((opener as any).broadcastBidAsk("robinhood", "v3", "group", v3PoolAddress, "0x1234", 0n, 100_000n)).resolves.toEqual({
       hash: expectedHash,
       pendingReconciliation: true,
     });
     expect(database.setPositionGroupOpenTransaction).toHaveBeenCalledWith("group", expectedHash, "opening");
     expect(database.setPositionGroupStatus).not.toHaveBeenCalled();
     expect(client.waitForTransactionReceipt).not.toHaveBeenCalled();
+  });
+
+  it("refuses to sign a V4 Bid-Ask open above the $1.50 ETH budget", async () => {
+    const database = {
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      nextPositionGroupExecutionNonce: vi.fn().mockResolvedValue(7),
+      recordPositionGroupExecution: vi.fn(),
+      setPositionGroupOpenTransaction: vi.fn(),
+      setPositionGroupStatus: vi.fn(),
+      withExecutionLock: vi.fn(async (_chainId: number, _owner: Address, work: () => Promise<unknown>) => work()),
+    };
+    const client = {
+      call: vi.fn().mockResolvedValue(undefined),
+      getTransactionCount: vi.fn().mockResolvedValue(7),
+    };
+    const chains = {
+      getForScan: vi.fn(() => ({ registry: chainRegistry.robinhood, client })),
+      getForExecution: vi.fn(() => ({ registry: chainRegistry.robinhood, client, transport: {} })),
+    };
+    const opener = new PositionOpener({
+      executorAddress: owner,
+      confirmations: 2,
+      dryRun: false,
+      bidAskLadderV4MaxOpenGasUsd: 1.5,
+      bidAskLadderV4EthUsd: 2_500,
+    } as never, chains as never, undefined, undefined, database as never);
+    (opener as any).account = {};
+    (opener as any).walletClient = vi.fn().mockReturnValue({
+      prepareTransactionRequest: vi.fn().mockResolvedValue({ nonce: 7n, gas: 740_922n, maxFeePerGas: 5_698_390_000n }),
+      signTransaction: vi.fn(),
+      sendRawTransaction: vi.fn(),
+    });
+
+    await expect((opener as any).broadcastBidAsk("robinhood", "v4", "group", v3PoolAddress, "0x1234", 0n, 740_922n))
+      .rejects.toThrow(/exceeds \$1\.50 limit/);
+    expect(database.recordPositionGroupExecution).toHaveBeenCalledWith("group", "open_batch", "planned", undefined, undefined, undefined, undefined, {
+      description: "atomic_bid_ask_open",
+    });
+    expect(database.setPositionGroupOpenTransaction).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -682,5 +721,86 @@ describe("SDK dual-side liquidity", () => {
 
     expect(BigInt(position.mintAmounts.amount0)).toBeGreaterThan(0n);
     expect(BigInt(position.mintAmounts.amount1)).toBeGreaterThan(0n);
+  });
+});
+
+describe("Bid-Ask V4 open gas budget", () => {
+  it("converts $1.50 at $2500/ETH into 0.0006 ETH", () => {
+    expect(bidAskV4OpenGasBudgetWei(1.5, 2_500)).toBe(600_000_000_000_000n);
+  });
+
+  it("rejects the sample 740,922-gas open at 5.70 gwei", () => {
+    expect(() => assertBidAskV4OpenGasCost(740_922n, 5_698_390_000n, bidAskV4OpenGasBudgetWei(1.5, 2_500), 1.5, 2_500))
+      .toThrow(/exceeds \$1\.50 limit/);
+  });
+
+  it("allows the sample 740,922-gas open at 0.81 gwei", () => {
+    expect(() => assertBidAskV4OpenGasCost(740_922n, 809_801_841n, bidAskV4OpenGasBudgetWei(1.5, 2_500), 1.5, 2_500))
+      .not.toThrow();
+  });
+
+  it("blocks a V4 estimate when the fee cap is above $1.50", async () => {
+    const client = {
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+      estimateGas: vi.fn().mockResolvedValue(740_922n),
+      getBlock: vi.fn().mockResolvedValue({ gasLimit: 30_000_000n }),
+      estimateFeesPerGas: vi.fn().mockResolvedValue({ maxFeePerGas: 5_698_390_000n }),
+    };
+    const chains = {
+      getForExecution: vi.fn(() => ({ registry: chainRegistry.robinhood, client, transport: {} })),
+    };
+    const opener = new PositionOpener({
+      executorAddress: owner,
+      bidAskLadderV4MaxOpenGasUsd: 1.5,
+      bidAskLadderV4EthUsd: 2_500,
+      bidAskLadderAtomicMaxBlockGasBps: 8_000,
+    } as never, chains as never);
+
+    await expect((opener as unknown as {
+      simulateAndEstimateBidAsk(
+        chain: "robinhood",
+        protocol: "v4",
+        plan: { to: Address; data: Hex; value: bigint },
+        bins: number,
+      ): Promise<unknown>;
+    }).simulateAndEstimateBidAsk(
+      "robinhood",
+      "v4",
+      { to: owner, data: "0x", value: 0n },
+      5,
+    )).rejects.toThrow(/exceeds \$1\.50 limit/);
+  });
+
+  it("does not apply the ETH dollar cap to V3 estimates", async () => {
+    const client = {
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+      estimateGas: vi.fn().mockResolvedValue(740_922n),
+      getBlock: vi.fn().mockResolvedValue({ gasLimit: 30_000_000n }),
+      estimateFeesPerGas: vi.fn().mockResolvedValue({ maxFeePerGas: 5_698_390_000n }),
+    };
+    const chains = {
+      getForExecution: vi.fn(() => ({ registry: chainRegistry.robinhood, client, transport: {} })),
+    };
+    const opener = new PositionOpener({
+      executorAddress: owner,
+      bidAskLadderV4MaxOpenGasUsd: 1.5,
+      bidAskLadderV4EthUsd: 2_500,
+      bidAskLadderAtomicMaxBlockGasBps: 8_000,
+    } as never, chains as never);
+
+    await expect((opener as unknown as {
+      simulateAndEstimateBidAsk(
+        chain: "robinhood",
+        protocol: "v3",
+        plan: { to: Address; data: Hex; value: bigint },
+        bins: number,
+      ): Promise<{ estimatedGas: bigint }>;
+    }).simulateAndEstimateBidAsk(
+      "robinhood",
+      "v3",
+      { to: owner, data: "0x", value: 0n },
+      5,
+    )).resolves.toMatchObject({ estimatedGas: 740_922n });
+    expect(client.estimateFeesPerGas).not.toHaveBeenCalled();
   });
 });

@@ -101,7 +101,7 @@ type DashboardAction =
   | { type: "trail_page"; page: number };
 
 type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "stock_yield" | "max_results";
-type RiskSettingKey = "stop_loss" | "take_profit" | "trailing_activation" | "trailing_drawdown";
+type RiskSettingKey = "stop_loss" | "take_profit" | "trailing_activation" | "trailing_drawdown" | "v4_open_gas_usd";
 type PendingInput =
   | { kind: "scan_token"; chain: ChainName }
   | { kind: "config"; key: PoolSettingKey; dashboardMessageId: number }
@@ -195,6 +195,7 @@ export class Notifier {
       { command: "history", description: "Tampilkan riwayat posisi close >= ±$0.50 PnL" },
       { command: "calendar", description: "Tampilkan kalender realized PnL UTC" },
       { command: "trail", description: "On/off trailing stop per posisi — /trail" },
+      { command: "recover_group", description: "Pulihkan group BA yang needs review — /recover_group <uuid>" },
     ]).catch((error) => {
       log.warn({ err: error }, "Telegram command registration failed; bot will continue without updated commands");
     });
@@ -205,6 +206,10 @@ export class Notifier {
     this.bot.command("close", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
       await this.handleClose(ctx, database, executor);
+    });
+    this.bot.command("recover_group", async (ctx: ChatContext) => {
+      void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
+      await this.handleRecoverGroup(ctx, database, executor);
     });
     this.bot.command("scan", async (ctx: ChatContext) => {
       void this.queueTemp(ctx.chat!.id.toString(), ctx.message!.message_id);
@@ -1982,6 +1987,7 @@ export class Notifier {
       takeProfitPercent: this.config.takeProfitPercent,
       trailingStopActivationPercent: this.config.trailingStopActivationPercent,
       trailingStopDrawdownPercent: this.config.trailingStopDrawdownPercent,
+      bidAskLadderV4MaxOpenGasUsd: this.config.bidAskLadderV4MaxOpenGasUsd,
     };
   }
 
@@ -1990,6 +1996,9 @@ export class Notifier {
     this.config.takeProfitPercent = settings.takeProfitPercent;
     this.config.trailingStopActivationPercent = settings.trailingStopActivationPercent;
     this.config.trailingStopDrawdownPercent = settings.trailingStopDrawdownPercent;
+    if (settings.bidAskLadderV4MaxOpenGasUsd !== undefined) {
+      this.config.bidAskLadderV4MaxOpenGasUsd = settings.bidAskLadderV4MaxOpenGasUsd;
+    }
   }
 
   private async showRiskConfig(chatId: string, messageId: number, page: number, notice?: string): Promise<void> {
@@ -2001,6 +2010,8 @@ export class Notifier {
       .text("Trailing activation", "lp:riskcfg:trailing_activation")
       .text("Trailing drawdown", "lp:riskcfg:trailing_drawdown")
       .row()
+      .text("BA V4 max gas", "lp:riskcfg:v4_open_gas_usd")
+      .row()
       .text("Reset ENV", dashboardAction("risk_reset", page))
       .text("← Back", dashboardAction("status", page));
     const lines = [
@@ -2009,8 +2020,9 @@ export class Notifier {
       `Take profit: +${settings.takeProfitPercent}%`,
       `Trailing activation: +${settings.trailingStopActivationPercent}%`,
       `Trailing drawdown: -${settings.trailingStopDrawdownPercent}%`,
+      `BA V4 max open gas: $${settings.bidAskLadderV4MaxOpenGasUsd!.toFixed(2)}`,
       "",
-      "Berlaku untuk semua posisi pada siklus monitor berikutnya.",
+      "Berlaku langsung untuk posisi berikutnya dan BA V4 yang dikonfirmasi.",
     ];
     if (notice) lines.push("", notice);
     await this.editDashboardMessage(chatId, messageId, lines.join("\n"), keyboard);
@@ -2388,6 +2400,33 @@ export class Notifier {
     }
   }
 
+  private async handleRecoverGroup(ctx: ChatContext, database: Database, executor: Executor): Promise<void> {
+    const chatId = ctx.chat.id.toString();
+    if (!this.authorized(chatId, ctx.from?.id.toString())) return;
+
+    const groupId = ctx.match.trim();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(groupId)) {
+      await this.replyTemp(ctx, "Gunakan /recover_group <uuid group BA>.");
+      return;
+    }
+    const group = await database.getPositionGroup(groupId);
+    if (!group || group.chainId !== 4663 || group.protocol !== "v4" || group.shape !== "bid_ask" || group.status !== "needs_review") {
+      await this.replyTemp(ctx, "Group recovery hanya untuk BA V4 Robinhood berstatus needs_review.");
+      return;
+    }
+
+    await this.replyTemp(ctx, `Memverifikasi dan memulihkan BA group ${shortHash(group.id)}...`);
+    try {
+      await executor.recoverGroup(group.id);
+      const refreshed = await database.getPositionGroup(group.id);
+      await this.replyTemp(ctx, refreshed?.status === "settled"
+        ? `BA group ${shortHash(group.id)} sudah settled.`
+        : `BA group ${shortHash(group.id)} recovery berjalan. Status: ${refreshed?.status ?? "unknown"}.`);
+    } catch (error) {
+      await this.replyTemp(ctx, `Recovery BA group gagal: ${errorMessage(error).slice(0, 300)}`);
+    }
+  }
+
   private isEnabledChain(chain: ChainName): boolean {
     return this.config.chains.includes(chain);
   }
@@ -2674,7 +2713,7 @@ function isPoolSettingKey(value: string | undefined): value is PoolSettingKey {
 }
 
 function isRiskSettingKey(value: string | undefined): value is RiskSettingKey {
-  return value === "stop_loss" || value === "take_profit" || value === "trailing_activation" || value === "trailing_drawdown";
+  return value === "stop_loss" || value === "take_profit" || value === "trailing_activation" || value === "trailing_drawdown" || value === "v4_open_gas_usd";
 }
 
 function isBidAskLadderChain(value: string | undefined): value is BidAskLadderChain {
@@ -3392,11 +3431,15 @@ function configInputPrompt(key: PoolSettingKey): string {
 }
 
 export function parseRiskSettingInput(key: RiskSettingKey, value: string): Partial<RiskSettings> {
-  const number = Number(value.trim().replace(/[%\s,]/g, ""));
+  const number = Number(value.trim().replace(key === "v4_open_gas_usd" ? /[$\s,]/g : /[%\s,]/g, ""));
   if (!Number.isFinite(number)) throw new Error("nilai harus angka");
   if (key === "stop_loss") {
     if (number >= 0 || number < -100) throw new Error("SL harus antara -100 dan kurang dari 0");
     return { stopLossPercent: number };
+  }
+  if (key === "v4_open_gas_usd") {
+    if (number <= 0 || number > 100) throw new Error("max gas harus lebih dari $0 dan maksimal $100");
+    return { bidAskLadderV4MaxOpenGasUsd: number };
   }
   if (number <= 0 || number > 1_000) throw new Error("nilai harus lebih dari 0 dan maksimal 1000");
   if (key === "take_profit") return { takeProfitPercent: number };
@@ -3408,6 +3451,7 @@ function riskInputPrompt(key: RiskSettingKey): string {
   if (key === "stop_loss") return "Kirim Stop Loss dalam persen negatif, contoh: -24.";
   if (key === "take_profit") return "Kirim Take Profit dalam persen positif, contoh: 20.";
   if (key === "trailing_activation") return "Kirim Trailing activation dalam persen positif, contoh: 5.";
+  if (key === "v4_open_gas_usd") return "Kirim max gas open BA V4 dalam USD, contoh: 2 atau $2.00.";
   return "Kirim Trailing drawdown dalam persen positif, contoh: 1.5.";
 }
 

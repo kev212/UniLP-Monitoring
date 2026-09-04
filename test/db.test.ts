@@ -10,6 +10,13 @@ describe("Database native USD backfill", () => {
       takeProfitPercent: 20,
       trailingStopActivationPercent: 5,
       trailingStopDrawdownPercent: 1.5,
+      bidAskLadderV4MaxOpenGasUsd: 2,
+    })).toBe(true);
+    expect(isRiskSettings({
+      stopLossPercent: -24,
+      takeProfitPercent: 20,
+      trailingStopActivationPercent: 5,
+      trailingStopDrawdownPercent: 1.5,
     })).toBe(true);
     expect(isRiskSettings({ stopLossPercent: -24 })).toBe(false);
     expect(isRiskSettings({
@@ -17,6 +24,7 @@ describe("Database native USD backfill", () => {
       takeProfitPercent: 20,
       trailingStopActivationPercent: 5,
       trailingStopDrawdownPercent: 1.5,
+      bidAskLadderV4MaxOpenGasUsd: 2,
     })).toBe(false);
   });
 

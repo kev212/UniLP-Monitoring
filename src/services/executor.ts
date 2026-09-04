@@ -105,6 +105,7 @@ export interface SwapRetryState {
 }
 
 const SWAP_RETRY_CYCLE_DELAY_MS = 3_000;
+const SWAP_PLANNING_MAX_DELAY_MS = 60_000;
 const PENDING_RECEIPT_REVIEW_MS = 5 * 60_000;
 const MAX_UINT256 = (1n << 256n) - 1n;
 const MAX_UINT160 = (1n << 160n) - 1n;
@@ -228,7 +229,7 @@ export class Executor {
   private async settleEmptyV3GroupUnlocked(group: PositionGroupRecord): Promise<boolean> {
     const bins = (await this.database.listPositionGroupBins(group.id)).filter((bin) => bin.status === "minted" && bin.tokenId !== null);
     if (bins.length === 0) return false;
-    const { client } = this.chains.getById(group.chainId);
+    const client = this.executionReadClient(group.chainId);
     const maxUint128 = (1n << 128n) - 1n;
     const calls: Hex[] = [];
     for (const bin of bins) {
@@ -299,6 +300,187 @@ export class Executor {
       this.groupExitRetryTimers.delete(groupId);
     }
     return this.runGroupExclusive(groupId, () => this.executeGroupUnlocked(groupId, trigger));
+  }
+
+  /**
+   * An operator-only escape hatch for groups paused by a transient RPC outage.
+   * Do not bypass the live child validation before returning the group to active.
+   */
+  async recoverGroup(groupId: string): Promise<void> {
+    return this.runGroupExclusive(groupId, async () => {
+      let group = await this.database.getPositionGroup(groupId);
+      if (!group) throw new Error(`Position group ${groupId} was not found`);
+      if (group.status !== "needs_review") throw new Error(`Position group ${groupId} is not awaiting recovery`);
+
+      if (await this.recoverPendingGroupExecution(group, "manual")) return;
+      group = await this.database.getPositionGroup(groupId) ?? group;
+      if (group.status !== "needs_review") return;
+
+      // This verifies every live child NFT, its owner, pool key, pair, ticks, and liquidity.
+      try {
+        await this.loadGroupChildren(group);
+      } catch (error) {
+        if (group.protocol === "v4") {
+          // Some children may already be closed on-chain from the outage. Reconcile
+          // each already-closed child from its own receipt, then close the live ones.
+          if (await this.recoverPartiallyClosedV4Group(group)) return;
+          if (/zero liquidity/i.test(errorMessage(error)) && await this.reconcileZeroLiquidityGroup(group)) return;
+        }
+        throw error;
+      }
+      const activated = await this.database.setPositionGroupStatus(group.id, "active", {
+        settlementRetryDisabled: null,
+        exitRetry: null,
+        lastExecutionError: null,
+        reason: null,
+        recoveryValidatedAt: new Date().toISOString(),
+      }, "needs_review");
+      if (!activated) throw new Error(`Position group ${group.id} changed while recovery was running`);
+
+      await this.executeGroupUnlocked(group.id, "manual");
+    });
+  }
+
+  private async recoverPartiallyClosedV4Group(group: PositionGroupRecord): Promise<boolean> {
+    if (group.protocol !== "v4" || group.shape !== "bid_ask") return false;
+    const bins = await this.database.listPositionGroupBins(group.id);
+    if (bins.length === 0 || bins.some((bin) => bin.status !== "minted" || bin.positionId === null || bin.tokenId === null)) return false;
+    const positions = await Promise.all(bins.map((bin) => this.database.getPositionById(bin.positionId!)));
+    if (positions.some((position) => position === null)) return false;
+
+    const quoteIsToken0 = group.quoteToken.toLowerCase() === group.token0.toLowerCase();
+    const nonQuoteToken = (quoteIsToken0 ? group.token1 : group.token0).toLowerCase() as Address;
+    const { registry } = this.chains.getById(group.chainId);
+    const client = this.executionReadClient(group.chainId);
+    const blockNumber = await client.getBlockNumber();
+    const live: PositionRecord[] = [];
+    const zero: Array<{ bin: PositionGroupBinRecord; position: PositionRecord }> = [];
+    for (let index = 0; index < bins.length; index += 1) {
+      const bin = bins[index]!;
+      const position = positions[index]!;
+      const owner = await client.readContract({
+        address: group.positionManager,
+        abi: v4PositionManagerAbi,
+        functionName: "ownerOf",
+        args: [bin.tokenId!],
+        blockNumber,
+      });
+      if (owner.toLowerCase() !== group.owner.toLowerCase()) {
+        throw new GroupIntegrityError(`Partially closed child ${position.positionKey} is no longer owned by the group owner`);
+      }
+      try {
+        const value = await this.reader.read(position, blockNumber, this.config.removeLiquiditySlippageBps, "execution");
+        if (value.liquidity > 0n) live.push(position);
+        else zero.push({ bin, position });
+      } catch (error) {
+        if (/zero liquidity/i.test(errorMessage(error))) zero.push({ bin, position });
+        else if (isTransientRpcError(error)) throw new TransientCloseError(group.id, error);
+        else throw new GroupIntegrityError(`Could not classify child ${position.positionKey} during partial recovery: ${errorMessage(error)}`);
+      }
+    }
+    if (live.length === 0 || zero.length === 0) return false;
+
+    // Read every already-closed child's own close receipt before mutating anything.
+    interface ZeroReceipt { bin: PositionGroupBinRecord; hash: Hex; block: bigint; amount0: bigint; amount1: bigint; quoteAmount: bigint }
+    const zeroReceipts: ZeroReceipt[] = [];
+    let earlierNonQuote = 0n;
+    for (const { bin, position } of zero) {
+      const salt = position.metadata.salt;
+      if (typeof salt !== "string" || !isHex(salt)) {
+        throw new GroupIntegrityError(`Partially closed child ${position.positionKey} has no position salt`);
+      }
+      const event = await this.findV4WithdrawalEvent(position, salt);
+      if (!event?.transactionHash || !event.blockNumber) {
+        throw new GroupIntegrityError(`Partially closed child ${position.positionKey} has no recoverable close receipt`);
+      }
+      const hash = event.transactionHash;
+      const receipt = await this.getConfirmedReceipt(group.chainId, hash);
+      if (receipt.status !== "success") throw new GroupIntegrityError(`Partially closed child close receipt reverted: ${hash}`);
+      const amount0 = await this.assetReceivedFromReceipt(group.chainId, group.token0, group.owner, hash, receipt);
+      const amount1 = await this.assetReceivedFromReceipt(group.chainId, group.token1, group.owner, hash, receipt);
+      const quoteAmount = quoteIsToken0 ? amount0 : amount1;
+      earlierNonQuote += quoteIsToken0 ? amount1 : amount0;
+      zeroReceipts.push({ bin, hash, block: receipt.blockNumber, amount0, amount1, quoteAmount });
+    }
+
+    // Reconcile each already-closed child into the group cashflow and close out its records.
+    for (const record of zeroReceipts) {
+      await this.database.addPositionGroupCashflow(
+        group.id,
+        record.block,
+        record.hash,
+        "close_receipt",
+        record.quoteAmount,
+        record.amount0,
+        record.amount1,
+        {
+          protocol: "v4",
+          childCount: 1,
+          trigger: "manual",
+          binIndex: record.bin.binIndex,
+          source: "partial_group_close_recovery",
+        },
+      );
+      await this.database.updatePositionGroupBin(group.id, record.bin.binIndex, {
+        status: "closed",
+        closeTransactionHash: record.hash,
+      });
+      const child = positions[bins.indexOf(record.bin)] ?? null;
+      if (child) {
+        await this.database.setPositionStatusUnlessSettled(child.id, "settled", {
+          closeTransactionHash: record.hash,
+          totalReceived: record.quoteAmount.toString(),
+          reason: "partial_group_close_recovered",
+        });
+      }
+    }
+
+    // Only live children remain minted, so the normal atomic close now passes validation.
+    const activated = await this.database.setPositionGroupStatus(group.id, "active", {
+      settlementRetryDisabled: null,
+      exitRetry: null,
+      lastExecutionError: null,
+      reason: null,
+      recoveryValidatedAt: new Date().toISOString(),
+    }, "needs_review");
+    if (!activated) throw new Error(`Position group ${group.id} changed while partial recovery was running`);
+    await this.executeGroupUnlocked(group.id, "manual");
+
+    // Fold the non-quote proceeds already received from the earlier partial closes into
+    // the pending settlement swap so the residual is swapped to the quote token.
+    if (earlierNonQuote > 0n) {
+      const after = await this.database.getPositionGroup(group.id);
+      const meta = after?.metadata;
+      const pending = meta && typeof meta.pendingSwap === "object" && meta.pendingSwap !== null
+        ? meta.pendingSwap as { token?: unknown; amount?: unknown }
+        : null;
+      if (after && after.status === "settling" && pending
+        && typeof pending.token === "string" && pending.token.toLowerCase() === nonQuoteToken
+        && typeof pending.amount === "string") {
+        await this.database.setPositionGroupStatus(after.id, "settling", {
+          pendingSwap: { token: pending.token, amount: (BigInt(pending.amount) + earlierNonQuote).toString() },
+        }, "settling");
+      }
+    }
+    return true;
+  }
+
+  private async reconcileZeroLiquidityGroup(group: PositionGroupRecord): Promise<boolean> {
+    const activeBins = (await this.database.listPositionGroupBins(group.id)).filter((bin) => bin.status === "minted");
+    if (activeBins.length === 0 || activeBins.some((bin) => !bin.positionId)) return false;
+    const positions = await Promise.all(activeBins.map((bin) => this.database.getPositionById(bin.positionId!)));
+    if (positions.some((position) => position === null)) return false;
+    const withdrawals = await Promise.all(positions.map(async (position) => {
+      const salt = position!.metadata.salt;
+      return typeof salt === "string" && isHex(salt) ? this.findV4WithdrawalEvent(position!, salt) : null;
+    }));
+    const first = withdrawals[0];
+    if (!first?.transactionHash || !first.blockNumber
+      || withdrawals.some((event) => event?.transactionHash !== first.transactionHash || event?.blockNumber !== first.blockNumber)) {
+      return false;
+    }
+    await this.reconcileGroupClose(group, first.transactionHash, "manual");
+    return true;
   }
 
   async executeRelatedPosition(position: PositionRecord, trigger: ExitTrigger): Promise<void> {
@@ -1177,7 +1359,7 @@ export class Executor {
     if (pending.nonce === undefined) return false;
     let currentNonce: number;
     try {
-      const { client } = this.chains.getById(group.chainId);
+      const client = this.executionReadClient(group.chainId);
       currentNonce = await client.getTransactionCount({ address: group.owner, blockTag: "latest" });
     } catch {
       return false;
@@ -1363,7 +1545,8 @@ export class Executor {
     if (burns.length > 0 && !legacyBurnClose) {
       throw new GroupIntegrityError("group close receipt contains a partial or unexpected NFT burn set");
     }
-    const { client, registry } = this.chains.getById(group.chainId);
+    const { registry } = this.chains.getById(group.chainId);
+    const client = this.executionReadClient(group.chainId);
     if (group.protocol === "v3") {
       const decreases = receipt.logs
         .filter((entry) => entry.address.toLowerCase() === group.positionManager.toLowerCase())
@@ -1683,7 +1866,7 @@ export class Executor {
     }
     const { token: tokenIn, amount: amountIn } = pending;
     const tokenOut = group.quoteToken;
-    const minimumAcceptableOut = await this.settlementMinimumOut(position, tokenIn, amountIn, tokenOut);
+    const spotMarkFloor = await this.settlementMinimumOut(position, tokenIn, amountIn, tokenOut);
     const quoteJobs: Promise<ApiSwapCandidate | null>[] = [];
     if (this.tradingApi) {
       quoteJobs.push(this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
@@ -1695,28 +1878,31 @@ export class Executor {
     }
     const results = await Promise.allSettled(quoteJobs);
     const errors: string[] = [];
-    const candidates: ApiSwapCandidate[] = [];
+    const quotedCandidates: ApiSwapCandidate[] = [];
     const rejectedProviders: string[] = [];
     for (const result of results) {
       if (result.status === "fulfilled") {
-        if (result.value) {
-          if (result.value.expectedOut < minimumAcceptableOut) {
-            errors.push(`${result.value.provider}: expected output is below spot-mark floor ${minimumAcceptableOut}`);
-            continue;
-          }
-          candidates.push(result.value);
-        }
+        if (result.value) quotedCandidates.push(result.value);
       } else {
         errors.push(errorMessage(result.reason));
       }
     }
+    const minimumAcceptableOut = this.settlementReferenceFloor(spotMarkFloor, quotedCandidates);
+    if (minimumAcceptableOut === null) {
+      throw new SettlementRouteError("No executable group settlement route: spot mark and aggregator reference are unavailable");
+    }
+    const candidates = quotedCandidates.filter((candidate) => {
+      if (candidate.expectedOut >= minimumAcceptableOut) return true;
+      errors.push(`${candidate.provider}: expected output is below settlement floor ${minimumAcceptableOut}`);
+      return false;
+    });
     candidates.sort((left, right) => compareSettlementCandidates(left, right, lastFailedProvider, failedProviders));
 
     for (const [candidateIndex, candidate] of candidates.entries()) {
       try {
         const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, minimumAcceptableOut);
         if (!constrained) {
-          errors.push(`${candidate.provider}: calldata minimum output is below spot-mark floor ${minimumAcceptableOut}`);
+          errors.push(`${candidate.provider}: calldata minimum output is below settlement floor ${minimumAcceptableOut}`);
           rejectedProviders.push(candidate.provider);
           continue;
         }
@@ -1735,7 +1921,7 @@ export class Executor {
     try {
       const route = await this.routes.quoteDirect(position, tokenIn, amountIn, tokenOut);
       if (!route) throw new Error("No safe local route remains for group settlement swap");
-      if (route.expectedOut < minimumAcceptableOut) throw new Error(`local expected output is below spot-mark floor ${minimumAcceptableOut}`);
+      if (route.expectedOut < minimumAcceptableOut) throw new Error(`local expected output is below settlement floor ${minimumAcceptableOut}`);
       const minimumOut = applySlippage(route.expectedOut, slippageBps);
       await this.ensureGroupSettlementApproval(group, position, route.protocol, route.router, tokenIn, amountIn);
       const plan = buildSwapPlan(group.chainId, group.owner, { ...route, minimumOut }, BigInt(Math.floor(Date.now() / 1_000) + 300));
@@ -1798,7 +1984,8 @@ export class Executor {
     amount: bigint,
   ): Promise<boolean> {
     if (token.toLowerCase() === zeroAddress.toLowerCase()) return false;
-    const { client, registry } = this.chains.getById(group.chainId);
+    const { registry } = this.chains.getById(group.chainId);
+    const client = this.executionReadClient(group.chainId);
     const spender = protocol === "v4" ? registry.contracts.v4.permit2 : router;
     let changed = false;
     const allowance = await client.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [group.owner, spender] });
@@ -2501,7 +2688,7 @@ export class Executor {
     if (dexNameFromMetadata(position.metadata) === "pancake") {
       return this.preparePancakeSettlementSwap(position, tokenIn, amountIn, tokenOut, slippageBps, lastFailedProvider, approvalRefreshes);
     }
-    const minimumAcceptableOut = await this.settlementMinimumOut(position, tokenIn, amountIn, tokenOut);
+    const spotMarkFloor = await this.settlementMinimumOut(position, tokenIn, amountIn, tokenOut);
     const quoteJobs: Promise<ApiSwapCandidate | null>[] = [];
     if (this.tradingApi) {
       quoteJobs.push(this.tradingApi.quote(position, tokenIn, amountIn, tokenOut, slippageBps)
@@ -2513,30 +2700,33 @@ export class Executor {
     }
     const results = await Promise.allSettled(quoteJobs);
     const errors: string[] = [];
-    const candidates: ApiSwapCandidate[] = [];
+    const quotedCandidates: ApiSwapCandidate[] = [];
     const rejectedProviders: string[] = [];
     for (const result of results) {
       if (result.status === "fulfilled") {
-        if (result.value) {
-          if (result.value.expectedOut < minimumAcceptableOut) {
-            const reason = `expected output ${result.value.expectedOut} is below spot-mark floor ${minimumAcceptableOut}`;
-            errors.push(`${result.value.provider}: ${reason}`);
-            log.warn({ positionKey: position.positionKey, provider: result.value.provider, expectedOut: result.value.expectedOut.toString(), minimumOut: result.value.minimumOut.toString(), minimumAcceptableOut: minimumAcceptableOut.toString() }, "settlement swap candidate rejected below spot-mark floor");
-            continue;
-          }
-          candidates.push(result.value);
-        }
+        if (result.value) quotedCandidates.push(result.value);
       } else {
         errors.push(errorMessage(result.reason));
       }
     }
+    const minimumAcceptableOut = this.settlementReferenceFloor(spotMarkFloor, quotedCandidates);
+    if (minimumAcceptableOut === null) {
+      throw new SettlementRouteError("No executable settlement route: spot mark and aggregator reference are unavailable");
+    }
+    const candidates = quotedCandidates.filter((candidate) => {
+      if (candidate.expectedOut >= minimumAcceptableOut) return true;
+      const reason = `expected output ${candidate.expectedOut} is below settlement floor ${minimumAcceptableOut}`;
+      errors.push(`${candidate.provider}: ${reason}`);
+      log.warn({ positionKey: position.positionKey, provider: candidate.provider, expectedOut: candidate.expectedOut.toString(), minimumOut: candidate.minimumOut.toString(), minimumAcceptableOut: minimumAcceptableOut.toString() }, "settlement swap candidate rejected below settlement floor");
+      return false;
+    });
     candidates.sort((left, right) => compareSettlementCandidates(left, right, lastFailedProvider, failedProviders));
 
     for (const [candidateIndex, candidate] of candidates.entries()) {
       try {
         const constrained = await this.constrainApiCandidate(position, tokenIn, amountIn, tokenOut, candidate, minimumAcceptableOut);
         if (!constrained) {
-          errors.push(`${candidate.provider}: cannot build calldata with spot-mark floor ${minimumAcceptableOut}`);
+          errors.push(`${candidate.provider}: cannot build calldata with settlement floor ${minimumAcceptableOut}`);
           rejectedProviders.push(candidate.provider);
           continue;
         }
@@ -2568,7 +2758,7 @@ export class Executor {
     try {
       const local = await this.prepareLocalSwap(position, tokenIn, amountIn, tokenOut, slippageBps);
       if (!local) return null;
-      if (local.expectedOut < minimumAcceptableOut) throw new Error(`local expected output is below spot-mark floor ${minimumAcceptableOut}`);
+      if (local.expectedOut < minimumAcceptableOut) throw new Error(`local expected output is below settlement floor ${minimumAcceptableOut}`);
       await this.simulatePlan(position, local.plan);
       return local;
     } catch (error) {
@@ -2655,7 +2845,11 @@ export class Executor {
       if (result.status === "fulfilled" && result.value) quoted.push(result.value);
     }
     if (quoted.length === 0) throw new SettlementRouteError("No pancake Universal Router or KyberSwap route available");
-    const floor = await this.settlementMinimumOut(position, tokenIn, amountIn, tokenOut);
+    const floor = this.settlementReferenceFloor(
+      await this.settlementMinimumOut(position, tokenIn, amountIn, tokenOut),
+      quoted,
+    );
+    if (floor === null) throw new SettlementRouteError("No trustworthy pancake settlement reference is available");
     const aboveFloor = quoted.filter((item) => item.expectedOut >= floor).sort((left, right) => right.expectedOut === left.expectedOut ? 0 : right.expectedOut > left.expectedOut ? -1 : 1);
     const belowFloor = quoted.filter((item) => item.expectedOut < floor).sort((left, right) => right.expectedOut === left.expectedOut ? 0 : right.expectedOut > left.expectedOut ? -1 : 1);
     return { aboveFloor, belowFloor, floor };
@@ -2730,7 +2924,7 @@ export class Executor {
     amount: bigint,
   ): Promise<boolean> {
     const erc20Changed = await this.ensureGroupSettlementApproval(group, position, "v3", PANCAKE_PERMIT2, token, amount);
-    const { client } = this.chains.getById(group.chainId);
+    const client = this.executionReadClient(group.chainId);
     if (amount > MAX_UINT160) throw new Error("Pancake UR settlement amount overflows Permit2 uint160");
     const permitAllowance = await client.readContract({
       address: PANCAKE_PERMIT2,
@@ -2937,7 +3131,7 @@ export class Executor {
 
   private async ensureApproval(position: PositionRecord, token: Address, spender: Address, amount: bigint, stage: string): Promise<boolean> {
     if (token.toLowerCase() === zeroAddress) throw new Error("Native ETH does not require ERC-20 approval");
-    const { client, registry } = this.chains.getById(position.chainId);
+    const client = this.executionReadClient(position.chainId);
     const allowance = await client.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [position.owner, spender] });
 
     if (this.isProtectedToken(position.chainId, token)) {
@@ -2973,7 +3167,8 @@ export class Executor {
   private async ensurePermit2Approval(position: PositionRecord, token: Address, spender: Address, amount: bigint, permit2?: Address): Promise<boolean> {
     if (token.toLowerCase() === zeroAddress) throw new Error("Native ETH does not require Permit2 approval");
     if (amount > MAX_UINT160) throw new Error("Permit2 approval amount overflows uint160");
-    const { client, registry } = this.chains.getById(position.chainId);
+    const { registry } = this.chains.getById(position.chainId);
+    const client = this.executionReadClient(position.chainId);
     const permit2Address = permit2 ?? registry.contracts.v4.permit2;
     const allowance = await client.readContract({
       address: permit2Address,
@@ -3167,7 +3362,7 @@ export class Executor {
     } catch {
       return false;
     }
-    const { client } = this.chains.getById(position.chainId);
+    const client = this.executionReadClient(position.chainId);
     try {
       const pendingNonce = await client.getTransactionCount({ address: position.owner, blockTag: "pending" });
       // A nonce advance is proof that this exact transaction was replaced or
@@ -3469,20 +3664,45 @@ export class Executor {
   private async findV4WithdrawalEvent(position: PositionRecord, salt: Hex) {
     const { registry } = this.chains.getById(position.chainId);
     const { client } = this.scanChain(registry.name);
-    const { client: logClient } = this.chains.getForLogs(registry.name);
-    const fromBlock = position.openedAtBlock ?? 0n;
-    let toBlock = await client.getBlockNumber();
-    while (toBlock >= fromBlock) {
-      const chunkFrom = toBlock - fromBlock >= V4_WITHDRAWAL_LOG_BLOCK_RANGE
-        ? toBlock - V4_WITHDRAWAL_LOG_BLOCK_RANGE + 1n
-        : fromBlock;
-      // Robinhood RPC rejects the indexed sender topic on this event. Filter it locally.
-      const events = await logClient.getLogs({
-        address: registry.contracts.v4.poolManager,
-        event: v4PoolManagerModifyLiquidityEvent,
-        fromBlock: chunkFrom,
-        toBlock,
-      });
+      // Robinhood's public scan RPC intermittently has no log backend or rate-limits
+      // this unfiltered query. Prefer the execution RPC (Alchemy first), and when it is
+      // available ask for the indexed sender topic so the scan stays bounded.
+      const executionLogClient = this.executionChain(registry.name).client;
+      const useExecutionLogs = registry.name === "robinhood" && typeof executionLogClient.getLogs === "function";
+      const { client: logClient } = useExecutionLogs
+        ? { client: executionLogClient }
+        : this.chains.getForLogs(registry.name);
+      const senderTopic = useExecutionLogs
+        ? `0x${registry.contracts.v4.positionManager.toLowerCase().slice(2).padStart(64, "0")}`
+        : null;
+      const fromBlock = position.openedAtBlock ?? 0n;
+      const scanHead = await client.getBlockNumber();
+      const logHead = typeof logClient.getBlockNumber === "function" ? await logClient.getBlockNumber() : scanHead;
+      let toBlock = scanHead < logHead ? scanHead : logHead;
+      while (toBlock >= fromBlock) {
+        const chunkFrom = toBlock - fromBlock >= V4_WITHDRAWAL_LOG_BLOCK_RANGE
+          ? toBlock - V4_WITHDRAWAL_LOG_BLOCK_RANGE + 1n
+          : fromBlock;
+        let events;
+        try {
+          events = await logClient.getLogs({
+            address: registry.contracts.v4.poolManager,
+            event: v4PoolManagerModifyLiquidityEvent,
+            ...(senderTopic ? { args: { sender: registry.contracts.v4.positionManager as Address } } : {}),
+            fromBlock: chunkFrom,
+            toBlock,
+          });
+        } catch (error) {
+          if (!senderTopic || isTransientRpcError(error) || !/topic|indexed|unsupported|resource not found|no backend/i.test(errorMessage(error))) throw error;
+          // Some Robinhood endpoints reject the indexed sender topic; fall back to
+          // unfiltered logs and filter locally.
+          events = await logClient.getLogs({
+            address: registry.contracts.v4.poolManager,
+            event: v4PoolManagerModifyLiquidityEvent,
+            fromBlock: chunkFrom,
+            toBlock,
+          });
+        }
       for (const event of [...events].reverse()) {
         const args = (event as unknown as { args: { sender?: Address; salt?: Hex; liquidityDelta?: bigint } }).args;
         if (args.sender?.toLowerCase() === registry.contracts.v4.positionManager.toLowerCase()
@@ -3500,7 +3720,8 @@ export class Executor {
   async autoSettleZeroLiquidityV3(name: string, position: PositionRecord): Promise<boolean> {
     if (position.protocol !== "v3" || !position.quoteToken) return false;
     const tokenId = BigInt(position.positionKey);
-    const { client, registry } = this.chains.getById(position.chainId);
+    const { registry } = this.chains.getById(position.chainId);
+    const client = this.executionReadClient(position.chainId);
     const { client: logClient } = this.chains.getForLogs(registry.name);
     const manager = v3ContractsFor(registry, dexNameFromMetadata(position.metadata)).positionManager;
     try {
@@ -3592,10 +3813,20 @@ export class Executor {
     return amounts;
   }
 
-  private async settlementMinimumOut(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address): Promise<bigint> {
-    const mark = await this.settlementSpotMarkQuote(position, tokenIn, amountIn, tokenOut);
-    if (mark <= 0n) throw new SettlementRouteError("Spot mark is unavailable");
-    return applySlippage(mark, this.config.settlementMaxImpactBps ?? 1_500);
+  private async settlementMinimumOut(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address): Promise<bigint | null> {
+    try {
+      const mark = await this.settlementSpotMarkQuote(position, tokenIn, amountIn, tokenOut);
+      return mark > 0n ? applySlippage(mark, this.config.settlementMaxImpactBps ?? 1_500) : null;
+    } catch (error) {
+      if (error instanceof SettlementRouteError) return null;
+      throw error;
+    }
+  }
+
+  private settlementReferenceFloor(spotMarkFloor: bigint | null, candidates: readonly ApiSwapCandidate[]): bigint | null {
+    if (spotMarkFloor !== null) return spotMarkFloor;
+    const best = candidates.reduce<bigint>((value, candidate) => candidate.expectedOut > value ? candidate.expectedOut : value, 0n);
+    return best > 0n ? applySlippage(best, this.config.settlementMaxImpactBps ?? 1_500) : null;
   }
 
   private async settlementSpotMarkQuote(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address): Promise<bigint> {
@@ -3604,7 +3835,8 @@ export class Executor {
     const tokenInIsToken0 = tokenIn.toLowerCase() === position.token0.toLowerCase();
     const amount0 = tokenInIsToken0 ? amountIn : 0n;
     const amount1 = tokenInIsToken0 ? 0n : amountIn;
-    const { client, registry } = this.chains.getById(position.chainId);
+    const { registry } = this.chains.getById(position.chainId);
+    const client = this.executionReadClient(position.chainId);
     const metadata = position.metadata as Record<string, unknown>;
     if (position.protocol === "v4") {
       const currency0 = (metadata.currency0 as Address | undefined) ?? position.token0;
@@ -3624,7 +3856,7 @@ export class Executor {
           args: [poolId],
         });
         const sqrtPriceX96 = sqrtPriceFromSlot0(slot0);
-        if (!isUsableSqrtPrice(sqrtPriceX96)) throw new SettlementRouteError("Spot mark is unavailable");
+        if (!isUsableSqrtPrice(sqrtPriceX96, tickFromSlot0(slot0))) throw new SettlementRouteError("Spot mark is unavailable");
         return quoteValueAtSqrtPrice(amount0, amount1, quoteIsToken0, sqrtPriceX96);
       }
     }
@@ -3635,7 +3867,7 @@ export class Executor {
         functionName: "slot0",
       });
       const sqrtPriceX96 = sqrtPriceFromSlot0(slot0);
-      if (!isUsableSqrtPrice(sqrtPriceX96)) throw new SettlementRouteError("Spot mark is unavailable");
+      if (!isUsableSqrtPrice(sqrtPriceX96, tickFromSlot0(slot0))) throw new SettlementRouteError("Spot mark is unavailable");
       return quoteValueAtSqrtPrice(amount0, amount1, quoteIsToken0, sqrtPriceX96);
     }
     if (position.poolAddress && position.protocol === "v2") {
@@ -3925,14 +4157,20 @@ export function nextSwapRetry(
   const previous = swapRetryState(metadata);
   const nextCycleAttempts = broadcastFailed ? previous.cycleBroadcastAttempts + 1 : 0;
   const cycleComplete = !broadcastFailed || nextCycleAttempts >= Math.max(1, cycleSize);
+  const planningFailures = broadcastFailed ? 0 : previous.planningFailures + 1;
   const nextFailedProviders = uniqueProviders([...(previous.failedProviders ?? []), ...failedProviders, lastProvider]);
+  const retryDelay = !cycleComplete
+    ? 0
+    : broadcastFailed
+      ? SWAP_RETRY_CYCLE_DELAY_MS
+      : Math.min(SWAP_PLANNING_MAX_DELAY_MS, SWAP_RETRY_CYCLE_DELAY_MS * (2 ** Math.min(planningFailures - 1, 10)));
   return {
     broadcastAttempts: previous.broadcastAttempts + (broadcastFailed ? 1 : 0),
-    planningFailures: broadcastFailed ? 0 : previous.planningFailures + 1,
+    planningFailures,
     cycleBroadcastAttempts: cycleComplete ? 0 : nextCycleAttempts,
     ...(lastProvider ? { lastProvider } : {}),
     ...(nextFailedProviders.length > 0 ? { failedProviders: nextFailedProviders } : {}),
-    nextAttemptAt: new Date(now + (cycleComplete ? SWAP_RETRY_CYCLE_DELAY_MS : 0)).toISOString(),
+    nextAttemptAt: new Date(now + retryDelay).toISOString(),
   };
 }
 
@@ -3940,6 +4178,10 @@ function sqrtPriceFromSlot0(slot0: unknown): bigint {
   if (typeof slot0 === "bigint") return slot0;
   if (Array.isArray(slot0) && typeof slot0[0] === "bigint") return slot0[0];
   return 0n;
+}
+
+function tickFromSlot0(slot0: unknown): number | undefined {
+  return Array.isArray(slot0) && typeof slot0[1] === "number" ? slot0[1] : undefined;
 }
 
 function compareSettlementCandidates(

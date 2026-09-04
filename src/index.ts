@@ -111,6 +111,9 @@ function applyRiskSettings(config: ReturnType<typeof loadConfig>, settings: Risk
   config.takeProfitPercent = settings.takeProfitPercent;
   config.trailingStopActivationPercent = settings.trailingStopActivationPercent;
   config.trailingStopDrawdownPercent = settings.trailingStopDrawdownPercent;
+  if (settings.bidAskLadderV4MaxOpenGasUsd !== undefined) {
+    config.bidAskLadderV4MaxOpenGasUsd = settings.bidAskLadderV4MaxOpenGasUsd;
+  }
 }
 
 main().catch((error: unknown) => {

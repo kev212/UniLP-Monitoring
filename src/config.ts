@@ -97,6 +97,8 @@ const envSchema = z.object({
   BIDASK_LADDER_MAX_BINS: strictInteger(1, 10_000, 16),
   BIDASK_LADDER_MAX_PRICE_DEVIATION_BPS: strictInteger(0, 10_000, 100),
   BIDASK_LADDER_ATOMIC_MAX_BLOCK_GAS_BPS: strictInteger(1, 10_000, 8_000),
+  BIDASK_LADDER_V4_MAX_OPEN_GAS_USD: z.coerce.number().positive().max(100).default(2),
+  BIDASK_LADDER_V4_ETH_USD: z.coerce.number().positive().max(1_000_000).default(2_500),
   BIDASK_LADDER_TRANSACTION_DEADLINE_SECONDS: strictInteger(1, 86_400, 300),
   BIDASK_LADDER_MAX_RETRIES: strictInteger(0, 100, 3),
   THEGRAPH_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
@@ -170,6 +172,8 @@ export interface RuntimeConfig {
   bidAskLadderMaxBins: number;
   bidAskLadderMaxPriceDeviationBps: number;
   bidAskLadderAtomicMaxBlockGasBps: number;
+  bidAskLadderV4MaxOpenGasUsd: number;
+  bidAskLadderV4EthUsd: number;
   bidAskLadderTransactionDeadlineSeconds: number;
   bidAskLadderMaxRetries: number;
   thegraphApiKey?: string;
@@ -420,6 +424,8 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     bidAskLadderMaxBins: env.BIDASK_LADDER_MAX_BINS,
     bidAskLadderMaxPriceDeviationBps: env.BIDASK_LADDER_MAX_PRICE_DEVIATION_BPS,
     bidAskLadderAtomicMaxBlockGasBps: env.BIDASK_LADDER_ATOMIC_MAX_BLOCK_GAS_BPS,
+    bidAskLadderV4MaxOpenGasUsd: env.BIDASK_LADDER_V4_MAX_OPEN_GAS_USD,
+    bidAskLadderV4EthUsd: env.BIDASK_LADDER_V4_ETH_USD,
     bidAskLadderTransactionDeadlineSeconds: env.BIDASK_LADDER_TRANSACTION_DEADLINE_SECONDS,
     bidAskLadderMaxRetries: env.BIDASK_LADDER_MAX_RETRIES,
     thegraphApiKey: env.THEGRAPH_API_KEY,

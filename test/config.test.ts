@@ -100,6 +100,8 @@ describe("loadConfig", () => {
     expect(config.bidAskLadderMaxBins).toBe(16);
     expect(config.bidAskLadderMaxPriceDeviationBps).toBe(100);
     expect(config.bidAskLadderAtomicMaxBlockGasBps).toBe(8_000);
+    expect(config.bidAskLadderV4MaxOpenGasUsd).toBe(2);
+    expect(config.bidAskLadderV4EthUsd).toBe(2_500);
     expect(config.bidAskLadderTransactionDeadlineSeconds).toBe(300);
     expect(config.bidAskLadderMaxRetries).toBe(3);
   });
@@ -118,6 +120,8 @@ describe("loadConfig", () => {
       BIDASK_LADDER_MAX_BINS: "4",
       BIDASK_LADDER_MAX_PRICE_DEVIATION_BPS: "125",
       BIDASK_LADDER_ATOMIC_MAX_BLOCK_GAS_BPS: "7500",
+      BIDASK_LADDER_V4_MAX_OPEN_GAS_USD: "1.5",
+      BIDASK_LADDER_V4_ETH_USD: "2500",
       BIDASK_LADDER_TRANSACTION_DEADLINE_SECONDS: "600",
       BIDASK_LADDER_MAX_RETRIES: "0",
     }));
@@ -127,6 +131,8 @@ describe("loadConfig", () => {
     expect(config.bidAskLadderMaxBins).toBe(4);
     expect(config.bidAskLadderMaxPriceDeviationBps).toBe(125);
     expect(config.bidAskLadderAtomicMaxBlockGasBps).toBe(7_500);
+    expect(config.bidAskLadderV4MaxOpenGasUsd).toBe(1.5);
+    expect(config.bidAskLadderV4EthUsd).toBe(2_500);
     expect(config.bidAskLadderTransactionDeadlineSeconds).toBe(600);
     expect(config.bidAskLadderMaxRetries).toBe(0);
 

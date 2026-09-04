@@ -632,6 +632,20 @@ describe("Executor pending settlement recovery", () => {
     expect(Date.parse(reverted.nextAttemptAt!)).toBe(now);
   });
 
+  it("backs off repeated settlement planning failures", () => {
+    const now = Date.now();
+    let retry = nextSwapRetry({}, "uniswap", false, 2, now);
+    expect(Date.parse(retry.nextAttemptAt!)).toBe(now + 3_000);
+
+    retry = nextSwapRetry({ swapRetry: retry }, "uniswap", false, 2, now);
+    expect(Date.parse(retry.nextAttemptAt!)).toBe(now + 6_000);
+    for (let attempt = 3; attempt <= 10; attempt += 1) {
+      retry = nextSwapRetry({ swapRetry: retry }, "uniswap", false, 2, now);
+    }
+    expect(retry.planningFailures).toBe(10);
+    expect(Date.parse(retry.nextAttemptAt!)).toBe(now + 60_000);
+  });
+
   it("restarts a failed two-provider cycle after three seconds without a hard retry cap", () => {
     const now = Date.now();
     let retry = nextSwapRetry({}, "kyberswap", true, 2, now);
@@ -1087,6 +1101,43 @@ describe("Executor pending settlement recovery", () => {
     expect(tradingApi.createSwap).toHaveBeenCalledTimes(1);
   });
 
+  it("uses the execution RPC client for group settlement reads", async () => {
+    const normalClient = {
+      readContract: vi.fn().mockRejectedValue(new Error("normal RPC queue is starved")),
+      call: vi.fn().mockRejectedValue(new Error("normal RPC queue is starved")),
+    };
+    const executionClient = {
+      readContract: markReadContract(),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const registry = v4Registry("robinhood");
+    const chains = {
+      getById: vi.fn(() => ({ client: normalClient, registry })),
+      getForExecution: vi.fn(() => ({ client: executionClient, registry })),
+    };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 230n, minimumOut: 225n, router: sender, slippageBps: 200 }),
+      approvalSpender: vi.fn().mockReturnValue(sender),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: sender, data: "0x22", description: "kyber" }),
+    };
+    const executor = new Executor({} as never, chains as never, {} as never, {} as never, {} as never, config, undefined, kyberswapApi as never);
+    const group = groupRecord("v4");
+
+    const prepared = await (executor as unknown as {
+      prepareGroupSettlementSwap(
+        value: PositionGroupRecord,
+        position: PositionRecord,
+        swap: { token: Address; amount: bigint },
+        slippage: number,
+      ): Promise<{ provider: string; expectedOut: bigint }>;
+    }).prepareGroupSettlementSwap(group, groupSettlementPosition(group), { token, amount: 5n }, 200);
+
+    expect(prepared).toMatchObject({ provider: "kyberswap", expectedOut: 230n });
+    expect(normalClient.readContract).not.toHaveBeenCalled();
+    expect(normalClient.call).not.toHaveBeenCalled();
+    expect(executionClient.readContract).toHaveBeenCalled();
+  });
+
   it("selects Uniswap for BOW/ETH after Kyber simulation reverts even at 200 bps", async () => {
     const uniswapTarget = "0x0000000000000000000000000000000000000004" as Address;
     const kyberTarget = "0x0000000000000000000000000000000000000005" as Address;
@@ -1314,6 +1365,57 @@ describe("Executor pending settlement recovery", () => {
     }).prepareBestSettlementSwap(position, token, 246n, usdg, 200);
 
     expect(prepared).toMatchObject({ provider: "kyberswap", expectedOut: 230n });
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
+  });
+
+  it("uses an aggregator reference when the source pool is at a price boundary", async () => {
+    const client = {
+      readContract: vi.fn(async ({ functionName, args }: { functionName: string; args?: unknown[] }) => {
+        if (functionName === "getSlot0") return [4_295_128_740n, -887_272, 0, 4_000];
+        if (functionName === "allowance") return (args?.length ?? 0) === 3 ? [10n ** 30n, 4_000_000_000] : 10n ** 30n;
+        return 10n ** 30n;
+      }),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
+    const kyberswapApi = {
+      quote: vi.fn().mockResolvedValue({ source: "kyberswap", expectedOut: 5_600_000n, minimumOut: 5_320_000n, router: sender }),
+      approvalSpender: vi.fn().mockReturnValue(sender),
+      createSwap: vi.fn().mockResolvedValue({ chainId: 4663, to: sender, data: "0x22", description: "kyber" }),
+    };
+    const routes = { quoteDirect: vi.fn() };
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, config, undefined, kyberswapApi as never);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1498291", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: { fee: 4_000, tickSpacing: 100, hooks: zeroAddress },
+    } as PositionRecord;
+
+    const prepared = await (executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<{ provider: string; expectedOut: bigint }>;
+    }).prepareBestSettlementSwap(position, token, 176_276_352_095_519_237_926n, usdg, 500);
+
+    expect(prepared).toMatchObject({ provider: "kyberswap", expectedOut: 5_600_000n });
+    expect(routes.quoteDirect).not.toHaveBeenCalled();
+  });
+
+  it("does not use a local route without a valid spot mark or aggregator reference", async () => {
+    const client = {
+      readContract: vi.fn().mockResolvedValue([4_295_128_740n, -887_272, 0, 4_000]),
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+    };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
+    const routes = { quoteDirect: vi.fn().mockResolvedValue({ expectedOut: 5_600_000n, protocol: "v3", router: sender, tokenIn: token, tokenOut: usdg, path: [token, usdg], amountIn: 1n }) };
+    const executor = new Executor({} as never, chains as never, {} as never, routes as never, {} as never, config);
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1498291", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "closing", liquidity: null,
+      openedAtBlock: null, metadata: { fee: 4_000, tickSpacing: 100, hooks: zeroAddress },
+    } as PositionRecord;
+
+    await expect((executor as unknown as {
+      prepareBestSettlementSwap(value: PositionRecord, tokenIn: Address, amount: bigint, tokenOut: Address, slippage: number): Promise<unknown>;
+    }).prepareBestSettlementSwap(position, token, 1n, usdg, 500)).rejects.toThrow("aggregator reference");
     expect(routes.quoteDirect).not.toHaveBeenCalled();
   });
 
@@ -1956,6 +2058,100 @@ describe("Executor pending settlement recovery", () => {
       expect.objectContaining({ source: "atomic_group_close", childCount: 2 }),
     );
     expect(closeReceiptAmounts).not.toHaveBeenCalled();
+  });
+
+  it("recovers a needs-review group only after live child validation", async () => {
+    const group = { ...groupRecord("v4"), status: "needs_review" as const };
+    const activeGroup = { ...group, status: "active" as const };
+    const database = {
+      getPositionGroup: vi.fn()
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(activeGroup),
+      claimPositionGroupLease: vi.fn().mockResolvedValue(true),
+      releasePositionGroupLease: vi.fn().mockResolvedValue(undefined),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(true),
+    };
+    const executor = new Executor(database as never, {} as never, {} as never, {} as never, {} as never, config);
+    const validate = vi.spyOn(executor as any, "loadGroupChildren").mockResolvedValue([]);
+    vi.spyOn(executor as any, "recoverPendingGroupExecution").mockResolvedValue(false);
+    const close = vi.spyOn(executor as any, "executeGroupUnlocked").mockResolvedValue(undefined);
+
+    await executor.recoverGroup(group.id);
+
+    expect(validate).toHaveBeenCalledWith(group);
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith(group.id, "active", expect.objectContaining({
+      settlementRetryDisabled: null,
+      recoveryValidatedAt: expect.any(String),
+    }), "needs_review");
+    expect(close).toHaveBeenCalledWith(group.id, "manual");
+  });
+
+  it("recovers a partially closed V4 group by closing only its live children", async () => {
+    const group = { ...groupRecord("v4"), status: "needs_review" as const };
+    const zeroHash = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" as Hex;
+    const bins = [groupBin(0, 8n, "child-z", -120, -60), groupBin(1, 9n, "child-l", -60, 0)];
+    const childZ = { ...v4GroupChild("child-z", 8n), positionKey: "8", metadata: { positionGroupId: groupId, salt: "0x0000000000000000000000000000000000000000000000000000000000000008" } };
+    const childL = { ...v4GroupChild("child-l", 9n), positionKey: "9", metadata: { positionGroupId: groupId, salt: "0x0000000000000000000000000000000000000000000000000000000000000009" } };
+    const poolManager = "0x0000000000000000000000000000000000000300" as Address;
+    const client = {
+      getBlockNumber: vi.fn().mockResolvedValue(100n),
+      readContract: vi.fn(async ({ functionName }: { functionName: string }) => functionName === "ownerOf" ? owner : 0n),
+    };
+    const chains = {
+      getById: vi.fn(() => ({ client, registry: v4Registry("robinhood", { poolManager, positionManager: groupManager }) })),
+      getForExecution: vi.fn(() => ({ client, transport: {} })),
+    };
+    const reader = {
+      read: vi.fn((position: PositionRecord) => position.positionKey === "8"
+        ? Promise.reject(new Error("V4 position has zero liquidity"))
+        : Promise.resolve(v4GroupValue(-60, 0, 10n))),
+    };
+    const settlingAfter = { ...group, status: "settling" as const, metadata: { pendingSwap: { token, amount: "10" } } };
+    const database = {
+      getPositionGroup: vi.fn()
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(settlingAfter),
+      getPositionById: vi.fn(async (id: string) => id === "child-z" ? childZ : childL),
+      listPositionGroupBins: vi.fn().mockResolvedValue(bins),
+      claimPositionGroupLease: vi.fn().mockResolvedValue(true),
+      releasePositionGroupLease: vi.fn().mockResolvedValue(undefined),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(true),
+      updatePositionGroupBin: vi.fn().mockResolvedValue(true),
+      addPositionGroupCashflow: vi.fn().mockResolvedValue(undefined),
+      setPositionStatusUnlessSettled: vi.fn().mockResolvedValue(true),
+    };
+    const executor = new Executor(database as never, chains as never, reader as never, {} as never, {} as never, config);
+    vi.spyOn(executor as any, "recoverPendingGroupExecution").mockResolvedValue(false);
+    vi.spyOn(executor as any, "findV4WithdrawalEvent").mockResolvedValue({ transactionHash: zeroHash, blockNumber: 90n });
+    vi.spyOn(executor as any, "getConfirmedReceipt").mockResolvedValue({ status: "success", blockNumber: 90n, logs: [] });
+    vi.spyOn(executor as any, "assetReceivedFromReceipt")
+      .mockResolvedValueOnce(5n)
+      .mockResolvedValueOnce(3n);
+    const close = vi.spyOn(executor as any, "executeGroupUnlocked").mockResolvedValue(undefined);
+
+    await executor.recoverGroup(group.id);
+
+    expect(database.updatePositionGroupBin).toHaveBeenCalledWith(group.id, 0, expect.objectContaining({ status: "closed" }));
+    expect(database.setPositionStatusUnlessSettled).toHaveBeenCalledWith("child-z", "settled", expect.objectContaining({
+      reason: "partial_group_close_recovered",
+    }));
+    expect(database.addPositionGroupCashflow).toHaveBeenCalledWith(
+      group.id,
+      90n,
+      zeroHash,
+      "close_receipt",
+      5n,
+      5n,
+      3n,
+      expect.objectContaining({ source: "partial_group_close_recovery", binIndex: 0 }),
+    );
+    expect(database.setPositionGroupStatus).toHaveBeenCalledWith(group.id, "active", expect.objectContaining({
+      recoveryValidatedAt: expect.any(String),
+    }), "needs_review");
+    expect(close).toHaveBeenCalledWith(group.id, "manual");
+    expect(database.setPositionStatusUnlessSettled).not.toHaveBeenCalledWith("child-l", "settled", expect.anything());
   });
 
   it("accepts retained zero-liquidity V4 NFTs after an atomic group close", async () => {

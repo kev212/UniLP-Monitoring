@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { createWalletClient, encodeAbiParameters, encodeFunctionData, keccak256, type Address, type Hex, type PublicClient, zeroAddress } from "viem";
+import { createWalletClient, encodeAbiParameters, encodeFunctionData, formatEther, keccak256, type Address, type Hex, type PublicClient, zeroAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
 import { erc20Abi, permit2Abi, v3FactoryAbi, v3PoolAbi, v4PoolKeysAbi, v4StateViewAbi, wethAbi } from "../abi.js";
@@ -207,6 +207,8 @@ type BidAskRuntimeConfig = RuntimeConfig & {
   bidAskLadderProtocols?: readonly ("v3" | "v4")[] | string;
   bidAskLadderMaxBins?: number;
   bidAskLadderAtomicMaxBlockGasBps?: number;
+  bidAskLadderV4MaxOpenGasUsd?: number;
+  bidAskLadderV4EthUsd?: number;
   bidAskLadderTransactionDeadlineSeconds?: number;
   bidAskLadderMaxPriceDeviationBps?: number;
   bidAskLadderOpenSlippageBps?: number;
@@ -643,7 +645,7 @@ export class PositionOpener {
       { address: preview.quoteToken, symbol: preview.quoteTokenSymbol },
       deadline,
     );
-    const gas = await this.simulateAndEstimateBidAsk(preview.chain, batchPlan, plan.generatedBinCount);
+    const gas = await this.simulateAndEstimateBidAsk(preview.chain, preview.protocol, batchPlan, plan.generatedBinCount);
     const planHash = hashBidAskPlan(plan);
     const finalPreview: BidAskOpenPreview = {
       ...preview,
@@ -678,7 +680,7 @@ export class PositionOpener {
     });
     let openedHash: Hex | null = null;
     try {
-      const result = await this.broadcastBidAsk(preview.chain, groupId, batchPlan.to, batchPlan.data, batchPlan.value ?? 0n);
+      const result = await this.broadcastBidAsk(preview.chain, preview.protocol, groupId, batchPlan.to, batchPlan.data, batchPlan.value ?? 0n, gas.estimatedGas);
       openedHash = result.hash;
       let pendingReconciliation = result.pendingReconciliation === true;
       if (result.hash) {
@@ -1123,7 +1125,7 @@ export class PositionOpener {
     return configured;
   }
 
-  private async simulateAndEstimateBidAsk(chain: ChainName, plan: TransactionPlan, binCount: number): Promise<BidAskGasResult> {
+  private async simulateAndEstimateBidAsk(chain: ChainName, protocol: "v3" | "v4", plan: TransactionPlan, binCount: number): Promise<BidAskGasResult> {
     const client = this.executionClient(chain);
     try {
       await client.call({ account: this.config.executorAddress, to: plan.to, data: plan.data, value: plan.value ?? 0n });
@@ -1154,11 +1156,36 @@ export class PositionOpener {
           throw atomicBatchInfeasible(`estimated gas ${estimatedGas} exceeds the block gas budget for ${binCount} bins`);
         }
       }
+      if (protocol === "v4") {
+        const maxFeePerGas = await this.nativeMaxFeePerGas(chain);
+        this.assertV4OpenGasBudget(chain, estimatedGas, maxFeePerGas);
+      }
       return { estimatedGas, blockGasLimit };
     } catch (error) {
       if (error instanceof Error && error.message.includes("atomic_batch_infeasible")) throw error;
       throw atomicBatchInfeasible(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  private async nativeMaxFeePerGas(chain: ChainName): Promise<bigint> {
+    const client = this.executionClient(chain);
+    try {
+      const fees = await client.estimateFeesPerGas();
+      const fee = fees.maxFeePerGas ?? ("gasPrice" in fees ? fees.gasPrice : undefined);
+      if (typeof fee === "bigint" && fee > 0n) return fee;
+    } catch {
+    }
+    const gasPrice = await client.getGasPrice();
+    if (gasPrice <= 0n) throw atomicBatchInfeasible("native gas price is unavailable");
+    return gasPrice;
+  }
+
+  private assertV4OpenGasBudget(chain: ChainName, gas: bigint, maxFeePerGas: bigint): void {
+    if (chainRegistry[chain].nativeSymbol !== "ETH") return;
+    const config = this.config as BidAskRuntimeConfig;
+    const maxUsd = config.bidAskLadderV4MaxOpenGasUsd ?? 2;
+    const ethUsd = config.bidAskLadderV4EthUsd ?? 2_500;
+    assertBidAskV4OpenGasCost(gas, maxFeePerGas, bidAskV4OpenGasBudgetWei(maxUsd, ethUsd), maxUsd, ethUsd);
   }
 
   private async persistBidAskPlan(preview: BidAskOpenPreview): Promise<string | undefined> {
@@ -1266,7 +1293,15 @@ export class PositionOpener {
     return group.id;
   }
 
-  private async broadcastBidAsk(chain: ChainName, groupId: string, to: Address, data: Hex, value = 0n): Promise<{ hash: Hex | null; receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>; pendingReconciliation?: boolean }> {
+  private async broadcastBidAsk(
+    chain: ChainName,
+    protocol: "v3" | "v4",
+    groupId: string,
+    to: Address,
+    data: Hex,
+    value = 0n,
+    estimatedGas: bigint,
+  ): Promise<{ hash: Hex | null; receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>; pendingReconciliation?: boolean }> {
     if (!this.database) throw new Error("Bid-Ask group database is not configured");
     const chainId = this.chains.getForScan(chain).registry.chain.id;
     const run = async (): Promise<{ hash: Hex | null; receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>; pendingReconciliation?: boolean }> => {
@@ -1288,6 +1323,13 @@ export class PositionOpener {
       const pendingNonce = await client.getTransactionCount({ address: this.account!.address, blockTag: "pending" });
       const nonce = await this.database!.nextPositionGroupExecutionNonce(chainId, pendingNonce);
       const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account!, to, data, value, nonce });
+      const signedGas = typeof preparedRequest.gas === "bigint" ? preparedRequest.gas : estimatedGas;
+      const signedFee = typeof preparedRequest.maxFeePerGas === "bigint"
+        ? preparedRequest.maxFeePerGas
+        : typeof preparedRequest.gasPrice === "bigint"
+          ? preparedRequest.gasPrice
+          : 0n;
+      if (protocol === "v4") this.assertV4OpenGasBudget(chain, signedGas, signedFee);
       const serializedTransaction = await wallet.signTransaction(preparedRequest);
       const hash = keccak256(serializedTransaction);
       const transactionNonce = preparedRequest.nonce === undefined ? undefined : BigInt(preparedRequest.nonce);
@@ -2088,6 +2130,35 @@ function toUint128(value: bigint, label: string): bigint {
 
 function atomicBatchInfeasible(reason: string): Error {
   return new Error(`atomic_batch_infeasible: ${reason}`);
+}
+
+export function bidAskV4OpenGasBudgetWei(maxOpenGasUsd: number, ethUsd: number): bigint {
+  const maxMicros = usdMicros(maxOpenGasUsd);
+  const ethMicros = usdMicros(ethUsd);
+  if (maxMicros <= 0n || ethMicros <= 0n) throw new Error("Bid-Ask V4 open gas budget must be positive");
+  return (maxMicros * 10n ** 18n) / ethMicros;
+}
+
+export function assertBidAskV4OpenGasCost(
+  gas: bigint,
+  maxFeePerGas: bigint,
+  budgetWei: bigint,
+  maxUsd: number,
+  ethUsd: number,
+): void {
+  if (gas <= 0n) throw atomicBatchInfeasible("estimated gas is unavailable");
+  if (maxFeePerGas <= 0n) throw atomicBatchInfeasible("native gas price is unavailable");
+  const costWei = gas * maxFeePerGas;
+  if (costWei <= budgetWei) return;
+  const costUsd = Number((costWei * usdMicros(ethUsd)) / 10n ** 18n) / 1_000_000;
+  throw atomicBatchInfeasible(
+    `estimated open gas ${formatEther(costWei)} ETH ($${costUsd.toFixed(2)} at $${ethUsd}/ETH) exceeds $${maxUsd.toFixed(2)} limit`,
+  );
+}
+
+function usdMicros(value: number): bigint {
+  if (!Number.isFinite(value) || value <= 0) throw new Error("USD amount must be a positive finite number");
+  return BigInt(Math.round(value * 1_000_000));
 }
 
 function jsonSafe(value: unknown): Record<string, unknown> {

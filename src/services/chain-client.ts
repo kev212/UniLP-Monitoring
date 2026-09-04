@@ -14,8 +14,9 @@ const RPC_TIMEOUT_MS = 20_000;
 export const ROBINHOOD_READ_CONCURRENCY = 12;
 export const ROBINHOOD_EXECUTION_CONCURRENCY = 4;
 
-class AsyncLimiter {
+export class AsyncLimiter {
   private active = 0;
+  private priorityHandoffs = 0;
   private readonly priorityWaiters: Array<() => void> = [];
   private readonly waiters: Array<() => void> = [];
 
@@ -39,7 +40,10 @@ class AsyncLimiter {
   }
 
   private release(): void {
-    const next = this.priorityWaiters.shift() ?? this.waiters.shift();
+    const servePriority = this.priorityWaiters.length > 0
+      && (this.waiters.length === 0 || this.priorityHandoffs < 4);
+    const next = servePriority ? this.priorityWaiters.shift() : this.waiters.shift() ?? this.priorityWaiters.shift();
+    if (next) this.priorityHandoffs = servePriority ? this.priorityHandoffs + 1 : 0;
     if (next) next();
     else this.active -= 1;
   }
