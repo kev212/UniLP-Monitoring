@@ -854,6 +854,43 @@ export class Executor {
     return this.runSettlementExclusive(position.id, () => this.resumeUnlocked(position));
   }
 
+  async reconcileExternalSettlementSwap(positionId: string, transactionHash: Hex): Promise<void> {
+    return this.runSettlementExclusive(positionId, async () => {
+      const position = await this.database.getPositionById(positionId);
+      if (!position) throw new Error(`Position ${positionId} was not found`);
+      if (position.status !== "needs_review" || position.metadata.reason !== "pending swap token is no longer held — position externally settled") {
+        throw new Error(`Position ${positionId} is not awaiting external settlement reconciliation`);
+      }
+      const pending = parsePendingSwap(position.metadata.pendingSwap);
+      if (!pending || pending.amount <= 0n || pending.token.toLowerCase() === zeroAddress) {
+        throw new Error(`Position ${positionId} has no ERC-20 pending settlement asset`);
+      }
+
+      const receipt = await this.getConfirmedReceipt(position.chainId, transactionHash);
+      if (receipt.status !== "success") throw new Error(`Settlement swap transaction reverted: ${transactionHash}`);
+      const transaction = await this.executorClient(position.chainId).getTransaction({ hash: transactionHash });
+      if (transaction.from.toLowerCase() !== position.owner.toLowerCase()) {
+        throw new Error(`Settlement swap sender does not match position owner: ${transactionHash}`);
+      }
+      const spent = receiptErc20AmountSent(receipt.logs, pending.token, position.owner);
+      if (spent < pending.amount) {
+        throw new Error(`Settlement swap spent ${spent} of expected pending amount ${pending.amount}`);
+      }
+      const quoteReceived = await this.assetReceivedFromReceipt(position.chainId, position.quoteToken!, position.owner, transactionHash, receipt);
+      if (quoteReceived <= 0n) throw new Error(`Settlement swap receipt has no quote-token output: ${transactionHash}`);
+
+      await this.database.recordExecution(position.id, "swap_to_quote", "confirmed", transactionHash);
+      await this.database.setPositionStatusUnlessSettled(position.id, "closing", {
+        reason: null,
+        settlementRetryDisabled: null,
+        pendingRawTransaction: null,
+        swapTransactionHash: transactionHash,
+      });
+      await this.completeSettlement({ ...position, status: "closing" }, 0n, transactionHash, transactionHash);
+      log.info({ positionId: position.id, positionKey: position.positionKey, transactionHash, spent, quoteReceived }, "reconciled externally settled swap receipt");
+    });
+  }
+
   private async resumeUnlocked(position: PositionRecord): Promise<void> {
     const durableMetadata = await this.database.getPositionMetadata(position.id);
     if (durableMetadata) position = { ...position, metadata: durableMetadata };
@@ -4034,6 +4071,25 @@ export function receiptErc20NetReceived(
     }
   }
   return incoming > outgoing ? incoming - outgoing : 0n;
+}
+
+export function receiptErc20AmountSent(
+  logs: readonly { address: Address; data: Hex; topics: readonly Hex[] }[],
+  token: Address,
+  owner: Address,
+): bigint {
+  let outgoing = 0n;
+  for (const entry of logs) {
+    if (entry.address.toLowerCase() !== token.toLowerCase()) continue;
+    try {
+      const decoded = decodeEventLog({ abi: [erc20TransferEvent], data: entry.data, topics: entry.topics as [Hex, ...Hex[]] });
+      const args = decoded.args as { from?: Address; value?: bigint };
+      if (args.from?.toLowerCase() === owner.toLowerCase() && args.value !== undefined) outgoing += args.value;
+    } catch {
+      // Ignore non-standard token logs.
+    }
+  }
+  return outgoing;
 }
 
 function positiveDelta(before: bigint, after: bigint): bigint {

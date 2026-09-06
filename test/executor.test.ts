@@ -1743,6 +1743,64 @@ describe("Executor pending settlement recovery", () => {
     expect(routes.quoteDirect).not.toHaveBeenCalled();
   });
 
+  it("reconciles a verified externally settled swap", async () => {
+    const metadata = {
+      reason: "pending swap token is no longer held — position externally settled",
+      pendingSwap: { token, amount: "5" },
+      settlementQuoteFromClose: "3",
+    };
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "needs_review", liquidity: null,
+      openedAtBlock: null, metadata,
+    } as PositionRecord;
+    const database = {
+      claimSettlementLease: vi.fn().mockResolvedValue(true),
+      releaseSettlementLease: vi.fn(),
+      getPositionById: vi.fn().mockResolvedValue(position),
+      recordExecution: vi.fn(),
+      setPositionStatusUnlessSettled: vi.fn(),
+    };
+    const client = { getTransaction: vi.fn().mockResolvedValue({ from: owner }) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
+    const receipt = { status: "success", logs: [transferLog(token, owner, sender, 5n)] };
+    vi.spyOn(executor as any, "getConfirmedReceipt").mockResolvedValue(receipt);
+    vi.spyOn(executor as any, "assetReceivedFromReceipt").mockResolvedValue(7n);
+    const complete = vi.spyOn(executor as any, "completeSettlement").mockResolvedValue(undefined);
+
+    await executor.reconcileExternalSettlementSwap("position", hash);
+
+    expect(database.recordExecution).toHaveBeenCalledWith("position", "swap_to_quote", "confirmed", hash);
+    expect(database.setPositionStatusUnlessSettled).toHaveBeenCalledWith("position", "closing", expect.objectContaining({
+      reason: null,
+      swapTransactionHash: hash,
+    }));
+    expect(complete).toHaveBeenCalledWith(expect.objectContaining({ id: "position", status: "closing" }), 0n, hash, hash);
+  });
+
+  it("rejects an external settlement hash from another sender", async () => {
+    const position = {
+      id: "position", chainId: 4663, protocol: "v4", positionKey: "1", owner, poolAddress: null,
+      token0: usdg, token1: token, quoteToken: usdg, status: "needs_review", liquidity: null,
+      openedAtBlock: null, metadata: {
+        reason: "pending swap token is no longer held — position externally settled",
+        pendingSwap: { token, amount: "5" },
+      },
+    } as PositionRecord;
+    const database = {
+      claimSettlementLease: vi.fn().mockResolvedValue(true),
+      releaseSettlementLease: vi.fn(),
+      getPositionById: vi.fn().mockResolvedValue(position),
+    };
+    const client = { getTransaction: vi.fn().mockResolvedValue({ from: sender }) };
+    const chains = { getById: vi.fn(() => ({ client, registry: v4Registry("robinhood") })) };
+    const executor = new Executor(database as never, chains as never, {} as never, {} as never, {} as never, config);
+    vi.spyOn(executor as any, "getConfirmedReceipt").mockResolvedValue({ status: "success", logs: [] });
+
+    await expect(executor.reconcileExternalSettlementSwap("position", hash)).rejects.toThrow("sender does not match");
+  });
+
   it("waits for receipt providers when a submitted swap nonce was consumed recently", async () => {
     const serialized = stringToHex("pending-swap-tx");
     const swapHash = keccak256(serialized);

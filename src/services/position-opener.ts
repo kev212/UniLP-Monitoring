@@ -1938,27 +1938,54 @@ export class PositionOpener {
   private async broadcast(chain: ChainName, to: Address, data: Hex, value = 0n): Promise<{ hash: Hex | null }> {
     const client = this.executionClient(chain);
     const executor = this.config.executorAddress;
-
-    await client.call({ account: executor, to, data, value });
-
-    if (this.config.dryRun) {
-      log.info({ to, data: data.slice(0, 100) }, "dry-run open position simulated");
-      return { hash: null };
-    }
-
-    const wallet = this.walletClient(chain);
-    const hash = await wallet.sendTransaction({ to, data, value, account: this.account!, chain: this.chains.getForScan(chain).registry.chain });
-    const receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
-    if (receipt.status !== "success") throw new Error(`Open position transaction reverted: ${hash}`);
-    log.info({ hash, to }, "open position transaction broadcast");
-    if (this.ingestOpenReceipt) {
-      try {
-        await this.ingestOpenReceipt(chain, receipt);
-      } catch (error) {
-        log.warn({ err: error, hash, chain }, "open receipt ingest failed");
+    const chainId = this.chains.getForScan(chain).registry.chain.id;
+    const run = async (): Promise<{ hash: Hex | null }> => {
+      if (this.database && await this.database.hasPendingRawTransaction(chainId)) {
+        throw new Error(`Chain ${chainId} has an unresolved signed transaction`);
       }
-    }
-    return { hash };
+      await client.call({ account: executor, to, data, value });
+
+      if (this.config.dryRun) {
+        log.info({ to, data: data.slice(0, 100) }, "dry-run open position simulated");
+        return { hash: null };
+      }
+
+      const wallet = this.walletClient(chain);
+      const pendingNonce = await client.getTransactionCount({ address: this.account!.address, blockTag: "pending" });
+      const request = await wallet.prepareTransactionRequest({ account: this.account!, to, data, value, nonce: pendingNonce });
+      const serializedTransaction = await wallet.signTransaction(request);
+      const hash = keccak256(serializedTransaction);
+      let receipt: Awaited<ReturnType<PublicClient["waitForTransactionReceipt"]>>;
+      try {
+        const broadcastHash = await wallet.sendRawTransaction({ serializedTransaction });
+        if (broadcastHash.toLowerCase() !== hash.toLowerCase()) throw new Error("Open position broadcast returned an unexpected transaction hash");
+        receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
+      } catch (error) {
+        if (!isAmbiguousBroadcastError(error)) throw error;
+        // Some RPC nodes accept a raw transaction then report a stale nonce from
+        // another backend. The signed hash is authoritative for reconciliation.
+        try {
+          receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations, timeout: 15_000 });
+          log.warn({ err: error, chain, hash }, "open transaction broadcast was ambiguous but receipt confirmed");
+        } catch {
+          throw error;
+        }
+      }
+      if (receipt.status !== "success") throw new Error(`Open position transaction reverted: ${hash}`);
+      log.info({ hash, to }, "open position transaction broadcast");
+      if (this.ingestOpenReceipt) {
+        try {
+          await this.ingestOpenReceipt(chain, receipt);
+        } catch (error) {
+          log.warn({ err: error, hash, chain }, "open receipt ingest failed");
+        }
+      }
+      return { hash };
+    };
+
+    return this.database
+      ? this.database.withExecutionLock(chainId, executor, run)
+      : run();
   }
 
   private async ensureApproval(client: PublicClient, token: Address, spender: Address, amount: bigint, owner: Address, chain: ChainName): Promise<void> {
@@ -1973,11 +2000,8 @@ export class PositionOpener {
       return;
     }
 
-    const wallet = this.walletClient(chain);
     const approveData = encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [spender, amount] });
-    const hash = await wallet.sendTransaction({ to: token, data: approveData, account: this.account!, chain: this.chains.getForScan(chain).registry.chain });
-    const receipt = await client.waitForTransactionReceipt({ hash });
-    if (receipt.status !== "success") throw new Error(`ERC-20 approval reverted for ${token}`);
+    const { hash } = await this.broadcast(chain, token, approveData);
     log.info({ hash, token, spender }, "approval submitted");
   }
 
@@ -2000,11 +2024,8 @@ export class PositionOpener {
       return;
     }
 
-    const wallet = this.walletClient(chain);
     const data = encodeFunctionData({ abi: wethAbi, functionName: "deposit" });
-    const hash = await wallet.sendTransaction({ to: token, data, value: shortfall, account: this.account!, chain: this.chains.getForScan(chain).registry.chain });
-    const receipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
-    if (receipt.status !== "success") throw new Error(`Native ETH wrap reverted for ${token}`);
+    const { hash } = await this.broadcast(chain, token, data, shortfall);
     log.info({ hash, token, shortfall: shortfall.toString() }, "native ETH wrapped for open position");
   }
 
@@ -2037,15 +2058,12 @@ export class PositionOpener {
       return;
     }
 
-    const wallet = this.walletClient(chain);
     const approvalData = encodeFunctionData({
       abi: permit2Abi,
       functionName: "approve",
       args: [token, spender, amount, expiration],
     });
-    const hash = await wallet.sendTransaction({ to: permit2, data: approvalData, account: this.account!, chain: this.chains.getForScan(chain).registry.chain });
-    const receipt = await client.waitForTransactionReceipt({ hash });
-    if (receipt.status !== "success") throw new Error(`Permit2 approval reverted for ${token}`);
+    const { hash } = await this.broadcast(chain, permit2, approvalData);
     log.info({ hash, token, spender }, "Permit2 approval submitted");
   }
 
@@ -2165,6 +2183,11 @@ function jsonSafe(value: unknown): Record<string, unknown> {
   return JSON.parse(JSON.stringify(value, (_key, nestedValue: unknown) => (
     typeof nestedValue === "bigint" ? nestedValue.toString() : nestedValue
   ))) as Record<string, unknown>;
+}
+
+function isAmbiguousBroadcastError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /nonce too low|nonce provided .* lower|already known|known transaction/i.test(message);
 }
 
 export function selectOpenQuoteToken(

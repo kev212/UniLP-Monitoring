@@ -804,3 +804,41 @@ describe("Bid-Ask V4 open gas budget", () => {
     expect(client.estimateFeesPerGas).not.toHaveBeenCalled();
   });
 });
+
+describe("normal open transaction broadcast", () => {
+  it("accepts a nonce error when the signed transaction receipt is confirmed", async () => {
+    const serializedTransaction = "0x01" as Hex;
+    const hash = keccak256(serializedTransaction);
+    const client = {
+      call: vi.fn().mockResolvedValue({ data: "0x" }),
+      getTransactionCount: vi.fn().mockResolvedValue(42),
+      waitForTransactionReceipt: vi.fn().mockResolvedValue({ status: "success" }),
+    };
+    const database = {
+      hasPendingRawTransaction: vi.fn().mockResolvedValue(false),
+      withExecutionLock: vi.fn(async (_chainId: number, _owner: string, work: () => Promise<unknown>) => work()),
+    };
+    const chains = {
+      getForExecution: vi.fn(() => ({ client, registry: chainRegistry.robinhood, transport: {} })),
+      getForScan: vi.fn(() => ({ registry: chainRegistry.robinhood })),
+    };
+    const ingest = vi.fn();
+    const opener = new PositionOpener({
+      executorAddress: owner,
+      executorPrivateKey: "0x1111111111111111111111111111111111111111111111111111111111111111",
+      confirmations: 1,
+    } as never, chains as never, undefined, undefined, database as never, undefined, ingest);
+    const wallet = {
+      prepareTransactionRequest: vi.fn().mockResolvedValue({ to: v3PoolAddress, data: "0x" }),
+      signTransaction: vi.fn().mockResolvedValue(serializedTransaction),
+      sendRawTransaction: vi.fn().mockRejectedValue(new Error("Nonce provided for the transaction is lower than the current nonce of the account")),
+    };
+    (opener as any).walletClient = vi.fn().mockReturnValue(wallet);
+
+    await expect((opener as any).broadcast("robinhood", v3PoolAddress, "0x")).resolves.toEqual({ hash });
+
+    expect(database.withExecutionLock).toHaveBeenCalledWith(4663, owner, expect.any(Function));
+    expect(client.waitForTransactionReceipt).toHaveBeenCalledWith({ hash, confirmations: 1, timeout: 15_000 });
+    expect(ingest).toHaveBeenCalledOnce();
+  });
+});
