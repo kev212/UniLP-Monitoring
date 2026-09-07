@@ -3487,7 +3487,34 @@ function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters): s
   return lines.join("\n");
 }
 
-function formatStockScan(scan: PoolMarketScan): string {
+export function formatStockScan(scan: PoolMarketScan): string {
+  if (scan.stockCoverage) {
+    const coverage = scan.stockCoverage;
+    const clean = (value: string, limit: number) => value.replace(/[\r\n]/g, " ").slice(0, limit);
+    const threshold = `${coverage.minYieldHourlyPercent}%`;
+    const symbols = clean(scan.stockSymbols?.join(" ") || "—", 180);
+    const lines = [
+      "📊 STOCK / ETF / KOMODITAS — POOL YIELD 1H",
+      "Chain: Robinhood | Uniswap V3/V4",
+      `Daftar: ${coverage.source}${coverage.fetchedAt ? ` | ${coverage.fetchedAt}` : ""}`,
+      ...(coverage.partial ? ["⚠️ Coverage parsial: daftar atau data belum dapat dipastikan lengkap."] : []),
+      `Universe: ${scan.candidateTokens} | Selesai: ${coverage.completedTokens} | Data tidak lengkap: ${coverage.failedTokens}`,
+      `Vol lolos: ${scan.evaluatedTokens} | Aset yield lolos: ${scan.qualifiedTokens}`,
+      `Tanpa pool relevan: ${coverage.noEligiblePools} | Vol rendah: ${coverage.belowVolumeTokens} | Pool belum terverifikasi/data kurang: ${coverage.unverifiedPools}`,
+      `Filter: vol ≥ $100k/24h vs USDG/WETH/ETH · yield/h > ${threshold}`,
+      `Simbol vol lolos: ${symbols}${(scan.stockSymbols?.join(" ").length ?? 0) > 180 ? "…" : ""}`,
+      `Top ${scan.pools.length} dari ${coverage.totalQualifiedPools} pool lolos`,
+      "",
+    ];
+    for (const [index, pool] of scan.pools.entries()) {
+      lines.push(`${index + 1}. ${pool.protocol.toUpperCase()} ${clean(pool.pair, 64)} | Fee ${((pool.currentLpFee ?? pool.feeTier) / 10_000).toFixed(2)}%`);
+      lines.push(`Yield/h: ${fmtPercent(pool.estimatedPoolYield1hPercent)} | Vol 1h: $${fmtUsd(pool.volume1hUsd)} | TVL: $${fmtUsd(pool.tvlUsd)}`);
+      lines.push(pool.uniswapUrl);
+    }
+    if (!scan.pools.length) lines.push(`Tidak ada pool terverifikasi dengan yield > ${threshold}/h${coverage.partial ? " pada data yang berhasil diperiksa" : ""}.`);
+    lines.push("", "Yield adalah estimasi gross pool, bukan hasil personal LP.");
+    return lines.join("\n");
+  }
   const symbols = scan.stockSymbols?.length ? scan.stockSymbols.join(" ") : "—";
   const bsc = scan.chain === "bsc";
   const lines = [

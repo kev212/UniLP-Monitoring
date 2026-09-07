@@ -26,8 +26,7 @@ export const STOCK_MIN_VOLUME_24H_USD = 100_000;
 const STOCK_MAX_RESULTS = 10;
 const STOCK_VERIFY_CONCURRENCY = 3;
 const STOCK_VOLUME_BATCH = 25;
-const STOCK_LIST_MAX_PAGES = 8;
-const BLOCKSCOUT_TOKENS = "https://robinhoodchain.blockscout.com/api/v2/tokens";
+const ROBINHOOD_ASSETS = "https://api.robinhood.com/rhj/assets";
 const STOCK_VOLUME_QUOTES = new Set<string>([USDG, WETH, zeroAddress]);
 const BSC_USDT = "0x55d398326f99059ff775485246999027b3197955";
 const BSC_USDC = "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d";
@@ -113,6 +112,18 @@ export interface PoolMarketScan {
   warming?: boolean;
   stockSymbols?: string[];
   chain?: ChainName;
+  stockCoverage?: {
+    source: "official" | "cache" | "seeds";
+    fetchedAt?: string;
+    partial: boolean;
+    completedTokens: number;
+    failedTokens: number;
+    noEligiblePools: number;
+    belowVolumeTokens: number;
+    unverifiedPools: number;
+    totalQualifiedPools: number;
+    minYieldHourlyPercent: number;
+  };
 }
 
 export interface VerifiedPool {
@@ -221,6 +232,8 @@ interface DexScreenerPair {
 }
 
 export class PoolScanner {
+  private officialStocks?: { tokens: { address: Address; symbol: string }[]; fetchedAt: string };
+  private nextStockRequestAt = 0;
   private marketScanCache?: { key: string; expiresAt: number; result: PoolMarketScan };
   private geckoRequestRunning = false;
   private readonly interactiveGeckoQueue: (() => void)[] = [];
@@ -839,6 +852,7 @@ export class PoolScanner {
     chain: ChainName = "robinhood",
     minYieldHourlyPercent = 0.1,
   ): Promise<PoolMarketScan> {
+    if (chain === "robinhood") return this.scanRobinhoodStocks(onProgress, minYieldHourlyPercent);
     const dexLabel = chain === "bsc" ? "Pancake/Uniswap V3" : "Uniswap V3/V4";
     onProgress?.(chain === "bsc" ? "Memuat token *B (stock/ETF/komoditas) di BSC..." : "Memuat daftar resmi Robinhood Token...");
     let universe: { address: Address; symbol: string }[] = chain === "bsc" ? [...BSC_STOCK_SEEDS] : [...ROBINHOOD_STOCK_TOKENS];
@@ -880,41 +894,138 @@ export class PoolScanner {
     };
   }
 
-  private async fetchOfficialStockTokens(): Promise<{ address: Address; symbol: string }[]> {
-    const seen = new Set<string>();
-    const stocks: { address: Address; symbol: string }[] = [];
-    let params = new URLSearchParams({ q: "Robinhood Token" });
-    for (let page = 0; page < STOCK_LIST_MAX_PAGES; page++) {
-      const response = await fetch(`${BLOCKSCOUT_TOKENS}?${params}`, {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(15_000),
-      });
-      if (!response.ok) break;
-      const body = await response.json() as {
-        items?: { address_hash?: string; name?: string | null; symbol?: string | null; icon_url?: string | null }[];
-        next_page_params?: Record<string, string | number | boolean | null>;
-      };
-      const items = body.items ?? [];
-      const first = items[0]?.address_hash?.toLowerCase();
-      if (page > 0 && first && seen.has(first)) break;
-      for (const item of items) {
-        if (!isOfficialRobinhoodStock(item) || !item.address_hash || !isAddress(item.address_hash)) continue;
-        const address = item.address_hash as Address;
-        const key = address.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-        stocks.push({ address, symbol: (item.symbol ?? "STOCK").toUpperCase() });
+  private async fetchStockJson(url: string): Promise<unknown> {
+    for (let attempt = 0; ; attempt++) {
+      // Keep stock discovery below the provider's request budget, including retries.
+      const waitMs = Math.max(0, this.nextStockRequestAt - Date.now());
+      this.nextStockRequestAt = Date.now() + waitMs + 250;
+      if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          headers: { Accept: "application/json" },
+          signal: AbortSignal.timeout(15_000),
+        });
+      } catch (error) {
+        if (attempt >= 2) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
+        continue;
       }
-      if (!body.next_page_params || items.length === 0) break;
-      const next = new URLSearchParams();
-      for (const [key, value] of Object.entries(body.next_page_params)) {
-        if (value === null || value === undefined) continue;
-        next.set(key, String(value));
+      if (response.ok) return response.json();
+      if (attempt >= 2 || (response.status !== 429 && response.status < 500)) {
+        throw new Error(`Stock data HTTP ${response.status}`);
       }
-      if ([...next.keys()].length === 0 || next.toString() === params.toString()) break;
-      params = next;
+      const retryAfter = response.headers.get("retry-after");
+      const delay = retryAfter === null ? NaN : Number(retryAfter) * 1_000;
+      const dateDelay = retryAfter === null ? NaN : Date.parse(retryAfter) - Date.now();
+      const retryMs = Number.isFinite(delay) ? delay : Number.isFinite(dateDelay) ? dateDelay : 500 * 2 ** attempt;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(30_000, Math.max(0, retryMs))));
     }
-    return stocks;
+  }
+
+  private async fetchOfficialStockTokens(): Promise<{ address: Address; symbol: string }[]> {
+    const body = await this.fetchStockJson(ROBINHOOD_ASSETS) as {
+      assets?: { tokenSymbol?: string; deployments?: { chainId?: number; contractAddress?: string }[] }[];
+    } | null;
+    if (!body || !Array.isArray(body.assets) || !body.assets.length) throw new Error("Empty or invalid Robinhood asset registry");
+    const stocks = new Map<string, { address: Address; symbol: string }>();
+    for (const asset of body.assets) {
+      if (!asset || !Array.isArray(asset.deployments)) throw new Error("Invalid asset deployments");
+      for (const deployment of asset.deployments) {
+        if (!deployment || typeof deployment.chainId !== "number") throw new Error("Invalid asset chain");
+        if (deployment.chainId !== chainRegistry.robinhood.chain.id) continue;
+        if (typeof deployment.contractAddress !== "string" || !isAddress(deployment.contractAddress)
+          || typeof asset.tokenSymbol !== "string" || !asset.tokenSymbol.trim()) throw new Error("Invalid Robinhood asset");
+        const address = deployment.contractAddress.toLowerCase() as Address;
+        stocks.set(address, { address, symbol: asset.tokenSymbol.trim().toUpperCase() });
+      }
+    }
+    if (!stocks.size) throw new Error("No Robinhood deployments in asset registry");
+    return [...stocks.values()];
+  }
+
+  private async scanRobinhoodStocks(onProgress: ((stage: string) => void) | undefined, minYieldHourlyPercent: number): Promise<PoolMarketScan> {
+    onProgress?.("Memuat daftar resmi stock/ETF/komoditas Robinhood...");
+    let source: "official" | "cache" | "seeds" = "official";
+    try {
+      const tokens = await this.fetchOfficialStockTokens();
+      this.officialStocks = { tokens, fetchedAt: new Date().toISOString() };
+    } catch (error) {
+      source = this.officialStocks ? "cache" : "seeds";
+      log.warn({ reason: String(error), source }, "Robinhood asset registry unavailable; coverage incomplete");
+    }
+    const universe = this.officialStocks?.tokens ?? [...ROBINHOOD_STOCK_TOKENS];
+    const coverage: NonNullable<PoolMarketScan["stockCoverage"]> = {
+      source, fetchedAt: this.officialStocks?.fetchedAt, partial: source !== "official",
+      completedTokens: 0, failedTokens: 0, noEligiblePools: 0, belowVolumeTokens: 0,
+      unverifiedPools: 0, totalQualifiedPools: 0, minYieldHourlyPercent,
+    };
+    const stockSymbols: string[] = [];
+    let qualifiedTokens = 0;
+    const results = await mapWithConcurrency(universe, STOCK_VERIFY_CONCURRENCY, async (stock) => {
+      const token = stock.address.toLowerCase();
+      const qualified: ScoredPool[] = [];
+      let tokenIncomplete = false;
+      try {
+        const body = await this.fetchStockJson(`${DEXSCREENER_BASE}/token-pairs/v1/robinhood/${token}`);
+        if (!Array.isArray(body)) throw new Error("Invalid token pairs response");
+        const pairs = [...new Map((body as DexScreenerPair[])
+          .filter((pair) => isStockScanPair(pair, "robinhood")
+            && [pair.baseToken.address.toLowerCase(), pair.quoteToken.address.toLowerCase()].includes(token))
+          .map((pair) => [pair.pairAddress.toLowerCase(), pair])).values()];
+        const knownVolumePairs = pairs.filter((pair) => pair.volume?.h24 != null
+          && Number.isFinite(Number(pair.volume.h24)) && Number(pair.volume.h24) >= 0);
+        tokenIncomplete = knownVolumePairs.length !== pairs.length;
+        if (!pairs.length) {
+          coverage.noEligiblePools++;
+        } else if (stockUniswapVolume24h(token, knownVolumePairs) < STOCK_MIN_VOLUME_24H_USD) {
+          // Unknown volume cannot prove a token failed the threshold.
+          if (!tokenIncomplete) coverage.belowVolumeTokens++;
+        } else {
+          stockSymbols.push(stock.symbol);
+          let tvlFallback: Map<string, number> | undefined;
+          if (pairs.some((pair) => !Number(pair.liquidity?.usd ?? 0))) {
+            try { tvlFallback = await this.buildGeckoTvlMap(token, "robinhood"); } catch { /* Individual pools report unavailable data below. */ }
+          }
+          // Sequential inside each worker: no more than three pool verifications in flight.
+          for (const pair of pairs) {
+            try {
+              if ([pair.volume?.h1, pair.volume?.h6].some((value) => value == null || !Number.isFinite(Number(value)) || Number(value) < 0)) {
+                throw new Error("Missing or invalid pool volume");
+              }
+              const pool = await this.toDexScreenerPool(pair, token, tvlFallback, "robinhood");
+              if (!pool) {
+                coverage.unverifiedPools++;
+                tokenIncomplete = true;
+              } else if (pool.activeLiquidity && pool.estimatedPoolYield1hPercent > minYieldHourlyPercent) {
+                qualified.push({ ...pool, pair: `${pool.pair} [${stock.symbol}]` });
+              }
+            } catch {
+              coverage.unverifiedPools++;
+              tokenIncomplete = true;
+            }
+          }
+        }
+      } catch (error) {
+        tokenIncomplete = true;
+        log.warn({ token, reason: String(error) }, "Robinhood stock data unavailable");
+      }
+      if (tokenIncomplete) coverage.failedTokens++;
+      else coverage.completedTokens++;
+      if (qualified.length) qualifiedTokens++;
+      onProgress?.(`Aset diperiksa: ${coverage.completedTokens + coverage.failedTokens}/${universe.length} | Vol lolos: ${stockSymbols.length} | Data tidak lengkap: ${coverage.failedTokens}`);
+      return qualified;
+    });
+    const pools = [...new Map(results.flat().map((pool) => [pool.uniswapUrl, pool])).values()]
+      .sort((a, b) => b.estimatedPoolYield1hPercent - a.estimatedPoolYield1hPercent || b.tvlUsd - a.tvlUsd);
+    coverage.totalQualifiedPools = pools.length;
+    coverage.partial ||= coverage.failedTokens > 0;
+    log.info({ ...coverage, candidateTokens: universe.length, qualifiedTokens }, "Robinhood stock scan completed");
+    return {
+      pools: pools.slice(0, STOCK_MAX_RESULTS), candidateTokens: universe.length,
+      evaluatedTokens: stockSymbols.length, qualifiedTokens, stockSymbols: stockSymbols.sort(),
+      chain: "robinhood", stockCoverage: coverage,
+    };
   }
 
   private async fetchBscStockTokens(): Promise<{ address: Address; symbol: string }[]> {
