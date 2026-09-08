@@ -155,7 +155,7 @@ export class MarketScanner {
               if (!pool.activeLiquidity) continue;
               outcome.totalTvl += pool.tvlUsd;
               if (fallback) coverage.snapshotPools++;
-              if (pool.tvlUsd >= filters.minPoolTvlUsd && pool.estimatedPoolYield1hPercent > filters.minYieldHourlyPercent) {
+              if (pool.tvlUsd >= filters.minPoolTvlUsd && pool.volume1hUsd >= (filters.minVolume1hUsd ?? 0) && pool.estimatedPoolYield1hPercent > filters.minYieldHourlyPercent) {
                 outcome.pools.push({ ...pool, warnings: [...pool.warnings, ...(fallback ? ['TVL snapshot Gecko ≤15m'] : [])],
                   tokenMarketCapUsd: valuation, tokenValuationSource: mc > 0 ? 'market_cap' : 'fdv', tokenOldestPoolAgeSeconds: age });
               }
@@ -193,7 +193,7 @@ export class MarketScanner {
       || !coverage.discoveryAt || Date.now() - Date.parse(coverage.discoveryAt) > 15 * 60_000;
     void this.deps.database.recordMarketEvaluations('robinhood', outcomes.filter(x => x.done).map(x => x.token), outcomes.filter(x => x.active).map(x => x.token))
       .catch(error => log.warn({ err: error }, 'market evaluation timestamps not saved'));
-    const result: PoolMarketScan = { pools: pools.slice(0, Math.min(10, filters.maxResults)), candidateTokens: candidates.length,
+    const result: PoolMarketScan = { pools: pools.slice(0, filters.maxResults), candidateTokens: candidates.length,
       evaluatedTokens: coverage.completedTokens + coverage.failedTokens, qualifiedTokens: pools.length,
       chain: 'robinhood', marketCoverage: coverage, warming: !candidates.length && !metadataFailed };
     log.info({ ...coverage, candidateTokens: candidates.length }, 'market scan completed');

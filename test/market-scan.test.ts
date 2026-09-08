@@ -36,6 +36,35 @@ function setup(count = 1) {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('bounded market scan', () => {
+  it('honors Top N 20 and sorts all retained results by yield', async () => {
+    const { scanner, score } = setup(25);
+    score.mockImplementation(async p => scored(p, Number(BigInt(p.baseToken.address))));
+    const pending = scanner.scan({ ...filters, maxResults: 20 });
+    await vi.runAllTimersAsync();
+    const result = await pending;
+    expect(result.pools).toHaveLength(20);
+    expect(result.pools.map(p => p.estimatedPoolYield1hPercent)).toEqual(Array.from({ length: 20 }, (_, i) => 25 - i));
+    expect(result.qualifiedTokens).toBe(25);
+  });
+
+  it.each([0, 99, 100, 101])('applies minimum volume %s inclusively', async minimum => {
+    const { scanner } = setup();
+    const pending = scanner.scan({ ...filters, minVolume1hUsd: minimum });
+    await vi.runAllTimersAsync();
+    expect((await pending).pools).toHaveLength(minimum <= 100 ? 1 : 0);
+  });
+
+  it('filters volume before choosing best yield while retaining total active TVL', async () => {
+    const { scanner, fetchMock, score } = setup();
+    const pairs = [pair(1), pair(2)];
+    fetchMock.mockResolvedValue(new Response(JSON.stringify(pairs)));
+    score.mockImplementation(async p => ({ ...scored(p, p.pairAddress === pairs[0].pairAddress ? 9 : 2),
+      volume1hUsd: p.pairAddress === pairs[0].pairAddress ? 10 : 200 }));
+    const pending = scanner.scan({ ...filters, minVolume1hUsd: 100, minTotalActiveTvlUsd: 10000 });
+    await vi.runAllTimersAsync();
+    expect((await pending).pools[0]).toMatchObject({ estimatedPoolYield1hPercent: 2, tokenTotalActiveTvlUsd: 12000 });
+  });
+
   it('evaluates the full 205-token universe within the budget with provider pacing', async () => {
     const { scanner, score } = setup(205);
     const pending = scanner.scan(filters);

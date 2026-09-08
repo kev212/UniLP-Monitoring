@@ -74,6 +74,7 @@ type DashboardAction =
   | { type: "scan"; page: number }
   | { type: "scan_chain"; chain: ChainName; page: number }
   | { type: "scan_pools"; page: number }
+  | { type: "pool_page"; page: number }
   | { type: "scan_pools_chain"; chain: ChainName; page: number }
   | { type: "config"; page: number }
   | { type: "config_reset"; page: number }
@@ -102,7 +103,7 @@ type DashboardAction =
   | { type: "trail"; page: number; chainId: number; protocol: Protocol; positionKey: string }
   | { type: "trail_page"; page: number };
 
-type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "stock_yield" | "max_results";
+type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "stock_yield" | "max_results" | "volume_1h";
 type RiskSettingKey = "stop_loss" | "take_profit" | "trailing_activation" | "trailing_drawdown" | "v4_open_gas_usd";
 type PendingInput =
   | { kind: "scan_token"; chain: ChainName }
@@ -140,6 +141,7 @@ export class Notifier {
   private openExecutionQueue: Promise<void> = Promise.resolve();
   private readonly riskDefaults: RiskSettings;
   private poolScanRunning = false;
+  private readonly poolScanPages = new Map<string, { pages: string[]; expiresAt: number }>();
   private tokenScanRunning = false;
   private scanV2Running = false;
   private gemScanRunning = false;
@@ -532,6 +534,32 @@ export class Notifier {
     const action = parseDashboardAction(callback.data);
     if (!action) {
       await this.acknowledgeDashboardCallback(ctx, "Tombol dashboard tidak valid.", true);
+      return;
+    }
+
+    if (action.type === "pool_page") {
+      const key = `${chatId}:${message.message_id}`;
+      const snapshot = this.poolScanPages.get(key);
+      if (!snapshot || snapshot.expiresAt <= Date.now()) {
+        this.poolScanPages.delete(key);
+        await this.acknowledgeDashboardCallback(ctx, "Hasil kedaluwarsa. Jalankan /scan_pools lagi.", true);
+        return;
+      }
+      if (!snapshot.pages[action.page]) {
+        await this.acknowledgeDashboardCallback(ctx, "Halaman tidak tersedia.", true);
+        return;
+      }
+      if (!await this.acknowledgeDashboardCallback(ctx)) return;
+      await this.enqueueDashboardMutation(key, async () => {
+        if (snapshot.expiresAt <= Date.now() || !this.bot) return;
+        try {
+          await this.bot.api.editMessageText(chatId, message.message_id, snapshot.pages[action.page]!, {
+            reply_markup: poolPageKeyboard(action.page, snapshot.pages.length),
+          });
+        } catch (error) {
+          if (!errorMessage(error).includes('message is not modified')) log.warn({ err: error }, 'pool page navigation failed');
+        }
+      });
       return;
     }
 
@@ -1444,24 +1472,12 @@ export class Notifier {
       const filters = lookupBudget ? await lookupBudget.run(() => this.poolScanFilters(database, chatId, chain)) : await this.poolScanFilters(database, chatId, chain);
       lookupBudget?.close();
       const scan = await scanner.scanPools(filters, (nextStage) => { stage = nextStage; }, startedAt);
-      const text = formatPoolMarketScan(scan, filters);
+      const pages = buildPoolScanPages(scan, filters);
       if (!this.bot) return;
-      if (chain === 'robinhood') {
-        clearInterval(heartbeat);
-        progressController.abort();
-        await this.deliverMarketScan(chatId, messageId, text, startedAt + 120_000);
-        return;
-      }
-      try {
-        await this.bot.api.editMessageText(chatId, messageId, text);
-      } catch (editError) {
-        const details = errorMessage(editError);
-        if (!details.includes("message is not modified")) {
-          await this.sendTemp([text], chatId, 300_000);
-          return;
-        }
-      }
-      await this.queueTemp(chatId, messageId, 300_000);
+      clearInterval(heartbeat);
+      progressController.abort();
+      await this.deliverMarketScan(chatId, messageId, pages[0]!,
+        chain === 'robinhood' ? startedAt + 120_000 : Date.now() + 10_000, pages);
     } catch (error) {
       const text = "Scan pools gagal. Coba lagi nanti.";
       if (chain === 'robinhood') {
@@ -1488,22 +1504,37 @@ export class Notifier {
     }
   }
 
-  private async deliverMarketScan(chatId: string, messageId: number, text: string, deadline: number): Promise<void> {
+  private rememberPoolPages(chatId: string, messageId: number, pages?: string[]): void {
+    if (!pages) return;
+    const key = `${chatId}:${messageId}`;
+    const snapshot = { pages, expiresAt: Date.now() + 300_000 };
+    this.poolScanPages.set(key, snapshot);
+    const timer = setTimeout(() => {
+      if (this.poolScanPages.get(key) === snapshot) this.poolScanPages.delete(key);
+    }, 300_000);
+    timer.unref();
+  }
+
+  private async deliverMarketScan(chatId: string, messageId: number, text: string, deadline: number, pages?: string[]): Promise<void> {
     if (!this.bot) return;
     const budget = new ScanBudget(deadline);
     // grammY's bundled signal type predates the native DOM signal; runtime accepts both.
     const signal = budget.signal as unknown as Parameters<Bot['api']['editMessageText']>[4];
+    const options = pages ? { reply_markup: poolPageKeyboard(0, pages.length) } : {};
     try {
       try {
-        await budget.run(() => this.bot!.api.editMessageText(chatId, messageId, text, {}, signal));
+        await budget.run(() => this.bot!.api.editMessageText(chatId, messageId, text, options, signal));
+        this.rememberPoolPages(chatId, messageId, pages);
         void this.queueTemp(chatId, messageId, 300_000);
       } catch (error) {
         if (errorMessage(error).includes('message is not modified')) {
+          this.rememberPoolPages(chatId, messageId, pages);
           void this.queueTemp(chatId, messageId, 300_000);
           return;
         }
         budget.check();
-        const sent = await budget.run(() => this.bot!.api.sendMessage(chatId, text, {}, signal));
+        const sent = await budget.run(() => this.bot!.api.sendMessage(chatId, text, options, signal));
+        this.rememberPoolPages(chatId, sent.message_id, pages);
         void this.queueTemp(chatId, sent.message_id, 300_000);
       }
     } finally { budget.close(); }
@@ -2096,6 +2127,7 @@ export class Notifier {
         .text("Min stock yield/h", "lp:cfg:stock_yield")
         .row()
       .text("Top N", "lp:cfg:max_results")
+      .text("Min volume 1h", "lp:cfg:volume_1h")
       .row();
     keyboard.row().text("Reset ENV", dashboardAction("config_reset", 0)).text("← Back", dashboardAction("status", 0));
     const lines = [
@@ -2107,6 +2139,7 @@ export class Notifier {
       `Min gross yield/h: ${fmtPercent(settings.minYieldHourlyPercent)}`,
       `Min stock yield/h: ${fmtPercent(settings.minStockYieldHourlyPercent)}`,
       `Top results: ${settings.maxResults}`,
+      `Min volume 1h per pool: $${fmtUsd(settings.minVolume1hUsd ?? 0)} (0 = nonaktif)`,
       "Quote mengikuti allowlist chain saat scan.",
     ];
     if (notice) lines.push("", notice);
@@ -2633,6 +2666,10 @@ function trailPageAction(page: number): string {
 export function parseDashboardAction(data: string | undefined): DashboardAction | null {
   if (!data) return null;
   const parts = data.split(":");
+  if (parts.length === 3 && parts[0] === "lp" && parts[1] === "poolpg") {
+    const page = parseDashboardPage(parts[2]);
+    return page === null ? null : { type: "pool_page", page };
+  }
   if (parts.length === 3 && parts[0] === "lp" && parts[1] === "calendar") {
     const match = /^(\d{4})-(\d{2})$/.exec(parts[2] ?? "");
     if (!match) return null;
@@ -2756,7 +2793,7 @@ function isProtocol(value: string | undefined): value is Protocol {
 }
 
 function isPoolSettingKey(value: string | undefined): value is PoolSettingKey {
-  return value === "market_cap" || value === "pool_tvl" || value === "total_tvl" || value === "age" || value === "yield" || value === "stock_yield" || value === "max_results";
+  return value === "market_cap" || value === "pool_tvl" || value === "total_tvl" || value === "age" || value === "yield" || value === "stock_yield" || value === "max_results" || value === "volume_1h";
 }
 
 function isRiskSettingKey(value: string | undefined): value is RiskSettingKey {
@@ -3447,7 +3484,7 @@ function scoreStars(score: number): string {
   return "☆☆☆☆☆";
 }
 
-function parsePoolScanInput(key: PoolSettingKey, value: string): Partial<PoolScanSettings> {
+export function parsePoolScanInput(key: PoolSettingKey, value: string): Partial<PoolScanSettings> {
   if (key === "age") {
     const match = value.trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*([mhd])$/);
     if (!match?.[1] || !match[2]) throw new Error("usia harus seperti 30m, 1h, atau 2d");
@@ -3460,6 +3497,10 @@ function parsePoolScanInput(key: PoolSettingKey, value: string): Partial<PoolSca
   if (!Number.isFinite(number) || number < 0) throw new Error("nilai harus angka positif");
   if (key === "market_cap") return { minMarketCapUsd: number };
   if (key === "pool_tvl") return { minPoolTvlUsd: number };
+  if (key === "volume_1h") {
+    if (!/\d/.test(value)) throw new Error("volume harus berupa angka USD");
+    return { minVolume1hUsd: number };
+  }
   if (key === "total_tvl") return { minTotalActiveTvlUsd: number };
   if (key === "yield") return { minYieldHourlyPercent: number };
   if (key === "stock_yield") return { minStockYieldHourlyPercent: number };
@@ -3468,6 +3509,7 @@ function parsePoolScanInput(key: PoolSettingKey, value: string): Partial<PoolSca
 }
 
 function configInputPrompt(key: PoolSettingKey): string {
+  if (key === "volume_1h") return "Kirim minimum volume 1 jam per pool dalam USD, contoh: 10000. Kirim 0 untuk menonaktifkan filter.";
   if (key === "market_cap") return "Kirim Min market cap, contoh: 500000 atau $500K.";
   if (key === "pool_tvl") return "Kirim Min TVL per pool, contoh: 10000.";
   if (key === "total_tvl") return "Kirim Min total active TVL V3/V4, contoh: 70000.";
@@ -3502,7 +3544,33 @@ function riskInputPrompt(key: RiskSettingKey): string {
   return "Kirim Trailing drawdown dalam persen positif, contoh: 1.5.";
 }
 
-export function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters): string {
+function poolPageKeyboard(page: number, count: number): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  if (page > 0) keyboard.text('← Prev', `lp:poolpg:${page - 1}`);
+  if (page + 1 < count) keyboard.text('Next →', `lp:poolpg:${page + 1}`);
+  return keyboard;
+}
+
+/** Freeze rendered pages so navigation never fetches data or uses newer config. */
+export function buildPoolScanPages(scan: PoolMarketScan, filters: PoolScanFilters): string[] {
+  const chunks: { start: number; text: string }[] = [];
+  let start = 0;
+  do {
+    let count = Math.min(10, scan.pools.length - start);
+    let text: string;
+    do {
+      text = formatPoolMarketScan({ ...scan, pools: scan.pools.slice(start, start + count) }, filters, start, scan.pools.length);
+      if (text.length <= 3900) break;
+      if (count <= 1) throw new Error('Pool result exceeds Telegram message limit');
+      count--;
+    } while (true);
+    chunks.push({ start, text });
+    start += count;
+  } while (start < scan.pools.length);
+  return chunks.map(({ text }, page) => `${text}\nHalaman ${page + 1}/${chunks.length} · ${scan.pools.length} hasil · Top N ${filters.maxResults}`);
+}
+
+export function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters, offset = 0, totalResults = scan.pools.length): string {
   if (scan.marketCoverage) {
     const c = scan.marketCoverage;
     const lines = [
@@ -3512,13 +3580,14 @@ export function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilt
       `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | Pool TVL ≥ $${fmtUsd(filters.minPoolTvlUsd)} | Total TVL > $${fmtUsd(filters.minTotalActiveTvlUsd)} | Usia > ${fmtDuration(filters.minPoolAgeSeconds)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
       `Pool data kurang: ${c.unavailablePools} | TVL dari snapshot: ${c.snapshotPools}`,
       ...(c.partial ? [`⚠️ Hasil parsial${c.timedOut ? ': tenggat tercapai' : ': data/discovery belum lengkap'}.`] : []),
-      `Top ${scan.pools.length} dari ${c.totalQualifiedTokens} token lolos`, '',
+      `Min volume 1h/pool: $${fmtUsd(filters.minVolume1hUsd ?? 0)}`,
+      `Top ${totalResults} dari ${c.totalQualifiedTokens} token lolos`, '',
     ];
     if (scan.warming) lines.push('Discovery sedang dipanaskan di background. Coba lagi setelah kandidat tersedia.');
     else if (!scan.pools.length) lines.push('Belum ada pool lolos pada data yang berhasil diverifikasi.');
     for (const [index, pool] of scan.pools.entries()) {
       const label = pool.pair.replace(/[\r\n]/g, ' ').slice(0, 48);
-      lines.push(`${index + 1}. ${pool.protocol.toUpperCase()} ${label} | Yield/h ${fmtPercent(pool.estimatedPoolYield1hPercent)}`);
+      lines.push(`${offset + index + 1}. ${pool.protocol.toUpperCase()} ${label} | Yield/h ${fmtPercent(pool.estimatedPoolYield1hPercent)}`);
       lines.push(`TVL $${fmtUsd(pool.tvlUsd)} | Vol 1h $${fmtUsd(pool.volume1hUsd)} | Fee ${((pool.currentLpFee ?? pool.feeTier) / 10_000).toFixed(2)}%`);
       if (pool.warnings.some(warning => warning.startsWith('Total TVL:'))) lines.push('Total TVL aktif: batas bawah; pemeriksaan parsial.');
       if (pool.warnings.some(warning => warning.startsWith('TVL snapshot'))) lines.push('TVL: snapshot Gecko ≤15m.');
@@ -3535,6 +3604,7 @@ export function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilt
     `Kandidat cache: ${scan.candidateTokens} | Dievaluasi DexScreener: ${scan.evaluatedTokens} | Lolos filter + on-chain: ${scan.qualifiedTokens}`,
     `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | Pool TVL > $${fmtUsd(filters.minPoolTvlUsd)} | Total TVL aktif > $${fmtUsd(filters.minTotalActiveTvlUsd)} | Usia > ${fmtDuration(filters.minPoolAgeSeconds)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
     `Quote: ${filters.allowedQuotes.join(", ")}`,
+    `Min volume 1h/pool: $${fmtUsd(filters.minVolume1hUsd ?? 0)}`,
     "",
   ];
   if (scan.warming) {
@@ -3548,7 +3618,7 @@ export function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilt
   for (let index = 0; index < scan.pools.length; index++) {
     const pool = scan.pools[index]!;
     const effectiveFee = pool.currentLpFee ?? pool.feeTier;
-    lines.push(`${index + 1}. ${pool.protocol.toUpperCase()} ${pool.pair} | ${(effectiveFee / 10_000).toFixed(2)}%${pool.dynamicFee ? " dynamic" : ""}`);
+    lines.push(`${offset + index + 1}. ${pool.protocol.toUpperCase()} ${pool.pair.replace(/[\r\n]/g, ' ').slice(0, 48)} | ${(effectiveFee / 10_000).toFixed(2)}%${pool.dynamicFee ? " dynamic" : ""}`);
     lines.push(`   Yield/h: ${fmtPercent(pool.estimatedPoolYield1hPercent)} | Vol 1h: $${fmtUsd(pool.volume1hUsd)} | Est. fees 1h: $${fmtUsd(pool.estimatedPoolFees1hUsd)}`);
     const valuationLabel = pool.tokenValuationSource === "fdv" ? "FDV fallback" : "MC";
     lines.push(`   ${valuationLabel}: $${fmtUsd(pool.tokenMarketCapUsd ?? 0)} | Total active TVL V3/V4: $${fmtUsd(pool.tokenTotalActiveTvlUsd ?? 0)} | Usia: ${fmtDuration(pool.tokenOldestPoolAgeSeconds ?? 0)}`);

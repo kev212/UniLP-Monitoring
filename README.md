@@ -71,13 +71,15 @@ BSC Uniswap V3/V4 diaktifkan melalui `CHAINS=robinhood,bsc`. Auto-exit SL/TP/tra
 | `/close <nomor atau key>` | Menutup posisi secara manual. |
 | `/scan [base\|robinhood\|bsc] <token-address>` | Mencari pool Uniswap untuk token. |
 | `/investigate [bsc\|bnb] <pool-id>` | Menganalisis pool V4/V3. |
-| `/scan_pools` | Top 10 token berdasarkan yield 1 jam; Robinhood memakai discovery background dan tenggat pemrosesan 110 detik. |
+| `/scan_pools` | Top N token berdasarkan yield 1 jam (1–20, sesuai config), dengan Prev/Next; Robinhood memakai discovery background dan tenggat pemrosesan 110 detik. |
 | `/history` | Riwayat close dengan PnL minimal `+/-0.5%`. |
 | `/calendar` | Kalender realized PnL UTC. |
 
 ### Discovery Robinhood
 
 `/scan_pools` mempertahankan kandidat lintas refresh selama 7 hari sejak terakhir ditemukan atau teramati aktif. Discovery berjalan setiap 15 menit, melanjutkan cursor yang tersimpan hingga 10 halaman per DEX serta new/trending pools. Nama pool tanpa fee tetap menjadi kandidat.
+
+Top N menentukan total hasil, dengan maksimal 10 hasil per halaman (lebih sedikit bila pesan terlalu panjang). Prev/Next memakai snapshot selama 5 menit sejak hasil dikirim, tanpa scan ulang; setelah restart atau kedaluwarsa, jalankan scan baru. Pool Scan Config menyediakan minimum volume 1 jam dalam USD **per pool** (`POOL_SCAN_MIN_VOLUME_1H_USD`, default `0` = nonaktif). Filter volume diterapkan sebelum pemilihan pool terbaik per token dan tidak mengurangi perhitungan total TVL aktif. Perubahan config berlaku untuk scan berikutnya.
 
 Scan interaktif menyegarkan data DexScreener dan memverifikasi pool on-chain sampai tenggat 110 detik, dengan cadangan sekitar 10 detik untuk Telegram. Hasil parsial mencantumkan kandidat yang belum selesai, data kurang, dan usia discovery. TVL fallback hanya memakai snapshot GeckoTerminal maksimal 15 menit; tidak menunggu request Gecko baru. Setting minimum TVL dan yield pengguna tetap berlaku.
 

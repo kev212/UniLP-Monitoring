@@ -88,6 +88,8 @@ export interface QuoteToken {
 }
 
 export interface PoolScanSettings {
+  /** Missing in settings saved before the volume filter; defaults to disabled. */
+  minVolume1hUsd?: number;
   minMarketCapUsd: number;
   minPoolTvlUsd: number;
   minTotalActiveTvlUsd: number;
