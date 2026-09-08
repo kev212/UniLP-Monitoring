@@ -220,6 +220,20 @@ export interface PositionGroupHistoryBackfillCandidate {
   settledAt: Date;
 }
 
+export interface MarketCandidate {
+  tokenAddress: string;
+  seedScore: number;
+  lastSeenAt: Date;
+  lastEvaluatedAt: Date | null;
+  sources: string[];
+}
+
+export interface MarketPoolSnapshot {
+  poolId: string;
+  tvlUsd: number;
+  observedAt: Date;
+}
+
 export class Database {
   private readonly pool: Pool;
 
@@ -584,6 +598,22 @@ export class Database {
       ALTER TABLE pool_scan_candidates DROP CONSTRAINT IF EXISTS pool_scan_candidates_pkey;
       ALTER TABLE pool_scan_candidates ADD PRIMARY KEY (chain, token_address);
       CREATE INDEX IF NOT EXISTS pool_scan_candidates_updated_idx ON pool_scan_candidates(updated_at DESC);
+      ALTER TABLE pool_scan_candidates ADD COLUMN IF NOT EXISTS last_evaluated_at TIMESTAMPTZ;
+      ALTER TABLE pool_scan_candidates ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ;
+      ALTER TABLE pool_scan_candidates ADD COLUMN IF NOT EXISTS sources JSONB NOT NULL DEFAULT '[]'::jsonb;
+      CREATE TABLE IF NOT EXISTS pool_scan_discovery_state (
+        chain TEXT PRIMARY KEY,
+        next_cursor INTEGER NOT NULL DEFAULT 0,
+        last_success_at TIMESTAMPTZ,
+        cycle_completed_at TIMESTAMPTZ
+      );
+      CREATE TABLE IF NOT EXISTS pool_scan_tvl_snapshots (
+        chain TEXT NOT NULL,
+        pool_id TEXT NOT NULL,
+        tvl_usd DOUBLE PRECISION NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (chain, pool_id)
+      );
       CREATE TABLE IF NOT EXISTS close_history (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         position_id UUID REFERENCES positions(id) ON DELETE CASCADE,
@@ -2368,6 +2398,69 @@ FROM position_groups g
       [chain, limit],
     );
     return result.rows.map((row) => ({ tokenAddress: row.token_address, seedScore: row.seed_score, updatedAt: new Date(row.updated_at) }));
+  }
+
+  async getMarketDiscoveryState(chain: ChainName): Promise<{ nextCursor: number; lastSuccessAt: Date | null; cycleCompletedAt: Date | null }> {
+    const result = await this.pool.query<{ next_cursor: number; last_success_at: Date | null; cycle_completed_at: Date | null }>(
+      "SELECT next_cursor, last_success_at, cycle_completed_at FROM pool_scan_discovery_state WHERE chain = $1", [chain],
+    );
+    return { nextCursor: result.rows[0]?.next_cursor ?? 0, lastSuccessAt: result.rows[0]?.last_success_at ?? null, cycleCompletedAt: result.rows[0]?.cycle_completed_at ?? null };
+  }
+
+  async saveMarketDiscoveryPage(
+    chain: ChainName, source: string, nextCursor: number,
+    candidates: readonly { tokenAddress: string; seedScore: number }[],
+    snapshots: readonly { poolId: string; tvlUsd: number }[],
+  ): Promise<void> {
+    await this.transaction(async (client) => {
+      for (const candidate of candidates) {
+        await client.query(`INSERT INTO pool_scan_candidates (chain, token_address, seed_score, sources)
+          VALUES ($1, $2, $3, jsonb_build_array($4::text))
+          ON CONFLICT (chain, token_address) DO UPDATE SET updated_at = NOW(),
+          seed_score = CASE WHEN pool_scan_candidates.updated_at < NOW() - INTERVAL '15 minutes'
+            THEN EXCLUDED.seed_score ELSE GREATEST(pool_scan_candidates.seed_score, EXCLUDED.seed_score) END,
+          sources = (SELECT jsonb_agg(DISTINCT value) FROM jsonb_array_elements(pool_scan_candidates.sources || EXCLUDED.sources))`,
+        [chain, candidate.tokenAddress.toLowerCase(), candidate.seedScore, source]);
+      }
+      for (const snapshot of snapshots) {
+        await client.query(`INSERT INTO pool_scan_tvl_snapshots (chain, pool_id, tvl_usd) VALUES ($1, $2, $3)
+          ON CONFLICT (chain, pool_id) DO UPDATE SET tvl_usd = EXCLUDED.tvl_usd, observed_at = NOW()`,
+        [chain, snapshot.poolId.toLowerCase(), snapshot.tvlUsd]);
+      }
+      await client.query(`INSERT INTO pool_scan_discovery_state (chain, next_cursor, last_success_at, cycle_completed_at)
+        VALUES ($1, $2, NOW(), CASE WHEN $2 = 0 THEN NOW() END)
+        ON CONFLICT (chain) DO UPDATE SET next_cursor = EXCLUDED.next_cursor, last_success_at = NOW(),
+        cycle_completed_at = CASE WHEN $2 = 0 THEN NOW() ELSE pool_scan_discovery_state.cycle_completed_at END`, [chain, nextCursor]);
+      await client.query(`DELETE FROM pool_scan_candidates WHERE chain = $1
+        AND GREATEST(updated_at, COALESCE(last_active_at, updated_at)) < NOW() - INTERVAL '7 days'`, [chain]);
+      await client.query("DELETE FROM pool_scan_tvl_snapshots WHERE chain = $1 AND observed_at < NOW() - INTERVAL '1 day'", [chain]);
+    });
+  }
+
+  async listRetainedMarketCandidates(chain: ChainName): Promise<MarketCandidate[]> {
+    const result = await this.pool.query<{ token_address: string; seed_score: number; updated_at: Date; last_evaluated_at: Date | null; sources: string[] }>({
+      text: `SELECT token_address, seed_score, updated_at, last_evaluated_at, sources FROM pool_scan_candidates
+        WHERE chain = $1 AND GREATEST(updated_at, COALESCE(last_active_at, updated_at)) >= NOW() - INTERVAL '7 days'
+        ORDER BY seed_score DESC, token_address`, values: [chain], ...{ query_timeout: 5000 },
+    });
+    return result.rows.map(row => ({ tokenAddress: row.token_address, seedScore: row.seed_score,
+      lastSeenAt: new Date(row.updated_at), lastEvaluatedAt: row.last_evaluated_at ? new Date(row.last_evaluated_at) : null, sources: row.sources }));
+  }
+
+  async listMarketTvlSnapshots(chain: ChainName): Promise<MarketPoolSnapshot[]> {
+    const result = await this.pool.query<{ pool_id: string; tvl_usd: number; observed_at: Date }>({
+      text: "SELECT pool_id, tvl_usd, observed_at FROM pool_scan_tvl_snapshots WHERE chain = $1 AND observed_at >= NOW() - INTERVAL '15 minutes'",
+      values: [chain], ...{ query_timeout: 5000 },
+    });
+    return result.rows.map(row => ({ poolId: row.pool_id, tvlUsd: row.tvl_usd, observedAt: new Date(row.observed_at) }));
+  }
+
+  async recordMarketEvaluations(chain: ChainName, evaluated: readonly string[], active: readonly string[]): Promise<void> {
+    await this.pool.query({ text: `UPDATE pool_scan_candidates SET
+      last_evaluated_at = CASE WHEN token_address = ANY($2::text[]) THEN NOW() ELSE last_evaluated_at END,
+      last_active_at = CASE WHEN token_address = ANY($3::text[]) THEN NOW() ELSE last_active_at END
+      WHERE chain = $1 AND (token_address = ANY($2::text[]) OR token_address = ANY($3::text[]))`,
+    values: [chain, evaluated, active], ...{ query_timeout: 5000 } });
   }
 
   async fetchDueDeletions(): Promise<{ id: string; chatId: string; messageId: number }[]> {

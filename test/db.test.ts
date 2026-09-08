@@ -785,3 +785,48 @@ describe("Database native USD backfill", () => {
     expect(query.mock.calls[1]![0]).toContain("SELECT chain_id");
   });
 });
+
+describe('persistent market discovery', () => {
+  it('upserts one page and advances its cursor in the same transaction without clearing live candidates', async () => {
+    const database = new Database('postgres://unused');
+    const query = vi.fn(async () => ({ rows: [], rowCount: 1 }));
+    const client = { query, release: vi.fn() };
+    Object.defineProperty(database, 'pool', { value: { connect: vi.fn(async () => client) } });
+    await database.saveMarketDiscoveryPage('robinhood', 'new_pools?page=1', 1,
+      [{tokenAddress:'0xABC', seedScore:0}], [{poolId:'0xDEF', tvlUsd:6000}]);
+    const sql = query.mock.calls.map(call => String(call[0]));
+    expect(sql[0]).toBe('BEGIN');
+    expect(sql.at(-1)).toBe('COMMIT');
+    expect(sql.some(text => text.includes('ON CONFLICT (chain, token_address) DO UPDATE'))).toBe(true);
+    expect(sql.some(text => text.includes('pool_scan_discovery_state') && text.includes('next_cursor'))).toBe(true);
+    const deletes = sql.filter(text => text.startsWith('DELETE FROM pool_scan_candidates'));
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0]).toContain("INTERVAL '7 days'");
+    expect(deletes[0]).toContain('last_active_at');
+    expect(query.mock.calls.some(call => JSON.stringify(call[1]) === JSON.stringify(['robinhood','0xabc',0,'new_pools?page=1']))).toBe(true);
+  });
+
+  it('rolls back page and cursor together if persistence fails', async () => {
+    const database = new Database('postgres://unused');
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes('INSERT INTO pool_scan_tvl_snapshots')) throw new Error('storage failed');
+      return { rows: [], rowCount: 1 };
+    });
+    Object.defineProperty(database, 'pool', { value: { connect: vi.fn(async () => ({query,release:vi.fn()})) } });
+    await expect(database.saveMarketDiscoveryPage('robinhood','page',1,[],[{poolId:'0xabc',tvlUsd:5}])).rejects.toThrow('storage failed');
+    expect(query.mock.calls.at(-1)![0]).toBe('ROLLBACK');
+    expect(query.mock.calls.some(([sql]) => sql.includes('INSERT INTO pool_scan_discovery_state'))).toBe(false);
+  });
+
+  it('loads all retained candidates with timestamps, without a top-20 limit', async () => {
+    const database = new Database('postgres://unused');
+    const query = vi.fn(async () => ({rowCount:1, rows:[{token_address:'0xabc',seed_score:2,updated_at:'2026-09-08T00:00:00Z',last_evaluated_at:null,sources:['page'] }]}));
+    Object.defineProperty(database,'pool',{value:{query}});
+    const rows=await database.listRetainedMarketCandidates('robinhood');
+    expect(rows[0]).toMatchObject({tokenAddress:'0xabc',lastEvaluatedAt:null,sources:['page']});
+    const config=query.mock.calls[0]![0] as any;
+    expect(config.text).not.toContain('LIMIT');
+    expect(config.text).toContain("INTERVAL '7 days'");
+    expect(config.values).toEqual(['robinhood']);
+  });
+});

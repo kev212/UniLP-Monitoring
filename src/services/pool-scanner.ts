@@ -1,5 +1,8 @@
 import { isAddress, isHex, zeroAddress, type Address, type Hex } from "viem";
 
+import { MarketDiscovery } from './market-discovery.js';
+import { MarketScanner, type MarketCoverage } from './market-scan.js';
+import { ScanBudget } from './scan-budget.js';
 import { chainRegistry, isEligibleScanDex } from "../chains.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
@@ -105,6 +108,7 @@ export interface PoolScanFilters extends PoolScanSettings {
 }
 
 export interface PoolMarketScan {
+  marketCoverage?: MarketCoverage;
   pools: ScoredPool[];
   candidateTokens: number;
   qualifiedTokens: number;
@@ -181,7 +185,7 @@ interface DexScreenerPairDetail {
   pairCreatedAt?: number | null;
 }
 
-interface GeckoPool {
+export interface GeckoPool {
   id: string;
   type: string;
   attributes: {
@@ -216,7 +220,7 @@ interface GeckoTokenResponse {
 
 type GeckoRequestPriority = "interactive" | "background";
 
-interface DexScreenerPair {
+export interface DexScreenerPair {
   chainId: string;
   dexId: string;
   pairAddress: string;
@@ -232,6 +236,12 @@ interface DexScreenerPair {
 }
 
 export class PoolScanner {
+  private readonly marketScanner: MarketScanner;
+  private readonly marketDiscovery: MarketDiscovery;
+  private interactiveScans = 0;
+  private readonly interactiveIdle = new Set<() => void>();
+  private readonly candidateRefreshChains = new Set<ChainName>();
+  private readonly staticPoolMetadata = new Map<string, { expiresAt: number; tokens: string[]; value: VerifiedPool }>();
   private officialStocks?: { tokens: { address: Address; symbol: string }[]; fetchedAt: string };
   private nextStockRequestAt = 0;
   private marketScanCache?: { key: string; expiresAt: number; result: PoolMarketScan };
@@ -245,25 +255,61 @@ export class PoolScanner {
     private readonly chains: ChainClients,
     private readonly database: Database,
     private readonly geckoMinRequestIntervalMs = GECKO_MIN_REQUEST_INTERVAL_MS,
-  ) {}
+  ) {
+    this.marketScanner = new MarketScanner({ database,
+      eligible: pair => isMarketScanPair(pair, 'robinhood'),
+      waitForInteractive: budget => this.waitForInteractive(budget),
+      score: (pair, token, tvls) => this.toDexScreenerPool(pair, token, tvls, 'robinhood', true),
+    });
+    this.marketDiscovery = new MarketDiscovery(database, async path => {
+      const response = await this.fetchGecko(`${GECKO_BASE}/networks/robinhood/${path}`, 'background');
+      if (!response.ok) throw new Error(`Discovery HTTP ${response.status}`);
+      const body = await response.json() as { data?: GeckoPool[] };
+      if (!Array.isArray(body.data)) throw new Error('Invalid discovery response');
+      return body.data;
+    });
+  }
+
+  beginTokenScan(): () => void {
+    this.interactiveScans++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (--this.interactiveScans === 0) { this.interactiveIdle.forEach(wake => wake()); this.interactiveIdle.clear(); }
+    };
+  }
+
+  private async waitForInteractive(budget?: ScanBudget): Promise<void> {
+    while (this.interactiveScans > 0) {
+      let wake: () => void = () => {};
+      const idle = () => new Promise<void>(resolve => { wake = resolve; this.interactiveIdle.add(wake); });
+      try { if (budget) await budget.run(idle); else await idle(); }
+      finally { this.interactiveIdle.delete(wake); }
+    }
+    budget?.check();
+  }
 
   async scan(tokenAddress: Address, chain: ChainName = "robinhood", minPoolTvlUsd = 300): Promise<PoolScan> {
-    const startedAt = Date.now();
-    const normalized = tokenAddress.toLowerCase();
+    const release = this.beginTokenScan();
+    try {
+      const startedAt = Date.now();
+      const normalized = tokenAddress.toLowerCase();
 
-    const pools = await this.fetchUniswapPools(normalized, chain, "interactive");
-    if (pools.length === 0) {
-      log.info({ token: normalized, rawPools: 0, durationMs: Date.now() - startedAt }, "token pool scan completed");
-      return { active: [], watchlist: [] };
-    }
+      const pools = await this.fetchUniswapPools(normalized, chain, "interactive");
+      if (pools.length === 0) {
+        log.info({ token: normalized, rawPools: 0, durationMs: Date.now() - startedAt }, "token pool scan completed");
+        return { active: [], watchlist: [] };
+      }
 
-    const dexTvlMap = await this.buildDexScreenerTvlMap(normalized, chain);
-    const scored = (await mapWithConcurrency(pools, TOKEN_SCAN_VERIFY_CONCURRENCY, (raw) =>
-      this.toScoredPool(raw, normalized, true, chain, dexTvlMap, "execution"),
-    )).filter((pool): pool is ScoredPool => pool !== null && pool.tvlUsd >= minPoolTvlUsd);
-    const result = rankPools(scored);
-    log.info({ token: normalized, rawPools: pools.length, scoredPools: scored.length, active: result.active.length, watchlist: result.watchlist.length, durationMs: Date.now() - startedAt }, "token pool scan completed");
-    return result;
+      const dexTvlMap = await this.buildDexScreenerTvlMap(normalized, chain);
+      const scored = (await mapWithConcurrency(pools, TOKEN_SCAN_VERIFY_CONCURRENCY, (raw) =>
+        this.toScoredPool(raw, normalized, true, chain, dexTvlMap, "execution"),
+      )).filter((pool): pool is ScoredPool => pool !== null && pool.tvlUsd >= minPoolTvlUsd);
+      const result = rankPools(scored);
+      log.info({ token: normalized, rawPools: pools.length, scoredPools: scored.length, active: result.active.length, watchlist: result.watchlist.length, durationMs: Date.now() - startedAt }, "token pool scan completed");
+      return result;
+    } finally { release(); }
   }
 
   async scanV2(tokenAddress: Address, chain: ChainName = "robinhood", downsidePercent = 35, onProgress?: (completed: number, total: number) => void): Promise<PoolScan> {
@@ -298,13 +344,18 @@ export class PoolScanner {
   }
 
   startCandidateRefresh(chain: ChainName, allowedQuoteAddresses: readonly Address[], candidatePages: number): void {
-    const refresh = () => void this.refreshCandidateCache(chain, allowedQuoteAddresses, candidatePages)
+    if (this.candidateRefreshChains.has(chain)) return;
+    this.candidateRefreshChains.add(chain);
+    const refresh = () => void (chain === 'robinhood'
+      ? this.marketDiscovery.refresh(allowedQuoteAddresses)
+      : this.refreshCandidateCache(chain, allowedQuoteAddresses, candidatePages))
       .catch((error) => log.warn({ chain, error: error instanceof Error ? error.message : String(error) }, "pool candidate refresh failed"));
     refresh();
     setInterval(refresh, CANDIDATE_REFRESH_MS);
   }
 
-  async scanPools(filters: PoolScanFilters, onProgress?: (stage: string) => void): Promise<PoolMarketScan> {
+  async scanPools(filters: PoolScanFilters, onProgress?: (stage: string) => void, startedAt = Date.now()): Promise<PoolMarketScan> {
+    if (filters.chain === 'robinhood') return this.marketScanner.scan(filters, onProgress, startedAt);
     const key = JSON.stringify({ ...filters, allowedQuoteAddresses: [...filters.allowedQuoteAddresses].sort() });
     if (this.marketScanCache?.key === key && this.marketScanCache.expiresAt > Date.now()) return this.marketScanCache.result;
     onProgress?.("Memuat kandidat pool cache...");
@@ -398,7 +449,7 @@ export class PoolScanner {
     }
   }
 
-  private async toDexScreenerPool(pair: DexScreenerPair, token: string, geckoTvlFallback?: Map<string, number>, chain: ChainName = "robinhood"): Promise<ScoredPool | null> {
+  private async toDexScreenerPool(pair: DexScreenerPair, token: string, geckoTvlFallback?: Map<string, number>, chain: ChainName = "robinhood", cacheMetadata = false): Promise<ScoredPool | null> {
     const protocol = stockPairProtocol(pair);
     if (!protocol) return null;
     const dexTvl = Number(pair.liquidity?.usd ?? 0);
@@ -406,7 +457,7 @@ export class PoolScanner {
     const volume1hUsd = Number(pair.volume?.h1 ?? 0);
     const volume6hUsd = Number(pair.volume?.h6 ?? 0);
     if (!Number.isFinite(tvlUsd) || tvlUsd <= 0 || !Number.isFinite(volume1hUsd) || volume1hUsd < 0 || !Number.isFinite(volume6hUsd) || volume6hUsd < 0) return null;
-    const verified = await this.verifyPool(protocol, pair.pairAddress as Address, token, chain);
+    const verified = await this.verifyPool(protocol, pair.pairAddress as Address, token, chain, "scan", cacheMetadata);
     if (!verified) return null;
     const feeTier = verified.feeTier ?? 0;
     const currentLpFee = verified.currentLpFee;
@@ -659,7 +710,9 @@ export class PoolScanner {
 
   private async fetchGecko(url: string, priority: GeckoRequestPriority): Promise<Response> {
     const queuedAt = Date.now();
+    if (priority === 'background') await this.waitForInteractive();
     await this.acquireGeckoSlot(priority);
+    let ownsSlot = true;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         const wait = Math.max(
@@ -667,6 +720,14 @@ export class PoolScanner {
           this.geckoCooldownUntil - Date.now(),
         );
         if (wait > 0) await sleep(wait);
+        if (priority === 'background' && this.interactiveScans > 0) {
+          this.releaseGeckoSlot(); ownsSlot = false;
+          await this.waitForInteractive();
+          await this.acquireGeckoSlot(priority); ownsSlot = true;
+          // Interactive calls may have moved both the request interval and cooldown.
+          attempt--;
+          continue;
+        }
         this.lastGeckoRequestAt = Date.now();
         const requestedAt = Date.now();
         const response = await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
@@ -680,7 +741,7 @@ export class PoolScanner {
       }
       throw new Error("GeckoTerminal retry loop ended unexpectedly");
     } finally {
-      this.releaseGeckoSlot();
+      if (ownsSlot) this.releaseGeckoSlot();
     }
   }
 
@@ -709,9 +770,10 @@ export class PoolScanner {
     searchToken: string,
     chain: ChainName,
     rpc: "scan" | "execution" = "scan",
+    cacheMetadata = false,
   ): Promise<VerifiedPool | null> {
-    if (protocol === "v3") return this.verifyV3Pool(poolAddress, searchToken, chain, rpc);
-    return this.verifyV4Pool(poolAddress, searchToken, chain, rpc);
+    if (protocol === "v3") return this.verifyV3Pool(poolAddress, searchToken, chain, rpc, cacheMetadata);
+    return this.verifyV4Pool(poolAddress, searchToken, chain, rpc, cacheMetadata);
   }
 
   private rpcClient(chain: ChainName, rpc: "scan" | "execution" = "scan") {
@@ -738,9 +800,16 @@ export class PoolScanner {
     return null;
   }
 
-  async verifyV3Pool(pool: Address, searchToken: string, chain: ChainName, rpc: "scan" | "execution" = "scan"): Promise<VerifiedPool | null> {
+  async verifyV3Pool(pool: Address, searchToken: string, chain: ChainName, rpc: "scan" | "execution" = "scan", cacheMetadata = false): Promise<VerifiedPool | null> {
     const { client } = this.rpcClient(chain, rpc);
     try {
+      const key = `${chain}:v3:${pool.toLowerCase()}`;
+      const cached = cacheMetadata ? this.staticPoolMetadata.get(key) : undefined;
+      if (cached && cached.expiresAt > Date.now() && cached.tokens.includes(searchToken.toLowerCase())) {
+        const liquidity = await client.readContract({ address: pool,
+          abi: [{ name: 'liquidity', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint128' }] }], functionName: 'liquidity' });
+        return { ...cached.value, activeLiquidity: liquidity > 0n };
+      }
       const [token0, token1, fee, liquidity] = await Promise.all([
         client.readContract({
           address: pool, abi: [{ name: "token0", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] }],
@@ -767,7 +836,9 @@ export class PoolScanner {
       const matched = await this.matchV3Factory(chain, pool, token0 as Address, token1 as Address, Number(fee), rpc);
       if (!matched) return null;
 
-      return { feeTier: Number(fee), activeLiquidity: liquidity > 0n, dex: matched };
+      const value: VerifiedPool = { feeTier: Number(fee), activeLiquidity: liquidity > 0n, dex: matched };
+      if (cacheMetadata) this.cachePoolMetadata(key, [t0, t1], value);
+      return value;
     } catch {
       return null;
     }
@@ -778,6 +849,7 @@ export class PoolScanner {
     searchToken: string,
     chain: ChainName,
     rpc: "scan" | "execution" = "scan",
+    cacheMetadata = false,
   ): Promise<VerifiedPool | null> {
     if (!isHex(poolId) || poolId.length !== 66) return null;
 
@@ -802,6 +874,12 @@ export class PoolScanner {
         }),
       ]);
 
+      const key = `${chain}:v4:${poolId.toLowerCase()}`;
+      const cached = cacheMetadata ? this.staticPoolMetadata.get(key) : undefined;
+      if (cached && cached.expiresAt > Date.now() && cached.tokens.includes(searchToken.toLowerCase())) {
+        if (slot0[0] === 0n) return null;
+        return { ...cached.value, currentLpFee: Number(slot0[3]), activeLiquidity: liquidity > 0n };
+      }
       const bytes25 = (poolId as Hex).slice(0, 2 + 25 * 2) as Hex;
       const poolKeyResult = await client.readContract({
         address: positionManager,
@@ -835,16 +913,26 @@ export class PoolScanner {
       });
       if (computedId.toLowerCase() !== poolId.toLowerCase() || slot0[0] === 0n) return null;
 
-      return {
+      const value: VerifiedPool = {
         feeTier: Number(poolKey.fee),
         currentLpFee: Number(slot0[3]),
         activeLiquidity: liquidity > 0n,
         hooks: poolKey.hooks,
         tickSpacing: Number(poolKey.tickSpacing),
       };
+      if (cacheMetadata) this.cachePoolMetadata(key, [c0, c1], value);
+      return value;
     } catch {
       return null;
     }
+  }
+
+  private cachePoolMetadata(key: string, tokens: string[], value: VerifiedPool): void {
+    if (this.staticPoolMetadata.size >= 10_000) {
+      for (const [id, item] of this.staticPoolMetadata) if (item.expiresAt <= Date.now()) this.staticPoolMetadata.delete(id);
+      if (this.staticPoolMetadata.size >= 10_000) this.staticPoolMetadata.delete(this.staticPoolMetadata.keys().next().value!);
+    }
+    this.staticPoolMetadata.set(key, { tokens, value, expiresAt: Date.now() + 24 * 60 * 60_000 });
   }
 
   async scanStocks(

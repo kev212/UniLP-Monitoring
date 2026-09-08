@@ -1,3 +1,5 @@
+import { ScanBudget } from './scan-budget.js';
+import { MARKET_SCAN_BUDGET_MS } from './market-scan.js';
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import { Bot, Context, InlineKeyboard, InputFile, type CommandContext } from "grammy";
@@ -1367,14 +1369,16 @@ export class Notifier {
     }
     this.lastScanAt = Date.now();
     this.tokenScanRunning = true;
+    const releasePriority = scanner.beginTokenScan();
 
     try {
       await this.replyTemp(ctx, `🔍 Mencari pool Uniswap V3/V4 untuk ${shortAddress(token)} di ${chainRegistry[chain].displayName}...`, undefined, 120_000);
     } catch (error) {
       this.tokenScanRunning = false;
+      releasePriority();
       throw error;
     }
-    void this.executeTokenScan(scanner, token, chain, chatId).catch((error) => log.error({ error: errorMessage(error), token, chain }, "token scan background job failed"));
+    void this.executeTokenScan(scanner, token, chain, chatId).finally(releasePriority).catch((error) => log.error({ error: errorMessage(error), token, chain }, "token scan background job failed"));
   }
 
   private async executeTokenScan(scanner: PoolScanner, token: Address, chain: ChainName, chatId: string): Promise<void> {
@@ -1411,6 +1415,7 @@ export class Notifier {
   }
 
   private async handleScanPools(ctx: Context, database: Database, scanner: PoolScanner, chain: ChainName): Promise<void> {
+    const startedAt = Date.now();
     const chatId = ctx.chat?.id.toString();
     if (!chatId || !this.authorized(chatId, ctx.from?.id.toString())) return;
     if (this.poolScanRunning) {
@@ -1419,23 +1424,34 @@ export class Notifier {
     }
     this.poolScanRunning = true;
     const dexes = chain === "bsc" ? "Uniswap V3/V4 + PancakeSwap V3" : "Uniswap V3/V4";
-    const progress = await ctx.reply(`🏆 Memeriksa kandidat ${dexes} ${chainHeading(chainRegistry[chain])} berdasarkan yield 1h. Scan dapat memerlukan sekitar 2 menit...`);
+    let progress;
+    try {
+      progress = await ctx.reply(`🏆 Memeriksa kandidat ${dexes} ${chainHeading(chainRegistry[chain])} berdasarkan yield 1h. Scan dapat memerlukan sekitar 2 menit...`);
+    } catch (error) { this.poolScanRunning = false; throw error; }
     const messageId = progress.message_id;
     void this.queueTemp(ctx.chat!.id.toString(), messageId, 120_000);
-    void this.executePoolScan(database, scanner, chatId, messageId, chain).catch((scanError) => log.error({ chain, error: errorMessage(scanError) }, "pool scan background job failed"));
+    void this.executePoolScan(database, scanner, chatId, messageId, chain, startedAt).catch((scanError) => log.error({ chain, error: errorMessage(scanError) }, "pool scan background job failed"));
   }
 
-  private async executePoolScan(database: Database, scanner: PoolScanner, chatId: string, messageId: number, chain: ChainName): Promise<void> {
+  private async executePoolScan(database: Database, scanner: PoolScanner, chatId: string, messageId: number, chain: ChainName, startedAt = Date.now()): Promise<void> {
     let stage = "Memuat kandidat cache...";
-    const startedAt = Date.now();
+    const lookupBudget = chain === "robinhood" ? new ScanBudget(startedAt + MARKET_SCAN_BUDGET_MS) : undefined;
+    const progressController = new AbortController();
     const heartbeat = setInterval(() => {
-      void this.refreshPoolScanProgress(chatId, messageId, `${stage}\nElapsed: ${Math.floor((Date.now() - startedAt) / 1_000)}s`);
+      void this.refreshPoolScanProgress(chatId, messageId, `${stage}\nElapsed: ${Math.floor((Date.now() - startedAt) / 1_000)}s`, progressController.signal);
     }, 20_000);
     try {
-      const filters = await this.poolScanFilters(database, chatId, chain);
-      const scan = await scanner.scanPools(filters, (nextStage) => { stage = nextStage; });
+      const filters = lookupBudget ? await lookupBudget.run(() => this.poolScanFilters(database, chatId, chain)) : await this.poolScanFilters(database, chatId, chain);
+      lookupBudget?.close();
+      const scan = await scanner.scanPools(filters, (nextStage) => { stage = nextStage; }, startedAt);
       const text = formatPoolMarketScan(scan, filters);
       if (!this.bot) return;
+      if (chain === 'robinhood') {
+        clearInterval(heartbeat);
+        progressController.abort();
+        await this.deliverMarketScan(chatId, messageId, text, startedAt + 120_000);
+        return;
+      }
       try {
         await this.bot.api.editMessageText(chatId, messageId, text);
       } catch (editError) {
@@ -1448,6 +1464,14 @@ export class Notifier {
       await this.queueTemp(chatId, messageId, 300_000);
     } catch (error) {
       const text = "Scan pools gagal. Coba lagi nanti.";
+      if (chain === 'robinhood') {
+        clearInterval(heartbeat);
+        progressController.abort();
+        await this.deliverMarketScan(chatId, messageId,
+          Date.now() >= startedAt + MARKET_SCAN_BUDGET_MS ? 'Scan mencapai tenggat sebelum data tersedia. Hasil belum lengkap; coba lagi.' : text,
+          startedAt + 120_000).catch(error => log.warn({ err: error }, 'market scan delivery failed'));
+        return;
+      }
       if (this.bot) {
         try {
           await this.bot.api.editMessageText(chatId, messageId, text);
@@ -1457,15 +1481,38 @@ export class Notifier {
         }
       }
     } finally {
+      lookupBudget?.close();
       clearInterval(heartbeat);
+      progressController.abort();
       this.poolScanRunning = false;
     }
   }
 
-  private async refreshPoolScanProgress(chatId: string, messageId: number, stage: string): Promise<void> {
+  private async deliverMarketScan(chatId: string, messageId: number, text: string, deadline: number): Promise<void> {
+    if (!this.bot) return;
+    const budget = new ScanBudget(deadline);
+    // grammY's bundled signal type predates the native DOM signal; runtime accepts both.
+    const signal = budget.signal as unknown as Parameters<Bot['api']['editMessageText']>[4];
+    try {
+      try {
+        await budget.run(() => this.bot!.api.editMessageText(chatId, messageId, text, {}, signal));
+        void this.queueTemp(chatId, messageId, 300_000);
+      } catch (error) {
+        if (errorMessage(error).includes('message is not modified')) {
+          void this.queueTemp(chatId, messageId, 300_000);
+          return;
+        }
+        budget.check();
+        const sent = await budget.run(() => this.bot!.api.sendMessage(chatId, text, {}, signal));
+        void this.queueTemp(chatId, sent.message_id, 300_000);
+      }
+    } finally { budget.close(); }
+  }
+
+  private async refreshPoolScanProgress(chatId: string, messageId: number, stage: string, signal?: AbortSignal): Promise<void> {
     if (!this.bot) return;
     try {
-      await this.bot.api.editMessageText(chatId, messageId, `🏆 SCAN POOLS BERJALAN\n${stage}`);
+      await this.bot.api.editMessageText(chatId, messageId, `🏆 SCAN POOLS BERJALAN\n${stage}`, {}, signal as unknown as Parameters<Bot['api']['editMessageText']>[4]);
       await this.queueTemp(chatId, messageId, 120_000);
     } catch {
       // Final result is sent as a new message if this progress message disappears.
@@ -3455,7 +3502,31 @@ function riskInputPrompt(key: RiskSettingKey): string {
   return "Kirim Trailing drawdown dalam persen positif, contoh: 1.5.";
 }
 
-function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters): string {
+export function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilters): string {
+  if (scan.marketCoverage) {
+    const c = scan.marketCoverage;
+    const lines = [
+      '🏆 TOP POOL YIELD 1H — ROBINHOOD',
+      `Kandidat: ${scan.candidateTokens} | Selesai: ${c.completedTokens} | Data kurang: ${c.failedTokens} | Belum selesai: ${c.pendingTokens}`,
+      `Discovery: ${c.discoveryAt ?? 'belum tersedia'} | Durasi: ${(c.durationMs / 1000).toFixed(1)}s`,
+      `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | Pool TVL ≥ $${fmtUsd(filters.minPoolTvlUsd)} | Total TVL > $${fmtUsd(filters.minTotalActiveTvlUsd)} | Usia > ${fmtDuration(filters.minPoolAgeSeconds)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
+      `Pool data kurang: ${c.unavailablePools} | TVL dari snapshot: ${c.snapshotPools}`,
+      ...(c.partial ? [`⚠️ Hasil parsial${c.timedOut ? ': tenggat tercapai' : ': data/discovery belum lengkap'}.`] : []),
+      `Top ${scan.pools.length} dari ${c.totalQualifiedTokens} token lolos`, '',
+    ];
+    if (scan.warming) lines.push('Discovery sedang dipanaskan di background. Coba lagi setelah kandidat tersedia.');
+    else if (!scan.pools.length) lines.push('Belum ada pool lolos pada data yang berhasil diverifikasi.');
+    for (const [index, pool] of scan.pools.entries()) {
+      const label = pool.pair.replace(/[\r\n]/g, ' ').slice(0, 48);
+      lines.push(`${index + 1}. ${pool.protocol.toUpperCase()} ${label} | Yield/h ${fmtPercent(pool.estimatedPoolYield1hPercent)}`);
+      lines.push(`TVL $${fmtUsd(pool.tvlUsd)} | Vol 1h $${fmtUsd(pool.volume1hUsd)} | Fee ${((pool.currentLpFee ?? pool.feeTier) / 10_000).toFixed(2)}%`);
+      if (pool.warnings.some(warning => warning.startsWith('Total TVL:'))) lines.push('Total TVL aktif: batas bawah; pemeriksaan parsial.');
+      if (pool.warnings.some(warning => warning.startsWith('TVL snapshot'))) lines.push('TVL: snapshot Gecko ≤15m.');
+      lines.push(pool.uniswapUrl);
+    }
+    lines.push('', 'Yield = volume 1h × fee saat pemeriksaan / TVL; estimasi gross pool.');
+    return lines.join('\n');
+  }
   const chain = scan.chain ?? filters.chain;
   const dexes = chain === "bsc" ? "Uniswap V3/V4 + PancakeSwap V3" : "Uniswap V3/V4";
   const lines = [
