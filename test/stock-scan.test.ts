@@ -25,6 +25,53 @@ function setup(assets = [asset(1)], pairs: (url: string) => unknown = () => []) 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe("Robinhood stock coverage", () => {
+  it.each([0, 999, 1000, 1001])('applies pool volume minimum %s inclusively', async minimum => {
+    const { scanner } = setup([asset(1)], () => [pair(1)]);
+    const scan = await scanner.scanStocks(undefined, 'robinhood', 0.1, minimum);
+    expect(scan.pools).toHaveLength(minimum <= 1000 ? 1 : 0);
+    expect(scan.evaluatedTokens).toBe(1);
+    expect(scan.qualifiedTokens).toBe(minimum <= 1000 ? 1 : 0);
+    expect(scan.stockFilters?.minPoolVolume1hUsd).toBe(minimum);
+    expect(formatStockScan(scan)).toContain('Vol pool 1h ≥ $');
+  });
+
+  it('retains token volume gate and filters pool volume before taking top results', async () => {
+    const pools = Array.from({ length: 12 }, (_, i) => ({ ...pair(i + 1),
+      liquidity: { usd: i < 10 ? 100 : 1000 },
+      volume: { h24: 100000, h1: i < 10 ? 500 : 2000, h6: 6000 } }));
+    const { scanner } = setup([asset(1), asset(2)], url => url.endsWith(address(1)) ? pools : [pair(99, address(2), 99999)]);
+    const scan = await scanner.scanStocks(undefined, 'robinhood', 0.1, 1000);
+    expect(scan.pools).toHaveLength(2);
+    expect(scan.pools.every(p => p.volume1hUsd === 2000)).toBe(true);
+    expect(scan.stockCoverage).toMatchObject({ belowVolumeTokens: 1, totalQualifiedPools: 2 });
+  });
+
+  it('does not let unavailable pool volume pass an active filter', async () => {
+    const p = pair(1); delete (p.volume as any).h1;
+    const { scanner } = setup([asset(1)], () => [p]);
+    const scan = await scanner.scanStocks(undefined, 'robinhood', 0.1, 1000);
+    expect(scan.pools).toHaveLength(0);
+    expect(scan.stockCoverage?.partial).toBe(true);
+  });
+
+  it('applies BSC pool filtering before ranking and counts only qualified tokens', async () => {
+    const { scanner, internals } = setup();
+    vi.spyOn(internals, 'fetchBscStockTokens').mockResolvedValue([1, 2, 3].map(n => ({ address: address(n), symbol: `STOCK${n}B` })));
+    vi.spyOn(internals, 'fetchStockVolumes').mockResolvedValue(new Map([[address(1), 100000], [address(2), 100000], [address(3), 99999]]));
+    vi.spyOn(internals, 'enrichStockPairs').mockImplementation(async (stock: any) => stock.address === address(1)
+      ? Array.from({ length: 12 }, (_, i) => ({ estimatedPoolYield1hPercent: i < 10 ? 9 : 1, volume1hUsd: i < 10 ? 999 : 1000, tvlUsd: 1000 }))
+      : [{ estimatedPoolYield1hPercent: 9, volume1hUsd: NaN }]);
+    const scan = await scanner.scanStocks(undefined, 'bsc', 0.2, 1000);
+    expect(scan.pools).toHaveLength(2);
+    expect(scan.qualifiedTokens).toBe(1);
+    expect(scan.evaluatedTokens).toBe(2);
+    expect(internals.enrichStockPairs).toHaveBeenCalledTimes(2);
+    const text = formatStockScan({ ...scan, pools: [] });
+    expect(text).toContain('≥ $100k');
+    expect(text).toContain('Vol pool 1h ≥ $1.00K');
+    expect(text).toContain('yield/h > 0.2%');
+  });
+
   it("scans more than 400 official assets including commodity ETFs without logo/name requirements", async () => {
     const assets = Array.from({ length: 405 }, (_, i) => asset(i + 1));
     ["GLD", "SLV", "USO", "QQQ", "NEW"].forEach((symbol, i) => { assets[i]!.tokenSymbol = symbol; });

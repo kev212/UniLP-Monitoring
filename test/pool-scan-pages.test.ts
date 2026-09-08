@@ -20,7 +20,7 @@ function setup() {
   vi.useFakeTimers();
   const database = { queueMessageDeletion: vi.fn(async () => {}) };
   const notifier = new Notifier({ telegram: { token: '123:test', chatId: '1', userId: '1' },
-    poolScanDefaults: { ...filters, minVolume1hUsd: 0 } } as unknown as RuntimeConfig, {} as never, database as never) as any;
+    poolScanDefaults: { ...filters, minVolume1hUsd: 0, minStockPoolVolume1hUsd: 0 } } as unknown as RuntimeConfig, {} as never, database as never) as any;
   const api = { editMessageText: vi.fn(async () => ({})), sendMessage: vi.fn(async () => ({ message_id: 99 })) };
   notifier.bot = { api };
   const scanner = { scanPools: vi.fn() };
@@ -100,6 +100,36 @@ describe('pool result pagination', () => {
 });
 
 describe('pool volume configuration', () => {
+  it('saves and resets the independent stock pool volume setting', async () => {
+    const { notifier } = setup();
+    let stored: any = { minVolume1hUsd: 500, maxResults: 20 };
+    const database = { getPoolScanSettings: vi.fn(async () => stored),
+      setPoolScanSettings: vi.fn(async (_chat: string, settings: unknown) => { stored = settings; }),
+      clearPoolScanSettings: vi.fn(async () => { stored = null; }) };
+    expect(await notifier.poolScanSettings(database, '1')).toMatchObject({ minStockPoolVolume1hUsd: 0 });
+    notifier.pendingInput.set('1', { kind: 'config', key: 'stock_pool_volume_1h', dashboardMessageId: 10 });
+    await notifier.handlePendingInput({ chat: { id: 1 }, from: { id: 1 }, message: { text: '1000' },
+      reply: vi.fn(async () => ({ message_id: 42 })) }, database, {});
+    expect(stored).toMatchObject({ minStockPoolVolume1hUsd: 1000, minVolume1hUsd: 500 });
+    await notifier.handleDashboardCallback({ from: { id: 1 }, callbackQuery: { data: 'lp:config_reset:0',
+      message: { message_id: 10, chat: { id: 1 } } }, answerCallbackQuery: vi.fn(async () => {}) }, database, {}, {}, {});
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await notifier.poolScanSettings(database, '1')).toMatchObject({ minStockPoolVolume1hUsd: 0 });
+    expect(parseDashboardAction('lp:cfg:stock_pool_volume_1h')).toEqual({ type: 'config_edit', key: 'stock_pool_volume_1h' });
+    for (const value of ['', '$', '-1', 'Infinity', 'abc']) expect(() => parsePoolScanInput('stock_pool_volume_1h', value)).toThrow();
+    expect(parsePoolScanInput('stock_pool_volume_1h', '0')).toEqual({ minStockPoolVolume1hUsd: 0 });
+  });
+
+  it.each(['robinhood', 'bsc'])('passes saved stock volume into the %s scanner', async chain => {
+    const { notifier } = setup();
+    const database = { getPoolScanSettings: vi.fn(async () => ({ minStockPoolVolume1hUsd: 2500 })) };
+    const scanner = { scanStocks: vi.fn(async () => ({ ...result(0), chain })) };
+    await notifier.handleScanStocks({ chat: { id: 1 }, from: { id: 1 }, message: { text: `/scan_stocks ${chain}` },
+      reply: vi.fn(async () => ({ message_id: 10 })) }, database, scanner);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(scanner.scanStocks).toHaveBeenCalledWith(expect.any(Function), chain, filters.minStockYieldHourlyPercent, 2500);
+  });
+
   it('saves volume through config input and resets it to ENV', async () => {
     const { notifier, api } = setup();
     let stored: Record<string, unknown> | null = { maxResults: 20 };

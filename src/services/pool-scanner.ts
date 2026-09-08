@@ -108,6 +108,7 @@ export interface PoolScanFilters extends PoolScanSettings {
 }
 
 export interface PoolMarketScan {
+  stockFilters?: { minPoolVolume1hUsd: number; minYieldHourlyPercent: number };
   marketCoverage?: MarketCoverage;
   pools: ScoredPool[];
   candidateTokens: number;
@@ -939,8 +940,9 @@ export class PoolScanner {
     onProgress?: (stage: string) => void,
     chain: ChainName = "robinhood",
     minYieldHourlyPercent = 0.1,
+    minPoolVolume1hUsd = 0,
   ): Promise<PoolMarketScan> {
-    if (chain === "robinhood") return this.scanRobinhoodStocks(onProgress, minYieldHourlyPercent);
+    if (chain === "robinhood") return this.scanRobinhoodStocks(onProgress, minYieldHourlyPercent, minPoolVolume1hUsd);
     const dexLabel = chain === "bsc" ? "Pancake/Uniswap V3" : "Uniswap V3/V4";
     onProgress?.(chain === "bsc" ? "Memuat token *B (stock/ETF/komoditas) di BSC..." : "Memuat daftar resmi Robinhood Token...");
     let universe: { address: Address; symbol: string }[] = chain === "bsc" ? [...BSC_STOCK_SEEDS] : [...ROBINHOOD_STOCK_TOKENS];
@@ -967,18 +969,20 @@ export class PoolScanner {
       this.enrichStockPairs(stock, chain).catch(() => null),
     );
     onProgress?.("Memverifikasi pool on-chain dan menghitung yield...");
-    const pools = enriched
-      .flatMap((result) => result ?? [])
-      .filter((pool) => pool.estimatedPoolYield1hPercent > minYieldHourlyPercent)
+    const qualified = enriched.map(result => (result ?? []).filter(pool =>
+      pool.estimatedPoolYield1hPercent > minYieldHourlyPercent
+      && (minPoolVolume1hUsd === 0 || (Number.isFinite(pool.volume1hUsd) && pool.volume1hUsd >= minPoolVolume1hUsd))));
+    const pools = qualified.flat()
       .sort((a, b) => b.estimatedPoolYield1hPercent - a.estimatedPoolYield1hPercent || b.tvlUsd - a.tvlUsd)
       .slice(0, STOCK_MAX_RESULTS);
     return {
       pools,
       candidateTokens: universe.length,
-      qualifiedTokens: enriched.filter((result) => result && result.length > 0).length,
+      qualifiedTokens: qualified.filter(result => result.length > 0).length,
       evaluatedTokens: liquid.length,
       stockSymbols,
       chain,
+      stockFilters: { minPoolVolume1hUsd, minYieldHourlyPercent },
     };
   }
 
@@ -1032,7 +1036,7 @@ export class PoolScanner {
     return [...stocks.values()];
   }
 
-  private async scanRobinhoodStocks(onProgress: ((stage: string) => void) | undefined, minYieldHourlyPercent: number): Promise<PoolMarketScan> {
+  private async scanRobinhoodStocks(onProgress: ((stage: string) => void) | undefined, minYieldHourlyPercent: number, minPoolVolume1hUsd: number): Promise<PoolMarketScan> {
     onProgress?.("Memuat daftar resmi stock/ETF/komoditas Robinhood...");
     let source: "official" | "cache" | "seeds" = "official";
     try {
@@ -1085,7 +1089,8 @@ export class PoolScanner {
               if (!pool) {
                 coverage.unverifiedPools++;
                 tokenIncomplete = true;
-              } else if (pool.activeLiquidity && pool.estimatedPoolYield1hPercent > minYieldHourlyPercent) {
+              } else if (pool.activeLiquidity && pool.estimatedPoolYield1hPercent > minYieldHourlyPercent
+                && (minPoolVolume1hUsd === 0 || (Number.isFinite(pool.volume1hUsd) && pool.volume1hUsd >= minPoolVolume1hUsd))) {
                 qualified.push({ ...pool, pair: `${pool.pair} [${stock.symbol}]` });
               }
             } catch {
@@ -1113,6 +1118,7 @@ export class PoolScanner {
       pools: pools.slice(0, STOCK_MAX_RESULTS), candidateTokens: universe.length,
       evaluatedTokens: stockSymbols.length, qualifiedTokens, stockSymbols: stockSymbols.sort(),
       chain: "robinhood", stockCoverage: coverage,
+      stockFilters: { minPoolVolume1hUsd, minYieldHourlyPercent },
     };
   }
 

@@ -44,6 +44,8 @@ function environment(overrides: Record<string, string> = {}): NodeJS.ProcessEnv 
 }
 
 it('loads and validates the pool volume ENV default', () => {
+  expect(loadConfig(environment({ POOL_SCAN_MIN_STOCK_POOL_VOLUME_1H_USD: '2500' })).poolScanDefaults.minStockPoolVolume1hUsd).toBe(2500);
+  expect(() => loadConfig(environment({ POOL_SCAN_MIN_STOCK_POOL_VOLUME_1H_USD: '-1' }))).toThrow();
   expect(loadConfig(environment({ POOL_SCAN_MIN_VOLUME_1H_USD: '1234' })).poolScanDefaults.minVolume1hUsd).toBe(1234);
   expect(() => loadConfig(environment({ POOL_SCAN_MIN_VOLUME_1H_USD: '-1' }))).toThrow();
 });
@@ -97,6 +99,7 @@ describe("loadConfig", () => {
       minStockYieldHourlyPercent: 0.1,
       maxResults: 10,
       minVolume1hUsd: 0,
+      minStockPoolVolume1hUsd: 0,
       allowedQuotes: ["USDG", "WETH", "ETH"],
     });
     expect(config.poolScanCandidatePages).toBe(3);

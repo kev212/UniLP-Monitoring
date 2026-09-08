@@ -103,7 +103,7 @@ type DashboardAction =
   | { type: "trail"; page: number; chainId: number; protocol: Protocol; positionKey: string }
   | { type: "trail_page"; page: number };
 
-type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "stock_yield" | "max_results" | "volume_1h";
+type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "stock_yield" | "max_results" | "volume_1h" | "stock_pool_volume_1h";
 type RiskSettingKey = "stop_loss" | "take_profit" | "trailing_activation" | "trailing_drawdown" | "v4_open_gas_usd";
 type PendingInput =
   | { kind: "scan_token"; chain: ChainName }
@@ -1563,12 +1563,12 @@ export class Notifier {
     this.stockScanRunning = true;
     const progress = await ctx.reply(
       chain === "bsc"
-        ? "📊 Memuat token *B BSC, saring vol Pancake/Uniswap V3 ≥ $100k, lalu hitung yield 1h..."
-        : "📊 Memuat stock resmi, saring vol Uniswap 24h ≥ $100k, lalu hitung yield 1h...",
+        ? `📊 Memuat token *B BSC, saring total vol token Pancake/Uniswap V3 ≥ $100k/24h dan vol pool ≥ $${fmtUsd(settings.minStockPoolVolume1hUsd ?? 0)}/1h, lalu hitung yield...`
+        : `📊 Memuat stock resmi, saring total vol token Uniswap ≥ $100k/24h dan vol pool ≥ $${fmtUsd(settings.minStockPoolVolume1hUsd ?? 0)}/1h, lalu hitung yield...`,
     );
     const messageId = progress.message_id;
     void this.queueTemp(chatId, messageId, 120_000);
-    void this.executeStockScan(scanner, chatId, messageId, chain, settings.minStockYieldHourlyPercent).catch((error) =>
+    void this.executeStockScan(scanner, chatId, messageId, chain, settings.minStockYieldHourlyPercent, settings.minStockPoolVolume1hUsd ?? 0).catch((error) =>
       log.error({ error: errorMessage(error) }, "stock scan background job failed"),
     );
   }
@@ -1579,6 +1579,7 @@ export class Notifier {
     messageId: number,
     chain: ChainName = "robinhood",
     minYieldHourlyPercent = 0.1,
+    minPoolVolume1hUsd = 0,
   ): Promise<void> {
     let stage = "Memuat data tokenized stocks...";
     const startedAt = Date.now();
@@ -1586,7 +1587,7 @@ export class Notifier {
       void this.refreshStockScanProgress(chatId, messageId, `${stage}\nElapsed: ${Math.floor((Date.now() - startedAt) / 1_000)}s`);
     }, 20_000);
     try {
-      const scan = await scanner.scanStocks((nextStage) => { stage = nextStage; }, chain, minYieldHourlyPercent);
+      const scan = await scanner.scanStocks((nextStage) => { stage = nextStage; }, chain, minYieldHourlyPercent, minPoolVolume1hUsd);
       const text = formatStockScan(scan);
       if (!this.bot) return;
       try {
@@ -2125,6 +2126,7 @@ export class Notifier {
         .text("Min yield/h", "lp:cfg:yield")
         .row()
         .text("Min stock yield/h", "lp:cfg:stock_yield")
+        .text("Min stock pool vol 1h", "lp:cfg:stock_pool_volume_1h")
         .row()
       .text("Top N", "lp:cfg:max_results")
       .text("Min volume 1h", "lp:cfg:volume_1h")
@@ -2138,6 +2140,7 @@ export class Notifier {
       `Min usia pool tertua: ${fmtDuration(settings.minPoolAgeSeconds)}`,
       `Min gross yield/h: ${fmtPercent(settings.minYieldHourlyPercent)}`,
       `Min stock yield/h: ${fmtPercent(settings.minStockYieldHourlyPercent)}`,
+      `Min stock pool volume 1h: $${fmtUsd(settings.minStockPoolVolume1hUsd ?? 0)} (0 = nonaktif)`,
       `Top results: ${settings.maxResults}`,
       `Min volume 1h per pool: $${fmtUsd(settings.minVolume1hUsd ?? 0)} (0 = nonaktif)`,
       "Quote mengikuti allowlist chain saat scan.",
@@ -2793,6 +2796,7 @@ function isProtocol(value: string | undefined): value is Protocol {
 }
 
 function isPoolSettingKey(value: string | undefined): value is PoolSettingKey {
+  if (value === "stock_pool_volume_1h") return true;
   return value === "market_cap" || value === "pool_tvl" || value === "total_tvl" || value === "age" || value === "yield" || value === "stock_yield" || value === "max_results" || value === "volume_1h";
 }
 
@@ -3497,9 +3501,9 @@ export function parsePoolScanInput(key: PoolSettingKey, value: string): Partial<
   if (!Number.isFinite(number) || number < 0) throw new Error("nilai harus angka positif");
   if (key === "market_cap") return { minMarketCapUsd: number };
   if (key === "pool_tvl") return { minPoolTvlUsd: number };
-  if (key === "volume_1h") {
+  if (key === "volume_1h" || key === "stock_pool_volume_1h") {
     if (!/\d/.test(value)) throw new Error("volume harus berupa angka USD");
-    return { minVolume1hUsd: number };
+    return key === "volume_1h" ? { minVolume1hUsd: number } : { minStockPoolVolume1hUsd: number };
   }
   if (key === "total_tvl") return { minTotalActiveTvlUsd: number };
   if (key === "yield") return { minYieldHourlyPercent: number };
@@ -3509,6 +3513,7 @@ export function parsePoolScanInput(key: PoolSettingKey, value: string): Partial<
 }
 
 function configInputPrompt(key: PoolSettingKey): string {
+  if (key === "stock_pool_volume_1h") return "Kirim minimum volume 1 jam per pool untuk /scan_stocks dalam USD, contoh: 10000. 0 = nonaktif. Syarat total volume token ≥ $100k/24h tetap berlaku.";
   if (key === "volume_1h") return "Kirim minimum volume 1 jam per pool dalam USD, contoh: 10000. Kirim 0 untuk menonaktifkan filter.";
   if (key === "market_cap") return "Kirim Min market cap, contoh: 500000 atau $500K.";
   if (key === "pool_tvl") return "Kirim Min TVL per pool, contoh: 10000.";
@@ -3629,6 +3634,8 @@ export function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilt
 }
 
 export function formatStockScan(scan: PoolMarketScan): string {
+  const poolVolumeFilter = `Vol pool 1h ≥ $${fmtUsd(scan.stockFilters?.minPoolVolume1hUsd ?? 0)}`;
+  const stockYield = scan.stockFilters?.minYieldHourlyPercent ?? 0.1;
   if (scan.stockCoverage) {
     const coverage = scan.stockCoverage;
     const clean = (value: string, limit: number) => value.replace(/[\r\n]/g, " ").slice(0, limit);
@@ -3643,6 +3650,7 @@ export function formatStockScan(scan: PoolMarketScan): string {
       `Vol lolos: ${scan.evaluatedTokens} | Aset yield lolos: ${scan.qualifiedTokens}`,
       `Tanpa pool relevan: ${coverage.noEligiblePools} | Vol rendah: ${coverage.belowVolumeTokens} | Pool belum terverifikasi/data kurang: ${coverage.unverifiedPools}`,
       `Filter: vol ≥ $100k/24h vs USDG/WETH/ETH · yield/h > ${threshold}`,
+      poolVolumeFilter,
       `Simbol vol lolos: ${symbols}${(scan.stockSymbols?.join(" ").length ?? 0) > 180 ? "…" : ""}`,
       `Top ${scan.pools.length} dari ${coverage.totalQualifiedPools} pool lolos`,
       "",
@@ -3652,7 +3660,7 @@ export function formatStockScan(scan: PoolMarketScan): string {
       lines.push(`Yield/h: ${fmtPercent(pool.estimatedPoolYield1hPercent)} | Vol 1h: $${fmtUsd(pool.volume1hUsd)} | TVL: $${fmtUsd(pool.tvlUsd)}`);
       lines.push(pool.uniswapUrl);
     }
-    if (!scan.pools.length) lines.push(`Tidak ada pool terverifikasi dengan yield > ${threshold}/h${coverage.partial ? " pada data yang berhasil diperiksa" : ""}.`);
+    if (!scan.pools.length) lines.push(`Tidak ada pool terverifikasi yang lolos filter volume pool dan yield > ${threshold}/h${coverage.partial ? " pada data yang berhasil diperiksa" : ""}.`);
     lines.push("", "Yield adalah estimasi gross pool, bukan hasil personal LP.");
     return lines.join("\n");
   }
@@ -3663,11 +3671,12 @@ export function formatStockScan(scan: PoolMarketScan): string {
     bsc ? "Chain: BSC | Pancake/Uniswap V3 | *B stock/ETF/komoditas" : "Chain: Robinhood | Uniswap V3/V4",
     `Vol ≥ $100k/24h: ${symbols}`,
     `Universe: ${scan.candidateTokens} | Vol lolos: ${scan.evaluatedTokens} | Yield lolos: ${scan.qualifiedTokens}`,
-    bsc ? "Filter: vol Pancake/Uniswap V3 24h ≥ $100k vs USDT/WBNB · yield/h > 0.1%" : "Filter: vol Uniswap 24h ≥ $100k · yield/h > 0.1%",
+    bsc ? `Filter: total vol token Pancake/Uniswap V3 24h ≥ $100k vs USDT/WBNB · yield/h > ${stockYield}%` : `Filter: total vol token Uniswap 24h ≥ $100k · yield/h > ${stockYield}%`,
+    poolVolumeFilter,
     "",
   ];
   if (scan.pools.length === 0) {
-    lines.push("Tidak ada stock pool dengan yield > 0.1%/h saat ini.");
+    lines.push(`Tidak ada stock pool yang lolos filter volume pool dan yield > ${stockYield}%/h saat ini.`);
     return lines.join("\n");
   }
   for (let index = 0; index < scan.pools.length; index++) {

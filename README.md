@@ -81,6 +81,8 @@ BSC Uniswap V3/V4 diaktifkan melalui `CHAINS=robinhood,bsc`. Auto-exit SL/TP/tra
 
 Top N menentukan total hasil, dengan maksimal 10 hasil per halaman (lebih sedikit bila pesan terlalu panjang). Prev/Next memakai snapshot selama 5 menit sejak hasil dikirim, tanpa scan ulang; setelah restart atau kedaluwarsa, jalankan scan baru. Pool Scan Config menyediakan minimum volume 1 jam dalam USD **per pool** (`POOL_SCAN_MIN_VOLUME_1H_USD`, default `0` = nonaktif). Filter volume diterapkan sebelum pemilihan pool terbaik per token dan tidak mengurangi perhitungan total TVL aktif. Perubahan config berlaku untuk scan berikutnya.
 
+Untuk `/scan_stocks` Robinhood/BSC, tombol **Min stock pool vol 1h** mengatur minimum volume USD per pool selama 1 jam secara terpisah (`POOL_SCAN_MIN_STOCK_POOL_VOLUME_1H_USD`, default `0` = nonaktif). Syarat total volume token ≥ $100k/24h tetap berlaku; hanya pool yang memenuhi minimum volume pool dan stock yield/h yang masuk hasil.
+
 Scan interaktif menyegarkan data DexScreener dan memverifikasi pool on-chain sampai tenggat 110 detik, dengan cadangan sekitar 10 detik untuk Telegram. Hasil parsial mencantumkan kandidat yang belum selesai, data kurang, dan usia discovery. TVL fallback hanya memakai snapshot GeckoTerminal maksimal 15 menit; tidak menunggu request Gecko baru. Setting minimum TVL dan yield pengguna tetap berlaku.
 
 Saat `/scan` aktif, discovery dan verifikasi baru dari `/scan_pools` dijeda. Request yang sudah berjalan dan cooldown provider tetap dapat memengaruhi waktu tunggu. Restart mempertahankan kandidat, cursor, serta snapshot dalam PostgreSQL; metadata kontrak dalam memori dipanaskan kembali. Migrasi tabel/kolom baru dijalankan oleh startup aplikasi seperti migrasi lain.
