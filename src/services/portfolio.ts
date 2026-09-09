@@ -13,6 +13,7 @@ import { quoteValueAtPriceMarker, quoteValueAtSqrtPrice } from "./uniswap-math.j
 import { log } from "../log.js";
 
 export const PORTFOLIO_REFRESH_INTERVAL_MS = 3 * 60_000;
+const MULTICALL3 = "0xca11bde05977b3631167028862be2a173976ca11" as Address;
 const DEXSCREENER_BASE = "https://api.dexscreener.com";
 const ROBINHOOD_USDG_WETH_PAIR = "0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca";
 
@@ -131,7 +132,7 @@ export class PortfolioService {
     const balances = await this.walletBalances(chain, excluded, blockNumber, issues, positions.length > 0);
     // Check NFT ownership at the same block as LP reads, including paused/closing positions.
     const nfts = positions.filter(p => p.protocol !== "v2");
-    const ownership = nfts.length ? await client.multicall({ blockNumber, contracts: nfts.map(p => ({
+    const ownership = nfts.length ? await client.multicall({ multicallAddress: MULTICALL3, blockNumber, contracts: nfts.map(p => ({
       address: this.manager(p), abi: v3PositionManagerAbi, functionName: "ownerOf" as const, args: [BigInt(p.positionKey)] as const,
     })) }) : [];
     const owned = new Set(positions.filter(p => p.protocol === "v2").map(p => p.id));
@@ -230,9 +231,13 @@ export class PortfolioService {
           if (!isAddress(item.contractAddress)) throw new Error("Invalid token address");
           const address = item.contractAddress.toLowerCase() as Address;
           if (excluded.has(address) || address === zeroAddress) continue;
-          known.add(address);
-          if (item.error || item.tokenBalance === null) throw new Error("Token balance unavailable");
-          amounts.set(address, BigInt(item.tokenBalance));
+          if (item.error || item.tokenBalance === null) {
+            known.add(address);
+            throw new Error("Token balance unavailable");
+          }
+          const amount = BigInt(item.tokenBalance);
+          if (amount > 0n) known.add(address);
+          amounts.set(address, amount);
         }
         pageKey = payload.result.pageKey;
         if (pageKey && seenPages.has(pageKey)) throw new Error("Repeated token page");
@@ -269,7 +274,7 @@ export class PortfolioService {
     // Drop latest balances before reconciliation, including failed calls.
     for (const address of addresses) amounts.delete(address);
     try {
-      const results = await this.chains.getForScan(chain).client.multicall({ blockNumber, contracts: addresses.map(address => ({
+      const results = await this.chains.getForScan(chain).client.multicall({ multicallAddress: MULTICALL3, blockNumber, contracts: addresses.map(address => ({
         address, abi: erc20Abi, functionName: "balanceOf" as const, args: [this.config.executorAddress] as const,
       })) });
       results.forEach((result, i) => {

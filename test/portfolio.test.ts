@@ -115,6 +115,7 @@ describe("portfolio totals and RPC budget", () => {
     expect(h.client.multicall.mock.calls.flatMap(([request]) => request.contracts).every(c => c.functionName === "ownerOf")).toBe(true);
     expect(h.client.getBalance).toHaveBeenCalledWith({ address: OWNER, blockNumber: 100n });
     expect(h.reader.read).toHaveBeenCalledWith(h.rows[0], 100n, 0, "scan", true);
+    expect(h.client.multicall).toHaveBeenCalledWith(expect.objectContaining({ multicallAddress: "0xca11bde05977b3631167028862be2a173976ca11" }));
   });
 
   it("refreshes every 180 seconds and shares in-flight work and dashboard cache", async () => {
@@ -189,6 +190,7 @@ describe("portfolio totals and RPC budget", () => {
     await h.service.refresh();
     expect(h.service.getSnapshot()).toMatchObject({ walletUsd: 2020, complete: false });
     expect(h.client.multicall).toHaveBeenCalledOnce();
+    expect(h.client.multicall).toHaveBeenCalledWith(expect.objectContaining({ multicallAddress: "0xca11bde05977b3631167028862be2a173976ca11" }));
     h.fetchMock.mockImplementation(original);
     await h.service.refresh();
     expect(h.service.getSnapshot().complete).toBe(true);
