@@ -473,7 +473,7 @@ describe("dashboard group visibility", () => {
 });
 
 describe("portfolio dashboard rendering", () => {
-  it("awaits shared portfolio refresh and shows the breakdown and incomplete state", async () => {
+  it("awaits shared portfolio refresh and shows only the balance breakdown", async () => {
     const notifier = new Notifier({ telegram: { token: "123:test", chatId: "1", userId: "1" }, chains: [] } as unknown as RuntimeConfig, {} as never, {} as never);
     let refreshed = false;
     const portfolio = {
@@ -490,6 +490,7 @@ describe("portfolio dashboard rendering", () => {
     expect(result.text).toContain("Total balance: $125");
     expect(result.text).toContain("LP termasuk fee: $105");
     expect(result.text).toContain("Wallet: $20");
-    expect(result.text).toContain("Total belum lengkap");
+    expect(result.text).not.toContain("Total belum lengkap");
+    expect(result.text).not.toContain("harga USD belum tersedia");
   });
 });
