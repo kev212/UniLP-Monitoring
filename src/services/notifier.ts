@@ -918,9 +918,18 @@ export class Notifier {
     const first = page * DASHBOARD_PAGE_SIZE;
     const lines = ["LP DASHBOARD", ...(notice ? [notice] : []), `Updated: ${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC`, ""];
     if (this.portfolioService) {
+      await this.portfolioService.ensureFresh();
       const portfolio = this.portfolioService.getSnapshot();
       const age = portfolio.updatedAt.getTime() > 0 ? ` · updated ${formatAge(Date.now() - portfolio.updatedAt.getTime())} ago` : "";
-      lines.push(`💰 Total balance: ${portfolio.calculating ? "calculating..." : `$${formatUsdValue(portfolio.totalUsd)}${age}`}`);
+      lines.push(`💰 Total balance: ${portfolio.calculating ? "calculating..." : portfolio.updatedAt.getTime() === 0 ? "belum tersedia" : `$${formatUsdValue(portfolio.totalUsd)}${age}`}`);
+      if (portfolio.updatedAt.getTime() > 0) {
+        lines.push(`LP termasuk fee: $${formatUsdValue(portfolio.activeLpUsd)} | Wallet: $${formatUsdValue(portfolio.walletUsd)}`);
+      }
+      if (!portfolio.calculating && !portfolio.complete) {
+        lines.push("⚠️ Total belum lengkap / data belum diperbarui.");
+        lines.push(...portfolio.issues.slice(0, 3));
+        if (portfolio.issues.length > 3) lines.push(`+${portfolio.issues.length - 3} kendala lainnya`);
+      }
       lines.push("");
     }
 

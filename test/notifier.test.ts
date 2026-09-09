@@ -471,3 +471,25 @@ describe("dashboard group visibility", () => {
     expect(trailingTogglePatch({ trailingDisabled: true }, false)).toEqual({ trailingDisabled: false });
   });
 });
+
+describe("portfolio dashboard rendering", () => {
+  it("awaits shared portfolio refresh and shows the breakdown and incomplete state", async () => {
+    const notifier = new Notifier({ telegram: { token: "123:test", chatId: "1", userId: "1" }, chains: [] } as unknown as RuntimeConfig, {} as never, {} as never);
+    let refreshed = false;
+    const portfolio = {
+      ensureFresh: vi.fn(async () => { refreshed = true; }),
+      getSnapshot: vi.fn(() => {
+        expect(refreshed).toBe(true);
+        return { totalUsd: 125, activeLpUsd: 105, walletUsd: 20, updatedAt: new Date(), calculating: false,
+          complete: false, issues: ["robinhood: harga USD belum tersedia"] };
+      }),
+    };
+    notifier.setPortfolioService(portfolio as never);
+    const result = await (notifier as unknown as { buildDashboard(db: unknown, pnl: unknown, page: number): Promise<{ text: string }> }).buildDashboard({}, {}, 0);
+    expect(portfolio.ensureFresh).toHaveBeenCalledOnce();
+    expect(result.text).toContain("Total balance: $125");
+    expect(result.text).toContain("LP termasuk fee: $105");
+    expect(result.text).toContain("Wallet: $20");
+    expect(result.text).toContain("Total belum lengkap");
+  });
+});

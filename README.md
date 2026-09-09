@@ -55,7 +55,7 @@ Mulai dengan `DRY_RUN=true`. Ubah ke `false` hanya setelah cashflow, PnL, dan si
 | `ALCHEMY_BSC_HTTP` | Endpoint Alchemy BSC untuk archive/log, bootstrap NFT, dan execution. |
 | `AUTO_EXIT_CHAINS` | Chain yang boleh auto-exit. Default `base,robinhood,bsc`. |
 | `BSC_POSITION_MONITOR_INTERVAL_MS` | Interval monitoring BSC. Default `10000`. |
-| `ALCHEMY_BASE_HTTP`, `ALCHEMY_ROBINHOOD_HTTP` | Endpoint RPC execution dan one-time wallet bootstrap. `ALCHEMY_ROBINHOOD_HTTP` khusus execution. |
+| `ALCHEMY_BASE_HTTP`, `ALCHEMY_ROBINHOOD_HTTP` | Endpoint RPC execution, one-time wallet bootstrap, dan enumerasi saldo ERC-20 portfolio setiap 3 menit pada chain aktif. |
 | `ALCHEMY_ROBINHOOD_MONITOR_HTTP` | Endpoint Alchemy khusus fallback monitoring Robinhood setelah public RPC dan BlockMachine gagal; tidak dipakai execution atau scan/discovery. |
 | `TELEGRAM_CHAT_ID`, `TELEGRAM_USER_ID` | Chat dan user yang diizinkan mengakses bot. |
 
@@ -104,3 +104,39 @@ npm run build
 ```
 
 UniLP adalah software eksekusi finansial. Verifikasi konfigurasi dan gunakan dry-run sebelum menjalankan transaksi live.
+
+### Total balance dashboard Telegram
+
+Total balance menghitung nilai spot LP yang masih dimiliki executor, termasuk fee
+belum diklaim, ditambah native coin dan ERC-20 wallet dalam USD. Hanya chain di
+`CHAINS` yang diperiksa. Refresh saat startup dan setiap **180 detik**; dashboard
+berbagi cache dan pekerjaan refresh, sehingga jumlah chat tidak menggandakan polling.
+
+Enumerasi token memakai `config.alchemyHttp[chain]` (misalnya
+`ALCHEMY_ROBINHOOD_HTTP`), bukan RPC scan public. Saldo native, verifikasi pemilik
+NFT, dan pembacaan LP memakai RPC scan chain terkait. Harga USD memakai
+DexScreener. Token LP V2 serta parent/child group tidak dihitung ganda. LP yang
+sudah ditarik hanya menyumbang fee tersisa, bila masih dapat diklaim.
+
+Cache pembacaan monitoring dipakai hanya jika block cocok dengan valuasi wallet.
+Jika block berubah selama enumerasi Alchemy (yang hanya menyediakan saldo latest),
+saldo token direkonsiliasi memakai multicall pada block LP. Ini sengaja lebih ketat
+daripada memakai cache berumur 3 menit, untuk mencegah penarikan LP dihitung dua
+kali. Metadata decimals dicache per chain/alamat. Valuasi tidak meminta quote swap.
+
+**Anggaran API:** 480 siklus/hari/chain aktif, ditambah startup; satu halaman
+Alchemy per siklus berarti sekitar 480 request token balance/hari. Dokumentasi
+[Alchemy Token Balances](https://www.alchemy.com/docs/data/token-api/token-api-endpoints/alchemy-get-token-balances)
+mencantumkan 20 CU/request (diperiksa 10 September 2026): sekitar 9.600 CU/hari
+untuk enumerasi satu halaman, belum termasuk pagination dan panggilan lain.
+Biaya uang mengikuti paket provider, bukan angka CU saja. Log `portfolio wallet
+read budget` mencatat request Alchemy, halaman sukses, jumlah subcall balanceOf,
+dan metadata yang belum dicache; `portfolio LP read budget` mencatat ownership
+subcall, pembacaan posisi/group, dan cache hit. Subcall multicall dan pembacaan LP
+bukan hitungan request HTTP atau tagihan persis; batching/retry provider bisa berbeda.
+
+Jika API enumerasi tidak tersedia pada chain tersebut, bot membaca token konfigurasi,
+token posisi, serta token yang pernah ditemukan dalam proses berjalan lewat
+multicall. Hasil ditandai **belum lengkap**, karena token lain tidak dapat dijamin
+tercakup. Harga/metadata/saldo yang gagal dibaca juga ditandai; kegagalan refresh
+menyeluruh mempertahankan angka dan timestamp sebelumnya. Tidak ada migrasi database.

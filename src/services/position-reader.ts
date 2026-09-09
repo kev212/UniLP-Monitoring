@@ -52,16 +52,33 @@ type V4StoredPosition = readonly [bigint, bigint, bigint];
 const MULTICALL3 = "0xca11bde05977b3631167028862be2a173976ca11" as Address;
 
 export class PositionReader {
+  private readonly portfolioValues = new Map<string, PositionValue>();
+
+  getPortfolioValue(position: PositionRecord, block: bigint): PositionValue | undefined {
+    const value = this.portfolioValues.get(position.id);
+    return value?.observedBlock === block ? value : undefined;
+  }
+
+  private remember(position: PositionRecord, value: PositionValue): PositionValue {
+    this.portfolioValues.delete(position.id);
+    this.portfolioValues.set(position.id, value);
+    if (this.portfolioValues.size > 2000) this.portfolioValues.delete(this.portfolioValues.keys().next().value!);
+    return value;
+  }
+
   private readonly v4Slot0Cache = new Map<string, Promise<V4Slot0>>();
 
   constructor(private readonly chains: ChainClients, private readonly slippageBps: number) {}
 
-  async read(position: PositionRecord, blockNumber?: bigint, removeSlippageBps?: number, rpc: RpcSource = "scan"): Promise<PositionValue> {
+  async read(position: PositionRecord, blockNumber?: bigint, removeSlippageBps?: number, rpc: RpcSource = "scan", allowEmpty = false): Promise<PositionValue> {
     const observedBlock = blockNumber ?? await this.rpcClient(position.chainId, rpc).getBlockNumber();
     const effective = removeSlippageBps ?? this.slippageBps;
-    if (position.protocol === "v2") return this.readV2(position, observedBlock, effective, rpc);
-    if (position.protocol === "v3") return this.readV3(position, observedBlock, effective, rpc);
-    return this.readV4(position, observedBlock, effective, rpc);
+    const value = position.protocol === "v2"
+      ? await this.readV2(position, observedBlock, effective, rpc, allowEmpty)
+      : position.protocol === "v3"
+        ? await this.readV3(position, observedBlock, effective, rpc, allowEmpty)
+        : await this.readV4(position, observedBlock, effective, rpc, allowEmpty);
+    return this.remember(position, value);
   }
 
   async readGroup(
@@ -70,15 +87,19 @@ export class PositionReader {
     blockNumber: bigint,
     removeSlippageBps?: number,
     rpc: RpcSource = "monitoring",
+    allowEmpty = false,
   ): Promise<PositionValue[]> {
     if (positions.length === 0) return [];
     if (positions.some((position) => position.protocol !== group.protocol || position.chainId !== group.chainId)) {
       throw new Error("Position group children do not match the parent protocol and chain");
     }
     const effective = removeSlippageBps ?? this.slippageBps;
-    if (group.protocol === "v3") return this.readV3Group(group, positions, blockNumber, effective, rpc);
-    if (group.protocol === "v4") return this.readV4Group(group, positions, blockNumber, effective, rpc);
-    return Promise.all(positions.map((position) => this.read(position, blockNumber, effective, rpc)));
+    const values = group.protocol === "v3"
+      ? await this.readV3Group(group, positions, blockNumber, effective, rpc, allowEmpty)
+      : group.protocol === "v4"
+        ? await this.readV4Group(group, positions, blockNumber, effective, rpc, allowEmpty)
+        : await Promise.all(positions.map((position) => this.read(position, blockNumber, effective, rpc, allowEmpty)));
+    return values.map((value, index) => this.remember(positions[index]!, value));
   }
 
   private async readV3Group(
@@ -87,6 +108,7 @@ export class PositionReader {
     blockNumber: bigint,
     removeSlippageBps: number,
     rpc: RpcSource,
+    allowEmpty = false,
   ): Promise<PositionValue[]> {
     const registry = this.chains.getById(group.chainId).registry;
     const client = this.rpcClient(group.chainId, rpc);
@@ -140,7 +162,7 @@ export class PositionReader {
         || tickUpper !== expectedRange.tickUpper) {
         throw new Error(`V3 position group child ${position.positionKey} differs from persisted metadata`);
       }
-      if (liquidity === 0n) throw new Error(`V3 position group child ${position.positionKey} has zero liquidity`);
+      if (liquidity === 0n && !allowEmpty) throw new Error(`V3 position group child ${position.positionKey} has zero liquidity`);
       const lower = tickData.get(tickLower);
       const upper = tickData.get(tickUpper);
       if (!lower || !upper) throw new Error(`V3 position group child ${position.positionKey} has incomplete tick state`);
@@ -173,6 +195,7 @@ export class PositionReader {
     blockNumber: bigint,
     removeSlippageBps: number,
     rpc: RpcSource,
+    allowEmpty = false,
   ): Promise<PositionValue[]> {
     const registry = this.chains.getById(group.chainId).registry;
     const client = this.rpcClient(group.chainId, rpc);
@@ -220,7 +243,7 @@ export class PositionReader {
       const feeGrowthInside = feeGrowthResults[index]!;
       const storedPosition = storedPositions[index]!;
       const liquidity = storedPosition[0];
-      if (liquidity === 0n) throw new Error(`V4 position group child ${position.positionKey} has zero liquidity`);
+      if (liquidity === 0n && !allowEmpty) throw new Error(`V4 position group child ${position.positionKey} has zero liquidity`);
       const principal = amountsForLiquidity(slot0[0], tickLower, tickUpper, liquidity);
       return {
         protocol: "v4",
@@ -250,7 +273,7 @@ export class PositionReader {
     }) as Promise<unknown[]>;
   }
 
-  private async readV2(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: RpcSource = "scan"): Promise<PositionValue> {
+  private async readV2(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: RpcSource = "scan", allowEmpty = false): Promise<PositionValue> {
     if (!position.poolAddress) throw new Error("V2 position has no pair address");
     const client = this.rpcClient(position.chainId, rpc);
     const [balance, totalSupply, reserves] = await Promise.all([
@@ -258,10 +281,10 @@ export class PositionReader {
       client.readContract({ address: position.poolAddress, abi: v2PairAbi, functionName: "totalSupply", blockNumber }),
       client.readContract({ address: position.poolAddress, abi: v2PairAbi, functionName: "getReserves", blockNumber }),
     ]);
-    if (balance === 0n || totalSupply === 0n) throw new Error("V2 position has zero liquidity");
+    if ((balance === 0n || totalSupply === 0n) && !allowEmpty) throw new Error("V2 position has zero liquidity");
 
-    const token0Amount = (reserves[0] * balance) / totalSupply;
-    const token1Amount = (reserves[1] * balance) / totalSupply;
+    const token0Amount = totalSupply === 0n ? 0n : (reserves[0] * balance) / totalSupply;
+    const token1Amount = totalSupply === 0n ? 0n : (reserves[1] * balance) / totalSupply;
     const priceMarker = reserves[0] === 0n ? 0n : (reserves[1] << 96n) / reserves[0];
     const minFactor = 10_000n - BigInt(removeSlippageBps);
 
@@ -281,7 +304,7 @@ export class PositionReader {
     };
   }
 
-  private async readV3(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: RpcSource = "scan"): Promise<PositionValue> {
+  private async readV3(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: RpcSource = "scan", allowEmpty = false): Promise<PositionValue> {
     const registry = this.chains.getById(position.chainId).registry;
     const client = this.rpcClient(position.chainId, rpc);
     const contracts = v3ContractsFor(registry, dexNameFromMetadata(position.metadata));
@@ -293,7 +316,7 @@ export class PositionReader {
       blockNumber,
     })) as readonly [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint];
     const [, , token0, token1, fee, tickLower, tickUpper, liquidity, feeGrowthInside0Last, feeGrowthInside1Last, tokensOwed0, tokensOwed1] = details;
-    if (liquidity === 0n) throw new Error("V3 position has zero liquidity");
+    if (liquidity === 0n && !allowEmpty) throw new Error("V3 position has zero liquidity");
 
     const poolAddress = await client.readContract({
       address: contracts.factory,
@@ -337,7 +360,7 @@ export class PositionReader {
     };
   }
 
-  private async readV4(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: RpcSource = "scan"): Promise<PositionValue> {
+  private async readV4(position: PositionRecord, blockNumber: bigint, removeSlippageBps: number, rpc: RpcSource = "scan", allowEmpty = false): Promise<PositionValue> {
     const registry = this.chains.getById(position.chainId).registry;
     const client = this.rpcClient(position.chainId, rpc);
     const tokenId = BigInt(position.positionKey);
@@ -370,7 +393,7 @@ export class PositionReader {
       }),
     ]);
     const liquidity = storedPosition[0];
-    if (liquidity === 0n) throw new Error("V4 position has zero liquidity");
+    if (liquidity === 0n && !allowEmpty) throw new Error("V4 position has zero liquidity");
     const principal = amountsForLiquidity(slot0[0], tickLower, tickUpper, liquidity);
     const fee0 = feeOwed(liquidity, feeGrowthInside[0], storedPosition[1]);
     const fee1 = feeOwed(liquidity, feeGrowthInside[1], storedPosition[2]);

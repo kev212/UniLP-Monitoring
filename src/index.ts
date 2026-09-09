@@ -54,7 +54,7 @@ async function main(): Promise<void> {
     kyberswapApi,
   );
   const gemScanner = new GemScanner(chains, database, scanner, config.quoteTokens.robinhood);
-  const portfolio = new PortfolioService(config, chains, database);
+  const portfolio = new PortfolioService(config, chains, database, reader);
   notifier.setPositionOpener(positionOpener);
   notifier.setGemScanner(gemScanner);
   notifier.setPortfolioService(portfolio);
