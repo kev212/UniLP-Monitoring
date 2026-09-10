@@ -20,6 +20,7 @@ import type { KyberSwapAggregatorApi } from "./kyberswap-aggregator-api.js";
 import type { PositionReader, PositionValue } from "./position-reader.js";
 import type { RoutePlanner } from "./route-planner.js";
 import type { UniswapTradingApi } from "./uniswap-trading-api.js";
+import type { FeeUsd6SpotPriceProvider } from "./spot-price.js";
 import { quoteRangeState } from "./quote-range.js";
 import { normalizeToUsd6 } from "./token-meta.js";
 import { applySlippage, isUsableSqrtPrice, quoteValueAtPriceMarker, quoteValueAtSqrtPrice, sqrtRatioAtTick } from "./uniswap-math.js";
@@ -90,6 +91,7 @@ export class PnlService {
     private readonly config: RuntimeConfig,
     private readonly tradingApi?: UniswapTradingApi,
     private readonly kyberswapApi?: KyberSwapAggregatorApi,
+    private readonly spotPrice?: FeeUsd6SpotPriceProvider,
   ) {}
 
   async value(
@@ -183,6 +185,7 @@ export class PnlService {
       quoteToken,
       feeQuote,
       (stable, amount) => this.quoteFresh(position, quoteToken, amount, stable, quoteSlippageBps, localOnly),
+      value.observedBlock,
     );
     const pnlQuote = totals.realized + feeQuote + liquidationQuote - totals.deposits;
     const pnlBps = (pnlQuote * 10_000n) / totals.deposits;
@@ -297,6 +300,7 @@ export class PnlService {
       group.quoteToken,
       feeQuote,
       (stable, amount) => this.quoteFresh(children[0]!, group.quoteToken, amount, stable, quoteSlippageBps, localOnly),
+      blockNumber,
     );
     const deposits = context.depositsQuote;
     if (deposits <= 0n) throw new Error("Position group cost basis has not been reconstructed");
@@ -741,6 +745,7 @@ export class PnlService {
     quoteToken: Address,
     feeQuote: bigint,
     convert: (stable: Address, amount: bigint) => Promise<{ expectedOut: bigint } | null>,
+    blockNumber: bigint,
   ): Promise<bigint> {
     const chainName = this.config.chains.find((name) => chainRegistry[name].chain.id === chainId);
     if (!chainName) return feeQuote;
@@ -751,6 +756,8 @@ export class PnlService {
       return normalizeToUsd6(feeQuote, decimals);
     }
     if (feeQuote <= 0n) return 0n;
+    const spot = await this.spotPrice?.quoteToUsd6(chainId, quoteToken, stable.address, feeQuote, blockNumber);
+    if (spot !== undefined) return spot ?? 0n;
     const route = await convert(stable.address, feeQuote);
     return normalizeToUsd6(route?.expectedOut ?? 0n, decimals);
   }

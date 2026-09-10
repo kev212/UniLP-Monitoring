@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { zeroAddress, type Address } from "viem";
+import { ContractFunctionRevertedError, zeroAddress, type Address } from "viem";
 
+import { v4QuoterAbi } from "../src/abi.js";
 import { RoutePlanner } from "../src/services/route-planner.js";
 import type { PositionRecord } from "../src/types.js";
 
@@ -93,6 +94,40 @@ describe("V4 route quotes", () => {
 
     expect(route).toMatchObject({ protocol: "v4", expectedOut: 269004n });
     expect(simulateContract).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a deterministic V4 contract revert", async () => {
+    const simulateContract = vi.fn().mockRejectedValue(new ContractFunctionRevertedError({
+      abi: v4QuoterAbi,
+      functionName: "quoteExactInputSingle",
+      message: "execution reverted",
+    }));
+    const contracts = { v4: { quoter: "0x0000000000000000000000000000000000000001", universalRouter: "0x0000000000000000000000000000000000000002" } };
+    const chains = {
+      getById: vi.fn(() => ({ client: { simulateContract }, registry: { name: "robinhood", contracts } })),
+      getForScan: vi.fn(() => ({ client: { simulateContract }, registry: { name: "robinhood", contracts } })),
+    };
+    const planner = new RoutePlanner(chains as never, 100, { base: [], robinhood: [] });
+    const position: PositionRecord = {
+      id: "position",
+      chainId: 4663,
+      protocol: "v4",
+      positionKey: "118505",
+      owner: "0x0000000000000000000000000000000000000003",
+      poolAddress: null,
+      token0: phood,
+      token1: usdg,
+      quoteToken: usdg,
+      status: "armed",
+      liquidity: 1n,
+      openedAtBlock: 1n,
+      metadata: { currency0: phood, currency1: usdg, fee: 49900, tickSpacing: 998, hooks: zeroAddress },
+    };
+
+    const route = await planner.quoteDirect(position, phood, 623984168426294977443n, usdg);
+
+    expect(route).toBeNull();
+    expect(simulateContract).toHaveBeenCalledTimes(1);
   });
 });
 

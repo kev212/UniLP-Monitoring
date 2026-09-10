@@ -11,11 +11,11 @@ import { PositionReader, type PositionValue } from "./position-reader.js";
 import { dexNameFromMetadata, v3ContractsFor } from "./v3-deployment.js";
 import { quoteValueAtPriceMarker, quoteValueAtSqrtPrice } from "./uniswap-math.js";
 import { log } from "../log.js";
+import { ROBINHOOD_USDG_WETH_POOL } from "./spot-price.js";
 
 export const PORTFOLIO_REFRESH_INTERVAL_MS = 3 * 60_000;
 const MULTICALL3 = "0xca11bde05977b3631167028862be2a173976ca11" as Address;
 const DEXSCREENER_BASE = "https://api.dexscreener.com";
-const ROBINHOOD_USDG_WETH_PAIR = "0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca";
 
 export interface PortfolioSnapshot {
   totalUsd: number;
@@ -341,7 +341,7 @@ export class PortfolioService {
   private async canonicalWethPrice(chain: ChainName, wethAddress: string, stableAddresses: Set<string>): Promise<number | null> {
     if (chain !== "robinhood") return null;
     try {
-      const response = await fetch(`${DEXSCREENER_BASE}/latest/dex/pairs/robinhood/${ROBINHOOD_USDG_WETH_PAIR}`, { signal: AbortSignal.timeout(15_000) });
+      const response = await fetch(`${DEXSCREENER_BASE}/latest/dex/pairs/robinhood/${ROBINHOOD_USDG_WETH_POOL}`, { signal: AbortSignal.timeout(15_000) });
       if (!response.ok) return null;
       const payload = await response.json() as DexPairResponse;
       for (const pair of payload.pairs ?? []) {

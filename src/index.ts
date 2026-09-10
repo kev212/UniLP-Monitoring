@@ -16,6 +16,7 @@ import { PoolScanner } from "./services/pool-scanner.js";
 import { PositionOpener } from "./services/position-opener.js";
 import { GemScanner } from "./services/gem-scanner.js";
 import { PortfolioService } from "./services/portfolio.js";
+import { SpotPriceService } from "./services/spot-price.js";
 import { KyberSwapAggregatorApi } from "./services/kyberswap-aggregator-api.js";
 import { PancakeUniversalRouter } from "./services/pancake-universal-router.js";
 import { isRiskSettings, type RiskSettings } from "./types.js";
@@ -26,6 +27,7 @@ async function main(): Promise<void> {
   const chains = new ChainClients(config);
   const reader = new PositionReader(chains, config.maxSwapSlippageBps);
   const routes = new RoutePlanner(chains, config.maxSwapSlippageBps, config.quoteTokens);
+  const spotPrice = new SpotPriceService(chains, config);
   const tradingApi = config.uniswapApiKey ? new UniswapTradingApi(config.uniswapApiKey, config.maxSwapSlippageBps, globalThis.fetch, config.swapApiTimeoutMs) : undefined;
   const kyberswapApi = config.kyberswapEnabled
     ? new KyberSwapAggregatorApi(
@@ -38,7 +40,7 @@ async function main(): Promise<void> {
   const notifier = new Notifier(config, chains, database);
   const discovery = new DiscoveryService(database, chains, config, notifier);
   const alchemyBootstrapper = new AlchemyBootstrapper(database, chains, discovery, config);
-  const pnl = new PnlService(database, reader, routes, config, tradingApi, kyberswapApi);
+  const pnl = new PnlService(database, reader, routes, config, tradingApi, kyberswapApi, spotPrice);
   const pancakeUr = new PancakeUniversalRouter(chains, routes, config.settlementSwapSlippageBps);
   const executor = new Executor(database, chains, reader, routes, notifier, config, tradingApi, kyberswapApi, pancakeUr);
   const guardian = new Guardian(config, database, chains, alchemyBootstrapper, discovery, pnl, executor, notifier);

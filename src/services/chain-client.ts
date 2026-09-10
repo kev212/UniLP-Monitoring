@@ -3,6 +3,7 @@ import { createPublicClient, fallback, http, type Address, type PublicClient, ty
 import { chainRegistry, type ChainRegistry } from "../chains.js";
 import type { RuntimeConfig } from "../config.js";
 import type { ChainName } from "../types.js";
+import { log } from "../log.js";
 
 export interface ChainClient {
   registry: ChainRegistry;
@@ -11,8 +12,64 @@ export interface ChainClient {
 }
 
 const RPC_TIMEOUT_MS = 20_000;
+const RPC_METRICS_INTERVAL_MS = 60_000;
 export const ROBINHOOD_READ_CONCURRENCY = 12;
 export const ROBINHOOD_EXECUTION_CONCURRENCY = 4;
+
+export type RpcMetricCategory = "success" | "rpc_error" | "contract_revert" | "rate_limited" | "invalid_request" | "transport_error";
+
+export interface RpcMetricSink {
+  record(endpoint: string, method: string, category: RpcMetricCategory, latencyMs: number): void;
+}
+
+export interface RpcTransportOptions {
+  endpointLabels?: readonly string[];
+  metrics?: RpcMetricSink;
+}
+
+interface RpcMetricCounter {
+  endpoint: string;
+  method: string;
+  category: RpcMetricCategory;
+  count: number;
+  latencyMs: number;
+  maxLatencyMs: number;
+}
+
+export class RpcMetrics implements RpcMetricSink {
+  private readonly counters = new Map<string, RpcMetricCounter>();
+
+  record(endpoint: string, method: string, category: RpcMetricCategory, latencyMs: number): void {
+    const key = `${endpoint}|${method}|${category}`;
+    const current = this.counters.get(key);
+    if (current) {
+      current.count += 1;
+      current.latencyMs += latencyMs;
+      current.maxLatencyMs = Math.max(current.maxLatencyMs, latencyMs);
+      return;
+    }
+    this.counters.set(key, { endpoint, method, category, count: 1, latencyMs, maxLatencyMs: latencyMs });
+  }
+
+  flush(): readonly RpcMetricCounter[] {
+    const rows = [...this.counters.values()].map((row) => ({ ...row }));
+    this.counters.clear();
+    if (rows.length > 0) {
+      const requests = rows.reduce((total, row) => total + row.count, 0);
+      const successes = rows.reduce((total, row) => total + (row.category === "success" ? row.count : 0), 0);
+      log.info({
+        rpcTotals: {
+          requests,
+          successes,
+          failures: requests - successes,
+          successRatePct: requests > 0 ? Math.round((successes / requests) * 10_000) / 100 : 100,
+        },
+        rpcMetrics: rows,
+      }, "RPC request metrics");
+    }
+    return rows;
+  }
+}
 
 export class AsyncLimiter {
   private active = 0;
@@ -58,10 +115,15 @@ function uniqueUrls(urls: readonly (string | undefined)[]): string[] {
  * must reach the next provider immediately instead of retrying the same
  * throttled endpoint before fallback gets a chance.
  */
-export function createRpcTransport(urls: readonly string[], limiter?: AsyncLimiter, priority = false): Transport {
+export function createRpcTransport(urls: readonly string[], limiter?: AsyncLimiter, priority = false, options?: RpcTransportOptions): Transport {
   const endpoints = uniqueUrls(urls);
   if (endpoints.length === 0) throw new Error("At least one RPC endpoint is required");
-  const transports = endpoints.map((url) => http(url, { retryCount: 0, timeout: RPC_TIMEOUT_MS }));
+  const transports = endpoints.map((url, index) => {
+    const transport = http(url, { retryCount: 0, timeout: RPC_TIMEOUT_MS });
+    const metrics = options?.metrics;
+    if (!metrics) return transport;
+    return instrumentRpcTransport(transport, options.endpointLabels?.[index] ?? url, metrics);
+  });
   const transport = transports.length === 1
     ? transports[0]!
     : fallback(transports as [Transport, ...Transport[]], { retryCount: 0 });
@@ -73,6 +135,63 @@ export function createRpcTransport(urls: readonly string[], limiter?: AsyncLimit
   }) as Transport;
 }
 
+function instrumentRpcTransport(base: Transport, endpoint: string, metrics: RpcMetricSink): Transport {
+  return ((options) => {
+    const inner = base(options);
+    const request = (async (args, requestOptions) => {
+      const startedAt = Date.now();
+      try {
+        const result = await inner.request(args, requestOptions);
+        metrics.record(endpoint, String(args.method), "success", Date.now() - startedAt);
+        return result;
+      } catch (error) {
+        metrics.record(endpoint, String(args.method), classifyRpcError(error), Date.now() - startedAt);
+        throw error;
+      }
+    }) as typeof inner.request;
+    return { ...inner, config: { ...inner.config, request }, request };
+  }) as Transport;
+}
+
+function classifyRpcError(error: unknown): RpcMetricCategory {
+  const seen = new Set<object>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 6 && current; depth += 1) {
+    if (typeof current !== "object") {
+      return classifyRpcMessage(String(current));
+    }
+    if (seen.has(current)) break;
+    seen.add(current);
+    const value = current as { code?: unknown; status?: unknown; statusCode?: unknown; message?: unknown; cause?: unknown; error?: unknown };
+    const code = numericValue(value.code);
+    const status = numericValue(value.status ?? value.statusCode);
+    if (status === 429 || code === 429 || code === -32005) return "rate_limited";
+    if (status >= 500 && status < 600) return "transport_error";
+    if (code === -32600 || code === -32601 || code === -32602) return "invalid_request";
+    if (code === 3) return "contract_revert";
+    if (typeof value.message === "string") {
+      const category = classifyRpcMessage(value.message);
+      if (category !== "rpc_error") return category;
+    }
+    current = value.cause ?? value.error;
+  }
+  return "rpc_error";
+}
+
+function numericValue(value: unknown): number {
+  if (typeof value === "number") return value;
+  if (typeof value === "string" && /^-?\d+$/.test(value)) return Number(value);
+  return Number.NaN;
+}
+
+function classifyRpcMessage(message: string): RpcMetricCategory {
+  if (/(?:429|rate.?limit|too many requests|throttl)/i.test(message)) return "rate_limited";
+  if (/(?:invalid (?:request|params?|argument)|malformed|unknown method)/i.test(message)) return "invalid_request";
+  if (/(?:execution reverted|contract function .*reverted|reverted with)/i.test(message)) return "contract_revert";
+  if (/(?:timeout|timed out|network|fetch|socket|econn|aborted|connection)/i.test(message)) return "transport_error";
+  return "rpc_error";
+}
+
 export class ChainClients {
   private readonly clients = new Map<ChainName, ChainClient>();
   private readonly monitoringClients = new Map<ChainName, ChainClient>();
@@ -82,9 +201,12 @@ export class ChainClients {
   private readonly executionClients = new Map<ChainName, ChainClient>();
   private readonly enabledChains: Set<ChainName>;
   private readonly tokenMetadata = new Map<string, { decimals: number; symbol: string }>();
+  private readonly rpcMetrics = new RpcMetrics();
 
   constructor(config: RuntimeConfig) {
     this.enabledChains = new Set(config.chains);
+    const metricsTimer = setInterval(() => this.rpcMetrics.flush(), RPC_METRICS_INTERVAL_MS);
+    metricsTimer.unref?.();
     for (const name of ["base", "robinhood", "bsc"] as const) {
       const registry = chainRegistry[name];
       const readLimiter = name === "robinhood" ? new AsyncLimiter(ROBINHOOD_READ_CONCURRENCY) : undefined;
@@ -97,10 +219,11 @@ export class ChainClients {
       const alchemyLastResort = name !== "base" && name !== "robinhood" && config.alchemyHttp[name]
         ? [config.alchemyHttp[name]]
         : [];
-      const normalTransport = createRpcTransport([
+      const normalUrls = uniqueUrls([
         ...publicEndpoints,
         ...alchemyLastResort,
-      ], readLimiter);
+      ]);
+      const normalTransport = createRpcTransport(normalUrls, readLimiter, false, this.rpcTransportOptions(config, name, "normal", normalUrls));
       this.clients.set(name, {
         registry,
         transport: normalTransport,
@@ -110,11 +233,12 @@ export class ChainClients {
           pollingInterval: 4_000,
         }),
       });
-      const monitoringTransport = createRpcTransport(uniqueUrls([
+      const monitoringUrls = uniqueUrls([
         ...(name === "robinhood" ? [config.alchemyMonitoringHttp?.[name]] : []),
         ...publicEndpoints,
         ...(name === "robinhood" ? [] : alchemyLastResort),
-      ]), readLimiter, true);
+      ]);
+      const monitoringTransport = createRpcTransport(monitoringUrls, readLimiter, true, this.rpcTransportOptions(config, name, "monitoring", monitoringUrls));
       this.monitoringClients.set(name, {
         registry,
         transport: monitoringTransport,
@@ -124,12 +248,13 @@ export class ChainClients {
           pollingInterval: 4_000,
         }),
       });
-      const scanTransport = createRpcTransport(uniqueUrls([
+      const scanUrls = uniqueUrls([
         config.rpcHttp[name],
         config.rpcHttpScanFallback?.[name],
         config.rpcHttpFallback[name],
         ...alchemyLastResort,
-      ]), readLimiter);
+      ]);
+      const scanTransport = createRpcTransport(scanUrls, readLimiter, false, this.rpcTransportOptions(config, name, "scan", scanUrls));
       this.scanClients.set(name, {
         registry,
         transport: scanTransport,
@@ -141,7 +266,8 @@ export class ChainClients {
       });
       const scanFallbackUrl = config.rpcHttpScanFallback?.[name];
       if (scanFallbackUrl) {
-        const scanFallbackTransport = createRpcTransport([scanFallbackUrl], readLimiter);
+        const scanFallbackUrls = [scanFallbackUrl];
+        const scanFallbackTransport = createRpcTransport(scanFallbackUrls, readLimiter, false, this.rpcTransportOptions(config, name, "scan-fallback", scanFallbackUrls));
         this.scanFallbackClients.set(name, {
           registry,
           transport: scanFallbackTransport,
@@ -159,7 +285,7 @@ export class ChainClients {
         ...alchemyLastResort,
       ]);
       if (logUrls.length > 0) {
-        const logTransport = createRpcTransport(logUrls, readLimiter);
+        const logTransport = createRpcTransport(logUrls, readLimiter, false, this.rpcTransportOptions(config, name, "logs", logUrls));
         this.logClients.set(name, {
           registry,
           transport: logTransport,
@@ -170,12 +296,13 @@ export class ChainClients {
           }),
         });
       }
-      const executionTransport = createRpcTransport(uniqueUrls([
+      const executionUrls = uniqueUrls([
         config.alchemyHttp[name],
         config.rpcHttpScanFallback?.[name],
         config.rpcHttp[name],
         config.rpcHttpFallback[name],
-      ]), executionLimiter);
+      ]);
+      const executionTransport = createRpcTransport(executionUrls, executionLimiter, false, this.rpcTransportOptions(config, name, "execution", executionUrls));
       this.executionClients.set(name, {
         registry,
         transport: executionTransport,
@@ -237,4 +364,22 @@ export class ChainClients {
   getCachedToken(address: Address): { decimals: number; symbol: string } | undefined {
     return this.tokenMetadata.get(address.toLowerCase());
   }
+
+  private rpcTransportOptions(config: RuntimeConfig, chain: ChainName, purpose: string, urls: readonly string[]): RpcTransportOptions {
+    return {
+      metrics: this.rpcMetrics,
+      endpointLabels: urls.map((url) => `${chain}:${purpose}:${rpcEndpointName(config, chain, url)}`),
+    };
+  }
+}
+
+function rpcEndpointName(config: RuntimeConfig, chain: ChainName, url: string): string {
+  const normalized = url.replace(/\/+$/, "");
+  const same = (candidate: string | undefined): boolean => Boolean(candidate && candidate.replace(/\/+$/, "") === normalized);
+  if (same(config.alchemyMonitoringHttp?.[chain])) return "alchemy-monitoring";
+  if (same(config.alchemyHttp[chain])) return "alchemy";
+  if (same(config.rpcHttp[chain])) return "public-primary";
+  if (same(config.rpcHttpScanFallback?.[chain])) return "public-scan-fallback";
+  if (same(config.rpcHttpFallback[chain])) return "public-fallback";
+  return "rpc";
 }

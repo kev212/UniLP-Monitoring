@@ -1,4 +1,4 @@
-import { zeroAddress, type Address, type Hex } from "viem";
+import { ContractFunctionRevertedError, zeroAddress, type Address, type Hex } from "viem";
 
 import { v2FactoryAbi, v2RouterAbi, v3FactoryAbi, v3QuoterAbi, v4QuoterAbi } from "../abi.js";
 import { isProtocolDeployed } from "../chains.js";
@@ -308,6 +308,11 @@ export class RoutePlanner {
           v4PoolKey: poolKey,
         };
       } catch (error) {
+        const deterministicRevert = isDeterministicContractRevert(error);
+        if (deterministicRevert) {
+          log.warn({ err: error, positionId: position.id, tokenIn, tokenOut, attempts: attempt }, "V4 quote reverted; skipping retries");
+          break;
+        }
         if (attempt === V4_QUOTE_ATTEMPTS) {
           log.warn({ err: error, positionId: position.id, tokenIn, tokenOut, attempts: attempt }, "V4 quote failed after retries");
         }
@@ -359,6 +364,24 @@ export class RoutePlanner {
       v4PoolKey: poolKey,
     };
   }
+}
+
+function isDeterministicContractRevert(error: unknown): boolean {
+  const seen = new Set<object>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 6 && current; depth += 1) {
+    if (current instanceof ContractFunctionRevertedError) return true;
+    if (typeof current !== "object") {
+      return /(?:execution reverted|contract function .*reverted|reverted with)/i.test(String(current));
+    }
+    if (seen.has(current)) return false;
+    seen.add(current);
+    const value = current as { code?: unknown; name?: unknown; message?: unknown; cause?: unknown; error?: unknown };
+    if (value.code === 3 || value.name === "ContractFunctionRevertedError") return true;
+    if (typeof value.message === "string" && /(?:execution reverted|contract function .*reverted|reverted with)/i.test(value.message)) return true;
+    current = value.cause ?? value.error;
+  }
+  return false;
 }
 
 function feeCombinations(hops: number): number[][] {

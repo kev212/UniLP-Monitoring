@@ -3,7 +3,7 @@ import { createPublicClient } from "viem";
 
 import { chainRegistry } from "../src/chains.js";
 import type { RuntimeConfig } from "../src/config.js";
-import { AsyncLimiter, ChainClients, createRpcTransport, ROBINHOOD_EXECUTION_CONCURRENCY, ROBINHOOD_READ_CONCURRENCY } from "../src/services/chain-client.js";
+import { AsyncLimiter, ChainClients, createRpcTransport, ROBINHOOD_EXECUTION_CONCURRENCY, ROBINHOOD_READ_CONCURRENCY, type RpcMetricSink } from "../src/services/chain-client.js";
 
 describe("RPC failover transport", () => {
   afterEach(() => {
@@ -57,6 +57,35 @@ describe("RPC failover transport", () => {
       "https://rpc.mainnet.chain.robinhood.com/",
     ]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("records endpoint, method, latency, and failure category for each fallback attempt", async () => {
+    const metrics: RpcMetricSink = { record: vi.fn() };
+    let calls = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) return new Response("rate limited", { status: 429 });
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x1237" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }));
+
+    const client = createPublicClient({
+      chain: chainRegistry.robinhood.chain,
+      transport: createRpcTransport([
+        "https://primary.example/rpc",
+        "https://rpc.mainnet.chain.robinhood.com",
+      ], undefined, false, {
+        endpointLabels: ["robinhood:monitoring:alchemy-monitoring", "robinhood:monitoring:public-primary"],
+        metrics,
+      }),
+    });
+
+    await expect(client.getChainId()).resolves.toBe(4663);
+    expect(metrics.record).toHaveBeenCalledTimes(2);
+    expect(metrics.record).toHaveBeenNthCalledWith(1, "robinhood:monitoring:alchemy-monitoring", "eth_chainId", "rate_limited", expect.any(Number));
+    expect(metrics.record).toHaveBeenNthCalledWith(2, "robinhood:monitoring:public-primary", "eth_chainId", "success", expect.any(Number));
   });
 
   it("moves to the fallback after a primary network failure without retrying the primary", async () => {
