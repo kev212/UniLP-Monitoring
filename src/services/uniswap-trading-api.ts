@@ -1,6 +1,7 @@
 import { decodeFunctionData, isAddress, isHex, parseAbi, zeroAddress, type Address, type Hex } from "viem";
 
 import type { PositionRecord, TransactionPlan } from "../types.js";
+import { combinedEvaluationSignal, evaluationCacheKey, assertEvaluationActive, evaluationWait } from "./evaluation-context.js";
 
 const API_URL = "https://trade-api.gateway.uniswap.org/v1";
 const UNIVERSAL_ROUTER_VERSION = "2.1.1";
@@ -54,17 +55,17 @@ export class UniswapTradingApi {
     private readonly budgetPerMinute = QUOTE_BUDGET_PER_MINUTE,
   ) {}
 
-  async quote(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address, slippageBps = this.slippageBps, opts?: { budget?: boolean }): Promise<TradingApiQuote | null> {
+  async quote(position: PositionRecord, tokenIn: Address, amountIn: bigint, tokenOut: Address, slippageBps = this.slippageBps, opts?: { budget?: boolean; signal?: AbortSignal }): Promise<TradingApiQuote | null> {
     if (!Number.isSafeInteger(slippageBps) || slippageBps < 1 || slippageBps > 2_000) throw new Error("Trading API slippage must be between 1 and 2000 bps");
     if (Date.now() < this.quoteRateLimitedUntil) return null;
     const pairKey = `${position.chainId}:${tokenIn.toLowerCase()}:${tokenOut.toLowerCase()}`;
     if ((this.pairRateLimitedUntil.get(pairKey) ?? 0) > Date.now()) return null;
     const budgeted = opts?.budget === true;
     if (budgeted && this.budgetExhausted()) return null;
-    const requestKey = `${pairKey}:${amountIn}:${slippageBps}`;
+    const requestKey = `${pairKey}:${amountIn}:${slippageBps}:${evaluationCacheKey()}`;
     const existing = this.inFlight.get(requestKey);
     if (existing) return existing;
-    const pending = this.quoteUncached(position, tokenIn, amountIn, tokenOut, slippageBps, pairKey, budgeted)
+    const pending = evaluationWait(this.quoteUncached(position, tokenIn, amountIn, tokenOut, slippageBps, pairKey, budgeted, opts?.signal))
       .finally(() => this.inFlight.delete(requestKey));
     this.inFlight.set(requestKey, pending);
     return pending;
@@ -78,6 +79,7 @@ export class UniswapTradingApi {
     slippageBps: number,
     pairKey: string,
     budgeted: boolean,
+    signal?: AbortSignal,
   ): Promise<TradingApiQuote | null> {
     if (budgeted) this.budgetedCalls.push(Date.now());
     let response: Json | null;
@@ -93,7 +95,7 @@ export class UniswapTradingApi {
         type: "EXACT_INPUT",
         slippageTolerance: slippageBps / 100,
         routingPreference: "BEST_PRICE",
-      }, true);
+      }, true, signal);
     } catch (error) {
       if (error instanceof Error && error.message.includes("failed (429)")) {
         this.quoteRateLimitedUntil = Date.now() + QUOTE_RATE_LIMIT_COOLDOWN_MS;
@@ -101,6 +103,7 @@ export class UniswapTradingApi {
       }
       throw error;
     }
+    assertEvaluationActive();
     if (!response) return null;
 
     if (response.routing !== "CLASSIC") {
@@ -190,7 +193,7 @@ export class UniswapTradingApi {
     };
   }
 
-  private async post(path: string, body: Json, noQuoteIsNull = false): Promise<Json | null> {
+  private async post(path: string, body: Json, noQuoteIsNull = false, signal?: AbortSignal): Promise<Json | null> {
     const response = await this.request(`${API_URL}${path}`, {
       method: "POST",
       headers: {
@@ -202,7 +205,7 @@ export class UniswapTradingApi {
         "x-permit2-disabled": "true",
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: signal ? AbortSignal.any([signal, combinedEvaluationSignal(this.timeoutMs)]) : combinedEvaluationSignal(this.timeoutMs),
     });
     const payload = await readJson(response);
     if (response.ok) return payload;

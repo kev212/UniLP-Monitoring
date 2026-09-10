@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { Guardian, shouldResumeExitRetry, shouldResumeGroupExitRetry, shouldWaitForExitRetry, shouldWaitForGroupExitRetry } from "../src/services/guardian.js";
+import {
+  currentEvaluation,
+  EvaluationCancelledError,
+  type EvaluationContext,
+  evaluationWait,
+  runEvaluation,
+} from "../src/services/evaluation-context.js";
 import { quoteRangeState } from "../src/services/quote-range.js";
 import { sqrtRatioAtTick } from "../src/services/uniswap-math.js";
 import type { RuntimeConfig } from "../src/config.js";
@@ -98,7 +105,7 @@ describe("profit + OOR above timer", () => {
     }).updateProfitOorAboveTimer(position, aboveRange, 600n);
 
     const db = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
-    expect(db.setPositionStatus).toHaveBeenCalledWith("position", "armed", expect.objectContaining({ profitOorAboveSeenAt: expect.any(Number) }));
+    expect(db.setPositionStatus).toHaveBeenCalledWith("position", "armed", expect.objectContaining({ profitOorAboveSeenAt: expect.any(Number) }), "armed");
   });
 
   it("resets the timer when PnL drops below the dedicated threshold", async () => {
@@ -108,7 +115,7 @@ describe("profit + OOR above timer", () => {
     }).updateProfitOorAboveTimer({ ...position, metadata: { profitOorAboveSeenAt: Date.now() - 10_000 } }, aboveRange, 299n);
 
     const db = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
-    expect(db.setPositionStatus).toHaveBeenCalledWith("position", "armed", expect.objectContaining({ profitOorAboveSeenAt: null }));
+    expect(db.setPositionStatus).toHaveBeenCalledWith("position", "armed", expect.objectContaining({ profitOorAboveSeenAt: null }), "armed");
   });
 
   it("does not use the trailing-stop activation threshold", async () => {
@@ -118,7 +125,7 @@ describe("profit + OOR above timer", () => {
     }).updateProfitOorAboveTimer(position, aboveRange, 300n);
 
     const db = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
-    expect(db.setPositionStatus).toHaveBeenCalledWith("position", "armed", expect.objectContaining({ profitOorAboveSeenAt: expect.any(Number) }));
+    expect(db.setPositionStatus).toHaveBeenCalledWith("position", "armed", expect.objectContaining({ profitOorAboveSeenAt: expect.any(Number) }), "armed");
   });
 
   it("keeps stop-loss eligible when a previous exit retry is still backing off", () => {
@@ -146,7 +153,7 @@ describe("profit + OOR above timer", () => {
 
     await expect(update({ ...position, metadata: { oorAboveSeenAt: Date.now() - 1_000_000 } }, inRange)).resolves.toBeNull();
     const db = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
-    expect(db.setPositionStatus).toHaveBeenCalledWith("position", "armed", expect.objectContaining({ oorAboveSeenAt: null }));
+    expect(db.setPositionStatus).toHaveBeenCalledWith("position", "armed", expect.objectContaining({ oorAboveSeenAt: null }), "armed");
   });
 
   it("does not resume dynamic retries after their live trigger disappears", () => {
@@ -201,7 +208,7 @@ describe("trailing TWAP guard timeout", () => {
       const guardian = makeGuardian();
       await expect(allow(guardian, position)).resolves.toBe(false);
       const database = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
-      expect(database.setPositionStatus).toHaveBeenCalledWith("trailing-position", "armed", { trailingTwapWaitStartedAt: 100_000 });
+      expect(database.setPositionStatus).toHaveBeenCalledWith("trailing-position", "armed", { trailingTwapWaitStartedAt: 100_000 }, "armed");
     } finally {
       vi.useRealTimers();
     }
@@ -243,7 +250,7 @@ describe("trailing TWAP guard timeout", () => {
       const guardian = makeGuardian();
       await expect(allowProfit(guardian, position, trigger)).resolves.toBe(false);
       const database = (guardian as unknown as { database: { setPositionStatus: ReturnType<typeof vi.fn> } }).database;
-      expect(database.setPositionStatus).toHaveBeenCalledWith("trailing-position", "armed", { profitTwapWaitStartedAt: 100_000 });
+      expect(database.setPositionStatus).toHaveBeenCalledWith("trailing-position", "armed", { profitTwapWaitStartedAt: 100_000 }, "armed");
       await expect(allowProfit(guardian, { ...position, metadata: { profitTwapWaitStartedAt: 94_999 } }, trigger)).resolves.toBe(true);
     } finally {
       vi.useRealTimers();
@@ -368,7 +375,7 @@ describe("valuation retry status handling", () => {
     }).evaluatePosition("robinhood", position, 10n);
 
     expect(result).toBe(false);
-    expect(database.setPositionStatus).toHaveBeenCalledWith("route-position", "armed", { reason: null });
+    expect(database.setPositionStatus).toHaveBeenCalledWith("route-position", "armed", { reason: null }, "syncing");
     expect(database.setPositionStatus).not.toHaveBeenCalledWith("route-position", "needs_review", expect.anything());
   });
 
@@ -390,7 +397,7 @@ describe("valuation retry status handling", () => {
       evaluatePosition(name: "robinhood", position: PositionRecord, blockNumber: bigint): Promise<boolean>;
     }).evaluatePosition("robinhood", position, 10n);
 
-    expect(database.setPositionStatus).toHaveBeenCalledWith("route-position", "armed", expect.objectContaining({ armedAtBlock: "10" }));
+    expect(database.setPositionStatus).toHaveBeenCalledWith("route-position", "armed", expect.objectContaining({ armedAtBlock: "10" }), "syncing");
     expect(notifier.armed).not.toHaveBeenCalled();
   });
 
@@ -462,7 +469,7 @@ describe("stop-loss local quote validation", () => {
     }).validateStopLossWithLocalQuote(position, 10n, snapshot(-5_844n));
 
     expect(result).toBeNull();
-    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "armed", { slTwapWaitStartedAt: null });
+    expect(database.setPositionStatus).toHaveBeenCalledWith("position", "armed", { slTwapWaitStartedAt: null }, "armed");
     expect(pnl.valueLocal).toHaveBeenCalledWith(position, 10n);
   });
 
@@ -663,7 +670,7 @@ describe("stop-loss local quote validation", () => {
 
     expect(database.setPositionStatus).toHaveBeenCalledWith("position", "armed", {
       trailingStopExpected: { peakPnlBps: 4_610n, activatedAtBlock: 10n },
-    });
+    }, "armed");
     expect(executor.executeRelatedPosition).toHaveBeenCalledWith(
       expect.objectContaining({ id: "position" }),
       "take_profit",
@@ -760,6 +767,223 @@ describe("position monitor timeouts", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("retries a timed-out position on the same block after it later succeeds", async () => {
+    vi.useFakeTimers();
+    try {
+      const snapshot: PnlSnapshot = {
+        positionId: position.id,
+        quoteToken: position.quoteToken,
+        depositsQuote: 1_000n,
+        realizedQuote: 0n,
+        liquidationQuote: 1_000n,
+        pnlQuote: 0n,
+        pnlBps: 0n,
+        blockNumber: 10n,
+        liquidity: 1n,
+        feeQuote: 0n,
+        feeNonQuote: null,
+        feeQuoteUsdg: 0n,
+      };
+      const valued = { snapshot, range: undefined, twapGuard: { ready: true } };
+      let resolveFirst!: (value: typeof valued) => void;
+      const firstValue = new Promise<typeof valued>((resolve) => { resolveFirst = resolve; });
+      let calls = 0;
+      const pnl = {
+        value: vi.fn(() => {
+          calls += 1;
+          return calls === 1 ? firstValue : Promise.resolve(valued);
+        }),
+        evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      };
+      const database = {
+        listPositionGroups: vi.fn().mockResolvedValue([]),
+        listOpenPositions: vi.fn().mockResolvedValue([{ ...position, metadata: { autoExitDisabled: true } }]),
+        addPnlSnapshot: vi.fn().mockResolvedValue(undefined),
+      };
+      const chains = {
+        get: vi.fn(() => ({
+          client: { getBlockNumber: vi.fn().mockResolvedValue(10n) },
+          registry: { chain: { id: 4663 }, monitoringEnabled: true },
+        })),
+      };
+      const guardian = new Guardian(
+        { positionMonitorConcurrency: 1, positionEvaluationStaggerMs: 0 } as RuntimeConfig,
+        database as never,
+        chains as never,
+        {} as never,
+        {} as never,
+        pnl as never,
+        {} as never,
+        { logPnL: vi.fn().mockResolvedValue(undefined) } as never,
+      );
+      const evaluate = (guardian as unknown as { evaluateChain(name: "robinhood"): Promise<void> }).evaluateChain.bind(guardian);
+
+      const first = evaluate("robinhood");
+      await vi.advanceTimersByTimeAsync(60_000);
+      await expect(first).resolves.toBeUndefined();
+
+      resolveFirst(valued);
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(evaluate("robinhood")).resolves.toBeUndefined();
+      await expect(evaluate("robinhood")).resolves.toBeUndefined();
+
+      expect(pnl.value).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores a late timed-out attempt after a newer attempt succeeds", async () => {
+    vi.useFakeTimers();
+    try {
+      const snapshot: PnlSnapshot = {
+        positionId: position.id,
+        quoteToken: position.quoteToken,
+        depositsQuote: 1_000n,
+        realizedQuote: 0n,
+        liquidationQuote: 1_000n,
+        pnlQuote: 0n,
+        pnlBps: 0n,
+        blockNumber: 10n,
+        liquidity: 1n,
+        feeQuote: 0n,
+        feeNonQuote: null,
+        feeQuoteUsdg: 0n,
+      };
+      const valued = { snapshot, range: undefined, twapGuard: { ready: true } };
+      let resolveFirst!: (value: typeof valued) => void;
+      const firstValue = new Promise<typeof valued>((resolve) => { resolveFirst = resolve; });
+      let calls = 0;
+      const pnl = {
+        value: vi.fn(() => {
+          calls += 1;
+          return calls === 1 ? firstValue : Promise.resolve(valued);
+        }),
+        evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      };
+      const database = {
+        getCashflowTotals: vi.fn().mockResolvedValue({ deposits: 1n }),
+        addPnlSnapshot: vi.fn().mockResolvedValue(undefined),
+        setPositionStatus: vi.fn().mockResolvedValue(true),
+      };
+      const discovery = { retryHydrateV4OpeningCashflow: vi.fn().mockResolvedValue(undefined) };
+      const guardian = new Guardian(
+        {} as RuntimeConfig,
+        database as never,
+        {} as never,
+        discovery as never,
+        {} as never,
+        pnl as never,
+        {} as never,
+        {
+          logPnL: vi.fn().mockResolvedValue(undefined),
+          armed: vi.fn().mockResolvedValue(undefined),
+        } as never,
+      );
+      const evaluate = (guardian as unknown as {
+        evaluatePositionWithTimeout(name: "robinhood", position: PositionRecord, blockNumber: bigint): Promise<boolean>;
+      }).evaluatePositionWithTimeout.bind(guardian);
+      const syncing = { ...position, status: "syncing" as const };
+
+      const first = evaluate("robinhood", syncing, 10n);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await expect(first).resolves.toBe(false);
+
+      await expect(evaluate("robinhood", syncing, 10n)).resolves.toBe(true);
+      const writesAfterFreshAttempt = database.setPositionStatus.mock.calls.length;
+
+      resolveFirst(valued);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(database.setPositionStatus).toHaveBeenCalledTimes(writesAfterFreshAttempt);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("prevents executor handoff when a stale position status conflict is detected", async () => {
+    const snapshot: PnlSnapshot = {
+      positionId: position.id,
+      quoteToken: position.quoteToken,
+      depositsQuote: 1_000n,
+      realizedQuote: 3_000n,
+      liquidationQuote: 1_000n,
+      pnlQuote: 3_000n,
+      pnlBps: 3_000n,
+      blockNumber: 10n,
+      liquidity: 1n,
+      feeQuote: 0n,
+      feeNonQuote: null,
+      feeQuoteUsdg: 0n,
+    };
+    const database = {
+      addPnlSnapshot: vi.fn().mockResolvedValue(undefined),
+      setPositionStatus: vi.fn().mockResolvedValue(false),
+    };
+    const pnl = {
+      value: vi.fn().mockResolvedValue({ snapshot, range: undefined, twapGuard: { ready: true } }),
+      valueExactProbe: vi.fn().mockResolvedValue({ snapshot, range: undefined }),
+      evaluateTrailingStop: vi.fn().mockReturnValue({ action: "none" }),
+      shouldTrigger: vi.fn().mockReturnValue("take_profit"),
+      isNearExactThreshold: vi.fn().mockReturnValue(false),
+    };
+    const executor = { executeRelatedPosition: vi.fn().mockResolvedValue(undefined) };
+    const guardian = new Guardian(
+      { autoExitChains: ["robinhood"] } as RuntimeConfig,
+      database as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      executor as never,
+      { logPnL: vi.fn().mockResolvedValue(undefined) } as never,
+    );
+
+    const result = await (guardian as unknown as {
+      evaluatePosition(name: "robinhood", position: PositionRecord, blockNumber: bigint): Promise<boolean>;
+    }).evaluatePosition("robinhood", position, 10n);
+
+    expect(result).toBe(false);
+    expect(database.setPositionStatus).toHaveBeenCalledWith(
+      position.id,
+      "armed",
+      expect.objectContaining({ exitSnapshot: expect.any(Object) }),
+      "armed",
+    );
+    expect(executor.executeRelatedPosition).not.toHaveBeenCalled();
+  });
+
+  it("keeps executor recovery detached from parent cancellation", async () => {
+    let releaseRecovery!: () => void;
+    const recovery = new Promise<void>((resolve) => { releaseRecovery = resolve; });
+    const executor = {
+      resume: vi.fn(async () => {
+        const context = currentEvaluation();
+        if (context) await evaluationWait(recovery, context);
+        else await recovery;
+      }),
+    };
+    const database = { setPositionStatusUnlessSettled: vi.fn().mockResolvedValue(true) };
+    const guardian = new Guardian({} as RuntimeConfig, database as never, {} as never, {} as never, {} as never, {} as never, executor as never, {} as never);
+    const controller = new AbortController();
+    const attempt: EvaluationContext = {
+      id: "recovery-attempt",
+      kind: "position",
+      entityId: position.id,
+      deadline: Date.now() + 60_000,
+      signal: controller.signal,
+    };
+    const pending = runEvaluation(attempt, () => (guardian as unknown as {
+      evaluatePosition(name: "robinhood", position: PositionRecord, blockNumber: bigint): Promise<boolean>;
+    }).evaluatePosition("robinhood", { ...position, status: "closing" }, 10n));
+
+    await vi.waitFor(() => expect(executor.resume).toHaveBeenCalledTimes(1));
+    controller.abort();
+    releaseRecovery();
+
+    await expect(pending).resolves.toBe(true);
   });
 });
 
@@ -1293,6 +1517,31 @@ describe("monitor RPC retries", () => {
 
     await expect(validate(group(trigger), 10n, trigger, valued.snapshot)).resolves.toEqual(valued.snapshot);
     expect(pnl.valueGroupLocalExitEstimate).toHaveBeenCalled();
+  });
+
+  it("does not convert group cancellation into success", async () => {
+    const cancellation = new EvaluationCancelledError();
+    const pnl = { valueGroupLocalExitEstimate: vi.fn().mockRejectedValue(cancellation) };
+    const guardian = new Guardian(
+      {} as RuntimeConfig,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      pnl as never,
+      {} as never,
+      {} as never,
+    );
+    const validate = (guardian as unknown as {
+      validateGroupProfitExit(
+        value: PositionGroupRecord,
+        block: bigint,
+        reason: "profit_oor_above" | "out_of_range_above",
+        snapshot: PositionGroupPnlSnapshot,
+      ): Promise<PositionGroupPnlSnapshot | null>;
+    }).validateGroupProfitExit.bind(guardian);
+
+    await expect(validate(group("cancelled"), 10n, "profit_oor_above", valued.snapshot)).rejects.toBe(cancellation);
   });
 
   it("does not fire group SL when the exact quote is above the threshold", async () => {

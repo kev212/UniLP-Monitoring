@@ -23,6 +23,7 @@ import type { PositionGroupRecord, PositionRangeInfo, PositionRecord, Protocol, 
 import type { ChainClients } from "./chain-client.js";
 import { amountsForLiquidity, applySlippage, sqrtRatioAtTick } from "./uniswap-math.js";
 import { dexNameFromMetadata, v3ContractsFor } from "./v3-deployment.js";
+import { evaluationCacheKey, assertEvaluationActive } from "./evaluation-context.js";
 
 export interface PositionValue {
   protocol: Protocol;
@@ -78,6 +79,7 @@ export class PositionReader {
       : position.protocol === "v3"
         ? await this.readV3(position, observedBlock, effective, rpc, allowEmpty)
         : await this.readV4(position, observedBlock, effective, rpc, allowEmpty);
+    assertEvaluationActive();
     return this.remember(position, value);
   }
 
@@ -99,6 +101,7 @@ export class PositionReader {
       : group.protocol === "v4"
         ? await this.readV4Group(group, positions, blockNumber, effective, rpc, allowEmpty)
         : await Promise.all(positions.map((position) => this.read(position, blockNumber, effective, rpc, allowEmpty)));
+    assertEvaluationActive();
     return values.map((value, index) => this.remember(positions[index]!, value));
   }
 
@@ -424,7 +427,7 @@ export class PositionReader {
     rpc: RpcSource,
     chainId: number,
   ): Promise<V4Slot0> {
-    const key = `${chainId}:${rpc}:${poolId}:${blockNumber}`;
+    const key = `${chainId}:${rpc}:${poolId}:${blockNumber}:${evaluationCacheKey()}`;
     const cached = this.v4Slot0Cache.get(key);
     if (cached) return cached;
     const pending = (client.readContract({

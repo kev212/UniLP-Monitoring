@@ -35,6 +35,7 @@ import type {
   TrailingStopState,
 } from "./types.js";
 import { normalizeToUsd6 } from "./services/token-meta.js";
+import { assertEvaluationActive, currentEvaluation, evaluationWait, withoutEvaluation, EvaluationCancelledError } from "./services/evaluation-context.js";
 
 const HISTORY_MIN_PNL_BPS = 50n;
 const HISTORY_MIN_PNL_USD = 500_000n;
@@ -42,6 +43,46 @@ const USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
 const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const USDT = "0x55d398326f99059ff775485246999027b3197955";
 const WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
+const TRANSACTION_CONTROL_TIMEOUT_MS = 5_000;
+
+class DatabaseControlTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DatabaseControlTimeoutError";
+  }
+}
+
+async function waitWithTimeout<T>(pending: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new DatabaseControlTimeoutError(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function isConnectionFailure(error: unknown): boolean {
+  const value = error as { code?: unknown; message?: unknown } | undefined;
+  const code = typeof value?.code === "string" ? value.code : "";
+  const message = typeof value?.message === "string" ? value.message : "";
+  return code.startsWith("08")
+    || code === "57P01"
+    || code === "57P02"
+    || code === "57P03"
+    || /connection (?:terminated|closed)|ECONNRESET|EPIPE|socket hang up/i.test(message);
+}
+
+function isQueryCancelled(error: unknown): boolean {
+  const value = error as { code?: unknown; message?: unknown } | undefined;
+  if (value?.code === "57014") return true;
+  return typeof value?.message === "string"
+    && /canceling statement due to statement timeout|query canceled/i.test(value.message);
+}
 
 interface PositionRow {
   id: string;
@@ -238,10 +279,73 @@ export class Database {
   private readonly pool: Pool;
 
   constructor(connectionString: string) {
-    this.pool = new Pool({ connectionString });
+    this.pool = new Pool({ connectionString, connectionTimeoutMillis: 5_000 });
     this.pool.on("error", (error) => {
       log.warn({ err: error }, "idle postgres client error");
     });
+
+    // Keep fencing at the common pool boundary so every existing monitoring
+    // query is covered, including newly-added query methods.
+    const poolQuery = this.pool.query.bind(this.pool) as (...args: any[]) => Promise<any>;
+    (this.pool as Pool & { query: (...args: any[]) => Promise<any> }).query = (...args: any[]) =>
+      this.evaluationQuery(poolQuery, args);
+  }
+
+  private async lockEvaluationParent(client: PoolClient): Promise<void> {
+    const context = currentEvaluation();
+    if (!context) return;
+    assertEvaluationActive(context);
+    const timeoutMs = Math.max(1, Math.min(5_000, context.deadline - Date.now()));
+    await client.query(`SET LOCAL statement_timeout = '${Math.ceil(timeoutMs)}ms'`);
+    await client.query(`SET LOCAL lock_timeout = '${Math.ceil(timeoutMs)}ms'`);
+    await client.query(`SET LOCAL idle_in_transaction_session_timeout = '${Math.ceil(timeoutMs)}ms'`);
+    const table = context.kind === "position" ? "positions" : "position_groups";
+    const result = await client.query<{ evaluation_generation: string; evaluation_deadline: Date | string | null; evaluation_valid: boolean }>(
+      `SELECT evaluation_generation, evaluation_deadline,
+              (evaluation_deadline IS NULL OR evaluation_deadline > clock_timestamp()) AS evaluation_valid
+         FROM ${table} WHERE id = $1 FOR UPDATE`,
+      [context.entityId],
+    );
+    if (result.rowCount !== 1) throw new EvaluationCancelledError(`evaluation parent not found: ${context.entityId}`);
+    const row = result.rows[0]!;
+    if (context.generation === undefined || String(row.evaluation_generation) !== context.generation) {
+      throw new EvaluationCancelledError(`evaluation generation is stale for ${context.entityId}`);
+    }
+    if (!row.evaluation_valid) {
+      throw new EvaluationCancelledError(`evaluation deadline is stale for ${context.entityId}`);
+    }
+    assertEvaluationActive(context);
+  }
+
+  private async evaluationQuery(poolQuery: (...args: any[]) => Promise<any>, args: any[]): Promise<any> {
+    const context = currentEvaluation();
+    if (!context) return poolQuery(...args);
+    assertEvaluationActive(context);
+    return evaluationWait(this.transaction(async (client) => {
+      const result = await (client.query as any)(...args);
+      assertEvaluationActive(context);
+      return result;
+    }), context);
+  }
+
+  async beginEvaluation(kind: "position" | "group", entityId: string, deadline: number): Promise<string> {
+    const table = kind === "position" ? "positions" : "position_groups";
+    const result = await withoutEvaluation(() => this.transaction(async client => {
+      const remaining = Math.min(5_000, deadline - Date.now());
+      if (remaining <= 0) throw new EvaluationCancelledError();
+      await client.query(`SET LOCAL statement_timeout = '${Math.ceil(remaining)}ms'`);
+      await client.query(`SET LOCAL lock_timeout = '${Math.ceil(remaining)}ms'`);
+      return client.query<{ evaluation_generation: string }>(
+      `UPDATE ${table}
+          SET evaluation_generation = COALESCE(evaluation_generation, 0) + 1,
+              evaluation_deadline = $2::timestamptz
+        WHERE id = $1 AND clock_timestamp() < $2::timestamptz
+        RETURNING evaluation_generation`,
+      [entityId, new Date(deadline)],
+      );
+    }));
+    if (result.rowCount !== 1) throw new EvaluationCancelledError(`evaluation parent unavailable or deadline expired: ${entityId}`);
+    return String(result.rows[0]!.evaluation_generation);
   }
 
   async connect(): Promise<void> {
@@ -287,6 +391,8 @@ export class Database {
       );
       ALTER TABLE positions ADD COLUMN IF NOT EXISTS settlement_lease_token TEXT;
       ALTER TABLE positions ADD COLUMN IF NOT EXISTS settlement_lease_until TIMESTAMPTZ;
+      ALTER TABLE positions ADD COLUMN IF NOT EXISTS evaluation_generation BIGINT NOT NULL DEFAULT 0;
+      ALTER TABLE positions ADD COLUMN IF NOT EXISTS evaluation_deadline TIMESTAMPTZ;
       ALTER TABLE positions ADD COLUMN IF NOT EXISTS dex TEXT NOT NULL DEFAULT 'uniswap';
       UPDATE positions SET dex = metadata->>'dex' WHERE metadata->>'dex' IS NOT NULL;
       ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_chain_id_protocol_position_key_key;
@@ -340,6 +446,8 @@ export class Database {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
        );
+       ALTER TABLE position_groups ADD COLUMN IF NOT EXISTS evaluation_generation BIGINT NOT NULL DEFAULT 0;
+       ALTER TABLE position_groups ADD COLUMN IF NOT EXISTS evaluation_deadline TIMESTAMPTZ;
        ALTER TABLE position_groups DROP CONSTRAINT IF EXISTS position_groups_shape_version_check;
        DO $$
        BEGIN
@@ -657,17 +765,160 @@ export class Database {
   }
 
   async transaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
+    const context = currentEvaluation();
+    const pendingClient = this.pool.connect();
+    let acquiredClient: PoolClient | undefined;
+    let abandoned = false;
+    let released = false;
+    const releaseClient = (destroy = false) => {
+      if (!acquiredClient || released) return;
+      released = true;
+      acquiredClient.release(destroy);
+    };
+    if (context) {
+      // If deadline racing wins before pool.connect resolves, release the
+      // eventual client. The release guard makes this exactly-once.
+      void pendingClient.then((lateClient) => {
+        acquiredClient = lateClient;
+        if (abandoned) releaseClient(true);
+      }, () => {});
+    }
+    let client: PoolClient;
     try {
-      await client.query("BEGIN");
-      const result = await work(client);
-      await client.query("COMMIT");
+      client = context ? await evaluationWait(pendingClient, context) : await pendingClient;
+      acquiredClient = client;
+    } catch (error) {
+      abandoned = true;
+      releaseClient(true);
+      throw error;
+    }
+    let connectionError: Error | undefined;
+    let rejectConnection!: (error: Error) => void;
+    const connectionFailed = new Promise<never>((_, reject) => { rejectConnection = reject; });
+    void connectionFailed.catch(() => {});
+    const onConnectionError = (error: Error) => {
+      connectionError = error;
+      rejectConnection(error);
+    };
+    const contextExpired = (): boolean => Boolean(context && (
+      context.signal.aborted || Date.now() >= context.deadline
+    ));
+    let destroy = false;
+    let transactionStarted = false;
+    let commitStarted = false;
+    let workFinished = false;
+    let stage: "begin" | "work" | "commit" = "begin";
+    const guardedClient = new Proxy(client, {
+      get: (target, property, receiver) => {
+        if (property === "query") {
+          return (...args: any[]) => {
+            if (workFinished) {
+              return Promise.reject(new EvaluationCancelledError("transaction work is already finished"));
+            }
+            if (context) assertEvaluationActive(context);
+            let pending: Promise<unknown>;
+            try {
+              pending = (target.query as any)(...args) as Promise<unknown>;
+            } catch (error) {
+              return Promise.reject(error);
+            }
+            return context ? evaluationWait(pending, context) : pending;
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    try {
+      client.on("error", onConnectionError);
+      if (context) assertEvaluationActive(context);
+      const pendingBegin = Promise.race([client.query("BEGIN"), connectionFailed]);
+      if (context) await evaluationWait(pendingBegin, context);
+      else await waitWithTimeout(pendingBegin, TRANSACTION_CONTROL_TIMEOUT_MS, "postgres BEGIN timed out");
+      transactionStarted = true;
+      stage = "work";
+      const pendingLock = Promise.race([this.lockEvaluationParent(client), connectionFailed]);
+      if (context) await evaluationWait(pendingLock, context);
+      else await pendingLock;
+      let result: T;
+      try {
+        const pendingWork = Promise.race([Promise.resolve().then(() => work(guardedClient)), connectionFailed]);
+        result = context ? await evaluationWait(pendingWork, context) : await pendingWork;
+      } finally {
+        workFinished = true;
+      }
+      if (context) {
+        assertEvaluationActive(context);
+        // Bound COMMIT itself by the remaining budget, not the budget at BEGIN.
+        // The locked generation row serializes any uncertain commit with retry:
+        // a new generation cannot start until this transaction releases its lock.
+        const remaining = Math.max(1, Math.min(5_000, context.deadline - Date.now()));
+        await evaluationWait(
+          Promise.race([
+            client.query(`SET LOCAL statement_timeout = '${Math.ceil(remaining)}ms'`),
+            connectionFailed,
+          ]),
+          context,
+        );
+        const valid = await evaluationWait(
+          Promise.race([
+            client.query<{ valid: boolean }>(
+              "SELECT clock_timestamp() < $1::timestamptz AS valid", [new Date(context.deadline)],
+            ),
+            connectionFailed,
+          ]),
+          context,
+        );
+        if (!valid.rows[0]?.valid) throw new EvaluationCancelledError();
+        assertEvaluationActive(context);
+      }
+      stage = "commit";
+      commitStarted = true;
+      const pendingCommit = Promise.race([client.query("COMMIT"), connectionFailed]);
+      // Do not wait past the evaluation deadline for COMMIT acknowledgement.
+      // A timed-out COMMIT may still reach PostgreSQL, so its outcome is
+      // deliberately treated as uncertain below.
+      if (context) await evaluationWait(pendingCommit, context);
+      else await pendingCommit;
+      if (context) assertEvaluationActive(context);
       return result;
     } catch (error) {
-      await client.query("ROLLBACK");
+      workFinished = true;
+      const connectionFailure = isConnectionFailure(error);
+      const cancelled = error instanceof EvaluationCancelledError || contextExpired();
+      const controlCancelled = stage === "begin" && (
+        isQueryCancelled(error) || error instanceof DatabaseControlTimeoutError
+      );
+      const commitUncertain = commitStarted && (
+        Boolean(connectionError)
+        || cancelled
+        || connectionFailure
+        || isQueryCancelled(error)
+      );
+      destroy = Boolean(connectionError) || connectionFailure || cancelled || controlCancelled || commitUncertain;
+      if (commitUncertain) {
+        log.warn({ err: error }, "postgres transaction COMMIT outcome is uncertain; destroying client");
+      }
+      if (transactionStarted && !destroy) {
+        try {
+          const rollback = waitWithTimeout(
+            Promise.race([client.query("ROLLBACK"), connectionFailed]),
+            TRANSACTION_CONTROL_TIMEOUT_MS,
+            "postgres ROLLBACK timed out",
+          );
+          await (context ? evaluationWait(rollback, context) : rollback);
+        }
+        catch { destroy = true; }
+      }
       throw error;
     } finally {
-      client.release();
+      workFinished = true;
+      const expired = contextExpired();
+      try {
+        client.removeListener("error", onConnectionError);
+      } finally {
+        releaseClient(destroy || expired || Boolean(connectionError));
+      }
     }
   }
 
@@ -1545,7 +1796,7 @@ FROM position_groups g
     const result = await this.pool.query<PositionGroupPnlSnapshotRow>(
       `SELECT * FROM position_group_pnl_snapshots
        WHERE group_id = $1
-       ORDER BY created_at DESC, id DESC
+       ORDER BY block_number DESC, created_at DESC, id DESC
        LIMIT 1`,
       [groupId],
     );
@@ -1631,11 +1882,24 @@ FROM position_groups g
     return result.rowCount ? result.rows[0]!.metadata : null;
   }
 
-  async setPositionStatus(positionId: string, status: PositionStatus, metadata?: Record<string, unknown>): Promise<void> {
-    await this.pool.query(
-      "UPDATE positions SET status = $2, metadata = metadata || $3::jsonb, updated_at = NOW() WHERE id = $1",
-      [positionId, status, stringifyJson(metadata ?? {})],
+  async setPositionStatus(
+    positionId: string,
+    status: PositionStatus,
+    metadata?: Record<string, unknown>,
+    expectedStatus?: PositionStatus,
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE positions
+       SET status = $2, metadata = metadata || $3::jsonb, updated_at = NOW()
+       WHERE id = $1
+         AND NOT (status = 'settled' AND $2::text <> 'settled')
+         AND NOT (status = 'cancelled' AND $2::text <> 'cancelled')
+         AND NOT (status = 'closing' AND $2::text IN ('discovered', 'syncing', 'armed'))
+         AND ($4::text IS NULL OR status = $4::text)
+       RETURNING id`,
+      [positionId, status, stringifyJson(metadata ?? {}), expectedStatus ?? null],
     );
+    return result.rowCount === 1;
   }
 
   async setPositionStatusUnlessSettled(positionId: string, status: PositionStatus, metadata?: Record<string, unknown>): Promise<boolean> {
@@ -1734,27 +1998,29 @@ FROM position_groups g
   }
 
   async recoverVerifiedSettlement(positionId: string): Promise<boolean> {
-    const result = await this.pool.query<{ trigger: string }>(
-      `UPDATE positions
-       SET status = 'settled',
-           metadata = metadata || jsonb_build_object('settlementRecoveredAt', NOW()::text),
-           updated_at = NOW()
-       WHERE id = $1
-         AND status <> 'settled'
-         AND jsonb_typeof(metadata->'totalReceived') = 'string'
-         AND (NOT (metadata ? 'pendingSwap') OR metadata->'pendingSwap' = 'null'::jsonb)
-         AND EXISTS (
-           SELECT 1 FROM execution_attempts
-            WHERE execution_attempts.position_id = positions.id
-              AND execution_attempts.stage = 'remove_liquidity'
-              AND execution_attempts.status = 'confirmed'
-         )
-       RETURNING COALESCE(NULLIF(metadata->>'exitTrigger', ''), 'settled') AS trigger`,
-      [positionId],
-    );
-    if (!result.rowCount) return false;
-    await this.finalizeCloseHistory(positionId, result.rows[0]!.trigger);
-    return true;
+    return this.transaction(async (client) => {
+      const result = await client.query<{ trigger: string }>(
+        `UPDATE positions
+         SET status = 'settled',
+             metadata = metadata || jsonb_build_object('settlementRecoveredAt', NOW()::text),
+             updated_at = NOW()
+         WHERE id = $1
+           AND status <> 'settled'
+           AND jsonb_typeof(metadata->'totalReceived') = 'string'
+           AND (NOT (metadata ? 'pendingSwap') OR metadata->'pendingSwap' = 'null'::jsonb)
+           AND EXISTS (
+             SELECT 1 FROM execution_attempts
+              WHERE execution_attempts.position_id = positions.id
+                AND execution_attempts.stage = 'remove_liquidity'
+                AND execution_attempts.status = 'confirmed'
+           )
+         RETURNING COALESCE(NULLIF(metadata->>'exitTrigger', ''), 'settled') AS trigger`,
+        [positionId],
+      );
+      if (!result.rowCount) return false;
+      await this.finalizeCloseHistoryWithClient(client, positionId, result.rows[0]!.trigger);
+      return true;
+    });
   }
 
   async setTrailingStopState(positionId: string, state: TrailingStopState): Promise<void> {
@@ -1805,7 +2071,15 @@ FROM position_groups g
   }
 
   async getCashflowTotals(positionId: string, excludedTransactionHashes: string[] = []): Promise<{ deposits: bigint; realized: bigint }> {
-    const result = await this.pool.query<{ deposits: string; realized: string }>(
+    return this.getCashflowTotalsWithClient(this.pool, positionId, excludedTransactionHashes);
+  }
+
+  private async getCashflowTotalsWithClient(
+    client: Pool | PoolClient,
+    positionId: string,
+    excludedTransactionHashes: string[] = [],
+  ): Promise<{ deposits: bigint; realized: bigint }> {
+    const result = await client.query<{ deposits: string; realized: string }>(
       `SELECT
         COALESCE(SUM(quote_value) FILTER (WHERE flow_type = 'deposit'), 0) AS deposits,
         COALESCE(SUM(quote_value) FILTER (WHERE flow_type IN ('withdrawal', 'fee')), 0) AS realized
@@ -1895,7 +2169,7 @@ FROM position_groups g
           position_id, pnl_bps, liquidation_quote, realized_quote, deposits_quote, block_number, fee_quote_usdg, created_at
        FROM pnl_snapshots
        WHERE position_id = ANY($1::uuid[])
-       ORDER BY position_id, created_at DESC`,
+       ORDER BY position_id, block_number DESC, created_at DESC, id DESC`,
       [positionIds],
     );
     const map = new Map<string, { pnlBps: bigint; liquidationQuote: bigint; realizedQuote: bigint; depositsQuote: bigint; blockNumber: bigint; feeQuoteUsdg: bigint; createdAt: Date }>();
@@ -2527,7 +2801,7 @@ FROM position_groups g
              FROM pnl_snapshots
             WHERE position_id = p.id
               AND created_at <= h.settled_at
-            ORDER BY created_at DESC
+            ORDER BY block_number DESC, created_at DESC, id DESC
             LIMIT 1
          ) snapshot ON TRUE
         WHERE p.id = $1
@@ -2589,7 +2863,7 @@ FROM position_groups g
            FROM position_group_pnl_snapshots
           WHERE group_id = g.id
             AND (g.settled_at IS NULL OR created_at <= g.settled_at)
-          ORDER BY created_at DESC, id DESC
+         ORDER BY block_number DESC, created_at DESC, id DESC
           LIMIT 1
        ) snapshot ON TRUE
       WHERE g.id = $1
@@ -2642,7 +2916,15 @@ FROM position_groups g
   }
 
   async finalizeCloseHistory(positionId: string, trigger: string): Promise<boolean> {
-    const pos = await this.pool.query<{
+    return this.finalizeCloseHistoryWithClient(this.pool, positionId, trigger);
+  }
+
+  private async finalizeCloseHistoryWithClient(
+    client: Pool | PoolClient,
+    positionId: string,
+    trigger: string,
+  ): Promise<boolean> {
+    const pos = await client.query<{
       chain_id: number; protocol: Protocol; position_key: string; status: PositionStatus;
       token0: string; token1: string; quote_token: string;
       metadata: Record<string, unknown>;
@@ -2658,13 +2940,13 @@ FROM position_groups g
 
     const meta = row.metadata;
     if (meta.historyExcluded === true) {
-      await this.pool.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);
+      await client.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);
       return false;
     }
     if (typeof meta.totalReceived !== "string") return false;
     const totalReceived = BigInt(meta.totalReceived);
 
-    const attempts = await this.pool.query<{ stage: string; transaction_hash: string }>(
+    const attempts = await client.query<{ stage: string; transaction_hash: string }>(
       `SELECT DISTINCT ON (stage) stage, transaction_hash
        FROM execution_attempts
        WHERE position_id = $1 AND status = 'confirmed' AND transaction_hash IS NOT NULL
@@ -2683,10 +2965,14 @@ FROM position_groups g
     const swapTx = attemptedSwapTx ?? metadataSwapTx;
     const closeSettlement = typeof meta.settlementQuoteFromClose === "string" ? BigInt(meta.settlementQuoteFromClose) : null;
     if (swapTx && closeSettlement !== null && totalReceived <= closeSettlement) {
-      await this.pool.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);
+      await client.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);
       return false;
     }
-    const totals = await this.getCashflowTotals(positionId, [closeTx, swapTx].filter((hash): hash is string => hash !== null));
+    const totals = await this.getCashflowTotalsWithClient(
+      client,
+      positionId,
+      [closeTx, swapTx].filter((hash): hash is string => hash !== null),
+    );
     if (totals.deposits === 0n) return false;
     const finalPnl = totals.realized + totalReceived - totals.deposits;
     const finalPnlBps = (finalPnl * 10000n) / totals.deposits;
@@ -2707,11 +2993,11 @@ FROM position_groups g
       ? finalPnlUsd > -HISTORY_MIN_PNL_USD && finalPnlUsd < HISTORY_MIN_PNL_USD
       : finalPnlBps > -HISTORY_MIN_PNL_BPS && finalPnlBps < HISTORY_MIN_PNL_BPS;
     if (belowHistoryThreshold) {
-      await this.pool.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);
+      await client.query("DELETE FROM close_history WHERE position_id = $1", [positionId]);
       return false;
     }
 
-    const updated = await this.pool.query(
+    const updated = await client.query(
       `UPDATE close_history
        SET final_pnl_bps = $2, final_pnl_quote = $3,
              final_pnl_usd = CASE
@@ -2726,7 +3012,7 @@ FROM position_groups g
     );
     if (updated.rowCount) return true;
 
-    await this.pool.query(
+    await client.query(
       `INSERT INTO close_history (position_id, chain_id, protocol, position_key, token0, token1, quote_token,
          final_pnl_bps, final_pnl_quote, final_pnl_usd, trigger, close_transaction_hash, swap_transaction_hash, settled_at, opened_at_block)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, COALESCE($14, NOW()), $15)`,

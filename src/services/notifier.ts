@@ -1147,7 +1147,7 @@ export class Notifier {
     const rangeStr = await this.formatPositionRange(position, rangeInfo);
     const base = `${index}. ${headerEmoji} ${pair}${feeLabel} · ${position.protocol.toUpperCase()}${operationalStatus}${reviewReason}${autoExitDisabled}`;
     const valueLine = `   💰 ${cv} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${pnlArrow} ${pnlSign}${pnlPct}%${trailingPeak}${trailingDisabledDisplay(position.metadata)}`;
-    return `${base}\n${valueLine}${formatExactQuoteLine(exact)}${rangeStr}\n`;
+    return `${base}\n${valueLine}${formatExactQuoteLine(exact)}${rangeStr}${snapshotFreshnessLine(snapshot)}\n`;
   }
 
   private async formatGroupStatusLine(position: PositionRecord, database: Database, index: number, exact?: PositionGroupExactQuote): Promise<string> {
@@ -1174,7 +1174,7 @@ export class Notifier {
     const trailingPeak = trailingPeakDisplay(position.metadata);
     const valueLine = `   💰 ${value} ${qtSymbol} · 🪙 ≈$${formatToken(feeUsdg, 6, 2)} · ${arrow} ${sign}${formatBps(snapshot.pnlBps)}%${trailingPeak}${trailingDisabledDisplay(position.metadata)}`;
     const rangeLine = await this.formatGroupPositionRange(position, snapshot, bins);
-    return `${base}\n${valueLine}${formatExactQuoteLine(exact)}${rangeLine}\n`;
+    return `${base}\n${valueLine}${formatExactQuoteLine(exact)}${rangeLine}${snapshotFreshnessLine(snapshot)}\n`;
   }
 
   private async groupFeeLabel(position: PositionRecord, database: Database): Promise<string> {
@@ -3457,6 +3457,14 @@ export function formatRangePrices(
     cur: ((current + halfDivisor) / divisor).toString(),
     high: ((maximum + halfDivisor) / divisor).toString(),
   };
+}
+
+export function snapshotFreshnessLine(snapshot: { createdAt: Date; blockNumber: bigint }, now = Date.now()): string {
+  const timestamp = snapshot.createdAt?.getTime();
+  if (!Number.isFinite(timestamp)) return "\n   ⚠️ DATA STALE · usia snapshot tidak diketahui";
+  const age = Math.max(0, now - timestamp);
+  if (age <= 90_000) return "";
+  return `\n   ⚠️ DATA STALE · snapshot ${Math.floor(age / 1000)}s lalu · block ${snapshot.blockNumber}`;
 }
 
 export function formatDashboardRangeStatus(

@@ -1,7 +1,30 @@
+import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 
 import { Database } from "../src/db.js";
+import { log } from "../src/log.js";
+import {
+  EvaluationCancelledError,
+  evaluationWait,
+  runEvaluation,
+  type EvaluationContext,
+} from "../src/services/evaluation-context.js";
 import { isRiskSettings } from "../src/types.js";
+
+function testPoolClient(query: (...args: any[]) => any, release = vi.fn()) {
+  return Object.assign(new EventEmitter(), { query, release });
+}
+
+function evaluationContext(deadline: number): EvaluationContext {
+  return {
+    id: "evaluation",
+    kind: "position",
+    entityId: "position",
+    generation: "1",
+    deadline,
+    signal: new AbortController().signal,
+  };
+}
 
 describe("Database native USD backfill", () => {
   it("rejects malformed persisted risk settings", () => {
@@ -26,6 +49,157 @@ describe("Database native USD backfill", () => {
       trailingStopDrawdownPercent: 1.5,
       bidAskLadderV4MaxOpenGasUsd: 2,
     })).toBe(false);
+  });
+
+  it("releases a transaction client and removes its error listener", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [] });
+    const client = testPoolClient(query);
+    Object.defineProperty(database, "pool", { value: { connect: vi.fn().mockResolvedValue(client) } });
+
+    await expect(database.transaction(async () => "result")).resolves.toBe("result");
+
+    expect(client.release).toHaveBeenCalledWith(false);
+    expect(client.listenerCount("error")).toBe(0);
+  });
+
+  it("releases a checked-out client when listener setup throws", async () => {
+    const database = new Database("postgres://unused");
+    const client = testPoolClient(vi.fn().mockResolvedValue({ rowCount: 1, rows: [] }));
+    vi.spyOn(client, "on").mockImplementation(() => {
+      throw new Error("listener setup failed");
+    });
+    Object.defineProperty(database, "pool", { value: { connect: vi.fn().mockResolvedValue(client) } });
+
+    await expect(database.transaction(async () => "result")).rejects.toThrow("listener setup failed");
+
+    expect(client.release).toHaveBeenCalledWith(false);
+  });
+
+  it("destroys a checked-out client when its connection fails", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [] });
+    const client = testPoolClient(query);
+    Object.defineProperty(database, "pool", { value: { connect: vi.fn().mockResolvedValue(client) } });
+    const connectionError = new Error("connection reset");
+
+    const outcome = database.transaction(async () => {
+      client.emit("error", connectionError);
+      await new Promise(() => {});
+    });
+
+    await expect(outcome).rejects.toBe(connectionError);
+    expect(query.mock.calls.some(([sql]) => sql === "ROLLBACK")).toBe(false);
+    expect(client.release).toHaveBeenCalledWith(true);
+    expect(client.listenerCount("error")).toBe(0);
+  });
+
+  it("releases exactly once when pool.connect resolves after an evaluation timeout", async () => {
+    const database = new Database("postgres://unused");
+    let resolveConnect!: (client: ReturnType<typeof testPoolClient>) => void;
+    const connect = vi.fn(() => new Promise<ReturnType<typeof testPoolClient>>((resolve) => {
+      resolveConnect = resolve;
+    }));
+    Object.defineProperty(database, "pool", { value: { connect } });
+    const context = evaluationContext(Date.now() + 20);
+
+    const outcome = runEvaluation(context, () => database.transaction(async () => undefined)).catch((error) => error);
+    await expect(outcome).resolves.toBeInstanceOf(EvaluationCancelledError);
+
+    const client = testPoolClient(vi.fn());
+    resolveConnect(client);
+    await vi.waitFor(() => expect(client.release).toHaveBeenCalledTimes(1));
+    expect(client.release).toHaveBeenCalledWith(true);
+  });
+
+  it("destroys the client without rollback when COMMIT exceeds the evaluation deadline", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("SELECT evaluation_generation")) {
+        return { rowCount: 1, rows: [{ evaluation_generation: "1", evaluation_valid: true }] };
+      }
+      if (sql.includes("clock_timestamp()")) return { rowCount: 1, rows: [{ valid: true }] };
+      if (sql === "COMMIT") return new Promise(() => {});
+      return { rowCount: 1, rows: [] };
+    });
+    const client = testPoolClient(query);
+    Object.defineProperty(database, "pool", { value: { connect: vi.fn().mockResolvedValue(client) } });
+    const context = evaluationContext(Date.now() + 100);
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => undefined);
+
+    const outcome = await runEvaluation(context, () => database.transaction(async () => "result")).catch((error) => error);
+
+    expect(outcome).toBeInstanceOf(EvaluationCancelledError);
+    expect(query.mock.calls.some(([sql]) => sql === "COMMIT")).toBe(true);
+    expect(query.mock.calls.some(([sql]) => sql === "ROLLBACK")).toBe(false);
+    expect(client.release).toHaveBeenCalledWith(true);
+    expect(client.listenerCount("error")).toBe(0);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ err: expect.any(EvaluationCancelledError) }),
+      expect.stringContaining("uncertain"),
+    );
+    warn.mockRestore();
+  });
+
+  it("rejects late application queries after timeout and destroys the client", async () => {
+    const database = new Database("postgres://unused");
+    const lateSql = "INSERT INTO guarded_late_query (value) VALUES (1)";
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("SELECT evaluation_generation")) {
+        return { rowCount: 1, rows: [{ evaluation_generation: "1", evaluation_valid: true }] };
+      }
+      return { rowCount: 1, rows: [] };
+    });
+    const client = testPoolClient(query);
+    Object.defineProperty(database, "pool", { value: { connect: vi.fn().mockResolvedValue(client) } });
+    const context = evaluationContext(Date.now() + 30);
+    let resume!: () => void;
+    const delayed = new Promise<void>((resolve) => { resume = resolve; });
+    let lateError: unknown;
+
+    const transaction = runEvaluation(context, () => database.transaction(async (guardedClient) => {
+      await delayed;
+      try {
+        await guardedClient.query(lateSql);
+      } catch (error) {
+        lateError = error;
+        throw error;
+      }
+    }));
+    const outcome = transaction.catch((error) => error);
+
+    await expect(evaluationWait(transaction, context)).rejects.toBeInstanceOf(EvaluationCancelledError);
+    resume();
+
+    await expect(outcome).resolves.toBeInstanceOf(EvaluationCancelledError);
+    expect(lateError).toBeInstanceOf(EvaluationCancelledError);
+    expect(query.mock.calls.some(([sql]) => sql === lateSql)).toBe(false);
+    expect(client.release).toHaveBeenCalledWith(true);
+    expect(client.listenerCount("error")).toBe(0);
+  });
+
+  it("destroys a client when BEGIN never resolves without an evaluation context", async () => {
+    vi.useFakeTimers();
+    try {
+      const database = new Database("postgres://unused");
+      const query = vi.fn((sql: string) => sql === "BEGIN"
+        ? new Promise(() => {})
+        : Promise.resolve({ rowCount: 1, rows: [] }));
+      const client = testPoolClient(query);
+      Object.defineProperty(database, "pool", { value: { connect: vi.fn().mockResolvedValue(client) } });
+
+      const outcome = database.transaction(async () => "unreachable").catch((error) => error);
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await expect(outcome).resolves.toMatchObject({
+        name: "DatabaseControlTimeoutError",
+        message: "postgres BEGIN timed out",
+      });
+      expect(client.release).toHaveBeenCalledWith(true);
+      expect(client.listenerCount("error")).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("persists one global risk-settings override", async () => {
@@ -190,7 +364,7 @@ describe("Database native USD backfill", () => {
       .mockResolvedValueOnce({})
       .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "history" }] })
       .mockResolvedValueOnce({});
-    const connect = vi.fn().mockResolvedValue({ query: clientQuery, release: vi.fn() });
+    const connect = vi.fn().mockResolvedValue(testPoolClient(clientQuery));
     Object.defineProperty(database, "pool", { value: { connect } });
 
     await expect(database.finalizePositionGroup("group", "0xclose", 100n, 2n, 200n, "manual", 123n)).resolves.toBe(true);
@@ -316,12 +490,36 @@ describe("Database native USD backfill", () => {
     const metadata = {
       trailingStopExpected: { peakPnlBps: 4_610n, activatedAtBlock: 50_847_048n },
     };
-    await expect(database.setPositionStatus("position", "armed", metadata)).resolves.toBeUndefined();
+    await expect(database.setPositionStatus("position", "armed", metadata)).resolves.toBe(true);
     await expect(database.setPositionStatusUnlessSettled("position", "closing", metadata)).resolves.toBe(true);
 
     const serialized = '{"trailingStopExpected":{"peakPnlBps":"4610","activatedAtBlock":"50847048"}}';
-    expect(query.mock.calls[0]![1]).toEqual(["position", "armed", serialized]);
+    expect(query.mock.calls[0]![1]).toEqual(["position", "armed", serialized, null]);
     expect(query.mock.calls[1]![1]).toEqual(["position", "closing", serialized]);
+  });
+
+  it("atomically checks expected status and blocks stale position revivals", async () => {
+    const database = new Database("postgres://unused");
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "position" }] })
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] });
+    Object.defineProperty(database, "pool", { value: { query } });
+
+    await expect(database.setPositionStatus("position", "settled", { reason: "complete" }, "closing")).resolves.toBe(true);
+    await expect(database.setPositionStatus("position", "armed", undefined, "closing")).resolves.toBe(false);
+
+    const sql = query.mock.calls[0]![0] as string;
+    expect(sql).toContain("NOT (status = 'settled' AND $2::text <> 'settled')");
+    expect(sql).toContain("NOT (status = 'cancelled' AND $2::text <> 'cancelled')");
+    expect(sql).toContain("NOT (status = 'closing' AND $2::text IN ('discovered', 'syncing', 'armed'))");
+    expect(sql).toContain("AND ($4::text IS NULL OR status = $4::text)");
+    expect(query.mock.calls[0]![1]).toEqual([
+      "position",
+      "settled",
+      JSON.stringify({ reason: "complete" }),
+      "closing",
+    ]);
+    expect(query.mock.calls[1]![1]).toEqual(["position", "armed", "{}", "closing"]);
   });
 
   it("renews a settlement lease only while the worker still owns it", async () => {
@@ -483,7 +681,7 @@ describe("Database native USD backfill", () => {
       .mockResolvedValueOnce({ rows: [{ id: "group" }] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "history" }] })
       .mockResolvedValueOnce({});
-    const connect = vi.fn().mockResolvedValue({ query: clientQuery, release: vi.fn() });
+    const connect = vi.fn().mockResolvedValue(testPoolClient(clientQuery));
     Object.defineProperty(database, "pool", { value: { connect } });
 
     await expect(database.backfillPositionGroupHistory(["group"])).resolves.toBe(1);
@@ -773,16 +971,53 @@ describe("Database native USD backfill", () => {
 
   it("recovers only receipt-backed settlements after liquidity reaches zero", async () => {
     const database = new Database("postgres://unused");
-    const query = vi.fn()
-      .mockResolvedValueOnce({ rowCount: 1, rows: [{ trigger: "out_of_range_above" }] })
-      .mockResolvedValueOnce({ rowCount: 0, rows: [] });
-    Object.defineProperty(database, "pool", { value: { query } });
+    const query = vi.fn(async (sql: string) => {
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+        return { rowCount: null, rows: [] };
+      }
+      if (sql.includes("UPDATE positions")) {
+        return { rowCount: 1, rows: [{ trigger: "out_of_range_above" }] };
+      }
+      if (sql.includes("SELECT chain_id")) {
+        return {
+          rowCount: 1,
+          rows: [{
+            chain_id: 4663,
+            protocol: "v4",
+            position_key: "position",
+            status: "settled",
+            token0: "0xtoken0",
+            token1: "0xtoken1",
+            quote_token: "0xquote",
+            metadata: { totalReceived: "20", closeTransactionHash: "0xclose" },
+            opened_at_block: null,
+            updated_at: "2026-08-12T00:00:00Z",
+          }],
+        };
+      }
+      if (sql.includes("FROM execution_attempts")) {
+        return { rowCount: 1, rows: [{ stage: "remove_liquidity", transaction_hash: "0xclose" }] };
+      }
+      if (sql.includes("FROM cashflows")) {
+        return { rowCount: 1, rows: [{ deposits: "10", realized: "0" }] };
+      }
+      if (sql.includes("UPDATE close_history")) {
+        return { rowCount: 1, rows: [] };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    });
+    const client = testPoolClient(query);
+    Object.defineProperty(database, "pool", { value: { connect: vi.fn().mockResolvedValue(client) } });
 
     await expect(database.recoverVerifiedSettlement("position")).resolves.toBe(true);
 
-    expect(query.mock.calls[0]![0]).toContain("jsonb_typeof(metadata->'totalReceived') = 'string'");
-    expect(query.mock.calls[0]![0]).toContain("execution_attempts.status = 'confirmed'");
-    expect(query.mock.calls[1]![0]).toContain("SELECT chain_id");
+    const sql = query.mock.calls.map(([statement]) => statement);
+    const recoveryUpdate = sql.find((statement) => statement.includes("UPDATE positions"));
+    expect(recoveryUpdate).toContain("jsonb_typeof(metadata->'totalReceived') = 'string'");
+    expect(recoveryUpdate).toContain("execution_attempts.status = 'confirmed'");
+    expect(sql.some((statement) => statement.includes("SELECT chain_id"))).toBe(true);
+    expect(sql.at(-1)).toBe("COMMIT");
+    expect(client.release).toHaveBeenCalledWith(false);
   });
 });
 
@@ -790,7 +1025,7 @@ describe('persistent market discovery', () => {
   it('upserts one page and advances its cursor in the same transaction without clearing live candidates', async () => {
     const database = new Database('postgres://unused');
     const query = vi.fn(async () => ({ rows: [], rowCount: 1 }));
-    const client = { query, release: vi.fn() };
+    const client = testPoolClient(query);
     Object.defineProperty(database, 'pool', { value: { connect: vi.fn(async () => client) } });
     await database.saveMarketDiscoveryPage('robinhood', 'new_pools?page=1', 1,
       [{tokenAddress:'0xABC', seedScore:0}], [{poolId:'0xDEF', tvlUsd:6000}]);
@@ -812,7 +1047,7 @@ describe('persistent market discovery', () => {
       if (sql.includes('INSERT INTO pool_scan_tvl_snapshots')) throw new Error('storage failed');
       return { rows: [], rowCount: 1 };
     });
-    Object.defineProperty(database, 'pool', { value: { connect: vi.fn(async () => ({query,release:vi.fn()})) } });
+    Object.defineProperty(database, 'pool', { value: { connect: vi.fn(async () => testPoolClient(query)) } });
     await expect(database.saveMarketDiscoveryPage('robinhood','page',1,[],[{poolId:'0xabc',tvlUsd:5}])).rejects.toThrow('storage failed');
     expect(query.mock.calls.at(-1)![0]).toBe('ROLLBACK');
     expect(query.mock.calls.some(([sql]) => sql.includes('INSERT INTO pool_scan_discovery_state'))).toBe(false);

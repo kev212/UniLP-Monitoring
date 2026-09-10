@@ -1,6 +1,7 @@
 import { decodeFunctionData, isAddress, isHex, parseAbi, zeroAddress, type Address, type Hex } from "viem";
 
 import type { PositionRecord, TransactionPlan } from "../types.js";
+import { combinedEvaluationSignal, evaluationCacheKey, assertEvaluationActive, evaluationWait } from "./evaluation-context.js";
 
 const API_URL = "https://aggregator-api.kyberswap.com";
 const KYBER_ROUTER = "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5" as Address;
@@ -52,15 +53,15 @@ export class KyberSwapAggregatorApi {
     amountIn: bigint,
     tokenOut: Address,
     slippageBps = this.defaultSlippageBps,
-    opts?: { budget?: boolean },
+    opts?: { budget?: boolean; signal?: AbortSignal },
   ): Promise<KyberSwapQuote | null> {
     if (this.now() < this.quoteRateLimitedUntil) return null;
     const budgeted = opts?.budget === true;
     if (budgeted && this.budgetExhausted()) return null;
-    const requestKey = `${position.chainId}:${tokenIn.toLowerCase()}:${tokenOut.toLowerCase()}:${amountIn}:${slippageBps}`;
+    const requestKey = `${position.chainId}:${tokenIn.toLowerCase()}:${tokenOut.toLowerCase()}:${amountIn}:${slippageBps}:${evaluationCacheKey()}`;
     const existing = this.inFlight.get(requestKey);
     if (existing) return existing;
-    const pending = this.quoteUncached(position, tokenIn, amountIn, tokenOut, slippageBps, budgeted)
+    const pending = evaluationWait(this.quoteUncached(position, tokenIn, amountIn, tokenOut, slippageBps, budgeted, opts?.signal))
       .finally(() => this.inFlight.delete(requestKey));
     this.inFlight.set(requestKey, pending);
     return pending;
@@ -79,6 +80,7 @@ export class KyberSwapAggregatorApi {
     tokenOut: Address,
     slippageBps: number,
     budgeted: boolean,
+    signal?: AbortSignal,
   ): Promise<KyberSwapQuote | null> {
     const chain = CHAIN_NAMES[position.chainId];
     if (!chain) return null;
@@ -100,8 +102,9 @@ export class KyberSwapAggregatorApi {
     });
     const response = await this.request(`${API_URL}/${chain}/api/v1/routes?${query}`, {
       headers: { Accept: "application/json", "x-client-id": this.clientId },
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: signal ? AbortSignal.any([signal, combinedEvaluationSignal(this.timeoutMs)]) : combinedEvaluationSignal(this.timeoutMs),
     });
+    assertEvaluationActive();
     const body = await readJson(response);
     if (response.status === 429) {
       this.quoteRateLimitedUntil = this.now() + QUOTE_RATE_LIMIT_COOLDOWN_MS;

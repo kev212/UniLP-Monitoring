@@ -2,6 +2,40 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { RuntimeConfig } from "../src/config.js";
 import type { PositionOpener } from "../src/services/position-opener.js";
+import { snapshotFreshnessLine } from "../src/services/notifier.js";
+
+describe("monitoring snapshot freshness", () => {
+  it("marks an old snapshot stale independently of render time", () => {
+    const snapshot = { createdAt: new Date(0), blockNumber: 59617011n };
+    expect(snapshotFreshnessLine(snapshot, 90_000)).toBe("");
+    expect(snapshotFreshnessLine(snapshot, 91_000)).toContain("DATA STALE · snapshot 91s lalu · block 59617011");
+    expect(snapshotFreshnessLine(snapshot, 120_000)).toContain("snapshot 120s lalu");
+  });
+
+  it("does not label unknown timestamps as fresh", () => {
+    expect(snapshotFreshnessLine({ createdAt: new Date(NaN), blockNumber: 1n })).toContain("usia snapshot tidak diketahui");
+  });
+
+  it("renders MARIO quote-token0 crossing the upper tick as OOR BELOW", async () => {
+    const { sqrtRatioAtTick } = await import("../src/services/uniswap-math.js");
+    const notifier = Object.create(Notifier.prototype) as any;
+    notifier.decimals = vi.fn().mockImplementation(async (token: string) => token === "quote" ? 6 : 18);
+    notifier.quoteSymbol = vi.fn().mockReturnValue("USDG");
+    const position = {
+      protocol: "v4", chainId: 4663, token0: "quote", token1: "mario", quoteToken: "quote",
+      metadata: { outerTickLower: 330786, outerTickUpper: 338400 },
+    };
+    const before = await notifier.formatGroupPositionRange(position, {
+      rangeCurrentTick: 335192, rangeCurrentSqrtPrice: sqrtRatioAtTick(335192),
+    }, 5);
+    expect(before).toContain("33% · 5 bins");
+    const after = await notifier.formatGroupPositionRange(position, {
+      rangeCurrentTick: 338401, rangeCurrentSqrtPrice: sqrtRatioAtTick(338401),
+    }, 5);
+    expect(after).toContain("OOR BELOW · 5 bins");
+    expect(after).not.toContain("33%");
+  });
+});
 import { canRequestManualClose, chainButtonLabel, clampDashboardPage, formatBidAskLadderReview, formatDashboardRangeStatus, formatFeeTier, formatRangePrices, groupFeeTier, invokeBidAskOpenerMethod, isDashboardVisibleGroup, isExpiredCallbackError, Notifier, parseBidAskPoolInput, parseBidAskRangeInput, parseDashboardAction, parseInvestigateInput, parseOpenPoolInput, parseRiskSettingInput, parseScanInput, parseScanPoolsInput, parseScanV2Input, positionRangeBins, positionRangeLine, soleEnabledChain, trailingDisabledDisplay, trailingPeakDisplay, trailingTogglePatch } from "../src/services/notifier.js";
 
 describe("Telegram dashboard callbacks", () => {

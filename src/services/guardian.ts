@@ -12,6 +12,16 @@ import type { PnlService } from "./pnl.js";
 import { isRpcRateLimited } from "../rpc.js";
 import { hasPendingSettlement } from "./pending-settlement.js";
 import { quoteRangeState } from "./quote-range.js";
+import {
+  assertEvaluationActive,
+  childEvaluation,
+  currentEvaluation,
+  EvaluationCancelledError,
+  type EvaluationContext,
+  evaluationWait,
+  runEvaluation,
+  withoutEvaluation,
+} from "./evaluation-context.js";
 
 const POSITION_EVALUATION_TIMEOUT_MS = 60_000;
 const TRAILING_HARD_FLOOR_DROP_BPS = 200n;
@@ -20,6 +30,8 @@ const EXACT_PROBE_REFRESH_MS = 60_000;
 const EXACT_PROBE_NEAR_REFRESH_MS = 10_000;
 const EXACT_PROBE_GUARD_BPS = 100n;
 
+function attemptAlive(attempt?: EvaluationContext): void { assertEvaluationActive(attempt); }
+
 export class Guardian {
   private readonly lastEvaluatedBlock = new Map<number, bigint>();
   private readonly evaluatedAtBlock = new Map<string, bigint>();
@@ -27,8 +39,10 @@ export class Guardian {
   private readonly queuedExitPositions = new Set<string>();
   private monitorRunning = false;
   private readonly chainMonitorRunning = new Set<string>();
-  private readonly positionEvaluations = new Set<string>();
-  private readonly groupEvaluations = new Set<string>();
+  private readonly positionEvaluations = new Map<string, string>();
+  private readonly groupEvaluations = new Map<string, string>();
+  private readonly timedOutGroups = new Set<string>();
+  private readonly timedOutPositions = new Set<string>();
   private readonly groupExactEvaluatedAt = new Map<string, number>();
   private readonly positionExactEvaluatedAt = new Map<string, number>();
   private readonly groupExactCache = new Map<string, { at: number; snapshot: PositionGroupPnlSnapshot }>();
@@ -126,7 +140,7 @@ export class Guardian {
     for (const position of positions) {
       let candidate = position;
       if (candidate.protocol === "v4") {
-        if (await this.executor.settleExternallyClosedV4(candidate)) continue;
+        if (await withoutEvaluation(() => this.executor.settleExternallyClosedV4(candidate))) continue;
       } else if (isInactiveReviewReason(candidate.metadata.reason)) {
         const settled = await this.database.settleUnverifiedZeroLiquidity(candidate.id, "externally_closed");
         if (settled) {
@@ -153,7 +167,10 @@ export class Guardian {
         candidate = repaired;
       }
 
-      await this.database.setPositionStatus(candidate.id, "syncing", { needsReviewRetriedAt: new Date().toISOString(), reason: null });
+      await this.setPositionStatusFromSnapshot(candidate, {
+        needsReviewRetriedAt: new Date().toISOString(),
+        reason: null,
+      }, "syncing");
       await this.evaluatePosition(name, { ...candidate, status: "syncing" }, blockNumber);
     }
   }
@@ -213,21 +230,44 @@ export class Guardian {
 
   private async evaluatePositionGroupWithTimeout(name: ChainName, group: PositionGroupRecord, blockNumber: bigint): Promise<boolean> {
     if (this.groupEvaluations.has(group.id)) return false;
-    this.groupEvaluations.add(group.id);
-    const evaluation = this.evaluatePositionGroup(name, group, blockNumber);
-    void evaluation.finally(() => this.groupEvaluations.delete(group.id)).catch(() => {});
+    const controller = new AbortController();
+    const deadline = Date.now() + POSITION_EVALUATION_TIMEOUT_MS;
+    const timeoutMs = Math.max(1, deadline - Date.now());
+    const attempt: EvaluationContext = { id: crypto.randomUUID(), kind: "group", entityId: group.id, deadline, signal: controller.signal };
+    this.groupEvaluations.set(group.id, attempt.id);
+    const evaluation = runEvaluation(attempt, async () => {
+      if (typeof this.database.beginEvaluation === "function") attempt.generation = await this.database.beginEvaluation("group", group.id, deadline);
+      return this.evaluatePositionGroup(name, group, blockNumber, attempt);
+    });
     try {
-      return await withTimeout(evaluation, POSITION_EVALUATION_TIMEOUT_MS);
+      const result = await withTimeout(evaluation, timeoutMs, () => {
+        controller.abort();
+        if (this.groupEvaluations.get(group.id) === attempt.id) this.groupEvaluations.delete(group.id);
+      });
+      if (result && this.timedOutGroups.delete(group.id)) {
+        log.info({ groupId: group.id, attemptId: attempt.id, blockNumber }, "position group valuation recovered after prior timeout");
+      }
+      return result;
     } catch (error) {
-      log.warn({ err: error, groupId: group.id, timeoutMs: POSITION_EVALUATION_TIMEOUT_MS }, "position group valuation timed out; continuing monitor cycle");
+      if (!this.timedOutGroups.has(group.id)) {
+        this.timedOutGroups.add(group.id);
+        log.warn({ err: error, groupId: group.id, attemptId: attempt.id, blockNumber, stage: attempt.stage, timeoutMs }, "position group valuation timed out; continuing monitor cycle");
+      }
       return false;
+    } finally {
+      controller.abort();
+      if (this.groupEvaluations.get(group.id) === attempt.id) this.groupEvaluations.delete(group.id);
+      void evaluation.catch(() => {});
     }
   }
 
-  private async evaluatePositionGroup(name: ChainName, group: PositionGroupRecord, blockNumber: bigint): Promise<boolean> {
+  private async evaluatePositionGroup(name: ChainName, group: PositionGroupRecord, blockNumber: bigint, attempt?: EvaluationContext): Promise<boolean> {
     try {
+      attemptAlive(attempt);
+      if (attempt) attempt.stage = "valuation";
       if (group.status === "settled" || group.metadata.settlementPhase === "complete") return true;
-      const valued = await this.pnl.valueGroup(group, blockNumber);
+      const valued = await this.pnl.valueGroup(group, blockNumber, undefined, true, false, false);
+      attemptAlive(attempt);
       const syntheticSnapshot: PnlSnapshot = {
         positionId: group.id,
         quoteToken: valued.snapshot.quoteToken,
@@ -263,11 +303,14 @@ export class Guardian {
       let exactSnapshot = cacheFresh ? cachedExact.snapshot : null;
       if (!cacheFresh) {
         try {
-          const exact = await this.pnl.valueGroupExactProbe(group, blockNumber, this.exactProbeSlippageBps(), { budget: !urgent });
+          if (attempt) attempt.stage = "exact_probe";
+          const exact = await childEvaluation(15_000, () => this.pnl.valueGroupExactProbe(group, blockNumber, this.exactProbeSlippageBps(), { budget: !urgent }));
+          attemptAlive(attempt);
           this.groupExactEvaluatedAt.set(group.id, now);
           this.groupExactCache.set(group.id, { at: now, snapshot: exact.snapshot });
           exactSnapshot = exact.snapshot;
         } catch (error) {
+          if (error instanceof EvaluationCancelledError) assertEvaluationActive(attempt);
           log.warn({ err: error, groupId: group.id, urgent }, "position group exact quote refresh deferred");
         }
       }
@@ -375,6 +418,8 @@ export class Guardian {
           : group;
         if (!(await this.allowGroupAfterTwapWait(slGroup, "stop_loss", valued.twapGuard.deviationBps))) return true;
       }
+      attemptAlive(attempt);
+      if (attempt) attempt.stage = "handoff";
       const stillActive = await this.database.setPositionGroupStatus(group.id, group.status, {
         exitTrigger: trigger,
         exitSnapshot: {
@@ -392,9 +437,11 @@ export class Guardian {
         return true;
       }
       log.warn({ groupId: group.id, chain: name, trigger, pnlBps: exitSnapshot.pnlBps, quoteIsToken0 }, "position group exit triggered");
-      await this.executor.executeRelatedGroup(group.id, trigger);
+      attemptAlive(attempt);
+      await withoutEvaluation(() => this.executor.executeRelatedGroup(group.id, trigger));
       return true;
     } catch (error) {
+      if (error instanceof EvaluationCancelledError || attempt?.signal.aborted) return false;
       if (isRpcRateLimited(error)) {
         log.warn({ err: error, chain: name, groupId: group.id }, "position group RPC limited; retrying next monitor cycle");
         return false;
@@ -404,7 +451,7 @@ export class Guardian {
         return false;
       }
       const reason = error instanceof Error ? error.message : String(error);
-      if (/zero liquidity/i.test(reason) && await this.executor.settleEmptyV3Group(group)) return true;
+      if (/zero liquidity/i.test(reason) && await withoutEvaluation(() => this.executor.settleEmptyV3Group(group))) return true;
       if (/Position group child|zero liquidity|NOT_MINTED|different pool|different token pair|ticks differ/i.test(reason)) {
         await this.database.setPositionGroupStatus(group.id, "needs_review", {
           reason: "position_group_child_integrity_changed",
@@ -419,25 +466,46 @@ export class Guardian {
   }
 
   private async evaluatePositionWithTimeout(name: ChainName, position: PositionRecord, blockNumber: bigint): Promise<boolean> {
-    if (this.positionEvaluations.has(position.id)) return true;
+    if (this.positionEvaluations.has(position.id)) return false;
 
-    this.positionEvaluations.add(position.id);
-    const evaluation = this.evaluatePosition(name, position, blockNumber);
-    void evaluation.finally(() => this.positionEvaluations.delete(position.id)).catch(() => {});
+    const controller = new AbortController();
+    const deadline = Date.now() + POSITION_EVALUATION_TIMEOUT_MS;
+    const timeoutMs = Math.max(1, deadline - Date.now());
+    const attempt: EvaluationContext = { id: crypto.randomUUID(), kind: "position", entityId: position.id, deadline, signal: controller.signal };
+    this.positionEvaluations.set(position.id, attempt.id);
+    const evaluation = runEvaluation(attempt, async () => {
+      if (typeof this.database.beginEvaluation === "function") attempt.generation = await this.database.beginEvaluation("position", position.id, deadline);
+      return this.evaluatePosition(name, position, blockNumber, attempt);
+    });
     try {
-      return await withTimeout(evaluation, POSITION_EVALUATION_TIMEOUT_MS);
+      const result = await withTimeout(evaluation, timeoutMs, () => {
+        controller.abort();
+        if (this.positionEvaluations.get(position.id) === attempt.id) this.positionEvaluations.delete(position.id);
+      });
+      if (result && this.timedOutPositions.delete(position.id)) {
+        log.info({ positionId: position.id, positionKey: position.positionKey, attemptId: attempt.id, blockNumber }, "position valuation recovered after prior timeout");
+      }
+      return result;
     } catch (error) {
-      log.warn({ err: error, positionId: position.id, positionKey: position.positionKey, timeoutMs: POSITION_EVALUATION_TIMEOUT_MS }, "position valuation timed out; continuing monitor cycle");
-      this.positionEvaluations.delete(position.id);
+      if (!this.timedOutPositions.has(position.id)) {
+        this.timedOutPositions.add(position.id);
+        log.warn({ err: error, positionId: position.id, positionKey: position.positionKey, attemptId: attempt.id, blockNumber, stage: attempt.stage, timeoutMs }, "position valuation timed out; continuing monitor cycle");
+      }
       // A timed-out RPC read is not a successful evaluation. Retrying is safer
       // than marking the block complete and leaving the position unmonitored.
       return false;
+    } finally {
+      controller.abort();
+      if (this.positionEvaluations.get(position.id) === attempt.id) this.positionEvaluations.delete(position.id);
+      void evaluation.catch(() => {});
     }
   }
 
-  private async evaluatePosition(name: ChainName, position: PositionRecord, blockNumber: bigint): Promise<boolean> {
+  private async evaluatePosition(name: ChainName, position: PositionRecord, blockNumber: bigint, attempt?: EvaluationContext): Promise<boolean> {
     const startedAt = Date.now();
     try {
+      if (attempt) attemptAlive(attempt);
+      if (attempt) attempt.stage = "valuation";
       if (hasPendingSettlement(position.status, position.metadata)) {
         if (position.metadata.settlementRetryDisabled === true) {
           await this.database.setPositionStatusUnlessSettled(position.id, "needs_review", {
@@ -446,7 +514,7 @@ export class Guardian {
           return true;
         }
         await this.database.setPositionStatusUnlessSettled(position.id, "closing", { reason: null });
-        await this.executor.resume({ ...position, status: "closing" });
+        await withoutEvaluation(() => this.executor.resume({ ...position, status: "closing" }));
         return true;
       }
       if (position.protocol === "v4" && position.status === "syncing") {
@@ -468,8 +536,11 @@ export class Guardian {
         }
       }
       const valued = await this.pnl.value(position, blockNumber);
+      if (attempt) attemptAlive(attempt);
       log.debug({ positionId: position.id, positionKey: position.positionKey, valuationMs: Date.now() - startedAt }, "position valued");
+      if (attempt) attemptAlive(attempt);
       await this.database.addPnlSnapshot(valued.snapshot);
+      if (attempt) attemptAlive(attempt);
       await this.notifier.logPnL(position, valued.snapshot);
       const trailingEnabled = position.metadata.trailingDisabled !== true;
       const localTrailing = trailingEnabled
@@ -489,10 +560,10 @@ export class Guardian {
           }, "trailing stop updated");
         }
         const firstArming = position.metadata.armedAtBlock === undefined || position.metadata.armedAtBlock === null;
-        await this.database.setPositionStatus(position.id, "armed", {
+        await this.setPositionStatusFromSnapshot(position, {
           armedAtBlock: blockNumber.toString(),
           twapReady: valued.twapGuard.ready,
-        });
+        }, "armed");
         if (firstArming) await this.notifier.armed(position, valued.snapshot);
         return true;
       }
@@ -516,12 +587,15 @@ export class Guardian {
       let exactRange = cacheFresh ? cachedExact.range : undefined;
       if (!cacheFresh) {
         try {
-          const exact = await this.pnl.valueExactProbe(position, blockNumber, this.exactProbeSlippageBps(), { budget: !urgent });
+          if (attempt) attempt.stage = "exact_probe";
+          const exact = await childEvaluation(15_000, () => this.pnl.valueExactProbe(position, blockNumber, this.exactProbeSlippageBps(), { budget: !urgent }));
+          if (attempt) attemptAlive(attempt);
           this.positionExactEvaluatedAt.set(position.id, now);
           this.positionExactCache.set(position.id, { at: now, snapshot: exact.snapshot, range: exact.range });
           exactSnapshot = exact.snapshot;
           exactRange = exact.range;
         } catch (error) {
+          if (error instanceof EvaluationCancelledError) assertEvaluationActive(attempt);
           log.warn({ err: error, positionId: position.id, urgent }, "position exact quote refresh deferred");
         }
       }
@@ -540,9 +614,9 @@ export class Guardian {
         }, "trailing stop updated");
       }
       if (expectedTrailing.action === "reset") {
-        await this.database.setPositionStatus(position.id, position.status, { trailingStopExpected: null });
+        await this.setPositionStatusFromSnapshot(position, { trailingStopExpected: null });
       } else if (expectedTrailing.action === "activate" || expectedTrailing.action === "raise_peak") {
-        await this.database.setPositionStatus(position.id, position.status, { trailingStopExpected: expectedTrailing.state });
+        await this.setPositionStatusFromSnapshot(position, { trailingStopExpected: expectedTrailing.state });
         position = { ...position, metadata: { ...position.metadata, trailingStopExpected: expectedTrailing.state } };
         log.info({ positionId: position.id, source: "expected", peakPnlBps: expectedTrailing.state.peakPnlBps, activationBlock: expectedTrailing.state.activatedAtBlock, action: expectedTrailing.action }, "trailing stop updated");
       }
@@ -554,6 +628,8 @@ export class Guardian {
         ? "local"
         : expectedTrailing.action === "trigger" ? "expected" : null;
 
+      if (attempt) attemptAlive(attempt);
+      if (attempt) attempt.stage = "handoff";
       const trigger = resolvedStaticTrigger
         ?? (trailingSource ? "trailing_take_profit" : null)
         ?? profitOorTrigger
@@ -571,7 +647,7 @@ export class Guardian {
           || position.metadata.trailingTwapWaitStartedAt !== undefined
           || position.metadata.profitTwapWaitStartedAt !== undefined
           || staleDynamicRetry) {
-          await this.database.setPositionStatus(position.id, position.status, {
+          await this.setPositionStatusFromSnapshot(position, {
             slTwapWaitStartedAt: null,
             trailingTwapWaitStartedAt: null,
             profitTwapWaitStartedAt: null,
@@ -585,7 +661,7 @@ export class Guardian {
           const slWaitStartedAt = typeof position.metadata.slTwapWaitStartedAt === "number"
             ? position.metadata.slTwapWaitStartedAt : null;
           if (slWaitStartedAt === null) {
-            await this.database.setPositionStatus(position.id, position.status, { slTwapWaitStartedAt: Date.now() });
+            await this.setPositionStatusFromSnapshot(position, { slTwapWaitStartedAt: Date.now() });
             log.warn({
               positionId: position.id,
               trigger: effectiveTrigger,
@@ -629,7 +705,7 @@ export class Guardian {
         exitSnapshot = localSnapshot;
       }
       try {
-        await this.database.setPositionStatus(position.id, position.status, {
+        await this.setPositionStatusFromSnapshot(position, {
           slTwapWaitStartedAt: null,
           trailingTwapWaitStartedAt: null,
           profitTwapWaitStartedAt: null,
@@ -647,6 +723,7 @@ export class Guardian {
         return false;
       }
     } catch (error) {
+      if (error instanceof EvaluationCancelledError || attempt?.signal.aborted) return false;
       if (isRpcRateLimited(error)) {
         log.warn({ err: error, chain: name, positionId: position.id, positionKey: position.positionKey }, "position RPC limited; retrying next monitor cycle");
         return false;
@@ -661,8 +738,8 @@ export class Guardian {
           log.info({ positionId: position.id, positionKey: position.positionKey }, "recovered verified settlement after on-chain liquidity reached zero");
           return true;
         }
-        if (await this.executor.autoSettleZeroLiquidityV3(name, position)) return true;
-        if (await this.executor.settleExternallyClosedV4(position)) return true;
+        if (await withoutEvaluation(() => this.executor.autoSettleZeroLiquidityV3(name, position))) return true;
+        if (await withoutEvaluation(() => this.executor.settleExternallyClosedV4(position))) return true;
         const settled = await this.database.settleUnverifiedZeroLiquidity(position.id, "externally_closed");
         if (!settled) {
           log.info({ positionId: position.id, positionKey: position.positionKey, reason: message }, "on-chain liquidity is gone but settlement remains pending");
@@ -676,12 +753,12 @@ export class Guardian {
           || (position.metadata.armedAtBlock !== undefined && position.metadata.armedAtBlock !== null);
         if (wasPreviouslyArmed) {
           if (position.status !== "armed") {
-            await this.database.setPositionStatus(position.id, "armed", { reason: null });
+            await this.setPositionStatusFromSnapshot(position, { reason: null }, "armed");
           }
           log.warn({ positionId: position.id, reason: message }, "valuation route unavailable; retaining armed position");
           return false;
         }
-        await this.database.setPositionStatus(position.id, "needs_review", { reason: message });
+        await this.setPositionStatusFromSnapshot(position, { reason: message }, "needs_review");
         log.warn({ positionId: position.id, reason: message }, "position requires review before arming");
         return true;
       }
@@ -695,9 +772,9 @@ export class Guardian {
     for (const position of positions) {
       try {
         if (position.status !== "closing") {
-          await this.database.setPositionStatus(position.id, "closing", { settlementRecoveryAt: new Date().toISOString() });
+          await this.setPositionStatusFromSnapshot(position, { settlementRecoveryAt: new Date().toISOString() }, "closing");
         }
-        await this.executor.resume({ ...position, status: "closing" });
+        await withoutEvaluation(() => this.executor.resume({ ...position, status: "closing" }));
       } catch (error) {
         log.warn({ err: error, positionId: position.id }, "settlement retry deferred");
       }
@@ -759,12 +836,23 @@ export class Guardian {
     }
   }
 
+  private async setPositionStatusFromSnapshot(
+    position: PositionRecord,
+    metadata: Record<string, unknown>,
+    status: PositionRecord["status"] = position.status,
+  ): Promise<void> {
+    const updated = await this.database.setPositionStatus(position.id, status, metadata, position.status);
+    if (updated === false) {
+      throw new EvaluationCancelledError(`position ${position.id} status changed from ${position.status}`);
+    }
+  }
+
   private async validateStopLossWithLocalQuote(position: PositionRecord, blockNumber: bigint, apiSnapshot: PnlSnapshot): Promise<PnlSnapshot | null> {
     try {
       const localValuation = await this.pnl.valueLocal(position, blockNumber);
       const quoteIsToken0 = position.quoteToken?.toLowerCase() === position.token0.toLowerCase();
       const localTrigger = this.pnl.shouldTrigger(localValuation.snapshot, localValuation.range, quoteIsToken0);
-      await this.database.setPositionStatus(position.id, position.status, { slTwapWaitStartedAt: null });
+      await this.setPositionStatusFromSnapshot(position, { slTwapWaitStartedAt: null });
       if (localTrigger !== "stop_loss") {
         log.warn({
           positionId: position.id,
@@ -777,7 +865,8 @@ export class Guardian {
       }
       return localValuation.snapshot;
     } catch (error) {
-      await this.database.setPositionStatus(position.id, position.status, { slTwapWaitStartedAt: null });
+      if (error instanceof EvaluationCancelledError) throw error;
+      await this.setPositionStatusFromSnapshot(position, { slTwapWaitStartedAt: null });
       log.warn({ err: error, positionId: position.id, positionKey: position.positionKey }, "SL local quote validation failed; skipping exit");
       return null;
     }
@@ -802,6 +891,7 @@ export class Guardian {
       }
       return localValuation.snapshot;
     } catch (error) {
+      if (error instanceof EvaluationCancelledError) throw error;
       if (isRpcRateLimited(error)) throw error;
       log.warn({ err: error, groupId: group.id }, "position group SL local quote validation failed; skipping exit");
       return null;
@@ -813,6 +903,7 @@ export class Guardian {
       const estimate = await this.pnl.valueGroupLocalExitEstimate(group, blockNumber, this.config.settlementSwapSlippageBps);
       return this.pnl.shouldTriggerGroup(estimate.snapshot) === "stop_loss" ? estimate.snapshot : null;
     } catch (error) {
+      if (error instanceof EvaluationCancelledError) throw error;
       if (isRpcRateLimited(error)) throw error;
       log.warn({ err: error, groupId: group.id }, "position group emergency SL local validation failed");
       return null;
@@ -846,6 +937,7 @@ export class Guardian {
       }
       return localValuation.snapshot;
     } catch (error) {
+      if (error instanceof EvaluationCancelledError) throw error;
       if (isRpcRateLimited(error)) throw error;
       log.warn({ err: error, groupId: group.id, trigger }, "position group profit exit local validation failed; skipping exit");
       return null;
@@ -909,7 +1001,7 @@ export class Guardian {
       ? position.metadata.trailingTwapWaitStartedAt
       : null;
     if (startedAt === null) {
-      await this.database.setPositionStatus(position.id, position.status, { trailingTwapWaitStartedAt: Date.now() });
+      await this.setPositionStatusFromSnapshot(position, { trailingTwapWaitStartedAt: Date.now() });
       log.warn({ positionId: position.id, positionKey: position.positionKey, deviationBps }, "trailing threshold reached but TWAP not ready; starting guard wait");
       return false;
     }
@@ -935,7 +1027,7 @@ export class Guardian {
       ? position.metadata.profitTwapWaitStartedAt
       : null;
     if (startedAt === null) {
-      await this.database.setPositionStatus(position.id, position.status, { profitTwapWaitStartedAt: Date.now() });
+      await this.setPositionStatusFromSnapshot(position, { profitTwapWaitStartedAt: Date.now() });
       log.warn({ positionId: position.id, positionKey: position.positionKey, trigger, deviationBps }, "profit threshold reached but TWAP not ready; starting guard wait");
       return false;
     }
@@ -953,7 +1045,9 @@ export class Guardian {
   private async executeExit(position: PositionRecord, trigger: ExitTrigger, triggerSnapshot: PnlSnapshot): Promise<void> {
     if (this.queuedExitPositions.has(position.id)) return;
     this.queuedExitPositions.add(position.id);
-    const attempt = this.exitQueue.then(async () => {
+    const context = currentEvaluation();
+    const work = this.exitQueue.then(async () => {
+      assertEvaluationActive(context);
       if (trigger === "trailing_take_profit") {
         const latestMetadata = await this.database.getPositionMetadata(position.id);
         const latestPosition = latestMetadata ? { ...position, metadata: latestMetadata } : position;
@@ -972,13 +1066,17 @@ export class Guardian {
         }
         position = latestPosition;
       }
-      await this.database.setPositionStatus(position.id, position.status, { trailingTwapWaitStartedAt: null });
+      assertEvaluationActive(context);
+      await this.setPositionStatusFromSnapshot(position, { trailingTwapWaitStartedAt: null });
+      assertEvaluationActive(context);
       void this.notifier.trigger(position, triggerSnapshot, trigger);
-      await this.executor.executeRelatedPosition(position, trigger);
+      // Settlement owns its executor lease and must outlive monitor cancellation.
+      await withoutEvaluation(() => this.executor.executeRelatedPosition(position, trigger));
     });
-    this.exitQueue = attempt.catch(() => undefined);
+    const queued = context ? evaluationWait(work, context) : work;
+    this.exitQueue = queued.catch(() => undefined);
     try {
-      await attempt;
+      await queued;
     } finally {
       this.queuedExitPositions.delete(position.id);
     }
@@ -1071,7 +1169,7 @@ export class Guardian {
     const active = state.status === "above" && state.aboveDistanceBps >= thresholdBps;
     if (active && typeof meta.oorAboveSeenAt !== "number") {
       const now = Date.now();
-      await this.database.setPositionStatus(position.id, position.status, {
+      await this.setPositionStatusFromSnapshot(position, {
         oorAboveSeenAt: now,
         oorAboveDistanceBps: Number(state.aboveDistanceBps),
         oorStatus: state.status,
@@ -1079,7 +1177,7 @@ export class Guardian {
       log.info({ positionId: position.id, rawRangeStatus: range?.status, quoteRangeStatus: state.status, quoteIsToken0, distanceBps: state.aboveDistanceBps }, "OOR above timer started");
       return null;
     } else if (!active && typeof meta.oorAboveSeenAt === "number") {
-      await this.database.setPositionStatus(position.id, position.status, {
+      await this.setPositionStatusFromSnapshot(position, {
         oorAboveSeenAt: null,
         oorAboveDistanceBps: null,
         oorStatus: state.status,
@@ -1130,14 +1228,14 @@ export class Guardian {
     const active = state.status === "above" && pnlBps >= thresholdBps;
     if (active && typeof meta.profitOorAboveSeenAt !== "number") {
       const now = Date.now();
-      await this.database.setPositionStatus(position.id, position.status, {
+      await this.setPositionStatusFromSnapshot(position, {
         profitOorAboveSeenAt: now,
         profitOorAbovePnlBps: Number(pnlBps),
       });
       log.info({ positionId: position.id, positionKey: position.positionKey, pnlBps, quoteRangeStatus: state.status, quoteIsToken0 }, "profit + OOR above timer started");
       return null;
     } else if (!active && typeof meta.profitOorAboveSeenAt === "number") {
-      await this.database.setPositionStatus(position.id, position.status, {
+      await this.setPositionStatusFromSnapshot(position, {
         profitOorAboveSeenAt: null,
         profitOorAbovePnlBps: null,
       });
@@ -1194,13 +1292,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, onTimeout?: () => void): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       promise,
       new Promise<T>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`position evaluation timed out after ${timeoutMs}ms`)), timeoutMs);
+        timer = setTimeout(() => {
+          onTimeout?.();
+          reject(new Error(`position evaluation timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
       }),
     ]);
   } finally {

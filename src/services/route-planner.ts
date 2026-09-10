@@ -7,6 +7,7 @@ import type { ChainName, PositionRecord, QuoteToken } from "../types.js";
 import { applySlippage } from "./uniswap-math.js";
 import { dexNameFromMetadata, v3ContractsFor } from "./v3-deployment.js";
 import type { ChainClient, ChainClients } from "./chain-client.js";
+import { evaluationCacheKey, assertEvaluationActive, evaluationWait } from "./evaluation-context.js";
 
 const V3_FEES = [100, 500, 2_500, 3_000, 10_000] as const;
 const MAX_CONCURRENT_ROUTE_QUOTES = 4;
@@ -211,7 +212,7 @@ export class RoutePlanner {
   private async getV3Pool(position: PositionRecord, tokenA: Address, tokenB: Address, fee: number, rpc: "scan" | "monitoring" = "scan"): Promise<Address> {
     const tokens = [tokenA.toLowerCase(), tokenB.toLowerCase()].sort();
     const dex = dexNameFromMetadata(position.metadata);
-    const key = `v3:${rpc}:${dex}:${position.chainId}:${tokens[0]}:${tokens[1]}:${fee}`;
+    const key = `v3:${rpc}:${dex}:${position.chainId}:${tokens[0]}:${tokens[1]}:${fee}:${evaluationCacheKey()}`;
     return this.getCachedPool(key, async () => {
       const { client, registry } = this.readChain(position, rpc);
       return client.readContract({
@@ -225,7 +226,7 @@ export class RoutePlanner {
 
   private async getV2Pair(position: PositionRecord, tokenA: Address, tokenB: Address, rpc: "scan" | "monitoring" = "scan"): Promise<Address> {
     const tokens = [tokenA.toLowerCase(), tokenB.toLowerCase()].sort();
-    const key = `v2:${rpc}:${position.chainId}:${tokens[0]}:${tokens[1]}`;
+    const key = `v2:${rpc}:${position.chainId}:${tokens[0]}:${tokens[1]}:${evaluationCacheKey()}`;
     return this.getCachedPool(key, async () => {
       const { client, registry } = this.readChain(position, rpc);
       return client.readContract({
@@ -245,6 +246,7 @@ export class RoutePlanner {
     if (pending) return pending;
 
     const lookup = lookupPool().then((pool) => {
+      assertEvaluationActive();
       this.poolCache.set(key, {
         pool,
         expiresAt: pool === zeroAddress ? Date.now() + MISSING_POOL_CACHE_MS : Number.POSITIVE_INFINITY,
@@ -412,7 +414,7 @@ function compareQuote(left: SwapRoute, right: SwapRoute): number {
 
 class AsyncLimiter {
   private active = 0;
-  private readonly waiters: Array<() => void> = [];
+  private readonly waiters: Array<{ resolve: () => void; cancelled: boolean }> = [];
 
   constructor(private readonly limit: number) {}
 
@@ -430,12 +432,21 @@ class AsyncLimiter {
       this.active += 1;
       return;
     }
-    await new Promise<void>((resolve) => this.waiters.push(resolve));
+    const waiter = { resolve: () => {}, cancelled: false };
+    const pending = new Promise<void>((resolve) => { waiter.resolve = resolve; this.waiters.push(waiter); });
+    try {
+      await evaluationWait(pending);
+    } catch (error) {
+      waiter.cancelled = true;
+      throw error;
+    }
     this.active += 1;
   }
 
   private release(): void {
     this.active -= 1;
-    this.waiters.shift()?.();
+    let waiter = this.waiters.shift();
+    while (waiter?.cancelled) waiter = this.waiters.shift();
+    waiter?.resolve();
   }
 }

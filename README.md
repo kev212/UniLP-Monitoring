@@ -107,6 +107,21 @@ UniLP adalah software eksekusi finansial. Verifikasi konfigurasi dan gunakan dry
 
 ### Total balance dashboard Telegram
 
+Snapshot posisi yang lebih tua dari 90 detik ditandai `DATA STALE` dengan usia
+snapshot dan block. Timestamp pembaruan pesan bukan bukti monitoring posisi berhasil.
+
+### Pengujian recovery monitoring
+
+Tes race database menggunakan PostgreSQL terisolasi dan hanya berjalan jika
+`MONITORING_TEST_DATABASE_URL` menunjuk database bernama `unilp_monitoring_test`.
+Jangan gunakan database production. Jalankan dengan:
+
+```bash
+MONITORING_TEST_DATABASE_URL=postgres://test:test@127.0.0.1:55432/unilp_monitoring_test npm test -- test/monitoring-recovery.integration.test.ts
+```
+
+### Perhitungan total balance
+
 Total balance menghitung nilai spot LP yang masih dimiliki executor, termasuk fee
 belum diklaim, ditambah native coin dan ERC-20 wallet dalam USD. Hanya chain di
 `CHAINS` yang diperiksa. Refresh saat startup dan setiap **180 detik**; dashboard

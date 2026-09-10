@@ -24,11 +24,26 @@ import type { FeeUsd6SpotPriceProvider } from "./spot-price.js";
 import { quoteRangeState } from "./quote-range.js";
 import { normalizeToUsd6 } from "./token-meta.js";
 import { applySlippage, isUsableSqrtPrice, quoteValueAtPriceMarker, quoteValueAtSqrtPrice, sqrtRatioAtTick } from "./uniswap-math.js";
+import { assertEvaluationActive, evaluationCacheKey, evaluationWait, currentEvaluation } from "./evaluation-context.js";
 
 const POSITION_READ_TIMEOUT_MS = 15_000;
 const ROUTE_QUOTE_TIMEOUT_MS = 15_000;
 const MIN_TWAP_OBSERVATIONS = 3;
 const GROUP_CONTEXT_CACHE_SIZE = 64;
+
+export interface PnlEvaluationOptions {
+  attemptId?: string;
+  generation?: number;
+  signal?: AbortSignal;
+  deadline?: number;
+}
+
+function checkEvaluation(options?: PnlEvaluationOptions): void {
+  assertEvaluationActive();
+  if (options?.signal?.aborted || (options?.deadline !== undefined && Date.now() >= options.deadline)) {
+    throw new DOMException("valuation cancelled", "AbortError");
+  }
+}
 
 export interface ValuedPosition {
   snapshot: PnlSnapshot;
@@ -100,6 +115,7 @@ export class PnlService {
     quoteSlippageBps = this.config.maxSwapSlippageBps,
     recordObservations = true,
     localOnly = false,
+    options?: PnlEvaluationOptions,
   ): Promise<ValuedPosition> {
     return this.valueWithMode(
       position,
@@ -108,6 +124,8 @@ export class PnlService {
       recordObservations,
       localOnly ? "exact_local" : "direct_pool",
       false,
+      true,
+      options,
     );
   }
 
@@ -119,9 +137,9 @@ export class PnlService {
     position: PositionRecord,
     blockNumber: bigint,
     quoteSlippageBps = this.config.maxSwapSlippageBps,
-    opts?: { budget?: boolean },
+    opts?: { budget?: boolean } & PnlEvaluationOptions,
   ): Promise<ValuedPosition> {
-    return this.valueWithMode(position, blockNumber, quoteSlippageBps, false, "exact_probe", false, opts?.budget !== false);
+    return this.valueWithMode(position, blockNumber, quoteSlippageBps, false, "exact_probe", false, opts?.budget !== false, opts);
   }
 
   async valueExitEstimate(position: PositionRecord, blockNumber: bigint, quoteSlippageBps = this.config.settlementSwapSlippageBps): Promise<ValuedPosition> {
@@ -136,10 +154,13 @@ export class PnlService {
     quoteMode: GroupQuoteMode,
     conservative: boolean,
     budgeted = true,
+    options?: PnlEvaluationOptions,
   ): Promise<ValuedPosition> {
+    checkEvaluation(options);
     if (!position.quoteToken) throw new Error("Position has no eligible quote token");
     const quoteToken = position.quoteToken;
-    const context = await this.positionValuationContext(position, blockNumber);
+    const context = await evaluationWait(this.positionValuationContext(position, blockNumber, options));
+    checkEvaluation(options);
     const value = context.value;
     if (recordObservations) {
       await this.database.recordPositionObservation(
@@ -170,7 +191,8 @@ export class PnlService {
     const useMark = quoteMode === "direct_pool" || quoteMode === "exact_local";
     const route = useMark
       ? null
-      : await this.quoteInContext(context, position, value.observedBlock, nonQuote.token, totalNonQuote, quoteToken, quoteSlippageBps, quoteMode, budgeted);
+      : await this.quoteInContext(context, position, value.observedBlock, nonQuote.token, totalNonQuote, quoteToken, quoteSlippageBps, quoteMode, budgeted, options);
+    checkEvaluation(options);
     if (!useMark && nonQuote.amount > 0n && !route) throw new Error("No safe direct Uniswap route from LP asset to quote token");
 
     const marked = useMark
@@ -248,18 +270,20 @@ export class PnlService {
     recordSnapshot = true,
     localOnly = false,
     conservative = false,
+    options?: PnlEvaluationOptions,
   ): Promise<ValuedPositionGroup> {
     const quoteMode: GroupQuoteMode = localOnly ? "exact_local" : "direct_pool";
-    return this.valueGroupWithMode(group, blockNumber, quoteSlippageBps, recordSnapshot, conservative, quoteMode);
+    return this.valueGroupWithMode(group, blockNumber, quoteSlippageBps, recordSnapshot, conservative, quoteMode, true, options);
   }
 
   async valueGroupExactProbe(
     group: PositionGroupRecord,
     blockNumber: bigint,
     quoteSlippageBps = this.config.maxSwapSlippageBps,
-    opts?: { budget?: boolean },
+    opts?: { budget?: boolean } & PnlEvaluationOptions,
+    options?: PnlEvaluationOptions,
   ): Promise<ValuedPositionGroup> {
-    return this.valueGroupWithMode(group, blockNumber, quoteSlippageBps, false, false, "exact_probe", opts?.budget !== false);
+    return this.valueGroupWithMode(group, blockNumber, quoteSlippageBps, false, false, "exact_probe", opts?.budget !== false, options ?? opts);
   }
 
   private async valueGroupWithMode(
@@ -270,8 +294,11 @@ export class PnlService {
     conservative: boolean,
     quoteMode: GroupQuoteMode,
     budgeted = true,
+    options?: PnlEvaluationOptions,
   ): Promise<ValuedPositionGroup> {
-    const context = await this.groupValuationContext(group, blockNumber);
+    checkEvaluation(options);
+    const context = await evaluationWait(this.groupValuationContext(group, blockNumber, options));
+    checkEvaluation(options);
     const { children, values, token0Amount, token1Amount, token0Fee, token1Fee } = context;
     const localOnly = quoteMode === "exact_local";
     const quoteIsToken0 = group.quoteToken.toLowerCase() === group.token0.toLowerCase();
@@ -288,7 +315,8 @@ export class PnlService {
     const useMark = quoteMode === "direct_pool" || quoteMode === "exact_local";
     const route = useMark
       ? null
-      : await this.quoteInContext(context, context.children[0]!, context.values[0]!.observedBlock, nonQuote.token, totalNonQuote, group.quoteToken, quoteSlippageBps, quoteMode, budgeted);
+      : await this.quoteInContext(context, context.children[0]!, context.values[0]!.observedBlock, nonQuote.token, totalNonQuote, group.quoteToken, quoteSlippageBps, quoteMode, budgeted, options);
+    checkEvaluation(options);
     if (!useMark && totalNonQuote > 0n && !route) throw new Error("No safe direct Uniswap route from group LP asset to quote token");
 
     const marked = useMark
@@ -332,8 +360,10 @@ export class PnlService {
       minimumPnlBps: quoteMode === "exact_probe" ? this.exactMinimumPnlBps(deposits, context.realizedQuote, quoteAmount, quoteFee, nonQuoteFee, totalNonQuote, route) : undefined,
       minimumLiquidationQuote: quoteMode === "exact_probe" ? this.exactMinimumLiquidation(quoteAmount, nonQuoteFee, totalNonQuote, route) : undefined,
     };
+    checkEvaluation(options);
     if (recordSnapshot) await this.database.addPositionGroupPnlSnapshot(snapshot);
     if (quoteMode === "exact_probe" && !conservative && route?.provider && route.provider !== "source_pool") {
+      checkEvaluation(options);
       await this.persistGroupExactQuote({
         groupId: group.id,
         quoteToken: group.quoteToken,
@@ -388,11 +418,11 @@ export class PnlService {
     return this.valueGroupWithMode(group, blockNumber, quoteSlippageBps, false, true, "exact_local");
   }
 
-  private groupValuationContext(group: PositionGroupRecord, blockNumber: bigint): Promise<GroupValuationContext> {
-    const key = `${group.id}:${blockNumber}`;
+  private groupValuationContext(group: PositionGroupRecord, blockNumber: bigint, options?: PnlEvaluationOptions): Promise<GroupValuationContext> {
+    const key = `${group.id}:${blockNumber}:${options?.attemptId ?? evaluationCacheKey()}`;
     const existing = this.groupContexts.get(key);
     if (existing) return existing;
-    const pending = this.loadGroupValuationContext(group, blockNumber).catch((error) => {
+    const pending = this.loadGroupValuationContext(group, blockNumber, options).catch((error) => {
       this.groupContexts.delete(key);
       throw error;
     });
@@ -405,14 +435,15 @@ export class PnlService {
     return pending;
   }
 
-  private async loadGroupValuationContext(group: PositionGroupRecord, blockNumber: bigint): Promise<GroupValuationContext> {
+  private async loadGroupValuationContext(group: PositionGroupRecord, blockNumber: bigint, options?: PnlEvaluationOptions): Promise<GroupValuationContext> {
+    checkEvaluation(options);
     const childRows = (await this.database.listPositionGroupChildren(group.id)).filter((child) => child.bin.status === "minted");
     if (childRows.length === 0) throw new Error("Position group has no active children to value");
     const missing = childRows.find((child) => child.position === null);
     if (missing) throw new Error(`Position group child bin ${missing.bin.binIndex} has no linked position`);
     const children = childRows.map((child) => child.position!);
     const [values, totals] = await Promise.all([
-      this.reader.readGroup(group, children, blockNumber, undefined, "monitoring"),
+      evaluationWait(this.reader.readGroup(group, children, blockNumber, undefined, "monitoring")),
       this.database.getPositionGroupCashflowTotals(group.id),
     ]);
     for (let index = 0; index < values.length; index += 1) {
@@ -440,11 +471,11 @@ export class PnlService {
     };
   }
 
-  private positionValuationContext(position: PositionRecord, blockNumber: bigint): Promise<PositionValuationContext> {
-    const key = `${position.id}:${blockNumber}`;
+  private positionValuationContext(position: PositionRecord, blockNumber: bigint, options?: PnlEvaluationOptions): Promise<PositionValuationContext> {
+    const key = `${position.id}:${blockNumber}:${options?.attemptId ?? evaluationCacheKey()}`;
     const existing = this.positionContexts.get(key);
     if (existing) return existing;
-    const pending = this.loadPositionValuationContext(position, blockNumber).catch((error) => {
+    const pending = this.loadPositionValuationContext(position, blockNumber, options).catch((error) => {
       this.positionContexts.delete(key);
       throw error;
     });
@@ -457,9 +488,10 @@ export class PnlService {
     return pending;
   }
 
-  private async loadPositionValuationContext(position: PositionRecord, blockNumber: bigint): Promise<PositionValuationContext> {
+  private async loadPositionValuationContext(position: PositionRecord, blockNumber: bigint, options?: PnlEvaluationOptions): Promise<PositionValuationContext> {
+    checkEvaluation(options);
     const [value, totals] = await Promise.all([
-      withTimeout(this.reader.read(position, blockNumber, undefined, "monitoring"), POSITION_READ_TIMEOUT_MS, "position read"),
+      evaluationWait(withTimeout(this.reader.read(position, blockNumber, undefined, "monitoring"), POSITION_READ_TIMEOUT_MS, "position read")),
       this.database.getCashflowTotals(position.id),
     ]);
     return { position, value, totals, quotes: new Map() };
@@ -475,7 +507,9 @@ export class PnlService {
     slippageBps: number,
     mode: GroupQuoteMode,
     budgeted = true,
+    options?: PnlEvaluationOptions,
   ): Promise<ValuationRoute | null> {
+    checkEvaluation(options);
     if (amountIn === 0n || tokenIn.toLowerCase() === tokenOut.toLowerCase()) return Promise.resolve(null);
     const key = `${mode}:${budgeted}:${tokenIn.toLowerCase()}:${amountIn}:${tokenOut.toLowerCase()}:${slippageBps}`;
     const existing = cache.quotes.get(key);
