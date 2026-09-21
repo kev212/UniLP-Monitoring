@@ -16,7 +16,7 @@ import type { ChainClients } from "./chain-client.js";
 import { TransientCloseError, type Executor } from "./executor.js";
 import { isTransientRpcError } from "../rpc.js";
 import type { PnlService } from "./pnl.js";
-import type { PositionOpener, OpenPositionPreview } from "./position-opener.js";
+import { BidAskOpenRetryableError, isRetryableBidAskPreparationError, type PositionOpener, type OpenPositionPreview } from "./position-opener.js";
 import { fmtUtc, renderPnlCard } from "./pnl-card.js";
 import { renderPnlCalendarCard } from "./pnl-calendar-card.js";
 import type { DiscoveryService } from "./discovery.js";
@@ -764,7 +764,7 @@ export class Notifier {
         }
         this.openConfirmations.delete(action.requestId);
         await this.dismissOpenReview(ctx, chatId, message.message_id);
-        await this.replyTemp(ctx, "⏳ Membuka posisi...");
+        if (confirmation.kind !== "bid_ask") await this.replyTemp(ctx, "⏳ Membuka posisi...");
         const execution = this.openExecutionQueue.then(() => this.executeOpenConfirmation(ctx, confirmation));
         this.openExecutionQueue = execution.catch((error) => {
           log.error({ error: errorMessage(error) }, "background open confirmation failed");
@@ -840,18 +840,12 @@ export class Notifier {
   }
 
   private async executeOpenConfirmation(ctx: Context, confirmation: OpenConfirmation): Promise<void> {
+    if (confirmation.kind === "bid_ask") {
+      await this.executeBidAskConfirmation(ctx, confirmation);
+      return;
+    }
     try {
       if (!this.positionOpener) throw new Error("Position opener is not configured");
-      if (confirmation.kind === "bid_ask") {
-        const result = await this.executeBidAskLadder(confirmation.preview);
-        const hashLabel = result.hash ? `\ntx: ${shortHash(result.hash)}` : "";
-        if (result.pendingReconciliation) {
-          await this.replyTemp(ctx, `🟡 BID-ASK TX TERKIRIM\n${formatBidAskLadderTarget(confirmation.preview, confirmation.request)}\nRekonsiliasi posisi sedang diproses otomatis. Jangan open ulang.${hashLabel}`);
-        } else {
-          await this.replyTemp(ctx, `🟢 BID-ASK LADDER OPENED\n${formatBidAskLadderTarget(confirmation.preview, confirmation.request)}\nAtomic: one transaction for all mintable bins${hashLabel}`);
-        }
-        return;
-      }
       const result = await this.positionOpener.executeOpen(confirmation.preview);
       const hashLabel = result.hash ? `\ntx: ${result.hash.slice(0, 18)}...` : "";
       const swapLabel = result.swapHash ? `\nswap: ${result.swapHash.slice(0, 18)}...` : "";
@@ -859,6 +853,61 @@ export class Notifier {
       await this.replyTemp(ctx, `🟢 LP OPENED\n${confirmation.preview.protocol.toUpperCase()} ${confirmation.preview.pair} | ${confirmation.preview.feeLabel}\nRange: ${confirmation.preview.lowerPrice} → ${confirmation.preview.upperPrice}\nDeposit: ${depositFormatted} ${confirmation.preview.quoteTokenSymbol}${swapLabel}${hashLabel}`);
     } catch (error) {
       await this.replyTemp(ctx, `❌ Open position gagal: ${errorMessage(error).slice(0, 200)}`);
+    }
+  }
+
+  private async executeBidAskConfirmation(ctx: Context, confirmation: Extract<OpenConfirmation, { kind: "bid_ask" }>): Promise<void> {
+    const request = { ...confirmation.request, quoteToken: { ...confirmation.request.quoteToken } };
+    const maxRetries = Number.isSafeInteger(request.maxRetries) && request.maxRetries >= 0 ? request.maxRetries : 0;
+    let messageId: number | undefined;
+    try {
+      messageId = (await ctx.reply("⏳ Membuka Bid-Ask Ladder...")).message_id;
+    } catch (error) {
+      log.warn({ err: error }, "Bid-Ask progress send failed");
+    }
+    const progress = async (text: string): Promise<void> => {
+      if (messageId === undefined) return;
+      try {
+        await ctx.api.editMessageText(ctx.chat!.id, messageId, text);
+      } catch (error) {
+        log.warn({ err: error }, "Bid-Ask progress edit failed");
+      }
+    };
+    let preview = confirmation.preview;
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      let preparing = attempt > 0;
+      let result: Awaited<ReturnType<Notifier["executeBidAskLadder"]>>;
+      try {
+        if (preparing) {
+          if (!this.positionOpener) throw new Error("Position opener is not configured");
+          const prepare = optionalPositionOpenerMethod(this.positionOpener, ["prepareBidAskLadder", "prepareBidAskOpen", "prepareBidAsk"]);
+          if (!prepare) throw new Error("Bid-Ask preparation is not configured");
+          const input = { ...request, quoteToken: { ...request.quoteToken } };
+          const result = await Promise.resolve(prepare.name === "prepareBidAskOpen" || prepare.call.length > 1
+            ? invokeBidAskOpenerMethod(this.positionOpener, prepare.call, [input.poolAddress, input.chain, input.rangePercent, input.depositAmount, input.quoteToken, input.binCount, input.direction])
+            : invokeBidAskOpenerMethod(this.positionOpener, prepare.call, [input]));
+          if (!isRecord(result)) throw new Error("Bid-Ask ladder preview is invalid");
+          preview = result;
+        }
+        preparing = false;
+        result = await this.executeBidAskLadder(preview);
+      } catch (error) {
+        const retryable = preparing ? isRetryableBidAskPreparationError(error) : error instanceof BidAskOpenRetryableError;
+        if (!retryable || attempt === maxRetries) {
+          await progress(`❌ Open Bid-Ask berhenti: ${errorMessage(error).slice(0, 200)}`);
+          return;
+        }
+        await progress(`⏳ Bid-Ask retry ${attempt + 1}/${maxRetries} dalam 3 detik\n${errorMessage(error).slice(0, 200)}`);
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
+        continue;
+      }
+      // Rendering and Telegram delivery are deliberately outside the retry catch.
+      const hashLabel = result.hash ? `\ntx: ${shortHash(result.hash)}` : "";
+      const status = result.pendingReconciliation || (!result.hash && !this.config.dryRun)
+        ? "🟡 BID-ASK RECONCILIATION\nJangan open ulang; status transaksi perlu direkonsiliasi."
+        : this.config.dryRun && !result.hash ? "🟡 BID-ASK DRY RUN" : "🟢 BID-ASK LADDER OPENED\nAtomic: one transaction for all mintable bins";
+      await progress(`${status}\n${formatBidAskLadderTarget(preview, request)}${hashLabel}`);
+      return;
     }
   }
 

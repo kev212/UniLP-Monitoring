@@ -7,6 +7,7 @@ import { chainRegistry } from "../chains.js";
 import type { RuntimeConfig } from "../config.js";
 import type { Database } from "../db.js";
 import { log } from "../log.js";
+import { isTransientRpcError } from "../rpc.js";
 import type { ChainName, PositionGroupBinRecord, PositionGroupRecord, PositionRecord, QuoteToken, TransactionPlan } from "../types.js";
 import {
   buildV3BidAskOpenPlan,
@@ -148,6 +149,22 @@ export interface BidAskOpenExecution {
   estimatedGas: bigint;
   blockGasLimit: bigint | null;
   pendingReconciliation?: boolean;
+}
+
+// Only the opener can attest that an execution failed without a possible mint.
+export class BidAskOpenRetryableError extends Error {
+  constructor(message: string, readonly safety: "pre_mint" | "confirmed_revert", cause?: unknown) {
+    super(message, { cause });
+    this.name = "BidAskOpenRetryableError";
+  }
+}
+
+export function isRetryableBidAskPreparationError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/insufficient|balance|not configured|configuration|disabled|unsupported|invalid|must be|configured maximum|unresolved signed transaction/i.test(message)
+    && !message.includes("range must be entirely below or above the current tick")) return false;
+  return isTransientRpcError(error)
+    || /revert|price moved|range must be entirely below or above the current tick|range orientation does not match|estimated (?:open )?gas .* exceeds/i.test(message);
 }
 
 const Q192 = 1n << 192n;
@@ -586,6 +603,18 @@ export class PositionOpener {
   }
 
   async executeBidAskOpen(preview: BidAskOpenPreview): Promise<BidAskOpenExecution> {
+    let broadcastEntered = false;
+    try {
+      return await this.executeBidAskOpenAttempt(preview, () => { broadcastEntered = true; });
+    } catch (error) {
+      if (!broadcastEntered && isRetryableBidAskPreparationError(error)) {
+        throw new BidAskOpenRetryableError(error instanceof Error ? error.message : String(error), "pre_mint", error);
+      }
+      throw error;
+    }
+  }
+
+  private async executeBidAskOpenAttempt(preview: BidAskOpenPreview, beforeBroadcast: () => void): Promise<BidAskOpenExecution> {
     if (preview.chain !== "base" && preview.chain !== "robinhood" && preview.chain !== "bsc") throw new Error("Bid-Ask ladders are supported on Base, Robinhood, and BSC only");
     this.assertBidAskEnabled(preview.protocol, preview.requestedBinCount);
     assertSafeOpenMarket(preview.currentTick, preview.poolLiquidity);
@@ -678,45 +707,28 @@ export class PositionOpener {
       atomicBatch: true,
       noOpeningSwap: true,
     });
-    let openedHash: Hex | null = null;
-    try {
-      const result = await this.broadcastBidAsk(preview.chain, preview.protocol, groupId, batchPlan.to, batchPlan.data, batchPlan.value ?? 0n, gas.estimatedGas);
-      openedHash = result.hash;
-      let pendingReconciliation = result.pendingReconciliation === true;
-      if (result.hash) {
-        if (result.receipt) {
-          try {
-            await this.reconcileBidAskOpen(preview.chain, groupId, result.hash, result.receipt);
-            pendingReconciliation = false;
-          } catch (error) {
-            pendingReconciliation = true;
-            log.warn({ err: error, chain: preview.chain, groupId, transactionHash: result.hash }, "Bid-Ask open confirmed; receipt reconciliation deferred");
-          }
-        }
-      } else {
-        await this.database.setPositionGroupStatus(groupId, "cancelled", {
-          reason: "bid_ask_open_no_transaction",
-          lastExecutionError: "Bid-Ask open did not produce a transaction hash",
-        });
+    // Broadcast owns the finer pre-sign boundary and durable cleanup. Once it
+    // starts, only its explicit safety signal can authorize another attempt.
+    beforeBroadcast();
+    const result = await this.broadcastBidAsk(preview.chain, preview.protocol, groupId, batchPlan.to, batchPlan.data, batchPlan.value ?? 0n, gas.estimatedGas);
+    let pendingReconciliation = result.pendingReconciliation === true || (!result.hash && !this.config.dryRun);
+    if (result.hash && result.receipt?.status === "success") {
+      try {
+        await this.reconcileBidAskOpen(preview.chain, groupId, result.hash, result.receipt);
+        pendingReconciliation = false;
+      } catch (error) {
+        pendingReconciliation = true;
+        log.warn({ err: error, chain: preview.chain, groupId, transactionHash: result.hash }, "Bid-Ask open confirmed; receipt reconciliation deferred");
       }
-      return {
-        hash: result.hash,
-        groupId,
-        plan: batchPlan,
-        estimatedGas: gas.estimatedGas,
-        blockGasLimit: gas.blockGasLimit,
-        ...(pendingReconciliation ? { pendingReconciliation: true } : {}),
-      };
-    } catch (error) {
-      const current = openedHash ? null : await this.database.getPositionGroup(groupId);
-      if (!openedHash && !current?.openTransactionHash) {
-        await this.database.setPositionGroupStatus(groupId, "cancelled", {
-          reason: "bid_ask_open_failed",
-          lastExecutionError: error instanceof Error ? error.message : String(error),
-        });
-      }
-      throw error;
     }
+    return {
+      hash: result.hash,
+      groupId,
+      plan: batchPlan,
+      estimatedGas: gas.estimatedGas,
+      blockGasLimit: gas.blockGasLimit,
+      ...(pendingReconciliation ? { pendingReconciliation: true } : {}),
+    };
   }
 
   async executeBidAsk(preview: BidAskOpenPreview): Promise<BidAskOpenExecution> {
@@ -1305,31 +1317,55 @@ export class PositionOpener {
     if (!this.database) throw new Error("Bid-Ask group database is not configured");
     const chainId = this.chains.getForScan(chain).registry.chain.id;
     const run = async (): Promise<{ hash: Hex | null; receipt?: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>; pendingReconciliation?: boolean }> => {
-      if (await this.database!.hasPendingRawTransaction(chainId)) throw new Error(`Chain ${chainId} has an unresolved signed transaction`);
-      const client = this.executionClient(chain);
-      const executor = this.config.executorAddress;
-      await client.call({ account: executor, to, data, value });
-      await this.database!.recordPositionGroupExecution(groupId, "open_batch", "planned", undefined, undefined, undefined, undefined, {
-        description: "atomic_bid_ask_open",
-      });
+      const preflight = async () => {
+        if (await this.database!.hasPendingRawTransaction(chainId)) throw new Error(`Chain ${chainId} has an unresolved signed transaction`);
+        const client = this.executionClient(chain);
+        const executor = this.config.executorAddress;
+        await client.call({ account: executor, to, data, value });
+        await this.database!.recordPositionGroupExecution(groupId, "open_batch", "planned", undefined, undefined, undefined, undefined, {
+          description: "atomic_bid_ask_open",
+        });
 
-      if (this.config.dryRun) {
-        await this.database!.setPositionGroupStatus(groupId, "planned", { dryRunPlan: "atomic_bid_ask_open", pendingRawTransaction: null });
-        log.info({ groupId, to, data: data.slice(0, 100) }, "dry-run Bid-Ask open batch simulated");
-        return { hash: null };
+        if (this.config.dryRun) {
+          await this.database!.setPositionGroupStatus(groupId, "planned", { dryRunPlan: "atomic_bid_ask_open", pendingRawTransaction: null });
+          log.info({ groupId, to, data: data.slice(0, 100) }, "dry-run Bid-Ask open batch simulated");
+          return null;
+        }
+
+        const wallet = this.walletClient(chain);
+        const pendingNonce = await client.getTransactionCount({ address: this.account!.address, blockTag: "pending" });
+        const nonce = await this.database!.nextPositionGroupExecutionNonce(chainId, pendingNonce);
+        const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account!, to, data, value, nonce });
+        const signedGas = typeof preparedRequest.gas === "bigint" ? preparedRequest.gas : estimatedGas;
+        const signedFee = typeof preparedRequest.maxFeePerGas === "bigint"
+          ? preparedRequest.maxFeePerGas
+          : typeof preparedRequest.gasPrice === "bigint"
+            ? preparedRequest.gasPrice
+            : 0n;
+        if (protocol === "v4") this.assertV4OpenGasBudget(chain, signedGas, signedFee);
+        return { client, wallet, preparedRequest };
+      };
+      let ready: Awaited<ReturnType<typeof preflight>>;
+      try {
+        ready = await preflight();
+      } catch (error) {
+        // Nothing has been signed or persisted for submission. Cleanup must
+        // succeed before a new attempt can be authorized.
+        const cancelled = await this.database!.setPositionGroupStatus(groupId, "cancelled", {
+          reason: "bid_ask_open_pre_sign_failed",
+          lastExecutionError: error instanceof Error ? error.message : String(error),
+          pendingRawTransaction: null,
+        });
+        if (!cancelled) throw new Error("Bid-Ask pre-sign group cancellation was not persisted", { cause: error });
+        if (isRetryableBidAskPreparationError(error)) {
+          throw new BidAskOpenRetryableError(error instanceof Error ? error.message : String(error), "pre_mint", error);
+        }
+        throw error;
       }
-
-      const wallet = this.walletClient(chain);
-      const pendingNonce = await client.getTransactionCount({ address: this.account!.address, blockTag: "pending" });
-      const nonce = await this.database!.nextPositionGroupExecutionNonce(chainId, pendingNonce);
-      const preparedRequest = await wallet.prepareTransactionRequest({ account: this.account!, to, data, value, nonce });
-      const signedGas = typeof preparedRequest.gas === "bigint" ? preparedRequest.gas : estimatedGas;
-      const signedFee = typeof preparedRequest.maxFeePerGas === "bigint"
-        ? preparedRequest.maxFeePerGas
-        : typeof preparedRequest.gasPrice === "bigint"
-          ? preparedRequest.gasPrice
-          : 0n;
-      if (protocol === "v4") this.assertV4OpenGasBudget(chain, signedGas, signedFee);
+      if (!ready) return { hash: null };
+      const { client, wallet, preparedRequest } = ready;
+      // From the signing call onward, an unknown failure must never authorize
+      // another mint, even if no transaction hash was linked to the group.
       const serializedTransaction = await wallet.signTransaction(preparedRequest);
       const hash = keccak256(serializedTransaction);
       const transactionNonce = preparedRequest.nonce === undefined ? undefined : BigInt(preparedRequest.nonce);
@@ -1345,7 +1381,7 @@ export class PositionOpener {
         const broadcastHash = await wallet.sendRawTransaction({ serializedTransaction });
         if (broadcastHash.toLowerCase() !== hash.toLowerCase()) throw new Error("Bid-Ask open broadcast returned an unexpected transaction hash");
         confirmedReceipt = await client.waitForTransactionReceipt({ hash, confirmations: this.config.confirmations });
-        if (confirmedReceipt.status !== "success") {
+        if (confirmedReceipt.status === "reverted") {
           await this.database!.recordPositionGroupExecution(groupId, "open_batch", "failed", hash, undefined, undefined, "transaction reverted");
           await this.database!.setPositionGroupStatus(groupId, "cancelled", {
             reason: "bid_ask_open_transaction_reverted",
@@ -1353,16 +1389,17 @@ export class PositionOpener {
             lastExecutionError: `open_batch transaction reverted: ${hash}`,
             pendingRawTransaction: null,
           });
-          throw new Error(`Bid-Ask open transaction reverted: ${hash}`);
+          throw new BidAskOpenRetryableError(`Bid-Ask open transaction reverted: ${hash}`, "confirmed_revert");
         }
+        if (confirmedReceipt.status !== "success") throw new Error("Bid-Ask open receipt status is unknown");
         await this.database!.recordPositionGroupExecution(groupId, "open_batch", "confirmed", hash);
         return { hash, receipt: confirmedReceipt };
       } catch (error) {
-        if (error instanceof Error && error.message.includes("reverted")) throw error;
+        if (error instanceof BidAskOpenRetryableError && error.safety === "confirmed_revert") throw error;
         // The signed transaction is persisted before broadcast. A provider error can occur
         // after accepting it, so reconciliation must own recovery instead of cancelling open.
         log.warn({ err: error, chain, groupId, transactionHash: hash }, "Bid-Ask open confirmation deferred to reconciliation");
-        return { hash, ...(confirmedReceipt ? { receipt: confirmedReceipt } : {}), pendingReconciliation: true };
+        return { hash, ...(confirmedReceipt?.status === "success" ? { receipt: confirmedReceipt } : {}), pendingReconciliation: true };
       }
     };
 

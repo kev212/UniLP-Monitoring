@@ -437,7 +437,7 @@ describe("Bid-Ask NVDA opening", () => {
       nextPositionGroupExecutionNonce: vi.fn().mockResolvedValue(7),
       recordPositionGroupExecution: vi.fn(),
       setPositionGroupOpenTransaction: vi.fn(),
-      setPositionGroupStatus: vi.fn(),
+      setPositionGroupStatus: vi.fn().mockResolvedValue(true),
       withExecutionLock: vi.fn(async (_chainId: number, _owner: Address, work: () => Promise<unknown>) => work()),
     };
     const client = {
