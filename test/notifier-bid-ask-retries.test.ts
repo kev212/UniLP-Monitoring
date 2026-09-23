@@ -19,12 +19,13 @@ function harness(maxRetries = 2) {
   const prepareBidAskOpen = vi.fn(async () => ({ ...confirmed, outerTickLower: 200 + generation++ }));
   const executeBidAskOpen = vi.fn().mockResolvedValue({ hash: "0x1234" });
   notifier.positionOpener = { prepareBidAskOpen, executeBidAskOpen };
+  notifier.database = { queueMessageDeletion: vi.fn(async () => {}) };
   const ctx = {
     chat: { id: 1 }, reply: vi.fn().mockResolvedValue({ message_id: 42 }),
     api: { editMessageText: vi.fn().mockResolvedValue(true) },
   };
   const run = () => notifier.executeOpenConfirmation(ctx, { kind: "bid_ask", request, preview: confirmed });
-  return { request, confirmed, prepareBidAskOpen, executeBidAskOpen, ctx, run };
+  return { request, confirmed, prepareBidAskOpen, executeBidAskOpen, ctx, run, database: notifier.database };
 }
 
 afterEach(() => { vi.useRealTimers(); });
@@ -103,6 +104,40 @@ describe("Bid-Ask confirmed open retries", () => {
     expect(h.executeBidAskOpen).toHaveBeenCalledTimes(2);
     expect(h.prepareBidAskOpen).toHaveBeenCalledOnce();
     expect(h.ctx.reply).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { name: "opened", result: { hash: "0x1234" }, text: "LADDER OPENED" },
+    { name: "reconciliation", result: { hash: null, pendingReconciliation: true }, text: "RECONCILIATION" },
+  ])("auto-deletes the final $name message 10s after the outcome", async ({ result, text }) => {
+    vi.useFakeTimers();
+    const h = harness();
+    h.executeBidAskOpen.mockResolvedValue(result);
+    await h.run();
+    expect(h.ctx.api.editMessageText.mock.lastCall![2]).toContain(text);
+    expect(h.database.queueMessageDeletion.mock.calls[0]).toEqual(["1", 42, new Date(Date.now() + 30 * 60_000)]);
+    expect(h.database.queueMessageDeletion.mock.calls.at(-1)).toEqual(["1", 42, new Date(Date.now() + 10_000)]);
+  });
+
+  it("auto-deletes the fatal error message 10s after it is rendered", async () => {
+    vi.useFakeTimers();
+    const h = harness(0);
+    h.executeBidAskOpen.mockRejectedValue(new Error("insufficient balance"));
+    await h.run();
+    expect(h.ctx.api.editMessageText.mock.lastCall![2]).toContain("Open Bid-Ask berhenti");
+    expect(h.database.queueMessageDeletion.mock.calls.at(-1)).toEqual(["1", 42, new Date(Date.now() + 10_000)]);
+  });
+
+  it("keeps retry progress messages queued at the safety TTL only", async () => {
+    vi.useFakeTimers();
+    const h = harness(1);
+    h.executeBidAskOpen.mockRejectedValueOnce(safeFailure());
+    const work = h.run();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.database.queueMessageDeletion).toHaveBeenCalledTimes(1);
+    await vi.runAllTimersAsync();
+    await work;
+    expect(h.database.queueMessageDeletion).toHaveBeenCalledTimes(2);
   });
 
   it("counts failed fresh preparations against the cap", async () => {

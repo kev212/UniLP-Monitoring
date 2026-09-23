@@ -66,6 +66,8 @@ const DASHBOARD_VALUE_CONCURRENCY = 3;
 const EXACT_QUOTE_STALE_MS = 90_000;
 const HISTORY_IDLE_TTL_MS = 30_000;
 const CALENDAR_IDLE_TTL_MS = 60_000;
+const BID_ASK_RESULT_TTL_MS = 10_000;
+const BID_ASK_SAFETY_TTL_MS = 30 * 60_000;
 
 type DashboardAction =
   | { type: "refresh"; page: number }
@@ -865,6 +867,7 @@ export class Notifier {
     } catch (error) {
       log.warn({ err: error }, "Bid-Ask progress send failed");
     }
+    if (messageId !== undefined) void this.queueTemp(ctx.chat!.id.toString(), messageId, BID_ASK_SAFETY_TTL_MS);
     const progress = async (text: string): Promise<void> => {
       if (messageId === undefined) return;
       try {
@@ -872,6 +875,10 @@ export class Notifier {
       } catch (error) {
         log.warn({ err: error }, "Bid-Ask progress edit failed");
       }
+    };
+    const finish = async (): Promise<void> => {
+      if (messageId === undefined) return;
+      await this.queueTemp(ctx.chat!.id.toString(), messageId, BID_ASK_RESULT_TTL_MS);
     };
     let preview = confirmation.preview;
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
@@ -895,6 +902,7 @@ export class Notifier {
         const retryable = preparing ? isRetryableBidAskPreparationError(error) : error instanceof BidAskOpenRetryableError;
         if (!retryable || attempt === maxRetries) {
           await progress(`❌ Open Bid-Ask berhenti: ${errorMessage(error).slice(0, 200)}`);
+          await finish();
           return;
         }
         await progress(`⏳ Bid-Ask retry ${attempt + 1}/${maxRetries} dalam 3 detik\n${errorMessage(error).slice(0, 200)}`);
@@ -907,6 +915,7 @@ export class Notifier {
         ? "🟡 BID-ASK RECONCILIATION\nJangan open ulang; status transaksi perlu direkonsiliasi."
         : this.config.dryRun && !result.hash ? "🟡 BID-ASK DRY RUN" : "🟢 BID-ASK LADDER OPENED\nAtomic: one transaction for all mintable bins";
       await progress(`${status}\n${formatBidAskLadderTarget(preview, request)}${hashLabel}`);
+      await finish();
       return;
     }
   }
