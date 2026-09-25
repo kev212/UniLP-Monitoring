@@ -1,5 +1,6 @@
 import type { Database, MarketCandidate } from '../db.js';
 import { log } from '../log.js';
+import { GmgnTrendingError, type MarketCandidateSource } from './gmgn-trending.js';
 import type { DexScreenerPair, PoolMarketScan, PoolScanFilters, ScoredPool } from './pool-scanner.js';
 import { ScanBudget, ScanSlots } from './scan-budget.js';
 
@@ -19,6 +20,7 @@ export interface MarketCoverage {
 
 interface Dependencies {
   database: Database;
+  candidateSource: MarketCandidateSource;
   eligible(pair: DexScreenerPair): boolean;
   waitForInteractive(budget: ScanBudget): Promise<void>;
   score(pair: DexScreenerPair, token: string, tvls: Map<string, number>): Promise<ScoredPool | null>;
@@ -88,16 +90,19 @@ export class MarketScanner {
     const outcomes: TokenResult[] = [];
     let candidates: MarketCandidate[] = [];
     let metadataFailed = false;
+    let fatalError: unknown;
     try {
-      const [rows, snapshots, discovery] = await budget.run(() => Promise.all([
-        this.deps.database.listRetainedMarketCandidates('robinhood'),
-        this.deps.database.listMarketTvlSnapshots('robinhood').catch(() => { metadataFailed = true; return []; }),
-        this.deps.database.getMarketDiscoveryState('robinhood').catch(() => { metadataFailed = true; return null; }),
-      ]));
-      candidates = fairMarketCandidates(rows);
-      if (!discovery?.cycleCompletedAt || Date.now() - new Date(discovery.cycleCompletedAt).getTime() > 30 * 60_000) metadataFailed = true;
-      const newest = Math.max(...rows.map(row => row.lastSeenAt.getTime()));
-      if (Number.isFinite(newest)) coverage.discoveryAt = new Date(newest).toISOString();
+      onProgress?.('Memuat trending GMGN 24h...');
+      const trending = await budget.run(() => this.deps.candidateSource.fetchCandidates(filters.minMarketCapUsd));
+      const snapshots = await budget.run(() => this.deps.database.listMarketTvlSnapshots('robinhood').catch(() => {
+        metadataFailed = true;
+        return [];
+      }));
+      // GMGN already orders this universe by 24h volume. Do not interleave it
+      // with the legacy cache fairness order or lower-ranked tokens can win the budget.
+      candidates = [...trending.candidates].sort((left, right) => right.seedScore - left.seedScore || left.tokenAddress.localeCompare(right.tokenAddress));
+      coverage.discoveryAt = trending.fetchedAt.toISOString();
+      onProgress?.(`Trending GMGN 24h: ${candidates.length} token`);
       const tvls = new Map(snapshots.filter(p => Date.now() - p.observedAt.getTime() <= 15 * 60_000)
         .map(p => [p.poolId.toLowerCase(), p.tvlUsd]));
       const snapshotTimes = new Map(snapshots.map(p => [p.poolId.toLowerCase(), p.observedAt.getTime()]));
@@ -123,9 +128,7 @@ export class MarketScanner {
             if (!(valuation > 0)) { outcome.incomplete = pairs.length > 0; continue; }
             if (valuation <= filters.minMarketCapUsd) continue;
             const oldest = Math.min(...pairs.map(pair => pair.pairCreatedAt ?? 0).filter(time => time > 0));
-            if (!Number.isFinite(oldest)) { outcome.incomplete = pairs.length > 0; continue; }
-            const age = Math.max(0, (Date.now() - oldest) / 1000);
-            if (age <= filters.minPoolAgeSeconds) continue;
+            const age = Number.isFinite(oldest) ? Math.max(0, (Date.now() - oldest) / 1000) : 0;
             // Turnover orders work only; no fee assumption or pool-count cutoff determines eligibility.
             const turnover = (pair: DexScreenerPair) => Number(pair.volume?.h1 ?? 0) / Math.max(1, Number(pair.liquidity?.usd ?? 0) || tvls.get(pair.pairAddress.toLowerCase()) || 1);
             pairs.sort((a, b) => turnover(b) - turnover(a));
@@ -175,12 +178,17 @@ export class MarketScanner {
       };
       await budget.run(() => Promise.all(Array.from({ length: 4 }, worker)));
     } catch (error) {
-      metadataFailed = true;
-      if (!budget.signal.aborted) log.warn({ reason: error instanceof Error ? error.name : 'error' }, 'market scan metadata unavailable');
+      if (error instanceof GmgnTrendingError) {
+        fatalError = error;
+      } else {
+        metadataFailed = true;
+        if (!budget.signal.aborted) log.warn({ reason: error instanceof Error ? error.name : 'error' }, 'market scan metadata unavailable');
+      }
     } finally {
       coverage.timedOut = budget.signal.aborted || Date.now() >= budget.deadline;
       budget.close();
     }
+    if (fatalError) throw fatalError;
     const pools = outcomes.filter(outcome => outcome.totalTvl > filters.minTotalActiveTvlUsd)
       .flatMap(outcome => [...outcome.pools].sort((a, b) => b.estimatedPoolYield1hPercent - a.estimatedPoolYield1hPercent || b.tvlUsd - a.tvlUsd).slice(0, 1)
         .map(pool => ({ ...pool, tokenTotalActiveTvlUsd: outcome.totalTvl,
@@ -191,11 +199,9 @@ export class MarketScanner {
     coverage.durationMs = Date.now() - startedAt;
     coverage.partial = metadataFailed || coverage.pendingTokens > 0 || coverage.failedTokens > 0
       || !coverage.discoveryAt || Date.now() - Date.parse(coverage.discoveryAt) > 15 * 60_000;
-    void this.deps.database.recordMarketEvaluations('robinhood', outcomes.filter(x => x.done).map(x => x.token), outcomes.filter(x => x.active).map(x => x.token))
-      .catch(error => log.warn({ err: error }, 'market evaluation timestamps not saved'));
     const result: PoolMarketScan = { pools: pools.slice(0, filters.maxResults), candidateTokens: candidates.length,
       evaluatedTokens: coverage.completedTokens + coverage.failedTokens, qualifiedTokens: pools.length,
-      chain: 'robinhood', marketCoverage: coverage, warming: !candidates.length && !metadataFailed };
+      chain: 'robinhood', marketCoverage: coverage, warming: false };
     log.info({ ...coverage, candidateTokens: candidates.length }, 'market scan completed');
     return result;
   }

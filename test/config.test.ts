@@ -94,7 +94,6 @@ describe("loadConfig", () => {
       minMarketCapUsd: 500_000,
       minPoolTvlUsd: 10_000,
       minTotalActiveTvlUsd: 70_000,
-      minPoolAgeSeconds: 3_600,
       minYieldHourlyPercent: 1,
       minStockYieldHourlyPercent: 0.1,
       maxResults: 10,
@@ -103,6 +102,10 @@ describe("loadConfig", () => {
       allowedQuotes: ["USDG", "WETH", "ETH"],
     });
     expect(config.poolScanCandidatePages).toBe(3);
+    expect(config.gmgnApiKey).toBeUndefined();
+    expect(config.gmgnBaseUrl).toBe("https://openapi.gmgn.ai");
+    expect(config.gmgnTrendingLimit).toBe(100);
+    expect(() => loadConfig(environment({ GMGN_BASE_URL: "http://localhost:8080" }))).toThrow();
     expect(config.scanV2Enabled).toBe(false);
     expect(config.bidAskLadderEnabled).toBe(false);
     expect(config.bidAskLadderProtocols).toEqual(["v3", "v4"]);

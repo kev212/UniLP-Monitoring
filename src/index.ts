@@ -20,9 +20,13 @@ import { SpotPriceService } from "./services/spot-price.js";
 import { KyberSwapAggregatorApi } from "./services/kyberswap-aggregator-api.js";
 import { PancakeUniversalRouter } from "./services/pancake-universal-router.js";
 import { isRiskSettings, type RiskSettings } from "./types.js";
+import { GmgnTrendingClient } from "./services/gmgn-trending.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  if (config.chains.includes("robinhood") && !config.gmgnApiKey) {
+    log.warn("GMGN_API_KEY is not configured; Robinhood pool scans will be unavailable");
+  }
   const database = new Database(config.databaseUrl);
   const chains = new ChainClients(config);
   const reader = new PositionReader(chains, config.maxSwapSlippageBps);
@@ -44,7 +48,11 @@ async function main(): Promise<void> {
   const pancakeUr = new PancakeUniversalRouter(chains, routes, config.settlementSwapSlippageBps);
   const executor = new Executor(database, chains, reader, routes, notifier, config, tradingApi, kyberswapApi, pancakeUr);
   const guardian = new Guardian(config, database, chains, alchemyBootstrapper, discovery, pnl, executor, notifier);
-  const scanner = new PoolScanner(chains, database);
+  const scanner = new PoolScanner(chains, database, undefined, new GmgnTrendingClient({
+    apiKey: config.gmgnApiKey,
+    baseUrl: config.gmgnBaseUrl,
+    limit: config.gmgnTrendingLimit,
+  }));
   const positionOpener = new PositionOpener(
     config,
     chains,

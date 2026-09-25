@@ -24,6 +24,7 @@ import type { PoolMarketScan, PoolScanFilters, PoolScanner, ScoredPool, Investig
 import type { PortfolioService } from "./portfolio.js";
 import type { GemScanner, GemScanResult } from "./gem-scanner.js";
 import type { GemCandidate } from "./gem-score.js";
+import { GmgnTrendingError } from "./gmgn-trending.js";
 import { quoteRangeState } from "./quote-range.js";
 import { sqrtRatioAtTick } from "./uniswap-math.js";
 
@@ -105,7 +106,7 @@ type DashboardAction =
   | { type: "trail"; page: number; chainId: number; protocol: Protocol; positionKey: string }
   | { type: "trail_page"; page: number };
 
-type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "age" | "yield" | "stock_yield" | "max_results" | "volume_1h" | "stock_pool_volume_1h";
+type PoolSettingKey = "market_cap" | "pool_tvl" | "total_tvl" | "yield" | "stock_yield" | "max_results" | "volume_1h" | "stock_pool_volume_1h";
 type RiskSettingKey = "stop_loss" | "take_profit" | "trailing_activation" | "trailing_drawdown" | "v4_open_gas_usd";
 type PendingInput =
   | { kind: "scan_token"; chain: ChainName }
@@ -1514,9 +1515,10 @@ export class Notifier {
     }
     this.poolScanRunning = true;
     const dexes = chain === "bsc" ? "Uniswap V3/V4 + PancakeSwap V3" : "Uniswap V3/V4";
+    const source = chain === "robinhood" ? "trending GMGN 24h" : "kandidat cache";
     let progress;
     try {
-      progress = await ctx.reply(`🏆 Memeriksa kandidat ${dexes} ${chainHeading(chainRegistry[chain])} berdasarkan yield 1h. Scan dapat memerlukan sekitar 2 menit...`);
+      progress = await ctx.reply(`🏆 Memeriksa ${source} ${dexes} ${chainHeading(chainRegistry[chain])} berdasarkan yield 1h. Scan dapat memerlukan sekitar 2 menit...`);
     } catch (error) { this.poolScanRunning = false; throw error; }
     const messageId = progress.message_id;
     void this.queueTemp(ctx.chat!.id.toString(), messageId, 120_000);
@@ -1524,7 +1526,7 @@ export class Notifier {
   }
 
   private async executePoolScan(database: Database, scanner: PoolScanner, chatId: string, messageId: number, chain: ChainName, startedAt = Date.now()): Promise<void> {
-    let stage = "Memuat kandidat cache...";
+    let stage = chain === "robinhood" ? "Memuat trending GMGN 24h..." : "Memuat kandidat cache...";
     const lookupBudget = chain === "robinhood" ? new ScanBudget(startedAt + MARKET_SCAN_BUDGET_MS) : undefined;
     const progressController = new AbortController();
     const heartbeat = setInterval(() => {
@@ -1541,7 +1543,9 @@ export class Notifier {
       await this.deliverMarketScan(chatId, messageId, pages[0]!,
         chain === 'robinhood' ? startedAt + 120_000 : Date.now() + 10_000, pages);
     } catch (error) {
-      const text = "Scan pools gagal. Coba lagi nanti.";
+      const text = error instanceof GmgnTrendingError
+        ? `Scan pools gagal: ${error.message}`
+        : "Scan pools gagal. Coba lagi nanti.";
       if (chain === 'robinhood') {
         clearInterval(heartbeat);
         progressController.abort();
@@ -2119,7 +2123,11 @@ export class Notifier {
   }
 
   private async poolScanSettings(database: Database, chatId: string): Promise<PoolScanSettings> {
-    return { ...this.config.poolScanDefaults, ...(await database.getPoolScanSettings(chatId)) };
+    const saved = await database.getPoolScanSettings(chatId);
+    const overrides = saved
+      ? Object.fromEntries(Object.entries(saved).filter(([key]) => key !== "minPoolAgeSeconds")) as Partial<PoolScanSettings>
+      : {};
+    return { ...this.config.poolScanDefaults, ...overrides };
   }
 
   private riskSettings(): RiskSettings {
@@ -2184,7 +2192,6 @@ export class Notifier {
       .row()
       .text("Min total TVL", "lp:cfg:total_tvl")
       .row()
-        .text("Min usia", "lp:cfg:age")
         .text("Min yield/h", "lp:cfg:yield")
         .row()
         .text("Min stock yield/h", "lp:cfg:stock_yield")
@@ -2199,7 +2206,6 @@ export class Notifier {
       `Min market cap: $${fmtUsd(settings.minMarketCapUsd)}`,
       `Min TVL per pool: $${fmtUsd(settings.minPoolTvlUsd)}`,
       `Min total active TVL V3/V4: $${fmtUsd(settings.minTotalActiveTvlUsd)}`,
-      `Min usia pool tertua: ${fmtDuration(settings.minPoolAgeSeconds)}`,
       `Min gross yield/h: ${fmtPercent(settings.minYieldHourlyPercent)}`,
       `Min stock yield/h: ${fmtPercent(settings.minStockYieldHourlyPercent)}`,
       `Min stock pool volume 1h: $${fmtUsd(settings.minStockPoolVolume1hUsd ?? 0)} (0 = nonaktif)`,
@@ -2859,7 +2865,7 @@ function isProtocol(value: string | undefined): value is Protocol {
 
 function isPoolSettingKey(value: string | undefined): value is PoolSettingKey {
   if (value === "stock_pool_volume_1h") return true;
-  return value === "market_cap" || value === "pool_tvl" || value === "total_tvl" || value === "age" || value === "yield" || value === "stock_yield" || value === "max_results" || value === "volume_1h";
+  return value === "market_cap" || value === "pool_tvl" || value === "total_tvl" || value === "yield" || value === "stock_yield" || value === "max_results" || value === "volume_1h";
 }
 
 function isRiskSettingKey(value: string | undefined): value is RiskSettingKey {
@@ -3559,14 +3565,6 @@ function scoreStars(score: number): string {
 }
 
 export function parsePoolScanInput(key: PoolSettingKey, value: string): Partial<PoolScanSettings> {
-  if (key === "age") {
-    const match = value.trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*([mhd])$/);
-    if (!match?.[1] || !match[2]) throw new Error("usia harus seperti 30m, 1h, atau 2d");
-    const amount = Number(match[1]);
-    const multiplier = match[2] === "m" ? 60 : match[2] === "h" ? 3_600 : 86_400;
-    if (!Number.isFinite(amount) || amount < 0) throw new Error("usia harus angka positif");
-    return { minPoolAgeSeconds: Math.floor(amount * multiplier) };
-  }
   const number = Number(value.replace(/[$,%\s,]/g, ""));
   if (!Number.isFinite(number) || number < 0) throw new Error("nilai harus angka positif");
   if (key === "market_cap") return { minMarketCapUsd: number };
@@ -3588,7 +3586,6 @@ function configInputPrompt(key: PoolSettingKey): string {
   if (key === "market_cap") return "Kirim Min market cap, contoh: 500000 atau $500K.";
   if (key === "pool_tvl") return "Kirim Min TVL per pool, contoh: 10000.";
   if (key === "total_tvl") return "Kirim Min total active TVL V3/V4, contoh: 70000.";
-  if (key === "age") return "Kirim Min usia pool tertua, contoh: 30m, 1h, atau 2d.";
   if (key === "yield") return "Kirim Min gross yield per jam, contoh: 1 atau 1%.";
   if (key === "stock_yield") return "Kirim Min stock yield per jam, contoh: 0.1 atau 0.1%.";
   return "Kirim jumlah hasil top, dari 1 sampai 20.";
@@ -3652,7 +3649,7 @@ export function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilt
       '🏆 TOP POOL YIELD 1H — ROBINHOOD',
       `Kandidat: ${scan.candidateTokens} | Selesai: ${c.completedTokens} | Data kurang: ${c.failedTokens} | Belum selesai: ${c.pendingTokens}`,
       `Discovery: ${c.discoveryAt ?? 'belum tersedia'} | Durasi: ${(c.durationMs / 1000).toFixed(1)}s`,
-      `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | Pool TVL ≥ $${fmtUsd(filters.minPoolTvlUsd)} | Total TVL > $${fmtUsd(filters.minTotalActiveTvlUsd)} | Usia > ${fmtDuration(filters.minPoolAgeSeconds)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
+      `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | Pool TVL ≥ $${fmtUsd(filters.minPoolTvlUsd)} | Total TVL > $${fmtUsd(filters.minTotalActiveTvlUsd)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
       `Pool data kurang: ${c.unavailablePools} | TVL dari snapshot: ${c.snapshotPools}`,
       ...(c.partial ? [`⚠️ Hasil parsial${c.timedOut ? ': tenggat tercapai' : ': data/discovery belum lengkap'}.`] : []),
       `Min volume 1h/pool: $${fmtUsd(filters.minVolume1hUsd ?? 0)}`,
@@ -3677,7 +3674,7 @@ export function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilt
     "🏆 TOP POOL YIELD 1H",
     `Chain: ${chainHeading(chainRegistry[chain])} | ${dexes}`,
     `Kandidat cache: ${scan.candidateTokens} | Dievaluasi DexScreener: ${scan.evaluatedTokens} | Lolos filter + on-chain: ${scan.qualifiedTokens}`,
-    `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | Pool TVL > $${fmtUsd(filters.minPoolTvlUsd)} | Total TVL aktif > $${fmtUsd(filters.minTotalActiveTvlUsd)} | Usia > ${fmtDuration(filters.minPoolAgeSeconds)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
+    `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | Pool TVL > $${fmtUsd(filters.minPoolTvlUsd)} | Total TVL aktif > $${fmtUsd(filters.minTotalActiveTvlUsd)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
     `Quote: ${filters.allowedQuotes.join(", ")}`,
     `Min volume 1h/pool: $${fmtUsd(filters.minVolume1hUsd ?? 0)}`,
     "",

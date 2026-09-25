@@ -4,7 +4,7 @@ import type { RuntimeConfig } from '../src/config.js';
 import type { PoolMarketScan, PoolScanFilters, ScoredPool } from '../src/services/pool-scanner.js';
 
 const filters: PoolScanFilters = { chain: 'robinhood', minMarketCapUsd: 300000, minPoolTvlUsd: 1000,
-  minTotalActiveTvlUsd: 5000, minPoolAgeSeconds: 60, minYieldHourlyPercent: 0.5,
+  minTotalActiveTvlUsd: 5000, minYieldHourlyPercent: 0.5,
   minStockYieldHourlyPercent: 0.05, maxResults: 20, minVolume1hUsd: 100,
   allowedQuotes: ['USDG'], allowedQuoteAddresses: [], candidatePages: 3 };
 function result(count: number): PoolMarketScan {

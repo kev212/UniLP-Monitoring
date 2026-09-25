@@ -32,7 +32,12 @@ const memory = {
   async listMarketTvlSnapshots() { return [...snapshots.values()]; },
   async recordMarketEvaluations() {},
 };
-const scanner = new PoolScanner(new ChainClients(config), memory);
+const candidateSource = {
+  async fetchCandidates() {
+    return { candidates: [...candidates.values()], fetchedAt: new Date() };
+  },
+};
+const scanner = new PoolScanner(new ChainClients(config), memory, undefined, candidateSource);
 const allowedQuoteAddresses = config.quoteTokens.robinhood.map(token => token.address);
 const warmingAt = Date.now();
 await scanner.marketDiscovery.refresh(allowedQuoteAddresses);

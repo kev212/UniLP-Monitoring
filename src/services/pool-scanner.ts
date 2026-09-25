@@ -2,6 +2,7 @@ import { isAddress, isHex, zeroAddress, type Address, type Hex } from "viem";
 
 import { MarketDiscovery } from './market-discovery.js';
 import { MarketScanner, type MarketCoverage } from './market-scan.js';
+import { GmgnTrendingClient, type MarketCandidateSource } from './gmgn-trending.js';
 import { ScanBudget } from './scan-budget.js';
 import { chainRegistry, isEligibleScanDex } from "../chains.js";
 import type { Database } from "../db.js";
@@ -256,8 +257,11 @@ export class PoolScanner {
     private readonly chains: ChainClients,
     private readonly database: Database,
     private readonly geckoMinRequestIntervalMs = GECKO_MIN_REQUEST_INTERVAL_MS,
+    candidateSource?: MarketCandidateSource,
   ) {
+    const gmgnTrending = candidateSource ?? new GmgnTrendingClient();
     this.marketScanner = new MarketScanner({ database,
+      candidateSource: gmgnTrending,
       eligible: pair => isMarketScanPair(pair, 'robinhood'),
       waitForInteractive: budget => this.waitForInteractive(budget),
       score: (pair, token, tvls) => this.toDexScreenerPool(pair, token, tvls, 'robinhood', true),
@@ -415,7 +419,6 @@ export class PoolScanner {
       .filter((createdAt) => createdAt > 0)
       .reduce((oldest, createdAt) => Math.min(oldest, createdAt), Number.POSITIVE_INFINITY);
     const oldestPoolAgeSeconds = Number.isFinite(oldestCreatedAt) ? Math.max(0, Math.floor((Date.now() - oldestCreatedAt) / 1_000)) : 0;
-    if (oldestPoolAgeSeconds <= filters.minPoolAgeSeconds) return null;
 
     const highestActivity = [...relevant]
       .sort((left, right) => Number(right.volume?.h1 ?? 0) - Number(left.volume?.h1 ?? 0) || Number(right.liquidity?.usd ?? 0) - Number(left.liquidity?.usd ?? 0))
@@ -693,7 +696,7 @@ export class PoolScanner {
       .filter(Number.isFinite)
       .reduce((oldest, createdAt) => Math.min(oldest, createdAt), Number.POSITIVE_INFINITY);
     const oldestPoolAgeSeconds = Number.isFinite(oldestCreatedAt) ? Math.max(0, Math.floor((Date.now() - oldestCreatedAt) / 1_000)) : 0;
-    if (totalActiveTvlUsd <= filters.minTotalActiveTvlUsd || oldestPoolAgeSeconds <= filters.minPoolAgeSeconds) return null;
+    if (totalActiveTvlUsd <= filters.minTotalActiveTvlUsd) return null;
     return active
       .filter((pool) => pool.tvlUsd >= filters.minPoolTvlUsd && pool.volume1hUsd >= (filters.minVolume1hUsd ?? 0) && pool.estimatedPoolYield1hPercent > filters.minYieldHourlyPercent)
       .map((pool) => ({ ...pool, tokenMarketCapUsd: valuation.value, tokenValuationSource: valuation.source, tokenTotalActiveTvlUsd: totalActiveTvlUsd, tokenOldestPoolAgeSeconds: oldestPoolAgeSeconds }));

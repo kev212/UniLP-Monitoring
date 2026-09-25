@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Database, MarketCandidate } from '../src/db.js';
+import { GmgnTrendingError } from '../src/services/gmgn-trending.js';
 import { MarketScanner, fairMarketCandidates } from '../src/services/market-scan.js';
 import { MarketDiscovery, ROBINHOOD_DISCOVERY_FEEDS } from '../src/services/market-discovery.js';
 import { ScanBudget, ScanSlots } from '../src/services/scan-budget.js';
@@ -18,20 +19,18 @@ const scored = (p: ReturnType<typeof pair>, yieldPercent = 1): ScoredPool => ({ 
   tvlUsd: p.liquidity.usd, volume1hUsd: 100, volume6hUsd: 600, estimatedPoolFees1hUsd: 3, estimatedPoolYield1hPercent: yieldPercent,
   estimatedPoolFees6hUsd: 18, estimatedPoolYieldHourlyPercent: 1, score: 1, safetyFactor: 1, dynamicFee: false, stale: false, warnings: [] });
 const filters: PoolScanFilters = { chain: 'robinhood', minPoolTvlUsd: 1000, minMarketCapUsd: 300000, minTotalActiveTvlUsd: 5000,
-  minPoolAgeSeconds: 60, minYieldHourlyPercent: 0.5, minStockYieldHourlyPercent: 0.05, maxResults: 10,
+  minYieldHourlyPercent: 0.5, minStockYieldHourlyPercent: 0.05, maxResults: 10,
   allowedQuotes: ['USDG'], allowedQuoteAddresses: [quote as any], candidatePages: 3 };
 function setup(count = 1) {
   vi.useFakeTimers();
-  const database = { listRetainedMarketCandidates: vi.fn(async () => Array.from({length:count}, (_, i) => candidate(i+1))),
-    listMarketTvlSnapshots: vi.fn(async () => [] as any[]),
-    getMarketDiscoveryState: vi.fn(async () => ({ nextCursor: 0, cycleCompletedAt: new Date(), lastSuccessAt: new Date() })),
-    recordMarketEvaluations: vi.fn(async () => {}) };
+  const database = { listMarketTvlSnapshots: vi.fn(async () => [] as any[]) };
+  const candidateSource = { fetchCandidates: vi.fn(async () => ({ candidates: Array.from({length:count}, (_, i) => candidate(i+1)), fetchedAt: new Date() })) };
   const score = vi.fn(async p => scored(p));
   const waitForInteractive = vi.fn(async (budget: ScanBudget) => budget.check());
   const fetchMock = vi.fn(async (url: string) => new Response(JSON.stringify([pair(1, url.split('/').at(-1)!)])));
   vi.stubGlobal('fetch', fetchMock);
-  const scanner = new MarketScanner({ database: database as unknown as Database, score, waitForInteractive, eligible: () => true });
-  return { scanner, score, waitForInteractive, database, fetchMock };
+  const scanner = new MarketScanner({ database: database as unknown as Database, candidateSource, score, waitForInteractive, eligible: () => true });
+  return { scanner, score, waitForInteractive, database, fetchMock, candidateSource };
 }
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
@@ -52,6 +51,41 @@ describe('bounded market scan', () => {
     const pending = scanner.scan({ ...filters, minVolume1hUsd: minimum });
     await vi.runAllTimersAsync();
     expect((await pending).pools).toHaveLength(minimum <= 100 ? 1 : 0);
+  });
+
+  it('does not reject a pool because it is new', async () => {
+    const { scanner, fetchMock } = setup();
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([{ ...pair(1), pairCreatedAt: Date.now() - 1_000 }] )));
+    const pending = scanner.scan(filters);
+    await vi.runAllTimersAsync();
+    expect((await pending).pools).toHaveLength(1);
+  });
+
+  it('keeps GMGN volume order instead of applying legacy fairness interleaving', async () => {
+    const { scanner, candidateSource, fetchMock } = setup(3);
+    const ordered = [
+      { ...candidate(1), seedScore: 300 },
+      { ...candidate(2), seedScore: 200 },
+      { ...candidate(3), seedScore: 100 },
+    ];
+    candidateSource.fetchCandidates.mockResolvedValue({ candidates: ordered, fetchedAt: new Date() });
+    const seen: string[] = [];
+    fetchMock.mockImplementation(async (url: string) => {
+      const tokenAddress = url.split('/').at(-1)!;
+      seen.push(tokenAddress);
+      return new Response(JSON.stringify([pair(1, tokenAddress)]));
+    });
+    const pending = scanner.scan(filters);
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(seen.slice(0, 3)).toEqual(ordered.map(item => item.tokenAddress));
+  });
+
+  it('fails without touching retained candidates when GMGN is unavailable', async () => {
+    const { scanner, candidateSource, fetchMock } = setup();
+    candidateSource.fetchCandidates.mockRejectedValue(new GmgnTrendingError('GMGN unavailable'));
+    await expect(scanner.scan(filters)).rejects.toThrow('GMGN unavailable');
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('filters volume before choosing best yield while retaining total active TVL', async () => {

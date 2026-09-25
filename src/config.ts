@@ -81,7 +81,6 @@ const envSchema = z.object({
   TOKEN_SCAN_MIN_POOL_TVL_USD: z.coerce.number().nonnegative().default(300),
   OPEN_MIN_EXECUTABLE_BPS: z.coerce.number().int().min(1).max(10_000).default(5_000),
   POOL_SCAN_MIN_TOTAL_ACTIVE_TVL_USD: z.coerce.number().nonnegative().default(70_000),
-  POOL_SCAN_MIN_POOL_AGE_SECONDS: z.coerce.number().int().nonnegative().default(3_600),
   POOL_SCAN_MIN_YIELD_HOURLY_PERCENT: z.coerce.number().nonnegative().default(1),
   POOL_SCAN_MIN_STOCK_YIELD_HOURLY_PERCENT: z.coerce.number().nonnegative().default(0.1),
   POOL_SCAN_MAX_RESULTS: z.coerce.number().int().min(1).max(20).default(10),
@@ -89,6 +88,9 @@ const envSchema = z.object({
   POOL_SCAN_MIN_STOCK_POOL_VOLUME_1H_USD: z.coerce.number().nonnegative().default(0),
   POOL_SCAN_ALLOWED_QUOTES: z.string().default("USDG,WETH,ETH"),
   POOL_SCAN_CANDIDATE_PAGES: z.coerce.number().int().min(1).max(10).default(3),
+  GMGN_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
+  GMGN_BASE_URL: z.string().url().refine(value => new URL(value).protocol === "https:", "GMGN_BASE_URL must use HTTPS").default("https://openapi.gmgn.ai"),
+  GMGN_TRENDING_LIMIT: z.coerce.number().int().min(1).max(100).default(100),
   SCANV2_ENABLED: z.string().default("false"),
   UNISWAP_API_KEY: z.string().optional().transform(v => v?.trim() || undefined),
   KYBERSWAP_ENABLED: z.string().default("true"),
@@ -164,6 +166,9 @@ export interface RuntimeConfig {
   tokenScanMinPoolTvlUsd: number;
   openMinExecutableBps: number;
   poolScanCandidatePages: number;
+  gmgnApiKey?: string;
+  gmgnBaseUrl: string;
+  gmgnTrendingLimit: number;
   scanV2Enabled: boolean;
   uniswapApiKey?: string;
   kyberswapEnabled: boolean;
@@ -407,7 +412,6 @@ export function loadConfig(environment = process.env): RuntimeConfig {
       minMarketCapUsd: env.POOL_SCAN_MIN_MARKET_CAP_USD,
       minPoolTvlUsd: env.POOL_SCAN_MIN_POOL_TVL_USD,
       minTotalActiveTvlUsd: env.POOL_SCAN_MIN_TOTAL_ACTIVE_TVL_USD,
-      minPoolAgeSeconds: env.POOL_SCAN_MIN_POOL_AGE_SECONDS,
       minYieldHourlyPercent: env.POOL_SCAN_MIN_YIELD_HOURLY_PERCENT,
       minStockYieldHourlyPercent: env.POOL_SCAN_MIN_STOCK_YIELD_HOURLY_PERCENT,
       maxResults: env.POOL_SCAN_MAX_RESULTS,
@@ -418,6 +422,9 @@ export function loadConfig(environment = process.env): RuntimeConfig {
     tokenScanMinPoolTvlUsd: env.TOKEN_SCAN_MIN_POOL_TVL_USD,
     openMinExecutableBps: env.OPEN_MIN_EXECUTABLE_BPS,
     poolScanCandidatePages: env.POOL_SCAN_CANDIDATE_PAGES,
+    gmgnApiKey: env.GMGN_API_KEY,
+    gmgnBaseUrl: env.GMGN_BASE_URL,
+    gmgnTrendingLimit: env.GMGN_TRENDING_LIMIT,
     scanV2Enabled: parseBoolean(env.SCANV2_ENABLED, "SCANV2_ENABLED"),
     uniswapApiKey: env.UNISWAP_API_KEY,
     kyberswapEnabled: parseBoolean(env.KYBERSWAP_ENABLED, "KYBERSWAP_ENABLED"),
