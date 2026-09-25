@@ -10,15 +10,15 @@ afterEach(() => {
 });
 
 describe("GMGN trending client", () => {
-  it("requests Robinhood 24h volume ranking and normalizes candidates", async () => {
+  it("requests Robinhood 24h volume ranking and normalizes the double-wrapped response", async () => {
     const fetcher = vi.fn(async () => new Response(JSON.stringify({
       code: 0,
-      data: { rank: [
+      data: { code: 0, message: "success", data: { rank: [
         { address: tokenA.toUpperCase(), volume: "12,500", rank: 1 },
         { address: tokenB, volume: 100, rank: 2 },
         { address: tokenA, volume: 11_000, rank: 3 },
         { address: "not-an-address", volume: 99_000, rank: 4 },
-      ] },
+      ] } },
     })));
     const client = new GmgnTrendingClient({
       apiKey: "test-key",
@@ -45,6 +45,16 @@ describe("GMGN trending client", () => {
     expect(snapshot.candidates.map(candidate => candidate.tokenAddress)).toEqual([tokenA, tokenB]);
     expect(snapshot.candidates[0]?.seedScore).toBe(12_500);
     expect(snapshot.candidates[0]?.sources).toEqual(["gmgn:24h"]);
+  });
+
+  it("accepts a flat data.rank response shape", async () => {
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({
+      code: 0,
+      data: { rank: [{ address: tokenA, volume: 500 }] },
+    })));
+    const client = new GmgnTrendingClient({ apiKey: "test-key", fetcher: fetcher as unknown as typeof fetch });
+    const snapshot = await client.fetchCandidates(500_000);
+    expect(snapshot.candidates.map(c => c.tokenAddress)).toEqual([tokenA]);
   });
 
   it("caches and single-flights the same market-cap threshold", async () => {

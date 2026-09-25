@@ -149,16 +149,22 @@ export class GmgnTrendingClient implements MarketCandidateSource {
         this.cooldownUntil = Math.max(this.cooldownUntil, resetAt.getTime());
       }
     }
-    const code = envelope?.code;
+    // Live responses are double-wrapped: { code, data: { code, data: { rank } } }.
+    const data = asObject(envelope?.data);
+    const inner = asObject(data?.data);
+    const code = envelope?.code ?? data?.code;
     if (!response.ok || (code !== undefined && code !== 0 && code !== "0")) {
-      const reason = stringValue(envelope?.error) ?? stringValue(envelope?.message) ?? `HTTP ${response.status}`;
+      const reason = stringValue(envelope?.error) ?? stringValue(envelope?.message)
+        ?? stringValue(data?.reason) ?? stringValue(data?.message) ?? `HTTP ${response.status}`;
       const suffix = resetAt ? `; rate limit reset at ${resetAt.toISOString()}` : "";
       throw new GmgnTrendingError(`GMGN trending request failed: ${reason}${suffix}`, response.status, resetAt);
     }
 
-    const data = asObject(envelope?.data) ?? envelope;
-    const ranking = data?.rank;
-    if (!Array.isArray(ranking)) throw new GmgnTrendingError("GMGN trending response data.rank is not an array", response.status);
+    const ranking = Array.isArray(data?.rank) ? data.rank
+      : Array.isArray(inner?.rank) ? inner.rank
+        : Array.isArray(envelope?.rank) ? envelope.rank
+          : null;
+    if (!ranking) throw new GmgnTrendingError("GMGN trending response rank is not an array", response.status);
 
     const fetchedAt = new Date(this.clock());
     const candidates = new Map<string, MarketCandidate>();
