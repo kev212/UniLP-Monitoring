@@ -88,15 +88,17 @@ describe('bounded market scan', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('filters volume before choosing best yield while retaining total active TVL', async () => {
+  it('verifies only the highest-TVL pool and applies the volume filter to it', async () => {
     const { scanner, fetchMock, score } = setup();
-    const pairs = [pair(1), pair(2)];
+    const pairs = [pair(1), { ...pair(2), liquidity: { usd: 12_000 } }];
     fetchMock.mockResolvedValue(new Response(JSON.stringify(pairs)));
-    score.mockImplementation(async p => ({ ...scored(p, p.pairAddress === pairs[0].pairAddress ? 9 : 2),
-      volume1hUsd: p.pairAddress === pairs[0].pairAddress ? 10 : 200 }));
-    const pending = scanner.scan({ ...filters, minVolume1hUsd: 100, minTotalActiveTvlUsd: 10000 });
+    score.mockImplementation(async p => scored(p, 2));
+    const pending = scanner.scan({ ...filters, minVolume1hUsd: 100 });
     await vi.runAllTimersAsync();
-    expect((await pending).pools[0]).toMatchObject({ estimatedPoolYield1hPercent: 2, tokenTotalActiveTvlUsd: 12000 });
+    const result = await pending;
+    expect(score).toHaveBeenCalledTimes(1);
+    expect(score.mock.calls[0]![0].pairAddress).toBe(pair(2).pairAddress);
+    expect(result.pools[0]).toMatchObject({ estimatedPoolYield1hPercent: 2, tokenTotalActiveTvlUsd: 12_000 });
   });
 
   it('evaluates the full 205-token universe within the budget with provider pacing', async () => {
@@ -110,46 +112,46 @@ describe('bounded market scan', () => {
     expect(result.pools).toHaveLength(10);
   });
 
-  it('evaluates pool 9+ and uses all active TVL while emitting one best pool per token', async () => {
+  it('verifies a single best pool per token even when many pools exist', async () => {
     const { scanner, fetchMock, score } = setup();
-    const pairs = Array.from({length:12}, (_, i) => pair(i));
+    const pairs = Array.from({length:12}, (_, i) => ({ ...pair(i), liquidity: { usd: 1_000 + i * 1_000 } }));
     fetchMock.mockResolvedValue(new Response(JSON.stringify(pairs)));
     score.mockImplementation(async p => scored(p, p.pairAddress === pairs[11]!.pairAddress ? 9 : 0.1));
     const pending = scanner.scan(filters); await vi.runAllTimersAsync(); const result = await pending;
-    expect(score).toHaveBeenCalledTimes(12);
-    expect(result.pools[0]).toMatchObject({ estimatedPoolYield1hPercent: 9, tokenTotalActiveTvlUsd: 72000 });
+    expect(score).toHaveBeenCalledTimes(1);
+    expect(score.mock.calls[0]![0].pairAddress).toBe(pairs[11]!.pairAddress);
+    expect(result.pools[0]).toMatchObject({ estimatedPoolYield1hPercent: 9, tokenTotalActiveTvlUsd: 12_000 });
   });
 
   it('returns partial verified results at 110 seconds and ignores a late RPC', async () => {
-    const { scanner, fetchMock, score } = setup();
-    fetchMock.mockResolvedValue(new Response(JSON.stringify([pair(1), pair(2)])));
+    const { scanner, score } = setup();
     let resolve!: (value: ScoredPool) => void;
-    score.mockImplementationOnce(async p => scored(p)).mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    score.mockImplementation(() => new Promise(r => { resolve = r; }));
     const pending = scanner.scan(filters); await vi.runAllTimersAsync(); const result = await pending;
     expect(result.marketCoverage).toMatchObject({ partial: true, timedOut: true, durationMs: 110000, pendingTokens: 1 });
-    expect(result.pools).toHaveLength(1);
-    expect(result.pools[0]!.warnings).toContain('Total TVL: batas bawah, pemeriksaan parsial');
-    const before = JSON.stringify(result); resolve(scored(pair(2), 99)); await Promise.resolve();
+    expect(result.pools).toHaveLength(0);
+    const before = JSON.stringify(result); resolve(scored(pair(1), 99)); await Promise.resolve();
     expect(JSON.stringify(result)).toBe(before);
   });
 
-  it('does not mistake missing total TVL for a completed filter rejection', async () => {
+  it('counts tokens whose pools all have zero TVL as no-eligible instead of data missing', async () => {
     const { scanner, fetchMock, score } = setup();
-    fetchMock.mockResolvedValue(new Response(JSON.stringify([pair(1), {...pair(2), liquidity: {usd:0}}])));
-    score.mockImplementation(async p => ({...scored(p), tvlUsd: 3000}));
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([{ ...pair(1), liquidity: { usd: 0 } }])));
     const pending = scanner.scan(filters); await vi.runAllTimersAsync(); const result = await pending;
+    expect(score).not.toHaveBeenCalled();
     expect(result.pools).toHaveLength(0);
-    expect(result.marketCoverage).toMatchObject({ failedTokens: 1, partial: true, completedTokens: 0, unavailablePools: 1 });
+    expect(result.marketCoverage).toMatchObject({ completedTokens: 1, failedTokens: 0, noEligiblePools: 1, partial: false });
   });
 
-  it('uses only fresh TVL snapshots and labels the fallback', async () => {
-    const { scanner, fetchMock, score, database } = setup();
-    database.listMarketTvlSnapshots.mockResolvedValue([{poolId: pair(1).pairAddress, tvlUsd: 6000, observedAt: new Date()}]);
-    fetchMock.mockResolvedValue(new Response(JSON.stringify([{...pair(1), liquidity: {usd:0}}])));
-    score.mockImplementation(async p => ({...scored(p), tvlUsd: 6000}));
-    const pending = scanner.scan(filters); await vi.runAllTimersAsync(); const result = await pending;
-    expect(result.pools[0]!.warnings).toContain('TVL snapshot Gecko ≤15m');
-    expect(result.marketCoverage!.snapshotPools).toBe(1);
+  it('skips tokens when the highest-TVL pool is below the minimum pool TVL', async () => {
+    const { scanner, fetchMock, score } = setup();
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([{ ...pair(1), liquidity: { usd: 500 } }])));
+    const pending = scanner.scan({ ...filters, minPoolTvlUsd: 1000 });
+    await vi.runAllTimersAsync();
+    const result = await pending;
+    expect(score).not.toHaveBeenCalled();
+    expect(result.pools).toHaveLength(0);
+    expect(result.marketCoverage).toMatchObject({ completedTokens: 1, failedTokens: 0 });
   });
 
   it('aborts hanging HTTP and clears queued work at the deadline', async () => {

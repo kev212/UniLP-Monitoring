@@ -3647,10 +3647,9 @@ export function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilt
     const c = scan.marketCoverage;
     const lines = [
       '🏆 TOP POOL YIELD 1H — ROBINHOOD',
-      `Kandidat: ${scan.candidateTokens} | Selesai: ${c.completedTokens} | Data kurang: ${c.failedTokens} | Belum selesai: ${c.pendingTokens}`,
+      `Kandidat: ${scan.candidateTokens} | Diproses: ${c.completedTokens + c.failedTokens} | Tanpa pool: ${c.noEligiblePools} | Data kurang: ${c.failedTokens} | Belum selesai: ${c.pendingTokens}`,
       `Discovery: ${c.discoveryAt ?? 'belum tersedia'} | Durasi: ${(c.durationMs / 1000).toFixed(1)}s`,
-      `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | Pool TVL ≥ $${fmtUsd(filters.minPoolTvlUsd)} | Total TVL > $${fmtUsd(filters.minTotalActiveTvlUsd)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
-      `Pool data kurang: ${c.unavailablePools} | TVL dari snapshot: ${c.snapshotPools}`,
+      `Filter: MC > $${fmtUsd(filters.minMarketCapUsd)} | Pool TVL ≥ $${fmtUsd(filters.minPoolTvlUsd)} | Yield/h > ${fmtPercent(filters.minYieldHourlyPercent)}`,
       ...(c.partial ? [`⚠️ Hasil parsial${c.timedOut ? ': tenggat tercapai' : ': data/discovery belum lengkap'}.`] : []),
       `Min volume 1h/pool: $${fmtUsd(filters.minVolume1hUsd ?? 0)}`,
       `Top ${totalResults} dari ${c.totalQualifiedTokens} token lolos`, '',
@@ -3661,8 +3660,6 @@ export function formatPoolMarketScan(scan: PoolMarketScan, filters: PoolScanFilt
       const label = pool.pair.replace(/[\r\n]/g, ' ').slice(0, 48);
       lines.push(`${offset + index + 1}. ${pool.protocol.toUpperCase()} ${label} | Yield/h ${fmtPercent(pool.estimatedPoolYield1hPercent)}`);
       lines.push(`TVL $${fmtUsd(pool.tvlUsd)} | Vol 1h $${fmtUsd(pool.volume1hUsd)} | Fee ${((pool.currentLpFee ?? pool.feeTier) / 10_000).toFixed(2)}%`);
-      if (pool.warnings.some(warning => warning.startsWith('Total TVL:'))) lines.push('Total TVL aktif: batas bawah; pemeriksaan parsial.');
-      if (pool.warnings.some(warning => warning.startsWith('TVL snapshot'))) lines.push('TVL: snapshot Gecko ≤15m.');
       lines.push(pool.uniswapUrl);
     }
     lines.push('', 'Yield = volume 1h × fee saat pemeriksaan / TVL; estimasi gross pool.');

@@ -10,7 +10,7 @@ const filters: PoolScanFilters = { chain: 'robinhood', minMarketCapUsd: 300000, 
 function result(count: number): PoolMarketScan {
   return { chain: 'robinhood', candidateTokens: count, evaluatedTokens: count, qualifiedTokens: count,
     marketCoverage: { partial: false, timedOut: false, completedTokens: count, pendingTokens: 0, failedTokens: 0,
-      unavailablePools: 0, snapshotPools: 0, totalQualifiedTokens: count, durationMs: 20000 },
+      noEligiblePools: 0, totalQualifiedTokens: count, durationMs: 20000 },
     pools: Array.from({ length: count }, (_, i) => ({ protocol: 'v4', pair: `TOKEN${i + 1}/USDG`,
       feeTier: 3000, tvlUsd: 6000, volume1hUsd: 1000, estimatedPoolYield1hPercent: 20 - i / 2,
       estimatedPoolFees1hUsd: 3, warnings: [],

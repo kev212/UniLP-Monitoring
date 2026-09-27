@@ -11,8 +11,7 @@ export interface MarketCoverage {
   completedTokens: number;
   pendingTokens: number;
   failedTokens: number;
-  unavailablePools: number;
-  snapshotPools: number;
+  noEligiblePools: number;
   totalQualifiedTokens: number;
   discoveryAt?: string;
   durationMs: number;
@@ -85,8 +84,8 @@ export class MarketScanner {
   async scan(filters: PoolScanFilters, onProgress?: (stage: string) => void, startedAt = Date.now()): Promise<PoolMarketScan> {
     const budget = new ScanBudget(startedAt + MARKET_SCAN_BUDGET_MS);
     const coverage: MarketCoverage = { partial: false, timedOut: false, completedTokens: 0, pendingTokens: 0,
-      failedTokens: 0, unavailablePools: 0, snapshotPools: 0, totalQualifiedTokens: 0, durationMs: 0 };
-    type TokenResult = { token: string; pools: ScoredPool[]; totalTvl: number; incomplete: boolean; done: boolean; active: boolean };
+      failedTokens: 0, noEligiblePools: 0, totalQualifiedTokens: 0, durationMs: 0 };
+    type TokenResult = { token: string; pools: ScoredPool[]; incomplete: boolean; done: boolean; active: boolean };
     const outcomes: TokenResult[] = [];
     let candidates: MarketCandidate[] = [];
     let metadataFailed = false;
@@ -94,25 +93,19 @@ export class MarketScanner {
     try {
       onProgress?.('Memuat trending GMGN 24h...');
       const trending = await budget.run(() => this.deps.candidateSource.fetchCandidates(filters.minMarketCapUsd));
-      const snapshots = await budget.run(() => this.deps.database.listMarketTvlSnapshots('robinhood').catch(() => {
-        metadataFailed = true;
-        return [];
-      }));
       // GMGN already orders this universe by 24h volume. Do not interleave it
       // with the legacy cache fairness order or lower-ranked tokens can win the budget.
       candidates = [...trending.candidates].sort((left, right) => right.seedScore - left.seedScore || left.tokenAddress.localeCompare(right.tokenAddress));
       coverage.discoveryAt = trending.fetchedAt.toISOString();
       onProgress?.(`Trending GMGN 24h: ${candidates.length} token`);
-      const tvls = new Map(snapshots.filter(p => Date.now() - p.observedAt.getTime() <= 15 * 60_000)
-        .map(p => [p.poolId.toLowerCase(), p.tvlUsd]));
-      const snapshotTimes = new Map(snapshots.map(p => [p.poolId.toLowerCase(), p.observedAt.getTime()]));
       const allowed = new Set(filters.allowedQuoteAddresses.map(address => address.toLowerCase()));
+      const noTvlFallback = new Map<string, number>();
       let index = 0;
       const worker = async () => {
         while (index < candidates.length && !budget.signal.aborted) {
           const candidate = candidates[index++]!;
           const token = candidate.tokenAddress.toLowerCase();
-          const outcome: TokenResult = { token, pools: [], totalTvl: 0, incomplete: false, done: false, active: false };
+          const outcome: TokenResult = { token, pools: [], incomplete: false, done: false, active: false };
           outcomes.push(outcome);
           try {
             const raw = await this.pairs(token, budget);
@@ -129,39 +122,36 @@ export class MarketScanner {
             if (valuation <= filters.minMarketCapUsd) continue;
             const oldest = Math.min(...pairs.map(pair => pair.pairCreatedAt ?? 0).filter(time => time > 0));
             const age = Number.isFinite(oldest) ? Math.max(0, (Date.now() - oldest) / 1000) : 0;
-            // Turnover orders work only; no fee assumption or pool-count cutoff determines eligibility.
-            const turnover = (pair: DexScreenerPair) => Number(pair.volume?.h1 ?? 0) / Math.max(1, Number(pair.liquidity?.usd ?? 0) || tvls.get(pair.pairAddress.toLowerCase()) || 1);
-            pairs.sort((a, b) => turnover(b) - turnover(a));
-            for (const pair of pairs) {
-              await this.deps.waitForInteractive(budget);
-              budget.check();
-              const id = pair.pairAddress.toLowerCase();
-              const fallback = !(Number(pair.liquidity?.usd) > 0);
-              if (fallback && (!tvls.has(id) || Date.now() - (snapshotTimes.get(id) ?? 0) > 15 * 60_000)) {
-                outcome.incomplete = true; coverage.unavailablePools++; continue;
-              }
-              if ([pair.volume?.h1, pair.volume?.h6].some(value => value == null || !Number.isFinite(Number(value)) || Number(value) < 0)) {
-                outcome.incomplete = true; coverage.unavailablePools++; continue;
-              }
-              let pool: ScoredPool | null;
-              try {
-                pool = await this.rpcSlots.run(budget, async () => {
-                  await this.deps.waitForInteractive(budget);
-                  budget.check();
-                  return this.deps.score(pair, token, tvls);
-                });
-              } catch (error) {
-                budget.check(); outcome.incomplete = true; coverage.unavailablePools++; continue;
-              }
-              budget.check();
-              if (!pool) { outcome.incomplete = true; coverage.unavailablePools++; continue; }
-              if (!pool.activeLiquidity) continue;
-              outcome.totalTvl += pool.tvlUsd;
-              if (fallback) coverage.snapshotPools++;
-              if (pool.tvlUsd >= filters.minPoolTvlUsd && pool.volume1hUsd >= (filters.minVolume1hUsd ?? 0) && pool.estimatedPoolYield1hPercent > filters.minYieldHourlyPercent) {
-                outcome.pools.push({ ...pool, warnings: [...pool.warnings, ...(fallback ? ['TVL snapshot Gecko ≤15m'] : [])],
-                  tokenMarketCapUsd: valuation, tokenValuationSource: mc > 0 ? 'market_cap' : 'fdv', tokenOldestPoolAgeSeconds: age });
-              }
+            // Single representative pool per token: the one with the largest DexScreener TVL.
+            const best = pairs.reduce<DexScreenerPair | null>((top, pair) => {
+              const tvl = Number(pair.liquidity?.usd ?? 0);
+              if (!(tvl > 0)) return top;
+              return !top || tvl > Number(top.liquidity?.usd ?? 0) ? pair : top;
+            }, null);
+            if (!best) { coverage.noEligiblePools++; continue; }
+            const bestTvlUsd = Number(best.liquidity?.usd ?? 0);
+            if (bestTvlUsd < filters.minPoolTvlUsd) continue;
+            if ([best.volume?.h1, best.volume?.h6].some(value => value == null || !Number.isFinite(Number(value)) || Number(value) < 0)) {
+              outcome.incomplete = true; continue;
+            }
+            await this.deps.waitForInteractive(budget);
+            budget.check();
+            let pool: ScoredPool | null;
+            try {
+              pool = await this.rpcSlots.run(budget, async () => {
+                await this.deps.waitForInteractive(budget);
+                budget.check();
+                return this.deps.score(best, token, noTvlFallback);
+              });
+            } catch (error) {
+              budget.check(); outcome.incomplete = true; continue;
+            }
+            budget.check();
+            if (!pool) { outcome.incomplete = true; continue; }
+            if (!pool.activeLiquidity) continue;
+            if (pool.volume1hUsd >= (filters.minVolume1hUsd ?? 0) && pool.estimatedPoolYield1hPercent > filters.minYieldHourlyPercent) {
+              outcome.pools.push({ ...pool, tokenMarketCapUsd: valuation, tokenValuationSource: mc > 0 ? 'market_cap' : 'fdv',
+                tokenTotalActiveTvlUsd: pool.tvlUsd, tokenOldestPoolAgeSeconds: age });
             }
           } catch (error) {
             if (!budget.signal.aborted) log.warn({ token, reason: error instanceof Error ? error.name : 'error' }, 'market token evaluation incomplete');
@@ -189,10 +179,7 @@ export class MarketScanner {
       budget.close();
     }
     if (fatalError) throw fatalError;
-    const pools = outcomes.filter(outcome => outcome.totalTvl > filters.minTotalActiveTvlUsd)
-      .flatMap(outcome => [...outcome.pools].sort((a, b) => b.estimatedPoolYield1hPercent - a.estimatedPoolYield1hPercent || b.tvlUsd - a.tvlUsd).slice(0, 1)
-        .map(pool => ({ ...pool, tokenTotalActiveTvlUsd: outcome.totalTvl,
-          warnings: [...pool.warnings, ...(!outcome.done || outcome.incomplete ? ['Total TVL: batas bawah, pemeriksaan parsial'] : [])] })))
+    const pools = outcomes.flatMap(outcome => outcome.pools)
       .sort((a, b) => b.estimatedPoolYield1hPercent - a.estimatedPoolYield1hPercent || b.tvlUsd - a.tvlUsd);
     coverage.totalQualifiedTokens = pools.length;
     coverage.pendingTokens = candidates.length - coverage.completedTokens - coverage.failedTokens;
